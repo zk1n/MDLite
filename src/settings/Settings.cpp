@@ -44,6 +44,10 @@ void Overlay(const SettingsLayer& layer, std::wstring_view origin, EffectiveSett
   if (layer.theme) { target.theme = *layer.theme; target.origins[L"theme"] = origin; }
   if (layer.font_face) { target.font_face = *layer.font_face; target.origins[L"font_face"] = origin; }
   if (layer.font_size_pt) { target.font_size_pt = *layer.font_size_pt; target.origins[L"font_size_pt"] = origin; }
+  if (layer.default_memo_workspace) {
+    target.default_memo_workspace = *layer.default_memo_workspace;
+    target.origins[L"default_memo_workspace"] = origin;
+  }
   for (const auto& [command, shortcut] : layer.keybindings) {
     target.keybindings[command] = shortcut;
     target.origins[L"keybinding." + command] = origin;
@@ -114,7 +118,9 @@ SettingsLayer DefaultSettingsLayer() {
   layer.theme = ThemeMode::System;
   layer.font_face = L"Segoe UI";
   layer.font_size_pt = 11;
-  layer.keybindings = {{L"file.open", L"Ctrl+O"}, {L"file.save", L"Ctrl+S"}, {L"file.quickOpen", L"Ctrl+P"},
+  layer.default_memo_workspace = std::filesystem::path{};
+  layer.keybindings = {{L"file.new", L"Ctrl+N"}, {L"file.open", L"Ctrl+O"},
+                       {L"file.save", L"Ctrl+S"}, {L"file.quickOpen", L"Ctrl+P"},
                        {L"file.close", L"Ctrl+W"}, {L"edit.find", L"Ctrl+F"}, {L"edit.findNext", L"F3"},
                        {L"view.commandPalette", L"Ctrl+Shift+P"}};
   return layer;
@@ -160,6 +166,12 @@ bool ValidateSettingsLayer(const SettingsLayer& layer, std::wstring& error) {
   if (layer.font_face && (layer.font_face->empty() || layer.font_face->size() > LF_FACESIZE - 1 ||
                           !IsSafeTomlString(*layer.font_face))) {
     error = L"フォント名は1〜31文字で指定してください。"; return false;
+  }
+  if (layer.default_memo_workspace && !layer.default_memo_workspace->empty() &&
+      (!layer.default_memo_workspace->is_absolute() ||
+       !IsSafeTomlString(layer.default_memo_workspace->wstring()))) {
+    error = L"既定のメモ用Workspaceは引用符を含まない絶対pathで指定してください。";
+    return false;
   }
   if (layer.font_size_pt && (*layer.font_size_pt < 6 || *layer.font_size_pt > 96)) {
     error = L"フォントサイズは6〜96ptで指定してください。"; return false;
@@ -219,6 +231,12 @@ bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, 
       const auto quoted = Unquote(raw);
       if (!quoted) { error = L"font_faceは引用符で囲んでください。"; return false; }
       layer.font_face = *quoted;
+    } else if (key == L"default_memo_workspace") {
+      const auto quoted = Unquote(raw);
+      if (!quoted) { error = L"default_memo_workspaceは引用符で囲んでください。"; return false; }
+      auto workspace = std::filesystem::path(*quoted);
+      workspace.make_preferred();
+      layer.default_memo_workspace = std::move(workspace);
     }
     else if (key == L"font_size_pt") {
       try {
@@ -252,6 +270,8 @@ bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& l
   if (layer.theme) text += L"theme = \"" + ThemeName(*layer.theme) + L"\"\n";
   if (layer.font_face) text += L"font_face = \"" + *layer.font_face + L"\"\n";
   if (layer.font_size_pt) text += L"font_size_pt = " + std::to_wstring(*layer.font_size_pt) + L"\n";
+  if (layer.default_memo_workspace)
+    text += L"default_memo_workspace = \"" + layer.default_memo_workspace->generic_wstring() + L"\"\n";
   for (const auto& [command, shortcut] : layer.keybindings) text += L"bind." + command + L" = \"" + shortcut + L"\"\n";
   for (const auto& [name, color] : layer.colors) text += L"color." + name + L" = \"" + color + L"\"\n";
   if (!layer.preserved_lines.empty()) {

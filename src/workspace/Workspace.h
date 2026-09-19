@@ -20,12 +20,23 @@ struct SessionDocument {
 
 struct SessionState {
   std::vector<SessionDocument> documents;
+  std::vector<std::filesystem::path> recent_documents;
   std::size_t active_index{};
   int main_x{};
   int main_y{};
   int main_width{1280};
   int main_height{800};
 };
+
+struct RecoverySnapshot {
+  std::filesystem::path recovery_path;
+  std::filesystem::path source_path;
+  std::wstring text;
+};
+
+std::vector<std::filesystem::path> FindQuickOpenCandidates(
+    const std::filesystem::path& root, std::wstring_view query,
+    const std::vector<std::filesystem::path>& recent, std::size_t limit = 20);
 
 class WorkspaceStore {
  public:
@@ -36,6 +47,10 @@ class WorkspaceStore {
                      std::wstring& error) const;
   bool RemoveRecovery(const std::filesystem::path& document_path, std::wstring& error) const;
   std::vector<std::filesystem::path> RecoveryFiles() const;
+  bool ReadRecoverySnapshot(const std::filesystem::path& recovery_path,
+                            RecoverySnapshot& snapshot, std::wstring& error) const;
+  bool DiscardRecoverySnapshot(const std::filesystem::path& recovery_path,
+                               std::wstring& error) const;
   bool WriteSession(const std::vector<std::filesystem::path>& open_documents,
                     std::wstring& error) const;
   bool ReadSession(std::vector<std::filesystem::path>& open_documents,

@@ -358,6 +358,7 @@ bool Document::Load(const std::filesystem::path& path, std::wstring& error) {
   }
 
   path_ = std::filesystem::absolute(path).lexically_normal();
+  untitled_ = false;
   text_ = std::move(decoded);
   encoding_ = detected;
   line_ending_ = DetectLineEnding(text_);
@@ -367,8 +368,23 @@ bool Document::Load(const std::filesystem::path& path, std::wstring& error) {
   return true;
 }
 
+void Document::CreateUntitled(const std::filesystem::path& recovery_identity) {
+  path_ = std::filesystem::absolute(recovery_identity).lexically_normal();
+  text_.clear();
+  encoding_ = TextEncoding::Utf8;
+  line_ending_ = LineEnding::None;
+  disk_fingerprint_ = {};
+  untitled_ = true;
+  revision_ = 1;
+  saved_revision_ = 0;
+}
+
 bool Document::Save(std::wstring& error) {
   if (!dirty()) return true;
+  if (untitled_) {
+    error = L"無題文書は最初に保存先を指定してください。";
+    return false;
+  }
   const FileFingerprint current = Fingerprint(path_);
   if (!current.valid || !(current == disk_fingerprint_)) {
     error = L"ファイルが外部で変更または削除されています。編集内容は上書きしていません。";
@@ -396,6 +412,7 @@ bool Document::SaveAs(const std::filesystem::path& path, std::wstring& error) {
     return false;
   }
   path_ = absolute;
+  untitled_ = false;
   disk_fingerprint_ = fingerprint;
   saved_revision_ = revision_;
   return true;

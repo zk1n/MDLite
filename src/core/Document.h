@@ -24,6 +24,7 @@ struct FileFingerprint {
 class Document {
  public:
   bool Load(const std::filesystem::path& path, std::wstring& error);
+  void CreateUntitled(const std::filesystem::path& recovery_identity);
   bool Save(std::wstring& error);
   bool SaveAs(const std::filesystem::path& path, std::wstring& error);
 
@@ -36,6 +37,7 @@ class Document {
   [[nodiscard]] TextEncoding encoding() const noexcept { return encoding_; }
   [[nodiscard]] LineEnding line_ending() const noexcept { return line_ending_; }
   [[nodiscard]] bool dirty() const noexcept { return revision_ != saved_revision_; }
+  [[nodiscard]] bool untitled() const noexcept { return untitled_; }
   [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
   [[nodiscard]] std::uint64_t saved_revision() const noexcept { return saved_revision_; }
   [[nodiscard]] bool HasExternalChange() const;
@@ -46,6 +48,7 @@ class Document {
   TextEncoding encoding_{TextEncoding::Utf8};
   LineEnding line_ending_{LineEnding::None};
   FileFingerprint disk_fingerprint_{};
+  bool untitled_{};
   std::uint64_t revision_{};
   std::uint64_t saved_revision_{};
 };

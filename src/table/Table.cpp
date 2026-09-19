@@ -167,6 +167,42 @@ TableEditResult MoveToAdjacentTableCell(std::wstring_view source, std::size_t ca
   return {std::move(result), selection, true};
 }
 
+std::optional<std::size_t> MoveTableCaretAtBoundary(std::wstring_view source, std::size_t caret,
+                                                    TableCaretDirection direction) {
+  const auto row = RowAt(source, caret);
+  if (!row) return std::nullopt;
+  const std::size_t cell = CellAt(*row, caret);
+  const auto [begin, end] = row->cells[cell];
+  if (direction == TableCaretDirection::Left) {
+    if (caret > begin || cell == 0) return std::nullopt;
+    return row->cells[cell - 1].second;
+  }
+  if (direction == TableCaretDirection::Right) {
+    if (caret < end || cell + 1 >= row->cells.size()) return std::nullopt;
+    return row->cells[cell + 1].first;
+  }
+  std::size_t adjacent_position{};
+  if (direction == TableCaretDirection::Up) {
+    if (row->begin == 0) return std::nullopt;
+    adjacent_position = row->begin - 1;
+  } else {
+    if (row->end >= source.size()) return std::nullopt;
+    adjacent_position = row->end + 1;
+  }
+  auto adjacent = RowAt(source, adjacent_position);
+  if (adjacent && IsDelimiter(CellValues(source, *adjacent))) {
+    if (direction == TableCaretDirection::Up) {
+      if (adjacent->begin == 0) return std::nullopt;
+      adjacent = RowAt(source, adjacent->begin - 1);
+    } else {
+      if (adjacent->end >= source.size()) return std::nullopt;
+      adjacent = RowAt(source, adjacent->end + 1);
+    }
+  }
+  if (!adjacent) return std::nullopt;
+  return adjacent->cells[std::min(cell, adjacent->cells.size() - 1)].first;
+}
+
 TableEditResult InsertTableRow(std::wstring_view source, std::size_t caret, bool after) {
   const auto row = RowAt(source, caret);
   if (!row) return {std::wstring(source), caret, false};

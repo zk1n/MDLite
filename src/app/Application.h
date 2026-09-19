@@ -14,6 +14,7 @@
 
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,8 @@ class Application {
     std::shared_ptr<WorkspaceStore> workspace_store;
     ULONGLONG autosave_due{};
     ULONGLONG recovery_due{};
+    std::map<std::size_t, unsigned> animated_image_frames;
+    ULONGLONG animation_due{};
   };
 
   enum class TableAction { InsertRowBefore, InsertRowAfter, DeleteRow, InsertColumnBefore,
@@ -60,22 +63,25 @@ class Application {
   void CreateMenuBar();
   void OpenWorkspaceDialog();
   void OpenFileDialog();
+  void NewUntitledDocument();
   void QuickOpen();
   void OpenWorkspace(const std::filesystem::path& path);
   void PopulateWorkspaceTree();
   void AddTreeDirectory(HTREEITEM parent, const std::filesystem::path& directory, int depth);
   void OpenDocument(const std::filesystem::path& path);
+  void OpenDocumentView(Document document, std::wstring tab_name);
+  void OpenRecoverySnapshot(const std::filesystem::path& path);
   void ActivateDocument(std::size_t index);
   bool SaveDocument(DocumentView& view, bool interactive);
   bool SaveDocumentAs(DocumentView& view);
   void ReloadDocumentFromDisk();
   void CompareDocumentWithDisk();
   bool SaveAll(bool interactive);
-  bool CloseDocumentsForWorkspaceSwitch();
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
   void RefreshDerivedImages(DocumentView& view);
+  void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);
   void RebuildOutline(const DocumentView& view);
   std::wstring EditorText(HWND editor) const;
   void UpdateStatus();
@@ -147,6 +153,7 @@ class Application {
   std::vector<std::filesystem::path> copied_files_;
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
   std::vector<std::unique_ptr<DocumentView>> documents_;
+  std::vector<std::filesystem::path> recent_documents_;
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
   bool external_operation_active_{};

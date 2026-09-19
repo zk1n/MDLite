@@ -111,6 +111,77 @@ bool ReadRasterImageInfo(const std::filesystem::path& path, RasterImageInfo& inf
   return true;
 }
 
+bool CreateRasterFramePngStream(const std::filesystem::path& path, unsigned frame_index,
+                                IStream*& stream, unsigned& delay_ms, std::wstring& error) {
+  stream = nullptr;
+  delay_ms = 100;
+  IWICImagingFactory* factory{};
+  IWICBitmapDecoder* decoder{};
+  IWICBitmapFrameDecode* source_frame{};
+  IWICMetadataQueryReader* metadata{};
+  IWICBitmapEncoder* encoder{};
+  IWICBitmapFrameEncode* target_frame{};
+  IPropertyBag2* properties{};
+  IStream* output{};
+  HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&factory));
+  if (SUCCEEDED(result)) {
+    result = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnLoad, &decoder);
+  }
+  UINT frame_count{};
+  if (SUCCEEDED(result)) result = decoder->GetFrameCount(&frame_count);
+  if (SUCCEEDED(result) && frame_index >= frame_count) result = E_INVALIDARG;
+  if (SUCCEEDED(result)) result = decoder->GetFrame(frame_index, &source_frame);
+
+  if (SUCCEEDED(result) && SUCCEEDED(source_frame->GetMetadataQueryReader(&metadata))) {
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    if (SUCCEEDED(metadata->GetMetadataByName(L"/grctlext/Delay", &value))) {
+      unsigned centiseconds{};
+      if (value.vt == VT_UI2) centiseconds = value.uiVal;
+      else if (value.vt == VT_UI4) centiseconds = value.ulVal;
+      if (centiseconds != 0) delay_ms = std::clamp(centiseconds * 10U, 20U, 10000U);
+    }
+    PropVariantClear(&value);
+  }
+
+  UINT width{};
+  UINT height{};
+  if (SUCCEEDED(result)) result = source_frame->GetSize(&width, &height);
+  if (SUCCEEDED(result) && (width == 0 || height == 0)) result = E_INVALIDARG;
+  if (SUCCEEDED(result)) result = CreateStreamOnHGlobal(nullptr, TRUE, &output);
+  if (SUCCEEDED(result)) result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+  if (SUCCEEDED(result)) result = encoder->Initialize(output, WICBitmapEncoderNoCache);
+  if (SUCCEEDED(result)) result = encoder->CreateNewFrame(&target_frame, &properties);
+  if (SUCCEEDED(result)) result = target_frame->Initialize(properties);
+  if (SUCCEEDED(result)) result = target_frame->SetSize(width, height);
+  WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
+  if (SUCCEEDED(result)) result = target_frame->SetPixelFormat(&pixel_format);
+  if (SUCCEEDED(result)) result = target_frame->WriteSource(source_frame, nullptr);
+  if (SUCCEEDED(result)) result = target_frame->Commit();
+  if (SUCCEEDED(result)) result = encoder->Commit();
+  if (SUCCEEDED(result)) {
+    LARGE_INTEGER start{};
+    result = output->Seek(start, STREAM_SEEK_SET, nullptr);
+  }
+
+  if (properties) properties->Release();
+  if (target_frame) target_frame->Release();
+  if (encoder) encoder->Release();
+  if (metadata) metadata->Release();
+  if (source_frame) source_frame->Release();
+  if (decoder) decoder->Release();
+  if (factory) factory->Release();
+  if (FAILED(result)) {
+    if (output) output->Release();
+    error = L"アニメーション画像のframeを描画用に変換できません: " + path.wstring();
+    return false;
+  }
+  stream = output;
+  return true;
+}
+
 bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
                         std::wstring& message, std::wstring& error) {
   safe = true;

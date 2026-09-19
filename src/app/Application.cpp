@@ -207,6 +207,7 @@ enum ControlId : int {
   kFindRegex,
   kFindWord,
   kFileOpenWorkspace = 1000,
+  kFileNew,
   kFileOpen,
   kFileQuickOpen,
   kFileClose,
@@ -282,6 +283,40 @@ bool IsMarkdownFile(const std::filesystem::path& path) {
   std::wstring extension = path.extension().wstring();
   std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
   return extension == L".md" || extension == L".markdown";
+}
+
+bool IsPathWithin(const std::filesystem::path& root, const std::filesystem::path& candidate) {
+  const auto normalized_root = std::filesystem::absolute(root).lexically_normal();
+  const auto normalized_candidate = std::filesystem::absolute(candidate).lexically_normal();
+  auto root_part = normalized_root.begin();
+  auto candidate_part = normalized_candidate.begin();
+  for (; root_part != normalized_root.end(); ++root_part, ++candidate_part) {
+    if (candidate_part == normalized_candidate.end() ||
+        _wcsicmp(root_part->c_str(), candidate_part->c_str()) != 0) return false;
+  }
+  return true;
+}
+
+bool LaunchMDLite(const std::filesystem::path& target, std::wstring& error) {
+  std::wstring executable(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (length == 0 || length >= executable.size()) {
+    error = L"MDLiteの実行pathを取得できません。";
+    return false;
+  }
+  executable.resize(length);
+  std::wstring command = L"\"" + executable + L"\" \"" + target.wstring() + L"\"";
+  STARTUPINFOW startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+                      nullptr, nullptr, &startup, &process)) {
+    error = L"別のMDLiteウィンドウを起動できません。Windows error " +
+            std::to_wstring(GetLastError());
+    return false;
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return true;
 }
 
 EditorSnapshot SnapshotFor(const Document& document) {
@@ -602,10 +637,24 @@ int Application::Run() {
 
 void Application::OpenInitialPath(const std::filesystem::path& path) {
   std::error_code error;
-  if (std::filesystem::is_directory(path, error)) OpenWorkspace(path);
-  else if (std::filesystem::is_regular_file(path, error)) {
-    OpenWorkspace(path.parent_path());
-    OpenDocument(path);
+  const auto absolute = std::filesystem::weakly_canonical(path, error);
+  if (error) return;
+  if (std::filesystem::is_directory(absolute, error)) {
+    if (!workspace_.empty() && workspace_ != absolute) {
+      std::wstring launch_error;
+      if (!LaunchMDLite(absolute, launch_error)) MessageBoxW(window_, launch_error.c_str(), L"Workspaceを開けません", MB_ICONERROR);
+      return;
+    }
+    OpenWorkspace(absolute);
+  }
+  else if (std::filesystem::is_regular_file(absolute, error)) {
+    if (!workspace_.empty() && !IsPathWithin(workspace_, absolute)) {
+      std::wstring launch_error;
+      if (!LaunchMDLite(absolute, launch_error)) MessageBoxW(window_, launch_error.c_str(), L"ファイルを開けません", MB_ICONERROR);
+      return;
+    }
+    if (workspace_.empty()) OpenWorkspace(absolute.parent_path());
+    OpenDocument(absolute);
   }
 }
 
@@ -666,21 +715,48 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       app->active_document_ < app->documents_.size() &&
       IsMarkdownFile(app->documents_[app->active_document_]->document.path()) &&
       app->documents_[app->active_document_]->editor == window) {
+    auto& view = *app->documents_[app->active_document_];
+    app->SyncDocumentFromEditor(view);
     CHARRANGE selection{};
     SendMessageW(window, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const auto edit = MoveToAdjacentTableCell(app->EditorText(window),
-                                              static_cast<std::size_t>(selection.cpMin),
+    const auto source_caret = view.editor_snapshot.ViewToSource(selection.cpMin);
+    const auto edit = MoveToAdjacentTableCell(view.document.text(), source_caret,
                                               (GetKeyState(VK_SHIFT) & 0x8000) != 0);
     if (edit.changed) {
+      const auto target = BuildMarkdownEditorSnapshot(edit.text);
       app->suppress_editor_change_ = true;
       SendMessageW(window, EM_SETSEL, 0, -1);
-      SendMessageW(window, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(edit.text.c_str()));
+      SendMessageW(window, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(target.view.c_str()));
       app->suppress_editor_change_ = false;
       app->OnEditorChanged(window);
     }
-    if (edit.selection != static_cast<std::size_t>(selection.cpMin) || edit.changed) {
-      SendMessageW(window, EM_SETSEL, edit.selection, edit.selection);
+    if (edit.selection != source_caret || edit.changed) {
+      const auto view_caret = view.editor_snapshot.SourceToView(edit.selection);
+      SendMessageW(window, EM_SETSEL, view_caret, view_caret);
       return 0;
+    }
+  }
+  if (message == WM_KEYDOWN && !app->ime_composing_ &&
+      (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN) &&
+      (GetKeyState(VK_SHIFT) & 0x8000) == 0 && (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+      (GetKeyState(VK_MENU) & 0x8000) == 0 && app->active_document_ < app->documents_.size() &&
+      IsMarkdownFile(app->documents_[app->active_document_]->document.path()) &&
+      app->documents_[app->active_document_]->editor == window) {
+    auto& view = *app->documents_[app->active_document_];
+    app->SyncDocumentFromEditor(view);
+    CHARRANGE selection{};
+    SendMessageW(window, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMin == selection.cpMax) {
+      const auto direction = wparam == VK_LEFT ? TableCaretDirection::Left :
+          wparam == VK_RIGHT ? TableCaretDirection::Right :
+          wparam == VK_UP ? TableCaretDirection::Up : TableCaretDirection::Down;
+      const auto destination = MoveTableCaretAtBoundary(
+          view.document.text(), view.editor_snapshot.ViewToSource(selection.cpMin), direction);
+      if (destination) {
+        const auto view_caret = view.editor_snapshot.SourceToView(*destination);
+        SendMessageW(window, EM_SETSEL, view_caret, view_caret);
+        return 0;
+      }
     }
   }
   if (message == WM_NCDESTROY) RemoveWindowSubclass(window, EditorSubclass, 1);
@@ -731,6 +807,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         const ULONGLONG now = GetTickCount64();
         bool pending = false;
         for (auto& view : documents_) {
+          if (!view->animated_image_frames.empty()) {
+            pending = true;
+            AdvanceAnimatedImages(*view, now);
+          }
           if (!view->document.dirty()) continue;
           pending = true;
           const bool composing_this_view = ime_composing_ && active_document_ < documents_.size() &&
@@ -851,6 +931,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_COMMAND: {
       const int command = LOWORD(wparam);
       if (command == kFileOpenWorkspace) OpenWorkspaceDialog();
+      else if (command == kFileNew) NewUntitledDocument();
       else if (command == kFileOpen) OpenFileDialog();
       else if (command == kFileQuickOpen) QuickOpen();
       else if (command == kFileClose && active_document_ < documents_.size()) CloseDocument(active_document_);
@@ -1051,6 +1132,7 @@ void Application::CreateMenuBar() {
   HMENU menu = CreateMenu();
   HMENU file = CreatePopupMenu();
   AppendMenuW(file, MF_STRING, kFileOpenWorkspace, L"Workspaceを開く…");
+  AppendMenuW(file, MF_STRING, kFileNew, L"新規無題文書\tCtrl+N");
   AppendMenuW(file, MF_STRING, kFileOpen, L"ファイルを開く…\tCtrl+O");
   AppendMenuW(file, MF_STRING, kFileQuickOpen, L"Quick Open…\tCtrl+P");
   AppendMenuW(file, MF_STRING, kFileClose, L"タブを閉じる\tCtrl+W");
@@ -1277,24 +1359,94 @@ void Application::OpenFileDialog() {
   dialog.lpstrFile = path;
   dialog.nMaxFile = static_cast<DWORD>(std::size(path));
   dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-  if (GetOpenFileNameW(&dialog)) {
-    if (workspace_.empty()) OpenWorkspace(std::filesystem::path(path).parent_path());
-    OpenDocument(path);
+  if (GetOpenFileNameW(&dialog)) OpenInitialPath(path);
+}
+
+void Application::NewUntitledDocument() {
+  if (workspace_.empty()) {
+    auto recovery_workspace = settings_.default_memo_workspace;
+    std::error_code path_error;
+    if (recovery_workspace.empty() || !std::filesystem::is_directory(recovery_workspace, path_error)) {
+      MessageBoxW(window_,
+                  L"無題文書の復旧先として使う既定のメモ用Workspaceを一度選択します。\n"
+                  L"通常の本文ファイルは保存操作まで作成しません。",
+                  L"新規無題文書", MB_ICONINFORMATION);
+      const auto selected = PickFolder(window_, L"既定のメモ用Workspace", {});
+      if (!selected) return;
+      recovery_workspace = std::filesystem::weakly_canonical(*selected, path_error);
+      if (path_error || !std::filesystem::is_directory(recovery_workspace)) return;
+      SettingsLayer common;
+      std::wstring settings_error;
+      const auto common_path = CommonSettingsPath();
+      if (!LoadSettingsLayer(common_path, common, settings_error)) {
+        MessageBoxW(window_, settings_error.c_str(), L"既定のメモ用Workspace", MB_ICONERROR);
+        return;
+      }
+      common.default_memo_workspace = recovery_workspace;
+      if (!SaveSettingsLayer(common_path, common, settings_error)) {
+        MessageBoxW(window_, settings_error.c_str(), L"既定のメモ用Workspace", MB_ICONERROR);
+        return;
+      }
+      LoadAndApplySettings();
+    }
+    OpenWorkspace(recovery_workspace);
+    if (workspace_.empty() || !workspace_store_) return;
+  }
+  Document document;
+  const auto identity = workspace_store_->state_root() / L"untitled" /
+      (std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".md");
+  document.CreateUntitled(identity);
+  OpenDocumentView(std::move(document), L"無題");
+  if (active_document_ < documents_.size()) {
+    auto& view = *documents_[active_document_];
+    view.recovery_due = GetTickCount64() + kRecoveryDelayMs;
+    SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
   }
 }
 
 void Application::QuickOpen() {
-  wchar_t path[32768]{};
-  OPENFILENAMEW dialog{sizeof(dialog)};
-  dialog.hwndOwner = window_;
-  dialog.lpstrTitle = L"Quick Open — Workspace内の文書を選択";
-  dialog.lpstrFilter = L"Markdown・テキスト\0*.md;*.markdown;*.txt;*.log;*.json;*.toml;*.yaml;*.yml\0すべて\0*.*\0";
-  dialog.lpstrFile = path;
-  dialog.nMaxFile = static_cast<DWORD>(std::size(path));
-  const std::wstring initial = workspace_.wstring();
-  dialog.lpstrInitialDir = initial.empty() ? nullptr : initial.c_str();
-  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-  if (GetOpenFileNameW(&dialog)) OpenDocument(path);
+  if (workspace_.empty()) return;
+  const auto initial = FindQuickOpenCandidates(workspace_, L"", recent_documents_, 12);
+  std::wstring list;
+  for (const auto& path : initial) {
+    std::error_code error;
+    const auto relative = std::filesystem::relative(path, workspace_, error);
+    if (!error) list += L"  " + relative.generic_wstring() + L"\n";
+  }
+  std::wstring query;
+  if (!PromptText(window_, instance_, L"Quick Open",
+                  L"ファイル名またはWorkspace相対pathで絞り込みます。\n"
+                  L"空欄なら最近使用した文書を先頭に表示します。\n\n" + list,
+                  query)) return;
+  auto matches = FindQuickOpenCandidates(workspace_, query, recent_documents_, 20);
+  if (matches.empty()) {
+    MessageBoxW(window_, L"一致する文書がありません。", L"Quick Open", MB_ICONINFORMATION);
+    return;
+  }
+  if (matches.size() == 1) {
+    OpenDocument(matches.front());
+    return;
+  }
+  std::wstring choices;
+  for (const auto& path : matches) {
+    std::error_code error;
+    const auto relative = std::filesystem::relative(path, workspace_, error);
+    if (!error) choices += relative.generic_wstring() + L"\n";
+  }
+  std::error_code relative_error;
+  std::wstring selected = std::filesystem::relative(matches.front(), workspace_, relative_error).generic_wstring();
+  if (!PromptText(window_, instance_, L"Quick Open — 候補",
+                  L"開く相対pathを指定してください。\n\n" + choices, selected)) return;
+  const auto match = std::ranges::find_if(matches, [&](const auto& path) {
+    std::error_code error;
+    const auto relative = std::filesystem::relative(path, workspace_, error).generic_wstring();
+    return !error && _wcsicmp(relative.c_str(), selected.c_str()) == 0;
+  });
+  if (match == matches.end()) {
+    MessageBoxW(window_, L"候補一覧にある相対pathを指定してください。", L"Quick Open", MB_ICONWARNING);
+    return;
+  }
+  OpenDocument(*match);
 }
 
 void Application::OpenWorkspace(const std::filesystem::path& path) {
@@ -1305,15 +1457,17 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
     return;
   }
   if (workspace_ == absolute) return;
+  if (!workspace_.empty()) {
+    std::wstring launch_error;
+    if (!LaunchMDLite(absolute, launch_error))
+      MessageBoxW(window_, launch_error.c_str(), L"Workspaceを開けません", MB_ICONERROR);
+    return;
+  }
   HANDLE new_mutex = CreateMutexW(nullptr, FALSE, WorkspaceMutexName(absolute).c_str());
   if (new_mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
     if (new_mutex) CloseHandle(new_mutex);
     MessageBoxW(window_, L"このWorkspaceは別のMDLiteウィンドウで既に開かれています。",
                 L"Workspace重複起動", MB_ICONWARNING);
-    return;
-  }
-  if (!workspace_.empty() && !CloseDocumentsForWorkspaceSwitch()) {
-    CloseHandle(new_mutex);
     return;
   }
   if (workspace_mutex_) CloseHandle(workspace_mutex_);
@@ -1334,15 +1488,29 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
       workspace_store_.reset();
     } else {
       const auto recoveries = workspace_store_->RecoveryFiles();
-      if (!recoveries.empty() && MessageBoxW(window_,
-            L"前回の復旧スナップショットがあります。内容を別タブで開きますか？",
-            L"MDLite 復旧", MB_ICONWARNING | MB_YESNO) == IDYES) {
-        for (const auto& recovery : recoveries) OpenDocument(recovery);
+      if (!recoveries.empty()) {
+        const int recover = MessageBoxW(window_,
+            L"前回の復旧スナップショットがあります。\n"
+            L"元文書への未保存編集として開きますか？",
+            L"MDLite 復旧", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON1);
+        if (recover == IDYES) {
+          for (const auto& recovery : recoveries) OpenRecoverySnapshot(recovery);
+        } else if (MessageBoxW(window_,
+                   L"復旧スナップショットを明示的に破棄しますか？\n"
+                   L"「いいえ」なら次回起動のために保持します。",
+                   L"MDLite 復旧", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) == IDYES) {
+          for (const auto& recovery : recoveries) {
+            std::wstring discard_error;
+            if (!workspace_store_->DiscardRecoverySnapshot(recovery, discard_error))
+              MessageBoxW(window_, discard_error.c_str(), L"復旧スナップショット", MB_ICONWARNING);
+          }
+        }
       }
       SessionState session;
       if (!workspace_store_->ReadSessionState(session, initialize_error)) {
         MessageBoxW(window_, initialize_error.c_str(), L"セッション復元", MB_ICONWARNING);
       } else {
+        recent_documents_ = session.recent_documents;
         PlaceOnVisibleMonitor(window_, session.main_x, session.main_y,
                               session.main_width, session.main_height);
         for (const auto& item : session.documents) OpenDocument(item.path);
@@ -1420,19 +1588,36 @@ void Application::OpenDocument(const std::filesystem::path& path) {
   std::error_code error;
   const auto absolute = std::filesystem::weakly_canonical(path, error);
   if (error || !IsTextFile(absolute)) return;
+  if (!workspace_.empty() && !IsPathWithin(workspace_, absolute)) {
+    std::wstring launch_error;
+    if (!LaunchMDLite(absolute, launch_error))
+      MessageBoxW(window_, launch_error.c_str(), L"ファイルを開けません", MB_ICONERROR);
+    return;
+  }
+  recent_documents_.erase(std::remove_if(recent_documents_.begin(), recent_documents_.end(),
+      [&](const auto& recent) { return _wcsicmp(recent.c_str(), absolute.c_str()) == 0; }),
+      recent_documents_.end());
+  recent_documents_.insert(recent_documents_.begin(), absolute);
+  if (recent_documents_.size() > 20) recent_documents_.resize(20);
   for (std::size_t i = 0; i < documents_.size(); ++i) {
     if (documents_[i]->document.path() == absolute) {
       ActivateDocument(i);
       return;
     }
   }
-  auto view = std::make_unique<DocumentView>();
-  view->workspace_store = workspace_store_;
   std::wstring load_error;
-  if (!view->document.Load(absolute, load_error)) {
+  Document document;
+  if (!document.Load(absolute, load_error)) {
     MessageBoxW(window_, load_error.c_str(), L"ファイルを開けません", MB_ICONERROR);
     return;
   }
+  OpenDocumentView(std::move(document), absolute.filename().wstring());
+}
+
+void Application::OpenDocumentView(Document document, std::wstring tab_name) {
+  auto view = std::make_unique<DocumentView>();
+  view->workspace_store = workspace_store_;
+  view->document = std::move(document);
   view->editor_snapshot = SnapshotFor(view->document);
   view->editor = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, nullptr,
                                   WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
@@ -1449,12 +1634,48 @@ void Application::OpenDocument(const std::filesystem::path& path) {
 
   TCITEMW tab{};
   tab.mask = TCIF_TEXT;
-  std::wstring name = absolute.filename().wstring();
-  tab.pszText = name.data();
+  tab.pszText = tab_name.data();
   TabCtrl_InsertItem(tabs_, static_cast<int>(documents_.size()), &tab);
   documents_.push_back(std::move(view));
   ApplySettings();
   ActivateDocument(documents_.size() - 1);
+}
+
+void Application::OpenRecoverySnapshot(const std::filesystem::path& path) {
+  if (!workspace_store_) return;
+  RecoverySnapshot snapshot;
+  std::wstring error;
+  if (!workspace_store_->ReadRecoverySnapshot(path, snapshot, error)) {
+    MessageBoxW(window_, (error + L"\nスナップショットは破棄していません。").c_str(),
+                L"復旧できません", MB_ICONWARNING);
+    return;
+  }
+  for (std::size_t index = 0; index < documents_.size(); ++index) {
+    if (documents_[index]->document.path() != snapshot.source_path) continue;
+    if (documents_[index]->document.dirty()) {
+      MessageBoxW(window_, L"同じ元文書の未保存タブがすでに開いているため、復旧内容を重ねていません。",
+                  L"復旧の競合", MB_ICONWARNING);
+      return;
+    }
+    documents_[index]->document.MarkEdited(std::move(snapshot.text));
+    documents_[index]->editor_snapshot = SnapshotFor(documents_[index]->document);
+    suppress_editor_change_ = true;
+    SetWindowTextW(documents_[index]->editor, documents_[index]->editor_snapshot.view.c_str());
+    suppress_editor_change_ = false;
+    ActivateDocument(index);
+    return;
+  }
+  Document document;
+  if (std::filesystem::is_regular_file(snapshot.source_path)) {
+    if (!document.Load(snapshot.source_path, error)) {
+      MessageBoxW(window_, error.c_str(), L"復旧元を開けません", MB_ICONWARNING);
+      return;
+    }
+  } else {
+    document.CreateUntitled(snapshot.source_path);
+  }
+  document.MarkEdited(std::move(snapshot.text));
+  OpenDocumentView(std::move(document), snapshot.source_path.filename().wstring() + L" (復旧)");
 }
 
 void Application::ActivateDocument(std::size_t index) {
@@ -1510,6 +1731,7 @@ bool Application::SaveDocument(DocumentView& view, bool interactive) {
   if (ime_composing_) return false;
   SyncDocumentFromEditor(view);
   if (!view.document.dirty()) return true;
+  if (view.document.untitled()) return SaveDocumentAs(view);
   std::wstring error;
   if (!view.document.Save(error)) {
     const bool recovered = SaveRecovery(view, false);
@@ -1533,15 +1755,17 @@ bool Application::SaveDocumentAs(DocumentView& view) {
   if (ime_composing_) return false;
   SyncDocumentFromEditor(view);
   wchar_t path[32768]{};
-  std::wstring suggested = view.document.path().stem().wstring() + L"-recovered" +
-                           view.document.path().extension().wstring();
+  std::wstring suggested = view.document.untitled()
+      ? L"untitled.md"
+      : view.document.path().stem().wstring() + L"-recovered" + view.document.path().extension().wstring();
   wcsncpy_s(path, suggested.c_str(), _TRUNCATE);
   OPENFILENAMEW dialog{sizeof(dialog)};
   dialog.hwndOwner = window_;
   dialog.lpstrFilter = L"Markdown・テキスト\0*.md;*.markdown;*.txt;*.log;*.json;*.toml;*.yaml;*.yml\0すべて\0*.*\0";
   dialog.lpstrFile = path;
   dialog.nMaxFile = static_cast<DWORD>(std::size(path));
-  const std::wstring initial_directory = view.document.path().parent_path().wstring();
+  const std::wstring initial_directory = view.document.untitled() && !workspace_.empty()
+      ? workspace_.wstring() : view.document.path().parent_path().wstring();
   dialog.lpstrInitialDir = initial_directory.c_str();
   dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
   if (!GetSaveFileNameW(&dialog)) return false;
@@ -1572,6 +1796,10 @@ bool Application::SaveDocumentAs(DocumentView& view) {
 void Application::ReloadDocumentFromDisk() {
   if (ime_composing_ || active_document_ >= documents_.size()) return;
   auto& view = *documents_[active_document_];
+  if (view.document.untitled()) {
+    MessageBoxW(window_, L"無題文書には再読込みするディスク版がありません。", L"再読込み", MB_ICONINFORMATION);
+    return;
+  }
   SyncDocumentFromEditor(view);
   std::wstring prompt = L"ディスク上の内容を再読込みしますか？";
   if (view.document.dirty()) {
@@ -1599,6 +1827,10 @@ void Application::ReloadDocumentFromDisk() {
 void Application::CompareDocumentWithDisk() {
   if (active_document_ >= documents_.size()) return;
   auto& view = *documents_[active_document_];
+  if (view.document.untitled()) {
+    MessageBoxW(window_, L"無題文書には比較するディスク版がありません。", L"外部変更の比較", MB_ICONINFORMATION);
+    return;
+  }
   SyncDocumentFromEditor(view);
   Document disk;
   std::wstring error;
@@ -1661,23 +1893,6 @@ bool Application::SaveAll(bool interactive) {
   return result;
 }
 
-bool Application::CloseDocumentsForWorkspaceSwitch() {
-  if (!SaveAll(true)) return false;
-  for (auto& view : documents_) {
-    if (view->compact_window) {
-      SetParent(view->editor, window_);
-      DestroyWindow(view->compact_window);
-      view->compact_window = nullptr;
-    }
-    DestroyWindow(view->editor);
-  }
-  documents_.clear();
-  TabCtrl_DeleteAllItems(tabs_);
-  TreeView_DeleteAllItems(outline_);
-  active_document_ = static_cast<std::size_t>(-1);
-  return true;
-}
-
 void Application::OnEditorChanged(HWND editor) {
   if (suppress_editor_change_ || ime_composing_) return;
   for (auto& view : documents_) {
@@ -1725,10 +1940,15 @@ void Application::RefreshDerivedImages(DocumentView& view) {
   if (!IsMarkdownFile(view.document.path())) return;
   if (view.derived_image_revision == view.document.revision()) return;
   view.derived_image_revision = view.document.revision();
+  view.animated_image_frames.clear();
+  view.animation_due = 0;
   const auto parsed = ParseMarkdown(view.document.text());
   if (parsed.images.empty()) return;
+  CHARRANGE selection{};
+  SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   PresentationUndoGuard undo_guard(view.editor);
   suppress_editor_change_ = true;
+  unsigned next_delay = std::numeric_limits<unsigned>::max();
   for (auto iterator = parsed.images.rbegin(); iterator != parsed.images.rend(); ++iterator) {
     const auto& image = *iterator;
     std::filesystem::path target(image.target);
@@ -1741,16 +1961,24 @@ void Application::RefreshDerivedImages(DocumentView& view) {
     std::wstring safety_error;
     if (!InspectImageSafety(target, safe, safety_message, safety_error) || !safe) continue;
     IStream* stream = nullptr;
-    if (FAILED(SHCreateStreamOnFileEx(target.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE,
-                                      FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream))) continue;
+    RasterImageInfo image_info;
+    std::wstring image_error;
+    const bool has_image_info = ReadRasterImageInfo(target, image_info, image_error);
+    unsigned frame_delay = 100;
+    if (has_image_info && image_info.animated) {
+      if (!CreateRasterFramePngStream(target, 0, stream, frame_delay, image_error)) continue;
+      view.animated_image_frames[image.begin] = 0;
+      next_delay = std::min(next_delay, frame_delay);
+    } else if (FAILED(SHCreateStreamOnFileEx(target.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE,
+                                             FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream))) {
+      continue;
+    }
     const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToView(image.begin));
     SendMessageW(view.editor, EM_SETSEL, position, position + 1);
     SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
     const unsigned width = image.width_dip == 0 ? 320U : image.width_dip;
     unsigned height = width * 9U / 16U;
-    RasterImageInfo image_info;
-    std::wstring image_error;
-    if (ReadRasterImageInfo(target, image_info, image_error)) {
+    if (has_image_info) {
       const auto scaled = static_cast<unsigned long long>(width) * image_info.height / image_info.width;
       height = static_cast<unsigned>(std::clamp<unsigned long long>(scaled, 16, 8192));
     }
@@ -1761,12 +1989,87 @@ void Application::RefreshDerivedImages(DocumentView& view) {
     parameters.Type = TA_BASELINE;
     parameters.pwszAlternateText = image.alternate_text.c_str();
     parameters.pIStream = stream;
-    if (!SendMessageW(view.editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters))) {
+    const auto inserted = static_cast<HRESULT>(
+        SendMessageW(view.editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters)));
+    if (FAILED(inserted)) {
       SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L"\uFFFC"));
     }
     stream->Release();
   }
+  SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   suppress_editor_change_ = false;
+  if (!view.animated_image_frames.empty()) {
+    view.animation_due = GetTickCount64() +
+        (next_delay == std::numeric_limits<unsigned>::max() ? 100 : next_delay);
+    SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
+  }
+}
+
+void Application::AdvanceAnimatedImages(DocumentView& view, ULONGLONG now) {
+  if (view.animation_due == 0 || now < view.animation_due || !IsWindowVisible(view.editor)) return;
+  const auto parsed = ParseMarkdown(view.document.text());
+  CHARRANGE selection{};
+  SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  RECT client{};
+  GetClientRect(view.editor, &client);
+  unsigned next_delay = std::numeric_limits<unsigned>::max();
+  bool kept_animation{};
+  bool changed{};
+  PresentationUndoGuard undo_guard(view.editor);
+  suppress_editor_change_ = true;
+  SendMessageW(view.editor, WM_SETREDRAW, FALSE, 0);
+  for (const auto& image : parsed.images) {
+    auto frame = view.animated_image_frames.find(image.begin);
+    if (frame == view.animated_image_frames.end()) continue;
+    std::filesystem::path target(image.target);
+    if (target.is_absolute() || image.target.find(L"://") != std::wstring::npos) continue;
+    target = (view.document.path().parent_path() / target).lexically_normal();
+    RasterImageInfo image_info;
+    std::wstring image_error;
+    if (!ReadRasterImageInfo(target, image_info, image_error) || image_info.frame_count < 2) continue;
+    kept_animation = true;
+    const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToView(image.begin));
+    POINT point{};
+    SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), position);
+    if (point.y < client.top || point.y >= client.bottom ||
+        point.x < client.left || point.x >= client.right) continue;
+    const unsigned next_frame = (frame->second + 1) % image_info.frame_count;
+    IStream* stream{};
+    unsigned frame_delay{};
+    if (!CreateRasterFramePngStream(target, next_frame, stream, frame_delay, image_error)) continue;
+    const unsigned width = image.width_dip == 0 ? 320U : image.width_dip;
+    const auto scaled = static_cast<unsigned long long>(width) * image_info.height / image_info.width;
+    const unsigned height = static_cast<unsigned>(std::clamp<unsigned long long>(scaled, 16, 8192));
+    SendMessageW(view.editor, EM_SETSEL, position, position + 1);
+    SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+    RICHEDIT_IMAGE_PARAMETERS parameters{};
+    parameters.xWidth = static_cast<LONG>(width * 2540U / 96U);
+    parameters.yHeight = static_cast<LONG>(height * 2540U / 96U);
+    parameters.Ascent = parameters.yHeight;
+    parameters.Type = TA_BASELINE;
+    parameters.pwszAlternateText = image.alternate_text.c_str();
+    parameters.pIStream = stream;
+    const auto inserted = static_cast<HRESULT>(
+        SendMessageW(view.editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters)));
+    if (FAILED(inserted))
+      SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L"\uFFFC"));
+    else
+      frame->second = next_frame;
+    stream->Release();
+    next_delay = std::min(next_delay, frame_delay);
+    changed = true;
+  }
+  SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
+  if (changed) InvalidateRect(view.editor, nullptr, FALSE);
+  suppress_editor_change_ = false;
+  if (!kept_animation) {
+    view.animated_image_frames.clear();
+    view.animation_due = 0;
+  } else {
+    view.animation_due = now +
+        (next_delay == std::numeric_limits<unsigned>::max() ? kTimerPollMs : next_delay);
+  }
 }
 
 void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
@@ -2171,46 +2474,54 @@ void Application::CreateProfileById(std::wstring id, const SYSTEMTIME* requested
 void Application::ApplyTableAction(TableAction action) {
   if (active_document_ >= documents_.size() || ime_composing_ ||
       !IsMarkdownFile(documents_[active_document_]->document.path())) return;
-  HWND editor = documents_[active_document_]->editor;
+  auto& view = *documents_[active_document_];
+  HWND editor = view.editor;
+  SyncDocumentFromEditor(view);
   CHARRANGE selection{};
   SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const std::wstring source = EditorText(editor);
+  const std::wstring source = view.document.text();
+  const auto source_caret = view.editor_snapshot.ViewToSource(selection.cpMin);
   TableEditResult edit;
   switch (action) {
-    case TableAction::InsertRowBefore: edit = InsertTableRow(source, selection.cpMin, false); break;
-    case TableAction::InsertRowAfter: edit = InsertTableRow(source, selection.cpMin, true); break;
-    case TableAction::DeleteRow: edit = DeleteTableRow(source, selection.cpMin); break;
-    case TableAction::InsertColumnBefore: edit = InsertTableColumn(source, selection.cpMin, false); break;
-    case TableAction::InsertColumnAfter: edit = InsertTableColumn(source, selection.cpMin, true); break;
-    case TableAction::DeleteColumn: edit = DeleteTableColumn(source, selection.cpMin); break;
+    case TableAction::InsertRowBefore: edit = InsertTableRow(source, source_caret, false); break;
+    case TableAction::InsertRowAfter: edit = InsertTableRow(source, source_caret, true); break;
+    case TableAction::DeleteRow: edit = DeleteTableRow(source, source_caret); break;
+    case TableAction::InsertColumnBefore: edit = InsertTableColumn(source, source_caret, false); break;
+    case TableAction::InsertColumnAfter: edit = InsertTableColumn(source, source_caret, true); break;
+    case TableAction::DeleteColumn: edit = DeleteTableColumn(source, source_caret); break;
   }
   if (!edit.changed) {
     MessageBoxW(window_, L"カーソルをMarkdown表のセル内へ移動してください。",
                 L"表の編集", MB_ICONINFORMATION);
     return;
   }
+  const auto target = BuildMarkdownEditorSnapshot(edit.text);
   suppress_editor_change_ = true;
   SendMessageW(editor, EM_SETSEL, 0, -1);
-  SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(edit.text.c_str()));
+  SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(target.view.c_str()));
   suppress_editor_change_ = false;
-  SendMessageW(editor, EM_SETSEL, edit.selection, edit.selection);
   OnEditorChanged(editor);
+  const auto view_caret = view.editor_snapshot.SourceToView(edit.selection);
+  SendMessageW(editor, EM_SETSEL, view_caret, view_caret);
 }
 
 void Application::MoveOutlineSection(std::size_t source_begin, std::size_t target_begin) {
   if (active_document_ >= documents_.size() || ime_composing_ || source_begin == target_begin ||
       !IsMarkdownFile(documents_[active_document_]->document.path())) return;
   auto& view = *documents_[active_document_];
-  const std::wstring source = EditorText(view.editor);
+  SyncDocumentFromEditor(view);
+  const std::wstring source = view.document.text();
   const auto edit = MoveHeadingSection(source, source_begin, target_begin);
   if (!edit.changed) return;
 
+  const auto target = BuildMarkdownEditorSnapshot(edit.text);
   suppress_editor_change_ = true;
   SendMessageW(view.editor, EM_SETSEL, 0, -1);
-  SendMessageW(view.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(edit.text.c_str()));
+  SendMessageW(view.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(target.view.c_str()));
   suppress_editor_change_ = false;
-  SendMessageW(view.editor, EM_SETSEL, edit.selection, edit.selection);
   OnEditorChanged(view.editor);
+  const auto view_caret = view.editor_snapshot.SourceToView(edit.selection);
+  SendMessageW(view.editor, EM_SETSEL, view_caret, view_caret);
 }
 
 bool Application::SaveRecovery(DocumentView& view, bool interactive) {
@@ -2236,6 +2547,7 @@ void Application::SaveSession() {
   session.main_y = main_rect.top;
   session.main_width = main_rect.right - main_rect.left;
   session.main_height = main_rect.bottom - main_rect.top;
+  session.recent_documents = recent_documents_;
   for (auto& view : documents_) {
     SyncDocumentFromEditor(*view);
     CHARRANGE selection{};
@@ -2961,6 +3273,7 @@ void Application::ApplySettings() {
 
 void Application::RebuildAccelerators() {
   const std::array commands{
+      std::pair{std::wstring_view(L"file.new"), static_cast<WORD>(kFileNew)},
       std::pair{std::wstring_view(L"file.open"), static_cast<WORD>(kFileOpen)},
       std::pair{std::wstring_view(L"file.save"), static_cast<WORD>(kFileSave)},
       std::pair{std::wstring_view(L"file.quickOpen"), static_cast<WORD>(kFileQuickOpen)},
@@ -2992,7 +3305,10 @@ void Application::OpenWorkspaceSettings() {
       settings_.origins[L"auto_save_delay_ms"] + L")\n" +
       L"theme: " + ThemeName(settings_.theme) + L" (" + settings_.origins[L"theme"] + L")\n" +
       L"font: " + settings_.font_face + L" " + std::to_wstring(settings_.font_size_pt) + L"pt (" +
-      settings_.origins[L"font_face"] + L" / " + settings_.origins[L"font_size_pt"] + L")\n\n" +
+      settings_.origins[L"font_face"] + L" / " + settings_.origins[L"font_size_pt"] + L")\n" +
+      L"default memo Workspace: " +
+      (settings_.default_memo_workspace.empty() ? std::wstring(L"未設定") : settings_.default_memo_workspace.wstring()) +
+      L" (" + settings_.origins[L"default_memo_workspace"] + L")\n\n" +
       L"編集範囲を common または workspace で指定します。\n"
       L"範囲全体を既定へ戻す場合は reset-common / reset-workspace。";
   std::wstring scope = workspace_store_ ? L"workspace" : L"common";
@@ -3072,6 +3388,15 @@ void Application::OpenWorkspaceSettings() {
     try { layer.font_size_pt = static_cast<unsigned>(std::stoul(size)); }
     catch (const std::exception&) { MessageBoxW(window_, L"font sizeが数値ではありません。", L"設定", MB_ICONWARNING); return; }
   }
+  if (scope == L"common") {
+    std::wstring memo_workspace = layer.default_memo_workspace
+        ? layer.default_memo_workspace->wstring() : L"inherit";
+    if (!PromptText(window_, instance_, L"ファイル",
+                    L"既定のメモ用Workspaceの絶対path。未設定へ戻す場合は inherit",
+                    memo_workspace)) return;
+    if (memo_workspace == L"inherit") layer.default_memo_workspace.reset();
+    else layer.default_memo_workspace = std::filesystem::path(memo_workspace);
+  }
   std::wstring binding;
   if (!PromptText(window_, instance_, L"キー割当て",
       L"任意: command=shortcut を1件指定。例 file.save=Ctrl+Shift+S\n"
@@ -3080,7 +3405,7 @@ void Application::OpenWorkspaceSettings() {
     const auto equals = binding.find(L'=');
     if (equals == std::wstring::npos) { MessageBoxW(window_, L"command=shortcut形式で指定してください。", L"設定", MB_ICONWARNING); return; }
     const auto command = binding.substr(0, equals);
-    static constexpr std::array known{L"file.open", L"file.save", L"file.quickOpen", L"file.close",
+    static constexpr std::array known{L"file.new", L"file.open", L"file.save", L"file.quickOpen", L"file.close",
                                       L"edit.find", L"edit.findNext", L"view.commandPalette"};
     if (std::ranges::find(known, command) == known.end()) {
       MessageBoxW(window_, L"未対応のcommand名です。", L"設定", MB_ICONWARNING); return;
@@ -3294,6 +3619,7 @@ void Application::ShowCommandPalette() {
   const bool has_workspace = !workspace_.empty();
   const bool trusted = has_workspace && IsWorkspaceTrusted(workspace_);
   const std::array entries{
+      Entry{L"ファイル: 新規無題文書", kFileNew, true, L""},
       Entry{L"ファイル: 開く", kFileOpen, true, L""},
       Entry{L"ファイル: Quick Open", kFileQuickOpen, has_workspace, L"Workspaceが未選択です"},
       Entry{L"ファイル: 保存", kFileSave, has_document, L"文書が開かれていません"},

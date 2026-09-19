@@ -4,8 +4,8 @@
 
 ## 状態
 
-初版実装中です。Windows 11 x64、日本語UIを対象とするネイティブWin32アプリを
-Debug／Releaseでビルドできます。正式Release、署名済み配布物、`main`統合はまだ行いません。
+初版の必須機能を統合した、Windows 11 x64・日本語UI向けネイティブWin32アプリです。
+Debug／Releaseでビルドできます。Humanによる実操作受入、正式Release、署名済み配布物、`main`統合はまだ行いません。
 
 ## 開発方針
 
@@ -15,8 +15,9 @@ source位置対応付きの見出しLive表示・native画像・表presentation�
 復旧スナップショット、Dairy／Meeting／Memo、カレンダー、Markdown表操作、
 Workspaceファイル操作、画像asset取込み、明示Trust付きGit／storage adapterを実装しています。
 
-完全なCommonMark/GFM、設定専用GUI、変更を伴うGit補助、compact window、画像resize／animation、
-大容量最適化など、未完了またはHuman実操作未検証の受入条件があります。詳細は
+対象CommonMark/GFM構文、設定GUI、変更を伴うGit補助、compact window、画像resize／可視animationまで接続済みです。
+IME／ATOK、DPI、各GUI操作、CommonMark/GFM公式conformance corpus、100MiBメモリ量や100回反復など、
+Human実操作または追加性能検証が残る受入条件があります。詳細は
 [実装・受入状況](docs/implementation-status.md)を参照してください。
 
 開発は`develop`を起点とした作業ブランチで行います。

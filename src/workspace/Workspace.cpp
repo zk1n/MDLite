@@ -12,6 +12,22 @@
 namespace mdlite {
 namespace {
 
+std::wstring Lower(std::wstring value) {
+  std::ranges::transform(value, value.begin(), towlower);
+  return value;
+}
+
+std::wstring PathKey(const std::filesystem::path& path) {
+  return Lower(std::filesystem::absolute(path).lexically_normal().generic_wstring());
+}
+
+bool IsQuickOpenTextFile(const std::filesystem::path& path) {
+  const auto extension = Lower(path.extension().wstring());
+  return extension == L".md" || extension == L".markdown" || extension == L".txt" ||
+         extension == L".log" || extension == L".json" || extension == L".toml" ||
+         extension == L".yaml" || extension == L".yml";
+}
+
 bool WriteNewFile(const std::filesystem::path& path, std::string_view content, std::wstring& error) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -43,6 +59,28 @@ bool EncodeUtf8(std::wstring_view text, std::string& result) {
   result.resize(size);
   return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
                              static_cast<int>(text.size()), result.data(), size, nullptr, nullptr) == size;
+}
+
+bool DecodeUtf8(std::string_view bytes, std::wstring& result) {
+  if (bytes.empty()) { result.clear(); return true; }
+  const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                       static_cast<int>(bytes.size()), nullptr, 0);
+  if (size <= 0) return false;
+  result.resize(static_cast<std::size_t>(size));
+  return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                             static_cast<int>(bytes.size()), result.data(), size) == size;
+}
+
+bool IsWithin(const std::filesystem::path& root, const std::filesystem::path& candidate) {
+  const auto normalized_root = std::filesystem::absolute(root).lexically_normal();
+  const auto normalized_candidate = std::filesystem::absolute(candidate).lexically_normal();
+  auto root_part = normalized_root.begin();
+  auto candidate_part = normalized_candidate.begin();
+  for (; root_part != normalized_root.end(); ++root_part, ++candidate_part) {
+    if (candidate_part == normalized_candidate.end() ||
+        _wcsicmp(root_part->c_str(), candidate_part->c_str()) != 0) return false;
+  }
+  return true;
 }
 
 bool AtomicWriteUtf8(const std::filesystem::path& path, std::wstring_view text, std::wstring& error) {
@@ -85,6 +123,68 @@ std::uint64_t HashPath(const std::filesystem::path& path) {
 }
 
 }  // namespace
+
+std::vector<std::filesystem::path> FindQuickOpenCandidates(
+    const std::filesystem::path& root, std::wstring_view query,
+    const std::vector<std::filesystem::path>& recent, std::size_t limit) {
+  struct Candidate {
+    std::filesystem::path path;
+    std::wstring relative;
+    std::size_t score{};
+  };
+  if (limit == 0) return {};
+  const auto needle = Lower(std::wstring(query));
+  std::vector<Candidate> candidates;
+  std::error_code error;
+  std::filesystem::recursive_directory_iterator iterator(
+      root, std::filesystem::directory_options::skip_permission_denied, error);
+  const std::filesystem::recursive_directory_iterator end;
+  while (!error && iterator != end) {
+    const auto entry = *iterator;
+    const auto name = Lower(entry.path().filename().wstring());
+    if (entry.is_directory(error) && (name == L".git" || name == L".mdlite")) {
+      iterator.disable_recursion_pending();
+    } else if (!error && entry.is_regular_file(error) && IsQuickOpenTextFile(entry.path())) {
+      auto relative_path = std::filesystem::relative(entry.path(), root, error);
+      if (!error) {
+        const auto relative = relative_path.generic_wstring();
+        const auto relative_lower = Lower(relative);
+        const auto filename_lower = Lower(entry.path().filename().wstring());
+        std::size_t score = 1000;
+        if (!needle.empty()) {
+          if (filename_lower == needle) score = 0;
+          else if (filename_lower.starts_with(needle)) score = 10;
+          else if (filename_lower.find(needle) != std::wstring::npos) score = 20;
+          else if (relative_lower.starts_with(needle)) score = 30;
+          else if (relative_lower.find(needle) != std::wstring::npos) score = 40;
+          else { iterator.increment(error); continue; }
+        }
+        const auto recent_position = std::ranges::find_if(recent, [&](const auto& recent_path) {
+          return PathKey(recent_path) == PathKey(entry.path());
+        });
+        if (recent_position != recent.end()) {
+          score += static_cast<std::size_t>(std::distance(recent.begin(), recent_position));
+        } else if (needle.empty()) {
+          score += recent.size();
+        } else {
+          score += 100;
+        }
+        candidates.push_back({entry.path(), relative, score});
+      }
+    }
+    error.clear();
+    iterator.increment(error);
+  }
+  std::ranges::sort(candidates, [](const auto& left, const auto& right) {
+    if (left.score != right.score) return left.score < right.score;
+    return _wcsicmp(left.relative.c_str(), right.relative.c_str()) < 0;
+  });
+  if (candidates.size() > limit) candidates.resize(limit);
+  std::vector<std::filesystem::path> result;
+  result.reserve(candidates.size());
+  for (auto& candidate : candidates) result.push_back(std::move(candidate.path));
+  return result;
+}
 
 WorkspaceStore::WorkspaceStore(std::filesystem::path root)
     : root_(std::filesystem::absolute(std::move(root)).lexically_normal()) {}
@@ -161,6 +261,48 @@ std::vector<std::filesystem::path> WorkspaceStore::RecoveryFiles() const {
   return result;
 }
 
+bool WorkspaceStore::ReadRecoverySnapshot(const std::filesystem::path& recovery_path,
+                                          RecoverySnapshot& snapshot, std::wstring& error) const {
+  snapshot = {};
+  const auto recovery_root = state_root() / L"recovery";
+  if (!IsWithin(recovery_root, recovery_path)) {
+    error = L"復旧スナップショットがWorkspaceの復旧領域外にあります。";
+    return false;
+  }
+  std::ifstream input(recovery_path, std::ios::binary);
+  if (!input) { error = L"復旧スナップショットを開けません。"; return false; }
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  std::wstring text;
+  if (!DecodeUtf8(bytes, text)) { error = L"復旧スナップショットが正しいUTF-8ではありません。"; return false; }
+  constexpr std::wstring_view prefix = L"<!-- MDLite recovery\nsource: ";
+  if (!text.starts_with(prefix)) { error = L"復旧スナップショットのheaderが一致しません。"; return false; }
+  const auto header_end = text.find(L"\n-->\n", prefix.size());
+  if (header_end == std::wstring::npos) { error = L"復旧スナップショットのheaderが閉じていません。"; return false; }
+  const std::filesystem::path source(text.substr(prefix.size(), header_end - prefix.size()));
+  if (!source.is_absolute() || !IsWithin(root_, source)) {
+    error = L"復旧元のpathがWorkspace外を指しています。";
+    return false;
+  }
+  snapshot.recovery_path = std::filesystem::absolute(recovery_path).lexically_normal();
+  snapshot.source_path = std::filesystem::absolute(source).lexically_normal();
+  snapshot.text = text.substr(header_end + 5);
+  return true;
+}
+
+bool WorkspaceStore::DiscardRecoverySnapshot(const std::filesystem::path& recovery_path,
+                                             std::wstring& error) const {
+  if (!IsWithin(state_root() / L"recovery", recovery_path)) {
+    error = L"復旧領域外のファイルは破棄できません。";
+    return false;
+  }
+  std::error_code filesystem_error;
+  if (!std::filesystem::remove(recovery_path, filesystem_error) || filesystem_error) {
+    error = L"復旧スナップショットを破棄できません。";
+    return false;
+  }
+  return true;
+}
+
 bool WorkspaceStore::WriteSession(const std::vector<std::filesystem::path>& open_documents,
                                   std::wstring& error) const {
   SessionState state;
@@ -174,6 +316,12 @@ bool WorkspaceStore::WriteSessionState(const SessionState& state, std::wstring& 
                          L"\nmain_y = " + std::to_wstring(state.main_y) +
                          L"\nmain_width = " + std::to_wstring(state.main_width) +
                          L"\nmain_height = " + std::to_wstring(state.main_height) + L"\n";
+  for (const auto& recent : state.recent_documents) {
+    std::error_code relative_error;
+    const auto relative = std::filesystem::relative(recent, root_, relative_error);
+    if (relative_error || relative.empty() || relative.native().starts_with(L"..")) continue;
+    session += L"recent = \"" + relative.generic_wstring() + L"\"\n";
+  }
   for (const auto& document : state.documents) {
     std::error_code relative_error;
     const auto relative = std::filesystem::relative(document.path, root_, relative_error);
@@ -236,6 +384,19 @@ bool WorkspaceStore::ReadSessionState(SessionState& state, std::wstring& error) 
       state.documents.emplace_back();
       current = &state.documents.back();
       key = L"path";
+    }
+    if (key == L"recent") {
+      if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
+        const std::filesystem::path relative(value.substr(1, value.size() - 2));
+        const auto normalized = relative.lexically_normal();
+        const auto candidate = (root_ / normalized).lexically_normal();
+        std::error_code filesystem_error;
+        if (!relative.is_absolute() && !normalized.empty() &&
+            !normalized.native().starts_with(L"..") &&
+            std::filesystem::is_regular_file(candidate, filesystem_error))
+          state.recent_documents.push_back(candidate);
+      }
+      continue;
     }
     if (!current) {
       if (key == L"active_index") state.active_index = static_cast<std::size_t>(std::max(0LL, number(value)));

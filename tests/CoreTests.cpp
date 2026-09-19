@@ -94,6 +94,21 @@ void TestUtf8NoOp(const std::filesystem::path& root) {
   Check(ReadBytes(path) == original, "unmodified save preserves exact bytes");
 }
 
+void TestUntitledDocument(const std::filesystem::path& root) {
+  mdlite::Document document;
+  document.CreateUntitled(root / L".mdlite/.state/untitled/test.md");
+  Check(document.untitled() && document.dirty() && document.text().empty(),
+        "new untitled document is dirty without creating a normal file");
+  std::wstring error;
+  Check(!document.Save(error), "untitled document requires an explicit save destination");
+  document.MarkEdited(L"draft");
+  const auto destination = root / L"saved-untitled.md";
+  Check(document.SaveAs(destination, error) && !document.untitled() && !document.dirty(),
+        "Save As converts an untitled document into a normal saved document");
+  Check(ReadBytes(destination) == std::vector<unsigned char>{'d','r','a','f','t'},
+        "untitled Save As writes the exact UTF-8 body");
+}
+
 void TestSaveAs(const std::filesystem::path& root) {
   const auto source = root / L"save-as-source.md";
   const auto destination = root / L"save-as-copy.md";
@@ -319,6 +334,16 @@ void TestEditorAdapter() {
   Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
   Check(mdlite::ParseMarkdownImages(L"```\n![not-image](code.png)\n```\n![image](real.png)").size() == 1,
         "image-only scan keeps fenced code out of derived image objects");
+  const std::wstring image_then_table =
+      L"![image](real.png)\n| A | B |\n| --- | --- |\n| 1 | 2 |";
+  const auto mixed_snapshot = mdlite::BuildMarkdownEditorSnapshot(image_then_table);
+  const auto table_edit = mdlite::InsertTableColumn(
+      image_then_table, image_then_table.find(L"1"), true);
+  const auto target_snapshot = mdlite::BuildMarkdownEditorSnapshot(table_edit.text);
+  const auto mapped_transaction = mdlite::ApplyEditorText(
+      mixed_snapshot, image_then_table, target_snapshot.view);
+  Check(mapped_transaction.source == table_edit.text,
+        "table transaction after a derived image maps back to the exact Markdown source");
 }
 
 void TestWorkspaceState(const std::filesystem::path& root) {
@@ -331,8 +356,22 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   Check(std::filesystem::exists(workspace / L".mdlite/templates/memo.md"), "built-in template is created");
   const auto document = workspace / L"note.md";
   WriteBytes(document, {'o', 'l', 'd'});
+  std::filesystem::create_directories(workspace / L"nested");
+  WriteBytes(workspace / L"Alpha.md", {'a'});
+  WriteBytes(workspace / L"nested/project-note.txt", {'b'});
+  const auto recent_candidates = mdlite::FindQuickOpenCandidates(
+      workspace, L"", {workspace / L"nested/project-note.txt"}, 3);
+  Check(!recent_candidates.empty() && recent_candidates.front().filename() == L"project-note.txt",
+        "Quick Open ranks recent documents before the remaining Workspace files");
+  const auto filtered_candidates = mdlite::FindQuickOpenCandidates(workspace, L"alpha", {}, 10);
+  Check(filtered_candidates.size() == 1 && filtered_candidates.front().filename() == L"Alpha.md",
+        "Quick Open filters by case-insensitive file name and relative path");
   Check(store.WriteRecovery(document, L"編集中", error), "recovery content writes inside workspace state");
   Check(store.RecoveryFiles().size() == 1, "recovery file is discoverable");
+  mdlite::RecoverySnapshot recovery;
+  Check(store.ReadRecoverySnapshot(store.RecoveryFiles().front(), recovery, error) &&
+            recovery.source_path == document && recovery.text == L"編集中",
+        "recovery header is validated and separated from the editable body");
   Check(store.WriteSession({document, L"C:\\outside.md"}, error), "session file writes");
   std::vector<std::filesystem::path> restored;
   Check(store.ReadSession(restored, error), "session file reads");
@@ -344,6 +383,7 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   session.main_y = 50;
   session.main_width = 1100;
   session.main_height = 700;
+  session.recent_documents = {workspace / L"nested/project-note.txt", workspace / L"Alpha.md"};
   session.documents.push_back({document, 1, 2, 3, true, 100, 120, 640, 480});
   Check(store.WriteSessionState(session, error), "detailed session state writes");
   mdlite::SessionState detailed;
@@ -351,9 +391,11 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   Check(detailed.documents.size() == 1 && detailed.documents[0].selection_begin == 1 &&
             detailed.documents[0].selection_end == 2 && detailed.documents[0].first_visible_line == 3 &&
             detailed.documents[0].compact && detailed.documents[0].width == 640 &&
-            detailed.main_width == 1100,
+            detailed.main_width == 1100 && detailed.recent_documents.size() == 2 &&
+            detailed.recent_documents[0].filename() == L"project-note.txt",
         "session preserves selection, scroll, compact placement, and main placement");
-  Check(store.RemoveRecovery(document, error), "recovery is removed after successful save");
+  Check(store.DiscardRecoverySnapshot(recovery.recovery_path, error),
+        "recovery can be explicitly discarded by its validated state path");
   Check(store.RecoveryFiles().empty(), "recovery removal is visible");
 }
 
@@ -562,6 +604,16 @@ void TestTableEditing() {
   const auto deleted = mdlite::DeleteTableRow(table, table.find(L"1"));
   Check(deleted.changed && deleted.text.find(L"| 1 | 2 |") == std::wstring::npos,
         "table row deletion removes only the selected row");
+  const auto right_inside = mdlite::MoveTableCaretAtBoundary(
+      table, table.find(L"1"), mdlite::TableCaretDirection::Right);
+  const auto right_boundary = mdlite::MoveTableCaretAtBoundary(
+      table, table.find(L"1") + 1, mdlite::TableCaretDirection::Right);
+  Check(!right_inside && right_boundary && *right_boundary == table.find(L"2"),
+        "Right stays in a cell until its boundary and then moves to the next cell");
+  const auto down = mdlite::MoveTableCaretAtBoundary(
+      table, table.find(L"A"), mdlite::TableCaretDirection::Down);
+  Check(down && *down == table.find(L"1"),
+        "Down skips the GFM delimiter row and keeps the table column");
 }
 
 void TestJapaneseHolidays() {
@@ -583,6 +635,32 @@ void TestAssets(const std::filesystem::path& root) {
   Check(mdlite::ReadRasterImageInfo(png, image_info, error) && image_info.width == 2 &&
             image_info.height == 1 && image_info.frame_count == 1,
         "real PNG is decoded with dimensions and frame count");
+  IStream* frame_stream{};
+  unsigned frame_delay{};
+  Check(mdlite::CreateRasterFramePngStream(png, 0, frame_stream, frame_delay, error) &&
+            frame_stream != nullptr && frame_delay >= 20,
+        "a WIC raster frame is converted to an in-memory PNG for native image refresh");
+  if (frame_stream) frame_stream->Release();
+  const auto gif = source_directory / L"animated.gif";
+  WriteBytes(gif, {
+      0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,0x80,0x00,0x00,
+      0x00,0x00,0x00,0xFF,0xFF,0xFF,
+      0x21,0xFF,0x0B,0x4E,0x45,0x54,0x53,0x43,0x41,0x50,0x45,0x32,0x2E,0x30,
+      0x03,0x01,0x00,0x00,0x00,
+      0x21,0xF9,0x04,0x00,0x0A,0x00,0x00,0x00,
+      0x2C,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,0x02,0x02,0x44,0x01,0x00,
+      0x21,0xF9,0x04,0x00,0x0A,0x00,0x00,0x00,
+      0x2C,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,0x02,0x02,0x4C,0x01,0x00,
+      0x3B});
+  error.clear();
+  Check(mdlite::ReadRasterImageInfo(gif, image_info, error) && image_info.animated &&
+            image_info.frame_count == 2,
+        "animated GIF is decoded as a multi-frame raster image");
+  frame_stream = nullptr;
+  Check(mdlite::CreateRasterFramePngStream(gif, 1, frame_stream, frame_delay, error) &&
+            frame_stream != nullptr,
+        "a later animated GIF frame is converted for native playback");
+  if (frame_stream) frame_stream->Release();
   mdlite::AssetImportResult first{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", first, error),
         "supported image copies into workspace assets");
@@ -650,6 +728,7 @@ void TestSettings(const std::filesystem::path& root) {
   common.auto_save_delay_ms = 1500;
   common.colors[L"link"] = L"#80A0FF";
   common.font_face = L"Yu Gothic UI";
+  common.default_memo_workspace = std::filesystem::absolute(directory / L"memos");
   common.keybindings[L"file.save"] = L"Ctrl+Shift+S";
   std::wstring error;
   Check(mdlite::SaveSettingsLayer(common_path, common, error), "common settings save atomically");
@@ -661,7 +740,8 @@ void TestSettings(const std::filesystem::path& root) {
   Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
   Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
             effective.font_size_pt == 14 && !effective.auto_save && effective.auto_save_delay_ms == 1500 &&
-            effective.colors[L"link"] == L"#80A0FF",
+            effective.colors[L"link"] == L"#80A0FF" &&
+            effective.default_memo_workspace == *common.default_memo_workspace,
         "workspace overrides common while inherited values remain");
   Check(effective.origins[L"theme"] == L"Workspace上書き" &&
             effective.origins[L"font_face"] == L"共通設定",
@@ -736,6 +816,7 @@ int wmain() {
   std::filesystem::remove_all(root, error);
   std::filesystem::create_directories(root);
   TestUtf8NoOp(root);
+  TestUntitledDocument(root);
   TestSaveAs(root);
   TestCp932RoundTrip(root);
   TestExternalConflict(root);

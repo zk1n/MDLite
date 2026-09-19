@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <objidl.h>
 #include <string>
 #include <string_view>
 
@@ -23,6 +24,8 @@ struct RasterImageInfo {
 bool IsSupportedImage(const std::filesystem::path& path);
 bool ReadRasterImageInfo(const std::filesystem::path& path, RasterImageInfo& info,
                          std::wstring& error);
+bool CreateRasterFramePngStream(const std::filesystem::path& path, unsigned frame_index,
+                                IStream*& stream, unsigned& delay_ms, std::wstring& error);
 bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
                         std::wstring& message, std::wstring& error);
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,

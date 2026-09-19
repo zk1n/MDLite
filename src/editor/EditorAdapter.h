@@ -7,11 +7,22 @@
 
 namespace mdlite {
 
+struct MappingPoint {
+  std::size_t source{};
+  std::size_t view{};
+};
+
+struct CollapsedRange {
+  std::size_t source_begin{};
+  std::size_t source_end{};
+  std::size_t view{};
+};
+
 struct EditorSnapshot {
-  std::wstring source;
   std::wstring view;
-  std::vector<std::size_t> source_to_view;
-  std::vector<std::size_t> view_to_source;
+  std::vector<MappingPoint> source_map;
+  std::vector<MappingPoint> view_map;
+  std::vector<CollapsedRange> collapsed;
 
   [[nodiscard]] std::size_t SourceToView(std::size_t position) const noexcept;
   [[nodiscard]] std::size_t ViewToSource(std::size_t position) const noexcept;
@@ -25,7 +36,9 @@ struct SourceTransaction {
   bool changed{};
 };
 
-EditorSnapshot BuildEditorSnapshot(std::wstring source);
-SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view new_view);
+EditorSnapshot BuildEditorSnapshot(std::wstring_view source);
+EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source);
+SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view source,
+                                  std::wstring_view new_view);
 
 }  // namespace mdlite

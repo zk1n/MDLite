@@ -10,12 +10,14 @@ Debug／Releaseでビルドできます。正式Release、署名済み配布物�
 ## 開発方針
 
 Markdownソースを正本とし、表示書式だけで本文を変更しません。現在は複数タブ、
-見出しLive表示、アウトライン、本文／Workspace検索、安全保存、UTF-8／BOM／CP932、
+source位置対応付きの見出しLive表示・native画像・表presentation、アウトライン、
+本文／Workspace検索・preview付き横断置換、安全保存、UTF-8／BOM／CP932、
 復旧スナップショット、Dairy／Meeting／Memo、カレンダー、Markdown表操作、
-Workspaceファイル操作、画像asset取込みを実装しています。
+Workspaceファイル操作、画像asset取込み、明示Trust付きGit／storage adapterを実装しています。
 
-インライン画像描画、完全なGFM、横断置換、設定GUI、Git補助、外部ストレージ連携など、
-未完了の受入条件があります。詳細は[実装・受入状況](docs/implementation-status.md)を参照してください。
+完全なCommonMark/GFM、設定専用GUI、変更を伴うGit補助、compact window、画像resize／animation、
+大容量最適化など、未完了またはHuman実操作未検証の受入条件があります。詳細は
+[実装・受入状況](docs/implementation-status.md)を参照してください。
 
 開発は`develop`を起点とした作業ブランチで行います。
 `main`は初期化用ファイルと、確認済みリリースの履歴を保持します。
@@ -28,6 +30,7 @@ Visual Studio Build ToolsのMSVC x64、Windows SDK、CMake、Ninjaを使用し�
 ```powershell
 .\tools\Invoke-Build.ps1 -Preset debug -Test
 .\tools\Invoke-Build.ps1 -Preset release -Test
+.\tools\Measure-Performance.ps1 -Preset release
 ```
 
 VS Codeでは「CMake: debug build」を実行後、F5で`build/debug/MDLite.exe`を起動します。

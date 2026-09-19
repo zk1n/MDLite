@@ -23,9 +23,24 @@ struct Heading {
   std::wstring text;
 };
 
+struct ImageReference {
+  std::size_t begin{};
+  std::size_t end{};
+  std::wstring alternate_text;
+  std::wstring target;
+  unsigned width_dip{};
+};
+
+struct TableBlock {
+  std::size_t begin{};
+  std::size_t end{};
+};
+
 struct MarkdownParseResult {
   std::vector<StyleSpan> spans;
   std::vector<Heading> headings;
+  std::vector<ImageReference> images;
+  std::vector<TableBlock> tables;
 };
 
 struct SectionMoveResult {

@@ -1,6 +1,7 @@
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
 #include "assets/Assets.h"
+#include "assets/StorageAdapter.h"
 #include "calendar/JapaneseHolidays.h"
 #include "markdown/Markdown.h"
 #include "profiles/Profiles.h"
@@ -220,6 +221,10 @@ void TestMarkdown() {
   Check(parsed.headings[0].level == 1 && parsed.headings[0].text == L"Parent", "H1 is parsed");
   Check(parsed.headings[1].level == 2 && parsed.headings[1].text == L"Child", "H2 is parsed");
   Check(!parsed.spans.empty(), "presentation spans are produced");
+  const auto visual = mdlite::ParseMarkdown(L"![代替](assets/a.png)\n| A | B |\n|---|---|\n| 1 | 2 |\n");
+  Check(visual.images.size() == 1 && visual.images.front().target == L"assets/a.png",
+        "image references retain source ranges and targets");
+  Check(visual.tables.size() == 1, "GFM table blocks are identified for native presentation");
 
   const std::wstring outline = L"# First\nintro\n## Child\nchild\n# Second\nend\n# Third\nlast\n";
   const auto outline_parse = mdlite::ParseMarkdown(outline);
@@ -237,11 +242,15 @@ void TestEditorAdapter() {
   Check(snapshot.SourceToView(2) == 3, "source-to-view mapping accounts for expanded LF");
   Check(snapshot.ViewToSource(2) == 1, "inserted CR maps to the source LF boundary");
 
-  const auto edited = mdlite::ApplyEditorText(snapshot, L"a\r\nnew\r\nb😀\r\nc");
+  const auto edited = mdlite::ApplyEditorText(snapshot, L"a\nb😀\r\nc", L"a\r\nnew\r\nb😀\r\nc");
   Check(edited.changed && edited.source == L"a\nnew\nb😀\r\nc",
         "range transaction preserves LF and existing CRLF without whole-document normalization");
-  const auto deleted = mdlite::ApplyEditorText(mdlite::BuildEditorSnapshot(L"a\r\nb\nc"), L"b\r\nc");
+  const auto deleted = mdlite::ApplyEditorText(mdlite::BuildEditorSnapshot(L"a\r\nb\nc"), L"a\r\nb\nc", L"b\r\nc");
   Check(deleted.source == L"b\nc", "range transaction keeps the surviving mixed line ending");
+  const auto image = mdlite::BuildMarkdownEditorSnapshot(L"before ![alt](img.png) after");
+  Check(image.view == L"before \uFFFC after", "derived editor view represents an image without changing source");
+  const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
+  Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
 }
 
 void TestWorkspaceState(const std::filesystem::path& root) {
@@ -398,6 +407,29 @@ void TestAssets(const std::filesystem::path& root) {
         "image resize markup stores width without height");
 }
 
+void TestStorageAdapter(const std::filesystem::path& root) {
+  const auto directory = root / L"storage";
+  std::filesystem::create_directories(directory);
+  const auto asset = directory / L"asset.png";
+  WriteBytes(asset, {'P','N','G'});
+  const auto config = directory / L"storage.toml";
+  WriteBytes(config, std::vector<unsigned char>{
+      'e','x','e','c','u','t','a','b','l','e',' ','=',' ','"','C',':','/','W','i','n','d','o','w','s','/','S','y','s','t','e','m','3','2','/','c','m','d','.','e','x','e','"','\n',
+      'a','r','g','u','m','e','n','t',' ','=',' ','"','/','d','"','\n',
+      'a','r','g','u','m','e','n','t',' ','=',' ','"','/','c','"','\n',
+      'a','r','g','u','m','e','n','t',' ','=',' ','"','e','c','h','o','"','\n',
+      'a','r','g','u','m','e','n','t',' ','=',' ','"','h','t','t','p','s',':','/','/','e','x','a','m','p','l','e','.','i','n','v','a','l','i','d','/','a','s','s','e','t','"','\n'});
+  mdlite::StorageAdapter adapter;
+  std::wstring error;
+  Check(mdlite::LoadStorageAdapter(config, adapter, error), "storage adapter config loads without credentials");
+  mdlite::StorageUploadResult result;
+  const bool uploaded = mdlite::UploadWithStorageAdapter(adapter, asset, L"revision-1", nullptr, result, error);
+  Check(uploaded,
+        "mock storage adapter success is supported");
+  Check(result.reference == L"https://example.invalid/asset" && ReadBytes(asset) == std::vector<unsigned char>({'P','N','G'}),
+        "storage adapter keeps local asset and returns a reference");
+}
+
 }  // namespace
 
 int wmain() {
@@ -421,6 +453,7 @@ int wmain() {
   TestTableEditing();
   TestJapaneseHolidays();
   TestAssets(root);
+  TestStorageAdapter(root);
   std::filesystem::remove_all(root, error);
   if (failures == 0) std::cout << "All MDLite core tests passed.\n";
   return failures == 0 ? 0 : 1;

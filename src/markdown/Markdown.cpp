@@ -30,6 +30,31 @@ void ParseDelimited(std::wstring_view line, std::size_t line_offset, std::wstrin
   }
 }
 
+void ParseImages(std::wstring_view line, std::size_t line_offset, MarkdownParseResult& result) {
+  std::size_t cursor{};
+  while ((cursor = line.find(L"![", cursor)) != std::wstring_view::npos) {
+    const auto alt_end = line.find(L"](", cursor + 2);
+    if (alt_end == std::wstring_view::npos) break;
+    const auto target_end = line.find(L')', alt_end + 2);
+    if (target_end == std::wstring_view::npos) break;
+    result.images.push_back({line_offset + cursor, line_offset + target_end + 1,
+                             std::wstring(line.substr(cursor + 2, alt_end - cursor - 2)),
+                             std::wstring(line.substr(alt_end + 2, target_end - alt_end - 2)), 0});
+    cursor = target_end + 1;
+  }
+}
+
+bool LooksLikeTableDelimiter(std::wstring_view line) {
+  if (line.find(L'|') == std::wstring_view::npos) return false;
+  bool dash{};
+  for (wchar_t character : line) {
+    if (character == L'-') dash = true;
+    else if (character != L'|' && character != L':' && character != L' ' && character != L'\t' && character != L'\r')
+      return false;
+  }
+  return dash;
+}
+
 }  // namespace
 
 MarkdownParseResult ParseMarkdown(std::wstring_view source) {
@@ -39,6 +64,10 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
   bool in_front_matter = false;
   bool first_line = true;
   std::size_t line_begin = 0;
+  std::size_t previous_line_begin{};
+  bool previous_has_pipe{};
+  bool in_table{};
+  std::size_t table_begin{};
 
   while (line_begin <= source.size()) {
     std::size_t line_end = source.find(L'\n', line_begin);
@@ -80,6 +109,15 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
       continue;
     }
 
+    const bool has_pipe = trimmed.find(L'|') != std::wstring_view::npos;
+    if (!in_table && previous_has_pipe && LooksLikeTableDelimiter(trimmed)) {
+      in_table = true;
+      table_begin = previous_line_begin;
+    } else if (in_table && !has_pipe) {
+      result.tables.push_back({table_begin, line_begin});
+      in_table = false;
+    }
+
     std::size_t hashes = 0;
     while (hashes < rest.size() && hashes < 6 && rest[hashes] == L'#') ++hashes;
     if (hashes > 0 && hashes < rest.size() && rest[hashes] == L' ') {
@@ -96,9 +134,13 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
     ParseDelimited(line, line_begin, L"**", SpanKind::Strong, result);
     ParseDelimited(line, line_begin, L"~~", SpanKind::Strike, result);
     ParseDelimited(line, line_begin, L"`", SpanKind::Code, result);
+    ParseImages(line, line_begin, result);
 
+    previous_line_begin = line_begin;
+    previous_has_pipe = has_pipe;
     line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
   }
+  if (in_table) result.tables.push_back({table_begin, source.size()});
   std::sort(result.spans.begin(), result.spans.end(),
             [](const StyleSpan& a, const StyleSpan& b) { return a.begin < b.begin; });
   return result;

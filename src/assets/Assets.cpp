@@ -81,6 +81,14 @@ bool IsSupportedImage(const std::filesystem::path& path) {
          extension == L".gif" || extension == L".webp" || extension == L".svg";
 }
 
+bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
+                        std::wstring& message, std::wstring& error) {
+  safe = true;
+  message.clear();
+  if (Lower(path.extension().wstring()) != L".svg") return true;
+  return InspectSvg(path, safe, message, error);
+}
+
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,
                       const std::filesystem::path& document, AssetImportResult& result,
                       std::wstring& error) {
@@ -121,8 +129,7 @@ bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem
     return false;
   }
   result.relative_reference = relative.generic_wstring();
-  if (Lower(result.stored_path.extension().wstring()) == L".svg" &&
-      !InspectSvg(result.stored_path, result.safe_to_render, result.safety_message, error)) return false;
+  if (!InspectImageSafety(result.stored_path, result.safe_to_render, result.safety_message, error)) return false;
   return true;
 }
 

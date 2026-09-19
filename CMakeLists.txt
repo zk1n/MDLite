@@ -13,6 +13,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(mdlite_core
   src/assets/Assets.cpp
   src/assets/Assets.h
+  src/assets/StorageAdapter.cpp
+  src/assets/StorageAdapter.h
   src/calendar/JapaneseHolidays.cpp
   src/calendar/JapaneseHolidays.h
   src/core/Document.cpp

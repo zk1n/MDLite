@@ -62,6 +62,7 @@ class Application {
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
+  void RefreshDerivedImages(DocumentView& view);
   void RebuildOutline(const DocumentView& view);
   std::wstring EditorText(HWND editor) const;
   void UpdateStatus();
@@ -87,6 +88,7 @@ class Application {
   void SetWorkspaceTrust(bool trusted);
   void RunGitStatus();
   void OpenWorkspaceSettings();
+  void UploadImageAtCaret();
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
 

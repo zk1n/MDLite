@@ -14,6 +14,8 @@ struct AssetImportResult {
 };
 
 bool IsSupportedImage(const std::filesystem::path& path);
+bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
+                        std::wstring& message, std::wstring& error);
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,
                       const std::filesystem::path& document, AssetImportResult& result,
                       std::wstring& error);

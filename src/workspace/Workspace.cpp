@@ -104,12 +104,13 @@ bool WorkspaceStore::Initialize(std::wstring& error) const {
     }
   }
 
-  static constexpr std::array<std::pair<const wchar_t*, std::string_view>, 8> files{{
+  static constexpr std::array<std::pair<const wchar_t*, std::string_view>, 9> files{{
       {L".gitignore", "/.cache/\n/.state/\n"},
       {L"workspace.toml", "schema_version = 1\n\n[creation]\ndefault_profile = \"memo\"\ndaily_profile = \"daily\"\n\n[calendar]\nweek_start = \"sunday\"\nholiday_region = \"JP\"\n"},
       {L"profiles.toml", "schema_version = 1\n\n[[profiles]]\nid = \"daily\"\nname = \"デイリーノート\"\ndirectory = \"Dairy/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/daily.md\"\ncollision = \"open-existing\"\n\n[[profiles]]\nid = \"meeting\"\nname = \"Meeting\"\ndirectory = \"Meeting/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/meeting.md\"\ncollision = \"sequence\"\n\n[[profiles]]\nid = \"memo\"\nname = \"Memo\"\ndirectory = \"Memo/{{date:yyyy}}/{{date:yyyyMM}}/{{date:yyyyMMdd}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/memo.md\"\ncollision = \"sequence\"\nsequence_format = \"_%02d\"\n"},
       {L"keybindings.toml", "schema_version = 1\n"},
       {L"commands.toml", "schema_version = 1\n"},
+      {L"storage.toml", "schema_version = 1\n# executable = \"C:/path/to/adapter.exe\"\n# argument = \"upload\"\n# argument = \"{file}\"\n# argument = \"{revision}\"\n# The adapter prints one https URL on stdout and reads credentials from its own protected store.\n"},
       {L"templates\\daily.md", "# {{date:yyyy-MM-dd}}\n\n{{cursor}}\n"},
       {L"templates\\meeting.md", "# Meeting {{date:yyyy-MM-dd}}\n\n## 参加者\n\n## 議題\n\n{{cursor}}\n"},
       {L"templates\\memo.md", "# Memo\n\n{{cursor}}\n"},

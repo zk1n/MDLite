@@ -1,4 +1,5 @@
 #include "editor/EditorAdapter.h"
+#include "markdown/Markdown.h"
 
 #include <algorithm>
 
@@ -32,39 +33,93 @@ std::wstring NormalizeReplacement(std::wstring_view value, bool crlf) {
 }  // namespace
 
 std::size_t EditorSnapshot::SourceToView(std::size_t position) const noexcept {
-  return source_to_view.empty() ? 0 : source_to_view[std::min(position, source_to_view.size() - 1)];
+  const auto collapsed_range = std::ranges::upper_bound(
+      collapsed, position, {}, &CollapsedRange::source_begin);
+  if (collapsed_range != collapsed.begin()) {
+    const auto& range = *std::prev(collapsed_range);
+    if (position < range.source_end) return range.view;
+  }
+  const auto point = std::ranges::upper_bound(source_map, position, {}, &MappingPoint::source);
+  if (point == source_map.begin()) return position;
+  const auto& base = *std::prev(point);
+  return base.view + position - base.source;
 }
 
 std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
-  return view_to_source.empty() ? 0 : view_to_source[std::min(position, view_to_source.size() - 1)];
+  const auto collapsed_range = std::ranges::lower_bound(collapsed, position, {}, &CollapsedRange::view);
+  if (collapsed_range != collapsed.end() && collapsed_range->view == position)
+    return collapsed_range->source_begin;
+  const auto point = std::ranges::upper_bound(view_map, position, {}, &MappingPoint::view);
+  if (point == view_map.begin()) return position;
+  const auto& base = *std::prev(point);
+  return base.source + position - base.view;
 }
 
-EditorSnapshot BuildEditorSnapshot(std::wstring source) {
+EditorSnapshot BuildEditorSnapshot(std::wstring_view source) {
   EditorSnapshot result;
-  result.source = std::move(source);
-  result.source_to_view.resize(result.source.size() + 1);
-  result.view_to_source.reserve(result.source.size() + 1);
-  for (std::size_t index = 0; index < result.source.size(); ++index) {
-    result.source_to_view[index] = result.view.size();
-    if (result.source[index] == L'\n' && (index == 0 || result.source[index - 1] != L'\r')) {
+  result.source_map.push_back({0, 0});
+  result.view_map.push_back({0, 0});
+  for (std::size_t index = 0; index < source.size(); ++index) {
+    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
+      const std::size_t before = result.view.size();
       result.view.push_back(L'\r');
-      result.view_to_source.push_back(index);
+      result.view_map.push_back({index, before});
+      result.view_map.push_back({index, before + 1});
     }
-    result.view.push_back(result.source[index]);
-    result.view_to_source.push_back(index);
+    result.view.push_back(source[index]);
+    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
+      result.source_map.push_back({index + 1, result.view.size()});
+      result.view_map.push_back({index + 1, result.view.size()});
+    }
   }
-  result.source_to_view.back() = result.view.size();
-  result.view_to_source.push_back(result.source.size());
   return result;
 }
 
-SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view new_view) {
+EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source) {
+  const auto parsed = ParseMarkdown(source);
+  if (parsed.images.empty()) return BuildEditorSnapshot(source);
+  EditorSnapshot result;
+  result.source_map.push_back({0, 0});
+  result.view_map.push_back({0, 0});
+  std::size_t image_index{};
+  for (std::size_t index = 0; index < source.size();) {
+    if (image_index < parsed.images.size() && index == parsed.images[image_index].begin &&
+        parsed.images[image_index].target.find(L"://") != std::wstring::npos) ++image_index;
+    if (image_index < parsed.images.size() && index == parsed.images[image_index].begin) {
+      const auto& image = parsed.images[image_index++];
+      const std::size_t view_position = result.view.size();
+      result.collapsed.push_back({image.begin, image.end, view_position});
+      result.view.push_back(0xFFFC);
+      result.source_map.push_back({image.end, result.view.size()});
+      result.view_map.push_back({image.begin, view_position});
+      result.view_map.push_back({image.end, result.view.size()});
+      index = image.end;
+      continue;
+    }
+    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
+      const std::size_t before = result.view.size();
+      result.view.push_back(L'\r');
+      result.view_map.push_back({index, before});
+      result.view_map.push_back({index, before + 1});
+    }
+    result.view.push_back(source[index]);
+    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
+      result.source_map.push_back({index + 1, result.view.size()});
+      result.view_map.push_back({index + 1, result.view.size()});
+    }
+    ++index;
+  }
+  return result;
+}
+
+SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view source,
+                                  std::wstring_view new_view) {
   SourceTransaction result;
   std::size_t prefix = 0;
   while (prefix < before.view.size() && prefix < new_view.size() &&
          before.view[prefix] == new_view[prefix]) ++prefix;
   if (prefix == before.view.size() && prefix == new_view.size()) {
-    result.source = before.source;
+    result.source = source;
     return result;
   }
   std::size_t old_suffix = before.view.size();
@@ -76,9 +131,9 @@ SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_vie
   }
   result.begin = before.ViewToSource(prefix);
   result.old_end = before.ViewToSource(old_suffix);
-  const bool crlf = PreferCrLf(before.source, result.begin);
+  const bool crlf = PreferCrLf(source, result.begin);
   const std::wstring replacement = NormalizeReplacement(new_view.substr(prefix, new_suffix - prefix), crlf);
-  result.source = before.source;
+  result.source = source;
   result.source.replace(result.begin, result.old_end - result.begin, replacement);
   result.new_end = result.begin + replacement.size();
   result.changed = true;

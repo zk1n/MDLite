@@ -4,16 +4,34 @@
 
 ## 状態
 
-開発準備段階です。利用可能なアプリケーションのリリースはまだありません。
-初版はWindows 11 x64、日本語UIを対象とします。
+初版実装中です。Windows 11 x64、日本語UIを対象とするネイティブWin32アプリを
+Debug／Releaseでビルドできます。正式Release、署名済み配布物、`main`統合はまだ行いません。
 
 ## 開発方針
 
-通常のテキスト編集時の省メモリと操作性を重視し、Live Markdown、
-Workspace操作、検索・置換、ノート作成支援を提供する予定です。
+Markdownソースを正本とし、表示書式だけで本文を変更しません。現在は複数タブ、
+見出しLive表示、アウトライン、本文／Workspace検索、安全保存、UTF-8／BOM／CP932、
+復旧スナップショット、Dairy／Meeting／Memo、カレンダー、Markdown表操作、
+Workspaceファイル操作、画像asset取込みを実装しています。
+
+インライン画像描画、完全なGFM、横断置換、設定GUI、Git補助、外部ストレージ連携など、
+未完了の受入条件があります。詳細は[実装・受入状況](docs/implementation-status.md)を参照してください。
 
 開発は`develop`を起点とした作業ブランチで行います。
 `main`は初期化用ファイルと、確認済みリリースの履歴を保持します。
+
+## ビルドと実行
+
+Visual Studio Build ToolsのMSVC x64、Windows SDK、CMake、Ninjaを使用します。
+インストール位置は`vswhere.exe`から実行時に検出します。
+
+```powershell
+.\tools\Invoke-Build.ps1 -Preset debug -Test
+.\tools\Invoke-Build.ps1 -Preset release -Test
+```
+
+VS Codeでは「CMake: debug build」を実行後、F5で`build/debug/MDLite.exe`を起動します。
+Workspaceをコマンドライン引数へ渡すこともできます。
 
 ## ライセンス
 

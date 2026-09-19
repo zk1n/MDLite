@@ -1,0 +1,66 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "MDLite Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "MDLite Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "targets": ["MDLite", "mdlite_core_tests"]
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "targets": ["MDLite", "mdlite_core_tests"]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

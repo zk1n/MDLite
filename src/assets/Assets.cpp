@@ -1,0 +1,140 @@
+#include "assets/Assets.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <cwctype>
+#include <fstream>
+#include <limits>
+
+namespace mdlite {
+namespace {
+
+std::wstring Lower(std::wstring value) {
+  std::ranges::transform(value, value.begin(), towlower);
+  return value;
+}
+
+std::wstring EscapeMarkdownAlt(std::wstring_view value) {
+  std::wstring escaped;
+  for (const wchar_t character : value) {
+    if (character == L'\\' || character == L'[' || character == L']') escaped.push_back(L'\\');
+    escaped.push_back(character);
+  }
+  return escaped;
+}
+
+std::wstring EscapeHtml(std::wstring_view value) {
+  std::wstring escaped;
+  for (const wchar_t character : value) {
+    if (character == L'&') escaped += L"&amp;";
+    else if (character == L'<') escaped += L"&lt;";
+    else if (character == L'>') escaped += L"&gt;";
+    else if (character == L'\"') escaped += L"&quot;";
+    else escaped.push_back(character);
+  }
+  return escaped;
+}
+
+bool InspectSvg(const std::filesystem::path& path, bool& safe, std::wstring& message,
+                std::wstring& error) {
+  safe = true;
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  if (!input) {
+    error = L"SVGを検査できません。";
+    return false;
+  }
+  const auto size = input.tellg();
+  if (size < 0 || size > 16 * 1024 * 1024) {
+    safe = false;
+    message = L"SVGが安全な表示検査のサイズ上限を超えています。元ファイルは変更していません。";
+    return true;
+  }
+  std::string bytes(static_cast<std::size_t>(size), '\0');
+  input.seekg(0);
+  if (!bytes.empty() && !input.read(bytes.data(), size)) {
+    error = L"SVGを最後まで読み込めません。";
+    return false;
+  }
+  std::ranges::transform(bytes, bytes.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  constexpr std::string_view blocked[] = {"<script", "foreignobject", "onload=", "onerror=",
+                                           "javascript:", "href=\"http", "href='http",
+                                           "xlink:href=\"//", "xlink:href='//", "data:text/html"};
+  for (const auto pattern : blocked) {
+    if (bytes.find(pattern) != std::string::npos) {
+      safe = false;
+      message = L"SVGにスクリプト、外部参照、または埋込みHTMLの可能性があるため表示を無効化します。"
+                L"元ファイルとリンクは変更していません。";
+      break;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+bool IsSupportedImage(const std::filesystem::path& path) {
+  const std::wstring extension = Lower(path.extension().wstring());
+  return extension == L".png" || extension == L".jpg" || extension == L".jpeg" ||
+         extension == L".gif" || extension == L".webp" || extension == L".svg";
+}
+
+bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,
+                      const std::filesystem::path& document, AssetImportResult& result,
+                      std::wstring& error) {
+  if (!IsSupportedImage(source) || !std::filesystem::is_regular_file(source)) {
+    error = L"PNG、JPEG、GIF、WebP、SVGの画像を選択してください。";
+    return false;
+  }
+  std::error_code filesystem_error;
+  const auto asset_directory = workspace / L"assets";
+  std::filesystem::create_directories(asset_directory, filesystem_error);
+  if (filesystem_error) {
+    error = L"assetsフォルダーを作成できません。";
+    return false;
+  }
+  const auto canonical_source = std::filesystem::weakly_canonical(source, filesystem_error);
+  if (filesystem_error) {
+    error = L"画像パスを確認できません。";
+    return false;
+  }
+  result.stored_path = asset_directory / source.filename();
+  for (unsigned suffix = 0; std::filesystem::exists(result.stored_path); ++suffix) {
+    if (std::filesystem::equivalent(canonical_source, result.stored_path, filesystem_error) &&
+        !filesystem_error) break;
+    const std::wstring extension = source.extension().wstring();
+    const std::wstring stem = source.stem().wstring();
+    result.stored_path = asset_directory /
+        (stem + L"_" + std::to_wstring(suffix + 1) + extension);
+  }
+  if (!std::filesystem::exists(result.stored_path)) {
+    if (!CopyFileW(canonical_source.c_str(), result.stored_path.c_str(), TRUE)) {
+      error = L"画像をassetsへ安全にコピーできません。本文にはリンクを挿入していません。";
+      return false;
+    }
+  }
+  const auto relative = std::filesystem::relative(result.stored_path, document.parent_path(), filesystem_error);
+  if (filesystem_error) {
+    error = L"文書から画像への相対パスを作成できません。";
+    return false;
+  }
+  result.relative_reference = relative.generic_wstring();
+  if (Lower(result.stored_path.extension().wstring()) == L".svg" &&
+      !InspectSvg(result.stored_path, result.safe_to_render, result.safety_message, error)) return false;
+  return true;
+}
+
+std::wstring ImageMarkdown(std::wstring_view alternate_text, std::wstring_view relative_reference) {
+  return L"![" + EscapeMarkdownAlt(alternate_text) + L"](" + std::wstring(relative_reference) + L")";
+}
+
+std::wstring ImageHtml(std::wstring_view alternate_text, std::wstring_view relative_reference,
+                       unsigned width_dip) {
+  width_dip = std::clamp(width_dip, 16U, 8192U);
+  return L"<img src=\"" + EscapeHtml(relative_reference) + L"\" alt=\"" +
+         EscapeHtml(alternate_text) + L"\" width=\"" + std::to_wstring(width_dip) + L"\">";
+}
+
+}  // namespace mdlite

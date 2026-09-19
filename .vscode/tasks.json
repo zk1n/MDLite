@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "MDLite: Debug build",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "debug", "-Test"],
+      "group": {"kind": "build", "isDefault": true},
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "MDLite: Release build and test",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "release", "-Test"],
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "MDLite: Release run",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "release", "-Run"],
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}

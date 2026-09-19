@@ -1,6 +1,7 @@
 #include "markdown/Markdown.h"
 
 #include <algorithm>
+#include <cwctype>
 
 namespace mdlite {
 namespace {
@@ -113,6 +114,77 @@ bool LooksLikeTableDelimiter(std::wstring_view line) {
   return dash;
 }
 
+bool IsThematicBreak(std::wstring_view line) {
+  wchar_t marker{};
+  unsigned count{};
+  for (const wchar_t character : line) {
+    if (character == L' ' || character == L'\t' || character == L'\r') continue;
+    if (character != L'*' && character != L'-' && character != L'_') return false;
+    if (marker == 0) marker = character;
+    if (character != marker) return false;
+    ++count;
+  }
+  return count >= 3;
+}
+
+bool IsOrderedListMarker(std::wstring_view line, std::size_t& marker_end) {
+  std::size_t cursor{};
+  while (cursor < line.size() && iswdigit(line[cursor])) ++cursor;
+  if (cursor == 0 || cursor > 9 || cursor + 1 >= line.size() ||
+      (line[cursor] != L'.' && line[cursor] != L')') ||
+      (line[cursor + 1] != L' ' && line[cursor + 1] != L'\t')) return false;
+  marker_end = cursor + 2;
+  return true;
+}
+
+BlockKind ClassifyBlock(std::wstring_view rest, bool indented) {
+  if (indented) return BlockKind::IndentedCode;
+  if (IsThematicBreak(rest)) return BlockKind::ThematicBreak;
+  if (rest.starts_with(L'>') && (rest.size() == 1 || rest[1] == L' ' || rest[1] == L'\t'))
+    return BlockKind::BlockQuote;
+  if (rest.size() >= 2 && (rest[0] == L'-' || rest[0] == L'+' || rest[0] == L'*') &&
+      (rest[1] == L' ' || rest[1] == L'\t')) {
+    const auto content = rest.substr(2);
+    if (content.size() >= 3 && content[0] == L'[' && content[2] == L']' &&
+        (content[1] == L' ' || content[1] == L'x' || content[1] == L'X') &&
+        (content.size() == 3 || content[3] == L' ' || content[3] == L'\t'))
+      return BlockKind::TaskListItem;
+    return BlockKind::BulletListItem;
+  }
+  std::size_t marker_end{};
+  if (IsOrderedListMarker(rest, marker_end)) return BlockKind::OrderedListItem;
+  if (rest.starts_with(L'<') && rest.ends_with(L'>')) return BlockKind::Html;
+  return BlockKind::Paragraph;
+}
+
+void ParseEmphasis(std::wstring_view line, std::size_t line_offset, MarkdownParseResult& result) {
+  for (const wchar_t delimiter : {L'*', L'_'}) {
+    std::size_t cursor{};
+    while (cursor < line.size()) {
+      const auto open = line.find(delimiter, cursor);
+      if (open == std::wstring_view::npos) break;
+      if ((open > 0 && line[open - 1] == L'\\') ||
+          (open + 1 < line.size() && line[open + 1] == delimiter)) {
+        cursor = open + 1;
+        continue;
+      }
+      const auto close = line.find(delimiter, open + 1);
+      if (close == std::wstring_view::npos || close == open + 1 ||
+          (close + 1 < line.size() && line[close + 1] == delimiter)) {
+        cursor = open + 1;
+        continue;
+      }
+      result.spans.push_back({SpanKind::EmphasisMarker, line_offset + open,
+                              line_offset + open + 1, 0});
+      result.spans.push_back({SpanKind::Emphasis, line_offset + open + 1,
+                              line_offset + close, 0});
+      result.spans.push_back({SpanKind::EmphasisMarker, line_offset + close,
+                              line_offset + close + 1, 0});
+      cursor = close + 1;
+    }
+  }
+}
+
 }  // namespace
 
 MarkdownParseResult ParseMarkdown(std::wstring_view source) {
@@ -135,12 +207,14 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
 
     if (first_line && trimmed == L"---") {
       in_front_matter = true;
+      result.blocks.push_back({BlockKind::FrontMatter, line_begin, line_end});
       first_line = false;
       line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
       continue;
     }
     first_line = false;
     if (in_front_matter) {
+      result.blocks.back().end = line_end;
       if (trimmed == L"---" || trimmed == L"...") in_front_matter = false;
       line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
       continue;
@@ -158,11 +232,16 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
         in_fence = false;
       }
       result.spans.push_back({SpanKind::CodeFence, line_begin + indent, line_begin + trimmed.size(), 0});
+      if (in_fence) result.blocks.push_back({BlockKind::FencedCode, line_begin, line_end});
+      else if (!result.blocks.empty() && result.blocks.back().kind == BlockKind::FencedCode)
+        result.blocks.back().end = line_end;
       line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
       continue;
     }
     if (in_fence) {
       result.spans.push_back({SpanKind::Code, line_begin, line_begin + trimmed.size(), 0});
+      if (!result.blocks.empty() && result.blocks.back().kind == BlockKind::FencedCode)
+        result.blocks.back().end = line_end;
       line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
       continue;
     }
@@ -174,6 +253,14 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
     } else if (in_table && !has_pipe) {
       result.tables.push_back({table_begin, line_begin});
       in_table = false;
+    }
+
+    if (!trimmed.empty()) {
+      const bool indented_code = indent == 4 || (!trimmed.empty() && trimmed.front() == L'\t');
+      const auto kind = ClassifyBlock(rest, indented_code);
+      result.blocks.push_back({kind, line_begin, line_end});
+      if (kind == BlockKind::IndentedCode)
+        result.spans.push_back({SpanKind::Code, line_begin, line_begin + trimmed.size(), 0});
     }
 
     std::size_t hashes = 0;
@@ -190,8 +277,10 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
     }
 
     ParseDelimited(line, line_begin, L"**", SpanKind::Strong, result);
+    ParseDelimited(line, line_begin, L"__", SpanKind::Strong, result);
     ParseDelimited(line, line_begin, L"~~", SpanKind::Strike, result);
     ParseDelimited(line, line_begin, L"`", SpanKind::Code, result);
+    ParseEmphasis(line, line_begin, result);
     ParseImages(line, line_begin, result);
     ParseLinks(line, line_begin, result);
 

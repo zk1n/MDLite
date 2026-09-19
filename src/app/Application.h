@@ -13,6 +13,7 @@
 #include <commctrl.h>
 
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@ class Application {
     HWND editor{};
     MarkdownParseResult parse;
     EditorSnapshot editor_snapshot;
+    std::uint64_t derived_image_revision{std::numeric_limits<std::uint64_t>::max()};
     int active_line{-1};
     HWND compact_window{};
     std::shared_ptr<WorkspaceStore> workspace_store;
@@ -66,6 +68,8 @@ class Application {
   void ActivateDocument(std::size_t index);
   bool SaveDocument(DocumentView& view, bool interactive);
   bool SaveDocumentAs(DocumentView& view);
+  void ReloadDocumentFromDisk();
+  void CompareDocumentWithDisk();
   bool SaveAll(bool interactive);
   bool CloseDocumentsForWorkspaceSwitch();
   void OnEditorChanged(HWND editor);
@@ -82,6 +86,7 @@ class Application {
   bool CloseDocument(std::size_t index);
   void CreateProfile(BuiltInProfile profile);
   void CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date);
+  void CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date);
   void ApplyTableAction(TableAction action);
   void MoveOutlineSection(std::size_t source_begin, std::size_t target_begin);
   bool SaveRecovery(DocumentView& view, bool interactive = false);
@@ -154,6 +159,9 @@ class Application {
   HANDLE workspace_mutex_{};
   HACCEL accelerator_table_{};
   HFONT editor_font_{};
+  HBRUSH background_brush_{};
+  COLORREF theme_background_{RGB(255, 255, 255)};
+  COLORREF theme_foreground_{RGB(24, 24, 24)};
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
 };

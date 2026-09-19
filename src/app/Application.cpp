@@ -33,7 +33,6 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"MDLite.MainWindow";
 constexpr wchar_t kCompactWindowClass[] = L"MDLite.CompactWindow";
 constexpr UINT_PTR kAutosaveTimer = 1;
-constexpr UINT kAutosaveDelayMs = 750;
 constexpr UINT kTimerPollMs = 250;
 constexpr UINT kRecoveryDelayMs = 5000;
 constexpr int kTreeWidth = 250;
@@ -46,6 +45,7 @@ struct ProcessDialogContext {
   HANDLE cancellation{};
   std::atomic<HWND> dialog{};
   std::atomic<bool> finished{};
+  bool marquee{};
 };
 
 HRESULT CALLBACK ProcessDialogCallback(HWND dialog, UINT notification, WPARAM wparam,
@@ -53,6 +53,10 @@ HRESULT CALLBACK ProcessDialogCallback(HWND dialog, UINT notification, WPARAM wp
   auto& context = *reinterpret_cast<ProcessDialogContext*>(data);
   if (notification == TDN_CREATED) {
     context.dialog.store(dialog);
+    if (context.marquee) {
+      SendMessageW(dialog, TDM_SET_MARQUEE_PROGRESS_BAR, TRUE, 0);
+      SendMessageW(dialog, TDM_SET_PROGRESS_BAR_MARQUEE, TRUE, 30);
+    }
     SendMessageW(dialog, TDM_ENABLE_BUTTON, kProcessDoneButton, context.finished.load());
     if (context.finished.load()) PostMessageW(dialog, TDM_CLICK_BUTTON, kProcessDoneButton, 0);
   } else if (notification == TDN_BUTTON_CLICKED) {
@@ -111,6 +115,83 @@ bool RunProcessWithCancel(HWND owner, const std::filesystem::path& executable,
   return started;
 }
 
+bool RunSearchWithCancel(HWND owner, const std::filesystem::path& root, const SearchQuery& query,
+                         const std::map<std::filesystem::path, std::wstring>& unsaved,
+                         std::vector<SearchMatch>& matches, std::wstring& error) {
+  HANDLE cancellation = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!cancellation) { error = L"検索のキャンセルeventを作成できません。"; return false; }
+  ProcessDialogContext context{cancellation};
+  context.marquee = true;
+  bool completed{};
+  std::thread worker([&] {
+    completed = SearchWorkspace(root, query, unsaved, matches, error, [&] {
+      return WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0;
+    });
+    context.finished.store(true);
+    if (const HWND dialog = context.dialog.load()) {
+      PostMessageW(dialog, TDM_ENABLE_BUTTON, kProcessDoneButton, TRUE);
+      PostMessageW(dialog, TDM_CLICK_BUTTON, kProcessDoneButton, 0);
+    }
+  });
+  const TASKDIALOG_BUTTON buttons[]{{kProcessDoneButton, L"完了"}};
+  TASKDIALOGCONFIG config{sizeof(config)};
+  config.hwndParent = owner;
+  config.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION |
+                   TDF_SHOW_MARQUEE_PROGRESS_BAR;
+  config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+  config.pszWindowTitle = L"Workspace検索";
+  config.pszMainInstruction = L"Workspaceを検索しています";
+  config.pszContent = L"直接走査の完了を待っています。必要ならキャンセルできます。";
+  config.cButtons = static_cast<UINT>(std::size(buttons));
+  config.pButtons = buttons;
+  config.pfCallback = ProcessDialogCallback;
+  config.lpCallbackData = reinterpret_cast<LONG_PTR>(&context);
+  int button{};
+  const HRESULT dialog_result = TaskDialogIndirect(&config, &button, nullptr, nullptr);
+  if (!context.finished.load()) SetEvent(cancellation);
+  worker.join();
+  CloseHandle(cancellation);
+  if (FAILED(dialog_result)) { error = L"検索進捗dialogを表示できません。"; return false; }
+  return completed;
+}
+
+bool RunCancellableTask(HWND owner, std::wstring_view title, std::wstring_view instruction,
+                        const std::function<bool(HANDLE)>& task, std::wstring& error) {
+  HANDLE cancellation = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!cancellation) { error = L"キャンセルeventを作成できません。"; return false; }
+  ProcessDialogContext context{cancellation};
+  context.marquee = true;
+  bool completed{};
+  std::thread worker([&] {
+    completed = task(cancellation);
+    context.finished.store(true);
+    if (const HWND dialog = context.dialog.load()) {
+      PostMessageW(dialog, TDM_ENABLE_BUTTON, kProcessDoneButton, TRUE);
+      PostMessageW(dialog, TDM_CLICK_BUTTON, kProcessDoneButton, 0);
+    }
+  });
+  const TASKDIALOG_BUTTON buttons[]{{kProcessDoneButton, L"完了"}};
+  TASKDIALOGCONFIG config{sizeof(config)};
+  config.hwndParent = owner;
+  config.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION |
+                   TDF_SHOW_MARQUEE_PROGRESS_BAR;
+  config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+  config.pszWindowTitle = title.data();
+  config.pszMainInstruction = instruction.data();
+  config.pszContent = L"MDLite は応答を保ったまま処理します。必要ならキャンセルできます。";
+  config.cButtons = static_cast<UINT>(std::size(buttons));
+  config.pButtons = buttons;
+  config.pfCallback = ProcessDialogCallback;
+  config.lpCallbackData = reinterpret_cast<LONG_PTR>(&context);
+  int button{};
+  const HRESULT dialog_result = TaskDialogIndirect(&config, &button, nullptr, nullptr);
+  if (!context.finished.load()) SetEvent(cancellation);
+  worker.join();
+  CloseHandle(cancellation);
+  if (FAILED(dialog_result)) { error = L"進捗dialogを表示できません。"; return false; }
+  return completed;
+}
+
 enum ControlId : int {
   kWorkspaceTree = 100,
   kTabs,
@@ -131,9 +212,12 @@ enum ControlId : int {
   kFileClose,
   kFileSave,
   kFileSaveAs,
+  kFileReload,
+  kFileCompare,
   kFileDaily,
   kFileMeeting,
   kFileMemo,
+  kFileProfile,
   kWorkspaceNewFile,
   kWorkspaceNewFolder,
   kWorkspaceCopy,
@@ -370,6 +454,16 @@ bool SystemUsesDarkTheme() {
   return status == ERROR_SUCCESS && light == 0;
 }
 
+COLORREF ThemeColor(const EffectiveSettings& settings, std::wstring_view name, COLORREF fallback) {
+  if (settings.theme != ThemeMode::Custom) return fallback;
+  const auto found = settings.colors.find(std::wstring(name));
+  if (found == settings.colors.end() || found->second.size() != 7 || found->second.front() != L'#') return fallback;
+  wchar_t* end{};
+  const unsigned long rgb = wcstoul(found->second.c_str() + 1, &end, 16);
+  if (!end || *end != L'\0' || rgb > 0xFFFFFFUL) return fallback;
+  return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
 std::filesystem::path ResolveGitExecutable() {
   wchar_t environment[32768]{};
   const DWORD length = GetEnvironmentVariableW(L"PATH", environment, static_cast<DWORD>(std::size(environment)));
@@ -455,6 +549,7 @@ Application::Application(HINSTANCE instance) : instance_(instance) {}
 Application::~Application() {
   if (accelerator_table_) DestroyAcceleratorTable(accelerator_table_);
   if (editor_font_) DeleteObject(editor_font_);
+  if (background_brush_) DeleteObject(background_brush_);
 }
 
 bool Application::Initialize(int show_command) {
@@ -645,7 +740,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             SaveRecovery(*view);
             view->recovery_due = now + kRecoveryDelayMs;
           }
-          if (view->autosave_due != 0 && now >= view->autosave_due) {
+          if (settings_.auto_save && view->autosave_due != 0 && now >= view->autosave_due) {
             if (SaveDocument(*view, false)) {
               view->autosave_due = 0;
               view->recovery_due = 0;
@@ -763,9 +858,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         SaveDocument(*documents_[active_document_], true);
       else if (command == kFileSaveAs && active_document_ < documents_.size())
         SaveDocumentAs(*documents_[active_document_]);
+      else if (command == kFileReload) ReloadDocumentFromDisk();
+      else if (command == kFileCompare) CompareDocumentWithDisk();
       else if (command == kFileDaily) CreateProfile(BuiltInProfile::Daily);
       else if (command == kFileMeeting) CreateProfile(BuiltInProfile::Meeting);
       else if (command == kFileMemo) CreateProfile(BuiltInProfile::Memo);
+      else if (command == kFileProfile) CreateProfileById(L"", nullptr);
       else if (command == kWorkspaceNewFile) CreateEmptyFile();
       else if (command == kWorkspaceNewFolder) CreateFolder();
       else if (command == kWorkspaceCopy) CopySelectedFile();
@@ -819,6 +917,21 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       if (header->hwndFrom == tabs_ && header->code == TCN_SELCHANGE) {
         const int index = TabCtrl_GetCurSel(tabs_);
         if (index >= 0) ActivateDocument(static_cast<std::size_t>(index));
+      } else if (header->hwndFrom == workspace_tree_ && header->code == TVN_ITEMEXPANDINGW) {
+        const auto* expansion = reinterpret_cast<NMTREEVIEWW*>(lparam);
+        if ((expansion->action & TVE_EXPAND) != 0 && expansion->itemNew.lParam != 0) {
+          const HTREEITEM first = TreeView_GetChild(workspace_tree_, expansion->itemNew.hItem);
+          if (first) {
+            TVITEMW child{};
+            child.mask = TVIF_PARAM;
+            child.hItem = first;
+            if (TreeView_GetItem(workspace_tree_, &child) && child.lParam == 0) {
+              TreeView_DeleteItem(workspace_tree_, first);
+              AddTreeDirectory(expansion->itemNew.hItem,
+                  *reinterpret_cast<const std::filesystem::path*>(expansion->itemNew.lParam), 0);
+            }
+          }
+        }
       } else if (header->hwndFrom == workspace_tree_ && header->code == NM_DBLCLK) {
         const auto path = SelectedTreePath();
         if (!path.empty() && std::filesystem::is_regular_file(path)) OpenDocument(path);
@@ -907,6 +1020,21 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_SETTINGCHANGE:
       if (settings_.theme == ThemeMode::System) ApplySettings();
       return 0;
+    case WM_ERASEBKGND: {
+      RECT area{};
+      GetClientRect(window_, &area);
+      FillRect(reinterpret_cast<HDC>(wparam), &area,
+               background_brush_ ? background_brush_ : GetSysColorBrush(COLOR_WINDOW));
+      return 1;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORLISTBOX: {
+      auto dc = reinterpret_cast<HDC>(wparam);
+      SetTextColor(dc, theme_foreground_);
+      SetBkColor(dc, theme_background_);
+      return reinterpret_cast<LRESULT>(background_brush_ ? background_brush_ : GetSysColorBrush(COLOR_WINDOW));
+    }
     case WM_DESTROY:
       if (workspace_mutex_) {
         CloseHandle(workspace_mutex_);
@@ -928,10 +1056,13 @@ void Application::CreateMenuBar() {
   AppendMenuW(file, MF_STRING, kFileClose, L"タブを閉じる\tCtrl+W");
   AppendMenuW(file, MF_STRING, kFileSave, L"保存\tCtrl+S");
   AppendMenuW(file, MF_STRING, kFileSaveAs, L"別名で保存…");
+  AppendMenuW(file, MF_STRING, kFileReload, L"ディスクから再読込み…");
+  AppendMenuW(file, MF_STRING, kFileCompare, L"ディスク上の内容と比較…");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, kFileDaily, L"今日のDairyを開く");
   AppendMenuW(file, MF_STRING, kFileMeeting, L"Meetingノートを作成");
   AppendMenuW(file, MF_STRING, kFileMemo, L"Memoを作成");
+  AppendMenuW(file, MF_STRING, kFileProfile, L"プロファイルから作成…");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, kFileExit, L"終了");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"ファイル");
@@ -1273,7 +1404,15 @@ void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path
     insert.item.pszText = const_cast<wchar_t*>(name.c_str());
     insert.item.lParam = reinterpret_cast<LPARAM>(tree_paths_.back().get());
     HTREEITEM item = TreeView_InsertItem(workspace_tree_, &insert);
-    if (entry.is_directory()) AddTreeDirectory(item, entry.path(), depth + 1);
+    if (entry.is_directory()) {
+      TVINSERTSTRUCTW placeholder{};
+      placeholder.hParent = item;
+      placeholder.hInsertAfter = TVI_LAST;
+      placeholder.item.mask = TVIF_TEXT | TVIF_PARAM;
+      placeholder.item.pszText = const_cast<wchar_t*>(L"");
+      placeholder.item.lParam = 0;
+      TreeView_InsertItem(workspace_tree_, &placeholder);
+    }
   }
 }
 
@@ -1430,6 +1569,68 @@ bool Application::SaveDocumentAs(DocumentView& view) {
   return true;
 }
 
+void Application::ReloadDocumentFromDisk() {
+  if (ime_composing_ || active_document_ >= documents_.size()) return;
+  auto& view = *documents_[active_document_];
+  SyncDocumentFromEditor(view);
+  std::wstring prompt = L"ディスク上の内容を再読込みしますか？";
+  if (view.document.dirty()) {
+    prompt += L"\n\n未保存の編集内容は復旧領域へ保全してから、表示をディスク版へ置き換えます。";
+  }
+  if (MessageBoxW(window_, prompt.c_str(), L"再読込み", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+  if (view.document.dirty() && !SaveRecovery(view, true)) return;
+  Document replacement;
+  std::wstring error;
+  if (!replacement.Load(view.document.path(), error)) {
+    MessageBoxW(window_, error.c_str(), L"再読込みできません", MB_ICONWARNING);
+    return;
+  }
+  view.document = std::move(replacement);
+  view.editor_snapshot = SnapshotFor(view.document);
+  view.derived_image_revision = std::numeric_limits<std::uint64_t>::max();
+  suppress_editor_change_ = true;
+  SetWindowTextW(view.editor, view.editor_snapshot.view.c_str());
+  suppress_editor_change_ = false;
+  ApplyMarkdownPresentation(view, true);
+  RebuildOutline(view);
+  UpdateStatus();
+}
+
+void Application::CompareDocumentWithDisk() {
+  if (active_document_ >= documents_.size()) return;
+  auto& view = *documents_[active_document_];
+  SyncDocumentFromEditor(view);
+  Document disk;
+  std::wstring error;
+  if (!disk.Load(view.document.path(), error)) {
+    MessageBoxW(window_, error.c_str(), L"比較できません", MB_ICONWARNING);
+    return;
+  }
+  const auto& editor = view.document.text();
+  const auto& stored = disk.text();
+  if (editor == stored) {
+    MessageBoxW(window_, L"編集内容とディスク上の内容は一致しています。", L"外部変更の比較", MB_ICONINFORMATION);
+    return;
+  }
+  std::size_t first{};
+  while (first < editor.size() && first < stored.size() && editor[first] == stored[first]) ++first;
+  const auto line_of = [](std::wstring_view text, std::size_t position) {
+    return 1U + static_cast<unsigned>(std::count(text.begin(), text.begin() + std::min(position, text.size()), L'\n'));
+  };
+  const auto excerpt = [first](std::wstring_view text) {
+    const auto begin = first > 80 ? first - 80 : 0;
+    std::wstring value(text.substr(begin, std::min<std::size_t>(240, text.size() - begin)));
+    std::ranges::replace(value, L'\r', L' ');
+    return value;
+  };
+  const std::wstring message = L"最初の相違位置（UTF-16）: " + std::to_wstring(first) +
+      L"\n編集側 line " + std::to_wstring(line_of(editor, first)) + L" / ディスク側 line " +
+      std::to_wstring(line_of(stored, first)) + L"\n\n編集側:\n" + excerpt(editor) +
+      L"\n\nディスク側:\n" + excerpt(stored) +
+      L"\n\n編集内容を残す場合は別名保存、ディスク版を採用する場合は再読込みを使用してください。";
+  MessageBoxW(window_, message.c_str(), L"外部変更の比較", MB_ICONINFORMATION);
+}
+
 bool Application::SaveAll(bool interactive) {
   bool result = true;
   bool all_recovered = true;
@@ -1491,7 +1692,7 @@ void Application::OnEditorChanged(HWND editor) {
     if (active_document_ < documents_.size() && documents_[active_document_].get() == view.get())
       RebuildOutline(*view);
     const ULONGLONG now = GetTickCount64();
-    view->autosave_due = now + kAutosaveDelayMs;
+    view->autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
     if (view->recovery_due == 0) view->recovery_due = now + kRecoveryDelayMs;
     SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
     UpdateStatus();
@@ -1522,13 +1723,10 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
 
 void Application::RefreshDerivedImages(DocumentView& view) {
   if (!IsMarkdownFile(view.document.path())) return;
+  if (view.derived_image_revision == view.document.revision()) return;
+  view.derived_image_revision = view.document.revision();
   const auto parsed = ParseMarkdown(view.document.text());
   if (parsed.images.empty()) return;
-  IRichEditOle* rich_edit = nullptr;
-  if (!SendMessageW(view.editor, EM_GETOLEINTERFACE, 0, reinterpret_cast<LPARAM>(&rich_edit)) || !rich_edit) return;
-  const LONG existing = rich_edit->GetObjectCount();
-  rich_edit->Release();
-  if (existing == static_cast<LONG>(parsed.images.size())) return;
   PresentationUndoGuard undo_guard(view.editor);
   suppress_editor_change_ = true;
   for (auto iterator = parsed.images.rbegin(); iterator != parsed.images.rend(); ++iterator) {
@@ -1549,14 +1747,23 @@ void Application::RefreshDerivedImages(DocumentView& view) {
     SendMessageW(view.editor, EM_SETSEL, position, position + 1);
     SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
     const unsigned width = image.width_dip == 0 ? 320U : image.width_dip;
+    unsigned height = width * 9U / 16U;
+    RasterImageInfo image_info;
+    std::wstring image_error;
+    if (ReadRasterImageInfo(target, image_info, image_error)) {
+      const auto scaled = static_cast<unsigned long long>(width) * image_info.height / image_info.width;
+      height = static_cast<unsigned>(std::clamp<unsigned long long>(scaled, 16, 8192));
+    }
     RICHEDIT_IMAGE_PARAMETERS parameters{};
     parameters.xWidth = static_cast<LONG>(width * 2540U / 96U);
-    parameters.yHeight = static_cast<LONG>(width * 9U / 16U * 2540U / 96U);
+    parameters.yHeight = static_cast<LONG>(height * 2540U / 96U);
     parameters.Ascent = parameters.yHeight;
     parameters.Type = TA_BASELINE;
     parameters.pwszAlternateText = image.alternate_text.c_str();
     parameters.pIStream = stream;
-    SendMessageW(view.editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters));
+    if (!SendMessageW(view.editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters))) {
+      SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L"\uFFFC"));
+    }
     stream->Release();
   }
   suppress_editor_change_ = false;
@@ -1578,12 +1785,18 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   SendMessageW(view.editor, WM_SETREDRAW, FALSE, 0);
   const LONG length = GetWindowTextLengthW(view.editor);
   SendMessageW(view.editor, EM_SETSEL, 0, length);
+  const bool dark = settings_.theme == ThemeMode::Dark ||
+                    (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
+  const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
+  const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
   CHARFORMAT2W normal{sizeof(normal)};
   normal.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_STRIKEOUT |
                   CFM_HIDDEN | CFM_BACKCOLOR | CFM_LINK;
-  normal.dwEffects = CFE_AUTOCOLOR | CFE_AUTOBACKCOLOR;
-  normal.yHeight = 220;
-  wcscpy_s(normal.szFaceName, L"Segoe UI");
+  normal.dwEffects = 0;
+  normal.crTextColor = foreground;
+  normal.crBackColor = background;
+  normal.yHeight = static_cast<LONG>(settings_.font_size_pt * 20);
+  wcsncpy_s(normal.szFaceName, settings_.font_face.c_str(), _TRUNCATE);
   SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&normal));
 
   const LONG active_start = static_cast<LONG>(SendMessageW(view.editor, EM_LINEINDEX, active_line, 0));
@@ -1596,25 +1809,29 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
     SendMessageW(view.editor, EM_SETSEL, static_cast<WPARAM>(view_begin), static_cast<LPARAM>(view_end));
     CHARFORMAT2W format{sizeof(format)};
     format.dwMask = CFM_COLOR;
-    format.crTextColor = RGB(38, 90, 140);
+    format.crTextColor = ThemeColor(settings_, L"heading", dark ? RGB(128, 190, 238) : RGB(38, 90, 140));
     if (span.kind == SpanKind::Heading) {
       format.dwMask |= CFM_SIZE | CFM_BOLD;
       format.dwEffects |= CFE_BOLD;
-      format.yHeight = std::max(260, 440 - span.level * 30);
+      const LONG base = static_cast<LONG>(settings_.font_size_pt * 20);
+      format.yHeight = std::max(base + 40, base * (190 - std::min(span.level, 6) * 10) / 100);
     } else if (span.kind == SpanKind::Strong) {
       format.dwMask |= CFM_BOLD;
       format.dwEffects |= CFE_BOLD;
+    } else if (span.kind == SpanKind::Emphasis) {
+      format.dwMask |= CFM_ITALIC;
+      format.dwEffects |= CFE_ITALIC;
     } else if (span.kind == SpanKind::Strike) {
       format.dwMask |= CFM_STRIKEOUT;
       format.dwEffects |= CFE_STRIKEOUT;
     } else if (span.kind == SpanKind::Code || span.kind == SpanKind::CodeFence) {
       format.dwMask |= CFM_FACE | CFM_BACKCOLOR;
       wcscpy_s(format.szFaceName, L"Cascadia Mono");
-      format.crBackColor = RGB(242, 242, 242);
+      format.crBackColor = ThemeColor(settings_, L"code_background", dark ? RGB(45, 45, 45) : RGB(242, 242, 242));
     } else if (span.kind == SpanKind::Link) {
       format.dwMask |= CFM_LINK | CFM_UNDERLINE;
       format.dwEffects |= CFE_LINK | CFE_UNDERLINE;
-      format.crTextColor = RGB(0, 102, 204);
+      format.crTextColor = ThemeColor(settings_, L"link", dark ? RGB(78, 160, 255) : RGB(0, 102, 204));
     } else if (span.kind == SpanKind::HeadingMarker || span.kind == SpanKind::EmphasisMarker) {
       const bool intersects_active = static_cast<LONG>(view_end) >= active_start &&
                                      static_cast<LONG>(view_begin) <= active_end;
@@ -1622,7 +1839,7 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
         format.dwMask |= CFM_HIDDEN;
         format.dwEffects |= CFE_HIDDEN;
       } else {
-        format.crTextColor = RGB(128, 128, 128);
+        format.crTextColor = ThemeColor(settings_, L"marker", dark ? RGB(150, 150, 150) : RGB(128, 128, 128));
       }
     }
     SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
@@ -1634,7 +1851,7 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
     CHARFORMAT2W table_format{sizeof(table_format)};
     table_format.dwMask = CFM_FACE | CFM_BACKCOLOR;
     wcscpy_s(table_format.szFaceName, L"Cascadia Mono");
-    table_format.crBackColor = RGB(244, 247, 250);
+    table_format.crBackColor = ThemeColor(settings_, L"table_background", dark ? RGB(38, 42, 48) : RGB(244, 247, 250));
     SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&table_format));
     PARAFORMAT2 paragraph{sizeof(paragraph)};
     paragraph.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING | PFM_BORDER;
@@ -1754,7 +1971,7 @@ void Application::SearchWorkspaceFromFindBar() {
                     SendMessageW(find_case_, BM_GETCHECK, 0, 0) == BST_CHECKED,
                     SendMessageW(find_regex_, BM_GETCHECK, 0, 0) == BST_CHECKED};
   query.whole_word = SendMessageW(find_word_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-  if (!SearchWorkspace(workspace_, query, unsaved, matches, error)) {
+  if (!RunSearchWithCancel(window_, workspace_, query, unsaved, matches, error)) {
     MessageBoxW(window_, error.c_str(), L"Workspace検索", MB_ICONWARNING);
     return;
   }
@@ -1795,7 +2012,12 @@ void Application::ReplaceWorkspaceFromFindBar() {
   query.whole_word = SendMessageW(find_word_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   ReplacePlan plan;
   std::wstring error;
-  if (!PreviewWorkspaceReplace(workspace_, query, replacement, {}, plan, error)) {
+  if (!RunCancellableTask(window_, L"置換preview", L"置換対象を確認しています",
+      [&](HANDLE cancellation) {
+        return PreviewWorkspaceReplace(workspace_, query, replacement, {}, plan, error, [&] {
+          return WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0;
+        });
+      }, error)) {
     MessageBoxW(window_, error.c_str(), L"置換preview", MB_ICONWARNING);
     return;
   }
@@ -1810,7 +2032,12 @@ void Application::ReplaceWorkspaceFromFindBar() {
       L"適用直前に各文書の改訂を再確認し、journalから条件付きで戻せます。続行しますか？";
   if (MessageBoxW(window_, preview.c_str(), L"置換preview", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
   ReplaceApplyResult result;
-  const bool complete = ApplyWorkspaceReplace(workspace_, plan, result, error);
+  const bool complete = RunCancellableTask(window_, L"Workspace置換", L"安全保存とjournalを適用しています",
+      [&](HANDLE cancellation) {
+        return ApplyWorkspaceReplace(workspace_, plan, result, error, [&] {
+          return WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0;
+        });
+      }, error);
   for (auto& view : documents_) {
     if (std::ranges::any_of(plan.files, [&](const auto& item) { return item.path == view->document.path(); })) {
       Document reloaded;
@@ -1818,6 +2045,7 @@ void Application::ReplaceWorkspaceFromFindBar() {
       if (reloaded.Load(view->document.path(), load_error)) {
         view->document = std::move(reloaded);
         view->editor_snapshot = SnapshotFor(view->document);
+        view->derived_image_revision = std::numeric_limits<std::uint64_t>::max();
         suppress_editor_change_ = true;
         SetWindowTextW(view->editor, view->editor_snapshot.view.c_str());
         suppress_editor_change_ = false;
@@ -1826,9 +2054,14 @@ void Application::ReplaceWorkspaceFromFindBar() {
     }
   }
   PopulateWorkspaceTree();
-  const std::wstring message = std::to_wstring(result.applied_files) + L"ファイル、" +
+  std::wstring message = std::to_wstring(result.applied_files) + L"ファイル、" +
       std::to_wstring(result.applied_replacements) + L"箇所を置換しました。\njournal: " +
-      result.journal.wstring() + (complete ? L"" : L"\n競合したファイルは変更していません。");
+      result.journal.wstring();
+  if (!complete && !error.empty()) message += L"\n" + error;
+  if (!result.conflicts.empty()) {
+    message += L"\n競合した" + std::to_wstring(result.conflicts.size()) +
+        L"ファイルは変更していません。";
+  }
   MessageBoxW(window_, message.c_str(), L"Workspace置換", complete ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
@@ -1877,9 +2110,54 @@ void Application::CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME&
                 L"ノート作成", MB_ICONINFORMATION);
     return;
   }
-  NoteCreationResult result{};
+  const std::wstring id = profile == BuiltInProfile::Daily ? L"daily" :
+                          profile == BuiltInProfile::Meeting ? L"meeting" : L"memo";
+  CreateProfileById(id, &date);
+}
+
+void Application::CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date) {
+  if (workspace_.empty() || !workspace_store_) {
+    MessageBoxW(window_, L"先にWorkspaceを開き、.mdliteの作成を許可してください。",
+                L"ノート作成", MB_ICONINFORMATION);
+    return;
+  }
   std::wstring error;
-  if (!CreateProfileNote(workspace_, profile, date, result, error)) {
+  std::vector<ProfileDefinition> profiles;
+  if (!ResolveProfiles(CommonProfilesPath(), workspace_store_->metadata_root() / L"profiles.toml",
+                       profiles, error)) {
+    MessageBoxW(window_, error.c_str(), L"ノート作成", MB_ICONWARNING);
+    return;
+  }
+  if (id.empty()) {
+    std::wstring choices;
+    for (const auto& profile : profiles) choices += profile.id + L" — " + profile.name + L"\n";
+    if (!profiles.empty()) id = profiles.front().id;
+    if (!PromptText(window_, instance_, L"プロファイルから作成",
+                    L"profile idを指定してください。\n\n" + choices, id) || id.empty()) return;
+  }
+  const auto profile = std::ranges::find_if(profiles, [&](const auto& item) { return item.id == id; });
+  if (profile == profiles.end()) {
+    MessageBoxW(window_, L"指定したprofileが見つかりません。", L"ノート作成", MB_ICONWARNING);
+    return;
+  }
+  SYSTEMTIME date{};
+  if (requested_date) date = *requested_date;
+  else GetLocalTime(&date);
+  ProfileValues values;
+  for (const auto& input : profile->inputs) {
+    std::wstring value = input.default_value;
+    std::wstring label = input.label;
+    if (input.required) label += L"（必須）";
+    if (!PromptText(window_, instance_, profile->name, label, value)) return;
+    values[input.id] = std::move(value);
+  }
+  const auto preview = PreviewProfilePath(workspace_, *profile, date, values, error);
+  if (!preview) {
+    MessageBoxW(window_, error.c_str(), L"ノート作成", MB_ICONWARNING);
+    return;
+  }
+  NoteCreationResult result{};
+  if (!CreateProfileNote(workspace_, *profile, date, values, result, error)) {
     MessageBoxW(window_, error.c_str(), L"ノート作成", MB_ICONWARNING);
     return;
   }
@@ -2622,13 +2900,25 @@ void Application::LoadAndApplySettings() {
   }
   ApplySettings();
   RebuildAccelerators();
+  const ULONGLONG now = GetTickCount64();
+  for (auto& view : documents_) {
+    if (view->document.dirty())
+      view->autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
+  }
 }
 
 void Application::ApplySettings() {
   const bool dark = settings_.theme == ThemeMode::Dark ||
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
-  const COLORREF background = dark ? RGB(31, 31, 31) : RGB(255, 255, 255);
-  const COLORREF foreground = dark ? RGB(230, 230, 230) : RGB(24, 24, 24);
+  const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
+  const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
+  HBRUSH replacement_brush = CreateSolidBrush(background);
+  if (replacement_brush) {
+    if (background_brush_) DeleteObject(background_brush_);
+    background_brush_ = replacement_brush;
+  }
+  theme_background_ = background;
+  theme_foreground_ = foreground;
   const int height = -MulDiv(static_cast<int>(settings_.font_size_pt),
                              static_cast<int>(GetDpiForWindow(window_)), 72);
   HFONT replacement = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -2697,6 +2987,9 @@ void Application::OpenWorkspaceSettings() {
   const auto workspace_path = workspace_store_ ? workspace_store_->metadata_root() / L"settings.toml"
                                                 : std::filesystem::path{};
   std::wstring summary = L"現在の実効値と継承元\n"
+      L"auto save: " + std::wstring(settings_.auto_save ? L"on" : L"off") + L" / " +
+      std::to_wstring(settings_.auto_save_delay_ms) + L"ms (" + settings_.origins[L"auto_save"] + L" / " +
+      settings_.origins[L"auto_save_delay_ms"] + L")\n" +
       L"theme: " + ThemeName(settings_.theme) + L" (" + settings_.origins[L"theme"] + L")\n" +
       L"font: " + settings_.font_face + L" " + std::to_wstring(settings_.font_size_pt) + L"pt (" +
       settings_.origins[L"font_face"] + L" / " + settings_.origins[L"font_size_pt"] + L")\n\n" +
@@ -2727,13 +3020,47 @@ void Application::OpenWorkspaceSettings() {
   SettingsLayer layer;
   std::wstring error;
   if (!LoadSettingsLayer(target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
+  std::wstring auto_save = layer.auto_save ? (*layer.auto_save ? L"on" : L"off") : L"inherit";
+  if (!PromptText(window_, instance_, L"編集", L"auto save: on / off / inherit", auto_save)) return;
+  std::ranges::transform(auto_save, auto_save.begin(), towlower);
+  if (auto_save == L"inherit") layer.auto_save.reset();
+  else if (auto_save == L"on") layer.auto_save = true;
+  else if (auto_save == L"off") layer.auto_save = false;
+  else { MessageBoxW(window_, L"auto save値が不正です。", L"設定", MB_ICONWARNING); return; }
+  std::wstring auto_save_delay = layer.auto_save_delay_ms ? std::to_wstring(*layer.auto_save_delay_ms) : L"inherit";
+  if (!PromptText(window_, instance_, L"編集", L"auto save delay (100〜60000ms)。継承はinherit", auto_save_delay)) return;
+  if (auto_save_delay == L"inherit") layer.auto_save_delay_ms.reset();
+  else {
+    try {
+      std::size_t consumed{};
+      const auto parsed = std::stoul(auto_save_delay, &consumed);
+      if (consumed != auto_save_delay.size()) throw std::invalid_argument("trailing characters");
+      layer.auto_save_delay_ms = static_cast<unsigned>(parsed);
+    } catch (const std::exception&) {
+      MessageBoxW(window_, L"auto save delayが数値ではありません。", L"設定", MB_ICONWARNING); return;
+    }
+  }
   std::wstring theme = layer.theme ? ThemeName(*layer.theme) : L"inherit";
-  if (!PromptText(window_, instance_, L"外観", L"theme: system / light / dark / inherit", theme)) return;
+  if (!PromptText(window_, instance_, L"外観", L"theme: system / light / dark / custom / inherit", theme)) return;
   if (theme == L"inherit") layer.theme.reset();
   else {
     const auto parsed = ParseTheme(theme);
     if (!parsed) { MessageBoxW(window_, L"theme値が不正です。", L"設定", MB_ICONWARNING); return; }
     layer.theme = *parsed;
+  }
+  std::wstring color;
+  if (!PromptText(window_, instance_, L"カスタムテーマ",
+      L"任意: color.name=#RRGGBB を1件指定。nameは background / foreground / link / heading / marker / code_background / table_background。\n"
+      L"継承へ戻す場合は color.name=inherit。空欄なら変更しません。", color)) return;
+  if (!color.empty()) {
+    const auto equals = color.find(L'=');
+    if (!color.starts_with(L"color.") || equals == std::wstring::npos || equals <= 6) {
+      MessageBoxW(window_, L"color.name=#RRGGBB形式で指定してください。", L"設定", MB_ICONWARNING); return;
+    }
+    const auto name = color.substr(6, equals - 6);
+    const auto value = color.substr(equals + 1);
+    if (value == L"inherit") layer.colors.erase(name);
+    else layer.colors[name] = value;
   }
   std::wstring font = layer.font_face.value_or(L"inherit");
   if (!PromptText(window_, instance_, L"外観", L"font face。継承する場合は inherit", font)) return;
@@ -2910,6 +3237,35 @@ void Application::ManageProfiles() {
   else {
     MessageBoxW(window_, L"collision値が不正です。", L"作成プロファイル", MB_ICONWARNING);
     return;
+  }
+  std::wstring input_count = std::to_wstring(profile.inputs.size());
+  if (!PromptText(window_, instance_, L"作成プロファイル",
+                  L"任意入力項目数（0～8）。titleというidは{{title}}、その他は{{input:id}}でtemplate／pathに使用できます。",
+                  input_count)) return;
+  if (input_count.empty() || !std::ranges::all_of(input_count, [](wchar_t value) { return iswdigit(value) != 0; }) || input_count.size() > 1 ||
+      input_count.front() > L'8') {
+    MessageBoxW(window_, L"入力項目数は0～8で指定してください。", L"作成プロファイル", MB_ICONWARNING);
+    return;
+  }
+  const auto requested_inputs = static_cast<std::size_t>(input_count.front() - L'0');
+  profile.inputs.resize(requested_inputs);
+  for (std::size_t index = 0; index < profile.inputs.size(); ++index) {
+    auto& input = profile.inputs[index];
+    if (input.id.empty()) input.id = index == 0 ? L"title" : L"field" + std::to_wstring(index + 1);
+    if (input.label.empty()) input.label = input.id;
+    std::wstring required = input.required ? L"yes" : L"no";
+    const auto number = std::to_wstring(index + 1);
+    if (!PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" id", input.id) ||
+        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 表示名", input.label) ||
+        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 既定値（空でも可）", input.default_value) ||
+        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 必須: yes / no", required)) return;
+    std::ranges::transform(required, required.begin(), towlower);
+    if (required == L"yes") input.required = true;
+    else if (required == L"no") input.required = false;
+    else {
+      MessageBoxW(window_, L"必須はyesまたはnoで指定してください。", L"作成プロファイル", MB_ICONWARNING);
+      return;
+    }
   }
   SYSTEMTIME now{};
   GetLocalTime(&now);
@@ -3154,7 +3510,7 @@ void Application::UploadImageAtCaret() {
   suppress_editor_change_ = false;
   ApplyMarkdownPresentation(view, true);
   const ULONGLONG now = GetTickCount64();
-  view.autosave_due = now + kAutosaveDelayMs;
+  view.autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
   view.recovery_due = now + kRecoveryDelayMs;
   SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
   UpdateStatus();

@@ -1,6 +1,7 @@
 #include "assets/Assets.h"
 
 #include <windows.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <cwctype>
@@ -81,12 +82,47 @@ bool IsSupportedImage(const std::filesystem::path& path) {
          extension == L".gif" || extension == L".webp" || extension == L".svg";
 }
 
+bool ReadRasterImageInfo(const std::filesystem::path& path, RasterImageInfo& info,
+                         std::wstring& error) {
+  info = {};
+  IWICImagingFactory* factory{};
+  IWICBitmapDecoder* decoder{};
+  IWICBitmapFrameDecode* frame{};
+  HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&factory));
+  if (SUCCEEDED(result)) {
+    result = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnLoad, &decoder);
+  }
+  UINT frames{};
+  if (SUCCEEDED(result)) result = decoder->GetFrameCount(&frames);
+  if (SUCCEEDED(result) && frames > 0) result = decoder->GetFrame(0, &frame);
+  UINT width{};
+  UINT height{};
+  if (SUCCEEDED(result)) result = frame->GetSize(&width, &height);
+  if (frame) frame->Release();
+  if (decoder) decoder->Release();
+  if (factory) factory->Release();
+  if (FAILED(result) || frames == 0 || width == 0 || height == 0) {
+    error = L"画像デコーダーで読み込めない、または寸法が不正な画像です: " + path.wstring();
+    return false;
+  }
+  info = {width, height, frames, frames > 1};
+  return true;
+}
+
 bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
                         std::wstring& message, std::wstring& error) {
   safe = true;
   message.clear();
-  if (Lower(path.extension().wstring()) != L".svg") return true;
-  return InspectSvg(path, safe, message, error);
+  if (Lower(path.extension().wstring()) == L".svg") return InspectSvg(path, safe, message, error);
+  RasterImageInfo info;
+  if (!ReadRasterImageInfo(path, info, error)) {
+    safe = false;
+    message = error;
+    return true;
+  }
+  return true;
 }
 
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,
@@ -94,6 +130,13 @@ bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem
                       std::wstring& error) {
   if (!IsSupportedImage(source) || !std::filesystem::is_regular_file(source)) {
     error = L"PNG、JPEG、GIF、WebP、SVGの画像を選択してください。";
+    return false;
+  }
+  bool source_safe{};
+  std::wstring source_safety;
+  if (!InspectImageSafety(source, source_safe, source_safety, error)) return false;
+  if (!source_safe && Lower(source.extension().wstring()) != L".svg") {
+    error = source_safety;
     return false;
   }
   std::error_code filesystem_error;

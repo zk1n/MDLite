@@ -13,7 +13,16 @@ struct AssetImportResult {
   std::wstring safety_message;
 };
 
+struct RasterImageInfo {
+  unsigned width{};
+  unsigned height{};
+  unsigned frame_count{};
+  bool animated{};
+};
+
 bool IsSupportedImage(const std::filesystem::path& path);
+bool ReadRasterImageInfo(const std::filesystem::path& path, RasterImageInfo& info,
+                         std::wstring& error);
 bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
                         std::wstring& message, std::wstring& error);
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,

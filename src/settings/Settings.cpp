@@ -36,12 +36,21 @@ bool EncodeUtf8(std::wstring_view text, std::string& bytes) {
   return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), bytes.data(), size, nullptr, nullptr) == size;
 }
 void Overlay(const SettingsLayer& layer, std::wstring_view origin, EffectiveSettings& target) {
+  if (layer.auto_save) { target.auto_save = *layer.auto_save; target.origins[L"auto_save"] = origin; }
+  if (layer.auto_save_delay_ms) {
+    target.auto_save_delay_ms = *layer.auto_save_delay_ms;
+    target.origins[L"auto_save_delay_ms"] = origin;
+  }
   if (layer.theme) { target.theme = *layer.theme; target.origins[L"theme"] = origin; }
   if (layer.font_face) { target.font_face = *layer.font_face; target.origins[L"font_face"] = origin; }
   if (layer.font_size_pt) { target.font_size_pt = *layer.font_size_pt; target.origins[L"font_size_pt"] = origin; }
   for (const auto& [command, shortcut] : layer.keybindings) {
     target.keybindings[command] = shortcut;
     target.origins[L"keybinding." + command] = origin;
+  }
+  for (const auto& [name, color] : layer.colors) {
+    target.colors[name] = color;
+    target.origins[L"color." + name] = origin;
   }
 }
 std::wstring NormalizeShortcut(std::wstring value) {
@@ -56,6 +65,10 @@ bool IsValidCommandName(std::wstring_view command) {
   return !command.empty() && std::ranges::all_of(command, [](wchar_t character) {
     return iswalnum(character) || character == L'.' || character == L'_' || character == L'-';
   });
+}
+bool IsValidColor(std::wstring_view color) {
+  return color.size() == 7 && color.front() == L'#' &&
+         std::ranges::all_of(color.substr(1), [](wchar_t value) { return iswxdigit(value) != 0; });
 }
 bool IsValidShortcut(std::wstring shortcut) {
   shortcut.erase(std::remove_if(shortcut.begin(), shortcut.end(), iswspace), shortcut.end());
@@ -96,6 +109,8 @@ bool IsValidShortcut(std::wstring shortcut) {
 
 SettingsLayer DefaultSettingsLayer() {
   SettingsLayer layer;
+  layer.auto_save = true;
+  layer.auto_save_delay_ms = 750;
   layer.theme = ThemeMode::System;
   layer.font_face = L"Segoe UI";
   layer.font_size_pt = 11;
@@ -108,6 +123,7 @@ SettingsLayer DefaultSettingsLayer() {
 std::wstring ThemeName(ThemeMode theme) {
   if (theme == ThemeMode::Light) return L"light";
   if (theme == ThemeMode::Dark) return L"dark";
+  if (theme == ThemeMode::Custom) return L"custom";
   return L"system";
 }
 std::optional<ThemeMode> ParseTheme(std::wstring_view value) {
@@ -116,6 +132,7 @@ std::optional<ThemeMode> ParseTheme(std::wstring_view value) {
   if (normalized == L"system") return ThemeMode::System;
   if (normalized == L"light") return ThemeMode::Light;
   if (normalized == L"dark") return ThemeMode::Dark;
+  if (normalized == L"custom") return ThemeMode::Custom;
   return std::nullopt;
 }
 
@@ -137,12 +154,23 @@ bool ValidateKeybindingConflicts(const std::map<std::wstring, std::wstring>& bin
   return true;
 }
 bool ValidateSettingsLayer(const SettingsLayer& layer, std::wstring& error) {
+  if (layer.auto_save_delay_ms && (*layer.auto_save_delay_ms < 100 || *layer.auto_save_delay_ms > 60000)) {
+    error = L"自動保存待機時間は100〜60000msで指定してください。"; return false;
+  }
   if (layer.font_face && (layer.font_face->empty() || layer.font_face->size() > LF_FACESIZE - 1 ||
                           !IsSafeTomlString(*layer.font_face))) {
     error = L"フォント名は1〜31文字で指定してください。"; return false;
   }
   if (layer.font_size_pt && (*layer.font_size_pt < 6 || *layer.font_size_pt > 96)) {
     error = L"フォントサイズは6〜96ptで指定してください。"; return false;
+  }
+  static constexpr std::wstring_view known_colors[]{L"background", L"foreground", L"link", L"heading",
+                                                     L"marker", L"code_background", L"table_background"};
+  for (const auto& [name, color] : layer.colors) {
+    if (std::ranges::find(known_colors, name) == std::end(known_colors) || !IsValidColor(color)) {
+      error = L"theme colorは既知のnameと#RRGGBBで指定してください: " + name;
+      return false;
+    }
   }
   return ValidateKeybindingConflicts(layer.keybindings, error);
 }
@@ -156,17 +184,36 @@ bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, 
   if (!DecodeUtf8(bytes, text)) { error = L"設定ファイルはUTF-8で保存してください: " + path.wstring(); return false; }
   std::wistringstream lines(text);
   std::wstring line;
+  bool schema_seen{};
   while (std::getline(lines, line)) {
     line = Trim(std::move(line));
-    if (line.empty() || line.front() == L'#' || line.front() == L'[') continue;
+    if (line.empty()) continue;
+    if (line.front() == L'#' || line.front() == L'[') {
+      layer.preserved_lines.push_back(line);
+      continue;
+    }
     const auto equals = line.find(L'=');
-    if (equals == std::wstring::npos) continue;
+    if (equals == std::wstring::npos) { error = L"設定行に=がありません。"; return false; }
     const auto key = Trim(line.substr(0, equals));
     const auto raw = Trim(line.substr(equals + 1));
-    if (key == L"theme") {
+    if (key == L"schema_version") {
+      if (raw != L"1") { error = L"未対応のsettings schemaです。"; return false; }
+      schema_seen = true;
+    } else if (key == L"auto_save") {
+      if (raw == L"true") layer.auto_save = true;
+      else if (raw == L"false") layer.auto_save = false;
+      else { error = L"auto_saveはtrueまたはfalseで指定してください。"; return false; }
+    } else if (key == L"auto_save_delay_ms") {
+      try {
+        std::size_t consumed{};
+        const auto value = std::stoul(raw, &consumed);
+        if (consumed != raw.size()) throw std::invalid_argument("trailing characters");
+        layer.auto_save_delay_ms = static_cast<unsigned>(value);
+      } catch (const std::exception&) { error = L"auto_save_delay_msが数値ではありません。"; return false; }
+    } else if (key == L"theme") {
       const auto quoted = Unquote(raw);
       const auto parsed = quoted ? ParseTheme(*quoted) : std::nullopt;
-      if (!parsed) { error = L"themeはsystem/light/darkで指定してください。"; return false; }
+      if (!parsed) { error = L"themeはsystem/light/dark/customで指定してください。"; return false; }
       layer.theme = *parsed;
     } else if (key == L"font_face") {
       const auto quoted = Unquote(raw);
@@ -185,18 +232,32 @@ bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, 
       const auto quoted = Unquote(raw);
       if (!quoted) { error = L"キー割当ては引用符で囲んでください。"; return false; }
       layer.keybindings[key.substr(5)] = *quoted;
+    } else if (key.starts_with(L"color.")) {
+      const auto quoted = Unquote(raw);
+      if (!quoted) { error = L"theme colorは引用符で囲んでください。"; return false; }
+      layer.colors[key.substr(6)] = *quoted;
+    } else {
+      layer.preserved_lines.push_back(line);
     }
   }
+  if (!schema_seen) { error = L"settings.tomlにschema_versionがありません。"; return false; }
   return ValidateSettingsLayer(layer, error);
 }
 
 bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& layer, std::wstring& error) {
   if (!ValidateSettingsLayer(layer, error)) return false;
   std::wstring text = L"schema_version = 1\n";
+  if (layer.auto_save) text += L"auto_save = " + std::wstring(*layer.auto_save ? L"true" : L"false") + L"\n";
+  if (layer.auto_save_delay_ms) text += L"auto_save_delay_ms = " + std::to_wstring(*layer.auto_save_delay_ms) + L"\n";
   if (layer.theme) text += L"theme = \"" + ThemeName(*layer.theme) + L"\"\n";
   if (layer.font_face) text += L"font_face = \"" + *layer.font_face + L"\"\n";
   if (layer.font_size_pt) text += L"font_size_pt = " + std::to_wstring(*layer.font_size_pt) + L"\n";
   for (const auto& [command, shortcut] : layer.keybindings) text += L"bind." + command + L" = \"" + shortcut + L"\"\n";
+  for (const auto& [name, color] : layer.colors) text += L"color." + name + L" = \"" + color + L"\"\n";
+  if (!layer.preserved_lines.empty()) {
+    text += L"\n# Preserved settings not managed by this MDLite build\n";
+    for (const auto& line : layer.preserved_lines) text += line + L"\n";
+  }
   std::string bytes;
   if (!EncodeUtf8(text, bytes)) { error = L"設定をUTF-8へ変換できません。"; return false; }
   std::error_code filesystem_error;

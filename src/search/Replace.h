@@ -32,9 +32,11 @@ struct ReplaceApplyResult {
 bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuery& query,
                              std::wstring_view replacement,
                              const std::map<std::filesystem::path, std::wstring>& unsaved,
-                             ReplacePlan& plan, std::wstring& error);
+                             ReplacePlan& plan, std::wstring& error,
+                             const std::function<bool()>& cancelled = {});
 bool ApplyWorkspaceReplace(const std::filesystem::path& workspace, const ReplacePlan& plan,
-                           ReplaceApplyResult& result, std::wstring& error);
+                           ReplaceApplyResult& result, std::wstring& error,
+                           const std::function<bool()>& cancelled = {});
 bool RollbackWorkspaceReplace(const std::filesystem::path& journal,
                               ReplaceApplyResult& result, std::wstring& error);
 

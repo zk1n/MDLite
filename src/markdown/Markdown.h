@@ -7,7 +7,30 @@
 
 namespace mdlite {
 
-enum class SpanKind { Heading, HeadingMarker, Strong, EmphasisMarker, Strike, Code, CodeFence, Link };
+enum class SpanKind {
+  Heading,
+  HeadingMarker,
+  Strong,
+  Emphasis,
+  EmphasisMarker,
+  Strike,
+  Code,
+  CodeFence,
+  Link
+};
+
+enum class BlockKind {
+  Paragraph,
+  ThematicBreak,
+  BlockQuote,
+  BulletListItem,
+  OrderedListItem,
+  TaskListItem,
+  IndentedCode,
+  FencedCode,
+  Html,
+  FrontMatter
+};
 
 struct StyleSpan {
   SpanKind kind{};
@@ -44,12 +67,19 @@ struct TableBlock {
   std::size_t end{};
 };
 
+struct MarkdownBlock {
+  BlockKind kind{};
+  std::size_t begin{};
+  std::size_t end{};
+};
+
 struct MarkdownParseResult {
   std::vector<StyleSpan> spans;
   std::vector<Heading> headings;
   std::vector<ImageReference> images;
   std::vector<LinkReference> links;
   std::vector<TableBlock> tables;
+  std::vector<MarkdownBlock> blocks;
 };
 
 struct SectionMoveResult {

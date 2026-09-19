@@ -4,23 +4,31 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mdlite {
 
-enum class ThemeMode { System, Light, Dark };
+enum class ThemeMode { System, Light, Dark, Custom };
 
 struct SettingsLayer {
+  std::optional<bool> auto_save;
+  std::optional<unsigned> auto_save_delay_ms;
   std::optional<ThemeMode> theme;
   std::optional<std::wstring> font_face;
   std::optional<unsigned> font_size_pt;
   std::map<std::wstring, std::wstring> keybindings;
+  std::map<std::wstring, std::wstring> colors;
+  std::vector<std::wstring> preserved_lines;
 };
 
 struct EffectiveSettings {
+  bool auto_save{true};
+  unsigned auto_save_delay_ms{750};
   ThemeMode theme{ThemeMode::System};
   std::wstring font_face{L"Segoe UI"};
   unsigned font_size_pt{11};
   std::map<std::wstring, std::wstring> keybindings;
+  std::map<std::wstring, std::wstring> colors;
   std::map<std::wstring, std::wstring> origins;
 };
 

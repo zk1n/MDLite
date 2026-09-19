@@ -15,7 +15,9 @@
 #include "workspace/Trust.h"
 
 #include <windows.h>
+#include <wincodec.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,6 +35,36 @@ void Check(bool condition, const char* message) {
     std::cerr << "FAIL: " << message << '\n';
     ++failures;
   }
+}
+
+bool WriteValidPng(const std::filesystem::path& path) {
+  IWICImagingFactory* factory{};
+  IWICStream* stream{};
+  IWICBitmapEncoder* encoder{};
+  IWICBitmapFrameEncode* frame{};
+  IPropertyBag2* properties{};
+  HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&factory));
+  if (SUCCEEDED(result)) result = factory->CreateStream(&stream);
+  if (SUCCEEDED(result)) result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+  if (SUCCEEDED(result)) result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+  if (SUCCEEDED(result)) result = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+  if (SUCCEEDED(result)) result = encoder->CreateNewFrame(&frame, &properties);
+  if (SUCCEEDED(result)) result = frame->Initialize(properties);
+  if (SUCCEEDED(result)) result = frame->SetSize(2, 1);
+  WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+  if (SUCCEEDED(result)) result = frame->SetPixelFormat(&format);
+  const std::array<unsigned char, 8> pixels{0, 0, 255, 255, 0, 255, 0, 255};
+  if (SUCCEEDED(result)) result = frame->WritePixels(1, 8, 8, const_cast<BYTE*>(pixels.data()));
+  if (SUCCEEDED(result)) result = frame->Commit();
+  if (SUCCEEDED(result)) result = encoder->Commit();
+  if (properties) properties->Release();
+  if (frame) frame->Release();
+  if (encoder) encoder->Release();
+  if (stream) stream->Release();
+  if (factory) factory->Release();
+  if (FAILED(result)) std::cerr << "WIC PNG fixture HRESULT: 0x" << std::hex << static_cast<unsigned long>(result) << std::dec << '\n';
+  return SUCCEEDED(result);
 }
 
 void WriteBytes(const std::filesystem::path& path, const std::vector<unsigned char>& bytes) {
@@ -241,6 +273,21 @@ void TestMarkdown() {
             L"<img src=\"assets/a.png\" alt=\"sample\" width=\"480\">").view == L"\uFFFC",
         "resized img markup remains a native derived image object");
 
+  const auto blocks = mdlite::ParseMarkdown(
+      L"paragraph *em* __strong__\n---\n> quote\n- bullet\n1. ordered\n- [x] task\n"
+      L"    indented code\n<div>kept</div>\n");
+  const auto has_block = [&](mdlite::BlockKind kind) {
+    return std::ranges::any_of(blocks.blocks, [kind](const auto& block) { return block.kind == kind; });
+  };
+  Check(has_block(mdlite::BlockKind::Paragraph) && has_block(mdlite::BlockKind::ThematicBreak) &&
+            has_block(mdlite::BlockKind::BlockQuote) && has_block(mdlite::BlockKind::BulletListItem) &&
+            has_block(mdlite::BlockKind::OrderedListItem) && has_block(mdlite::BlockKind::TaskListItem) &&
+            has_block(mdlite::BlockKind::IndentedCode) && has_block(mdlite::BlockKind::Html),
+        "initial CommonMark and GFM block set retains source ranges");
+  Check(std::ranges::any_of(blocks.spans, [](const auto& span) {
+          return span.kind == mdlite::SpanKind::Emphasis;
+        }), "single emphasis is recognized separately from strong emphasis");
+
   const std::wstring outline = L"# First\nintro\n## Child\nchild\n# Second\nend\n# Third\nlast\n";
   const auto outline_parse = mdlite::ParseMarkdown(outline);
   const auto moved = mdlite::MoveHeadingSection(outline, outline_parse.headings[0].begin,
@@ -401,6 +448,37 @@ void TestProfiles(const std::filesystem::path& root) {
               's','e','q','u','e','n','c','e','_','f','o','r','m','a','t',' ','=',' ','"','_','%','0','3','d','"','\n'});
   Check(!mdlite::LoadProfileFile(unsupported_sequence, loaded, error),
         "profile parser rejects unsupported sequence format instead of silently changing semantics");
+
+  const std::string input_template = "# {{title}}\n{{input:owner}}\n{{cursor}}end";
+  WriteBytes(workspace / L".mdlite/templates/input.md",
+             std::vector<unsigned char>(input_template.begin(), input_template.end()));
+  mdlite::ProfileDefinition input_profile{
+      L"input", L"Input", L"Projects/{{input:owner}}", L"{{title}}.md",
+      L"templates/input.md", mdlite::ProfileCollision::OpenExisting,
+      {{L"title", L"Title", L"", true}, {L"owner", L"Owner", L"team", false}}};
+  const auto input_file = workspace / L"input-profile.toml";
+  Check(mdlite::SaveProfileFile(input_file, {input_profile}, error),
+        "profile input definitions save");
+  Check(mdlite::LoadProfileFile(input_file, loaded, error) && loaded.size() == 1 &&
+            loaded.front().inputs.size() == 2 && loaded.front().inputs.front().required,
+        "profile input definitions round trip through the shared TOML model");
+  mdlite::ProfileValues values{{L"title", L"Roadmap"}, {L"owner", L"alice"}};
+  const auto input_preview = mdlite::PreviewProfilePath(workspace, input_profile, date, values, error);
+  Check(input_preview && *input_preview == workspace / L"Projects/alice/Roadmap.md",
+        "profile path preview expands finite title and input variables");
+  mdlite::NoteCreationResult input_note{};
+  Check(mdlite::CreateProfileNote(workspace, input_profile, date, values, input_note, error),
+        "profile note creates with prompted values");
+  const std::vector<unsigned char> expected_input_body{'#',' ','R','o','a','d','m','a','p','\n',
+                                                        'a','l','i','c','e','\n','e','n','d'};
+  Check(ReadBytes(input_note.path) == expected_input_body && input_note.cursor == 16,
+        "profile values expand once and cursor is removed at the expanded UTF-16 position");
+  values[L"title"] = L"";
+  Check(!mdlite::PreviewProfilePath(workspace, input_profile, date, values, error),
+        "profile preview rejects a missing required input");
+  values[L"title"] = L"../escape";
+  Check(!mdlite::PreviewProfilePath(workspace, input_profile, date, values, error),
+        "profile preview rejects path separators introduced by input");
 }
 
 void TestSearch(const std::filesystem::path& root) {
@@ -441,6 +519,35 @@ void TestSearch(const std::filesystem::path& root) {
         "replace journal rollback succeeds");
   Check(replaced.Load(workspace / L"words.md", error) && replaced.text() == L"cat scatter cat",
         "rollback restores the preview baseline");
+
+  error.clear();
+  mdlite::ReplacePlan cancelled_preview;
+  Check(!mdlite::PreviewWorkspaceReplace(workspace, whole, L"dog", {}, cancelled_preview, error,
+                                         [] { return true; }),
+        "replace preview can be cancelled");
+  Check(error.find(L"中止") != std::wstring::npos, "cancelled preview reports cancellation");
+
+  WriteBytes(workspace / L"cancel-a.md", {'c','a','t'});
+  WriteBytes(workspace / L"cancel-b.md", {'c','a','t'});
+  mdlite::ReplacePlan cancellable_plan;
+  error.clear();
+  Check(mdlite::PreviewWorkspaceReplace(workspace, whole, L"dog", {}, cancellable_plan, error),
+        "cancellable replace preview succeeds");
+  std::size_t cancellation_checks{};
+  mdlite::ReplaceApplyResult cancelled_apply;
+  Check(!mdlite::ApplyWorkspaceReplace(workspace, cancellable_plan, cancelled_apply, error,
+                                       [&] { return ++cancellation_checks > 1; }),
+        "replace apply can be cancelled between files");
+  Check(cancelled_apply.applied_files == 1 && std::filesystem::exists(cancelled_apply.journal),
+        "cancelled replace records the partial apply in a journal");
+  mdlite::Document cancel_a;
+  mdlite::Document cancel_b;
+  Check(cancel_a.Load(workspace / L"cancel-a.md", error) && cancel_a.text() == L"dog" &&
+            cancel_b.Load(workspace / L"cancel-b.md", error) && cancel_b.text() == L"cat",
+        "cancelled replace changes only the completed file");
+  mdlite::ReplaceApplyResult cancelled_rollback;
+  Check(mdlite::RollbackWorkspaceReplace(cancelled_apply.journal, cancelled_rollback, error),
+        "cancelled replace journal can roll back the partial apply");
 }
 
 void TestTableEditing() {
@@ -470,17 +577,27 @@ void TestAssets(const std::filesystem::path& root) {
   std::filesystem::create_directories(workspace);
   std::filesystem::create_directories(source_directory);
   const auto png = source_directory / L"image.png";
-  WriteBytes(png, {0x89, 'P', 'N', 'G'});
-  mdlite::AssetImportResult first{};
+  Check(WriteValidPng(png), "valid PNG fixture is encoded by WIC");
+  mdlite::RasterImageInfo image_info;
   std::wstring error;
+  Check(mdlite::ReadRasterImageInfo(png, image_info, error) && image_info.width == 2 &&
+            image_info.height == 1 && image_info.frame_count == 1,
+        "real PNG is decoded with dimensions and frame count");
+  mdlite::AssetImportResult first{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", first, error),
         "supported image copies into workspace assets");
   Check(first.relative_reference == L"assets/image.png", "image reference is document-relative");
-  WriteBytes(png, {0x89, 'P', 'N', 'G', '2'});
+  Check(WriteValidPng(png), "replacement PNG fixture is valid");
   mdlite::AssetImportResult second{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", second, error),
         "second image import succeeds without overwrite");
   Check(second.stored_path.filename() == L"image_1.png", "asset collision gets a new name");
+  const auto corrupt = source_directory / L"corrupt.png";
+  WriteBytes(corrupt, {0x89, 'P', 'N', 'G'});
+  mdlite::AssetImportResult corrupt_result{};
+  error.clear();
+  Check(!mdlite::ImportImageAsset(corrupt, workspace, workspace / L"note.md", corrupt_result, error),
+        "corrupt raster image is rejected before a Markdown link is created");
   const auto svg = source_directory / L"unsafe.svg";
   const std::string unsafe = "<svg><script>alert(1)</script></svg>";
   WriteBytes(svg, std::vector<unsigned char>(unsafe.begin(), unsafe.end()));
@@ -529,6 +646,9 @@ void TestSettings(const std::filesystem::path& root) {
   const auto workspace_path = directory / L"workspace.toml";
   mdlite::SettingsLayer common;
   common.theme = mdlite::ThemeMode::Dark;
+  common.auto_save = false;
+  common.auto_save_delay_ms = 1500;
+  common.colors[L"link"] = L"#80A0FF";
   common.font_face = L"Yu Gothic UI";
   common.keybindings[L"file.save"] = L"Ctrl+Shift+S";
   std::wstring error;
@@ -540,7 +660,8 @@ void TestSettings(const std::filesystem::path& root) {
   mdlite::EffectiveSettings effective;
   Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
   Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
-            effective.font_size_pt == 14,
+            effective.font_size_pt == 14 && !effective.auto_save && effective.auto_save_delay_ms == 1500 &&
+            effective.colors[L"link"] == L"#80A0FF",
         "workspace overrides common while inherited values remain");
   Check(effective.origins[L"theme"] == L"Workspace上書き" &&
             effective.origins[L"font_face"] == L"共通設定",
@@ -556,6 +677,11 @@ void TestSettings(const std::filesystem::path& root) {
   Check(!mdlite::SaveSettingsLayer(directory / L"invalid.toml", invalid, error),
         "settings serializer rejects unsafe quoted strings");
   invalid = {};
+  invalid.colors[L"unknown"] = L"#FFFFFF";
+  error.clear();
+  Check(!mdlite::SaveSettingsLayer(directory / L"invalid-color.toml", invalid, error),
+        "settings reject unknown custom color keys");
+  invalid = {};
   invalid.keybindings[L"file.open"] = L"Ctrl+Shift+NotAKey";
   error.clear();
   Check(!mdlite::SaveSettingsLayer(directory / L"invalid-shortcut.toml", invalid, error),
@@ -566,6 +692,17 @@ void TestSettings(const std::filesystem::path& root) {
   error.clear();
   Check(!mdlite::LoadSettingsLayer(directory / L"malformed.toml", invalid, error),
         "settings reject numeric values with trailing characters");
+  const std::string future = "schema_version = 1\n[future]\nnew_option = \"keep-me\"\n";
+  const auto future_path = directory / L"future.toml";
+  WriteBytes(future_path, std::vector<unsigned char>(future.begin(), future.end()));
+  mdlite::SettingsLayer future_layer;
+  Check(mdlite::LoadSettingsLayer(future_path, future_layer, error) &&
+            mdlite::SaveSettingsLayer(future_path, future_layer, error),
+        "settings GUI model can round trip a file with future fields");
+  const auto preserved = ReadBytes(future_path);
+  const std::string preserved_text(preserved.begin(), preserved.end());
+  Check(preserved_text.find("new_option = \"keep-me\"") != std::string::npos,
+        "settings save preserves fields unknown to this build");
 }
 
 void TestGitConflicts() {
@@ -592,6 +729,7 @@ void TestGitConflicts() {
 }  // namespace
 
 int wmain() {
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   const auto root = std::filesystem::temp_directory_path() /
                     (L"mdlite-core-tests-" + std::to_wstring(GetCurrentProcessId()));
   std::error_code error;
@@ -616,6 +754,7 @@ int wmain() {
   TestSettings(root);
   TestGitConflicts();
   std::filesystem::remove_all(root, error);
+  if (SUCCEEDED(com)) CoUninitialize();
   if (failures == 0) std::cout << "All MDLite core tests passed.\n";
   return failures == 0 ? 0 : 1;
 }

@@ -157,13 +157,15 @@ bool WriteJournal(const std::filesystem::path& path, const ReplacePlan& plan,
 bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuery& query,
                              std::wstring_view replacement,
                              const std::map<std::filesystem::path, std::wstring>& unsaved,
-                             ReplacePlan& plan, std::wstring& error) {
+                             ReplacePlan& plan, std::wstring& error,
+                             const std::function<bool()>& cancelled) {
   plan = {query, std::wstring(replacement), {}};
   std::vector<SearchMatch> matches;
-  if (!SearchWorkspace(root, query, unsaved, matches, error)) return false;
+  if (!SearchWorkspace(root, query, unsaved, matches, error, cancelled)) return false;
   std::map<std::filesystem::path, std::size_t> counts;
   for (const auto& match : matches) ++counts[match.path];
   for (const auto& [path, expected_count] : counts) {
+    if (cancelled && cancelled()) { error = L"置換previewを中止しました。"; return false; }
     std::wstring before;
     const auto unsaved_it = unsaved.find(path);
     if (unsaved_it != unsaved.end()) before = unsaved_it->second;
@@ -185,7 +187,8 @@ bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuer
 }
 
 bool ApplyWorkspaceReplace(const std::filesystem::path& workspace, const ReplacePlan& plan,
-                           ReplaceApplyResult& result, std::wstring& error) {
+                           ReplaceApplyResult& result, std::wstring& error,
+                           const std::function<bool()>& cancelled) {
   result = {};
   const auto journal_directory = workspace / L".mdlite/.state/replace";
   std::error_code filesystem_error;
@@ -196,6 +199,11 @@ bool ApplyWorkspaceReplace(const std::filesystem::path& workspace, const Replace
   result.journal = journal_directory / (L"replace-" + std::to_wstring(stamp) + L".journal");
   std::vector<bool> applied(plan.files.size(), false);
   for (std::size_t index = 0; index < plan.files.size(); ++index) {
+    if (cancelled && cancelled()) {
+      if (!WriteJournal(result.journal, plan, applied, error)) return false;
+      error = L"置換適用を中止しました。適用済みファイルはjournalから条件付きで戻せます。";
+      return false;
+    }
     const auto& item = plan.files[index];
     Document document;
     std::wstring item_error;

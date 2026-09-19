@@ -23,10 +23,19 @@ std::wstring Number(unsigned value, int width) {
 
 std::wstring ExpandDate(std::wstring value, const SYSTEMTIME& date) {
   const std::pair<std::wstring_view, std::wstring> replacements[] = {
+      {L"{{date:yyyyMMddHHmm}}", Number(date.wYear, 4) + Number(date.wMonth, 2) + Number(date.wDay, 2) +
+                                  Number(date.wHour, 2) + Number(date.wMinute, 2)},
       {L"{{date:yyyyMMdd}}", Number(date.wYear, 4) + Number(date.wMonth, 2) + Number(date.wDay, 2)},
       {L"{{date:yyyyMM}}", Number(date.wYear, 4) + Number(date.wMonth, 2)},
+      {L"{{date:yyyy-MM-dd HH-mm}}", Number(date.wYear, 4) + L"-" + Number(date.wMonth, 2) + L"-" +
+                                     Number(date.wDay, 2) + L" " + Number(date.wHour, 2) + L"-" +
+                                     Number(date.wMinute, 2)},
       {L"{{date:yyyy-MM-dd}}", Number(date.wYear, 4) + L"-" + Number(date.wMonth, 2) + L"-" + Number(date.wDay, 2)},
       {L"{{date:yyyy}}", Number(date.wYear, 4)},
+      {L"{{date:MM}}", Number(date.wMonth, 2)},
+      {L"{{date:dd}}", Number(date.wDay, 2)},
+      {L"{{date:HH}}", Number(date.wHour, 2)},
+      {L"{{date:mm}}", Number(date.wMinute, 2)},
   };
   for (const auto& [token, replacement] : replacements) {
     std::size_t position{};
@@ -59,17 +68,53 @@ bool HasUnsafePathPart(const std::filesystem::path& path) {
   return std::ranges::any_of(path, [](const auto& part) { return part == L".." || part == L"."; });
 }
 
-bool HasUnknownToken(std::wstring_view value) {
+bool HasInput(const ProfileDefinition& profile, std::wstring_view id) {
+  return std::ranges::any_of(profile.inputs, [&](const auto& input) { return input.id == id; });
+}
+
+bool HasUnknownToken(std::wstring_view value, const ProfileDefinition& profile, bool allow_cursor = false) {
   std::size_t cursor{};
   while ((cursor = value.find(L"{{", cursor)) != std::wstring_view::npos) {
     const auto end = value.find(L"}}", cursor + 2);
     if (end == std::wstring_view::npos) return true;
     const auto token = value.substr(cursor, end + 2 - cursor);
-    if (token != L"{{date:yyyy}}" && token != L"{{date:yyyyMM}}" &&
-        token != L"{{date:yyyyMMdd}}" && token != L"{{date:yyyy-MM-dd}}") return true;
+    const bool known_date = token == L"{{date:yyyy}}" || token == L"{{date:MM}}" ||
+                            token == L"{{date:dd}}" || token == L"{{date:HH}}" ||
+                            token == L"{{date:mm}}" || token == L"{{date:yyyyMM}}" ||
+                            token == L"{{date:yyyyMMdd}}" || token == L"{{date:yyyyMMddHHmm}}" ||
+                            token == L"{{date:yyyy-MM-dd}}" || token == L"{{date:yyyy-MM-dd HH-mm}}";
+    bool known_input = token == L"{{title}}" && HasInput(profile, L"title");
+    constexpr std::wstring_view prefix = L"{{input:";
+    if (token.starts_with(prefix) && token.size() > prefix.size() + 2) {
+      known_input = HasInput(profile, token.substr(prefix.size(), token.size() - prefix.size() - 2));
+    }
+    if (!known_date && !known_input && !(allow_cursor && token == L"{{cursor}}")) return true;
     cursor = end + 2;
   }
   return false;
+}
+
+bool ExpandInputs(std::wstring& value, const ProfileDefinition& profile, const ProfileValues& values,
+                  std::wstring& error) {
+  for (const auto& input : profile.inputs) {
+    const auto found = values.find(input.id);
+    const std::wstring& replacement = found == values.end() ? input.default_value : found->second;
+    if (input.required && replacement.empty()) {
+      error = L"必須入力が未指定です: " + input.label;
+      return false;
+    }
+    const std::wstring tokens[] = {L"{{input:" + input.id + L"}}",
+                                   input.id == L"title" ? L"{{title}}" : L""};
+    for (const auto& token : tokens) {
+      if (token.empty()) continue;
+      std::size_t position{};
+      while ((position = value.find(token, position)) != std::wstring::npos) {
+        value.replace(position, token.size(), replacement);
+        position += replacement.size();
+      }
+    }
+  }
+  return true;
 }
 
 bool EncodeUtf8(std::wstring_view text, std::string& bytes);
@@ -179,11 +224,23 @@ bool ValidateProfile(const ProfileDefinition& profile, std::wstring& error) {
     error = L"profile idまたはnameが不正です。";
     return false;
   }
+  std::map<std::wstring, bool> input_ids;
+  for (const auto& input : profile.inputs) {
+    const bool valid_input_id = !input.id.empty() && std::ranges::all_of(input.id, [](wchar_t character) {
+      return iswalnum(character) || character == L'_' || character == L'-';
+    });
+    if (!valid_input_id || input.label.empty() || !IsSafeString(input.id) || !IsSafeString(input.label) ||
+        !IsSafeString(input.default_value) || !input_ids.emplace(input.id, true).second) {
+      error = L"profile inputのid、label、defaultまたは重複が不正です。";
+      return false;
+    }
+  }
   if (HasUnsafePathPart(profile.directory) || HasUnsafePathPart(profile.template_path) ||
       profile.filename.empty() || profile.filename.filename() != profile.filename ||
       !IsSafeString(profile.directory.generic_wstring()) || !IsSafeString(profile.filename.generic_wstring()) ||
       !IsSafeString(profile.template_path.generic_wstring()) ||
-      HasUnknownToken(profile.directory.generic_wstring()) || HasUnknownToken(profile.filename.generic_wstring())) {
+      HasUnknownToken(profile.directory.generic_wstring(), profile) ||
+      HasUnknownToken(profile.filename.generic_wstring(), profile)) {
     error = L"profile pathは既知の日付tokenを使うWorkspace内の相対pathで指定してください。";
     return false;
   }
@@ -199,12 +256,21 @@ bool LoadProfileFile(const std::filesystem::path& path, std::vector<ProfileDefin
   std::wistringstream lines(text);
   std::wstring line;
   ProfileDefinition* current{};
+  ProfileInputDefinition* current_input{};
+  bool schema_seen{};
   while (std::getline(lines, line)) {
     line = Trim(std::move(line));
     if (line.empty() || line.front() == L'#') continue;
     if (line == L"[[profiles]]") {
       profiles.emplace_back();
       current = &profiles.back();
+      current_input = nullptr;
+      continue;
+    }
+    if (line == L"[[profiles.inputs]]") {
+      if (!current) { error = L"profile inputは[[profiles]]の後に指定してください。"; return false; }
+      current->inputs.emplace_back();
+      current_input = &current->inputs.back();
       continue;
     }
     const auto equals = line.find(L'=');
@@ -213,9 +279,25 @@ bool LoadProfileFile(const std::filesystem::path& path, std::vector<ProfileDefin
     const auto raw = Trim(line.substr(equals + 1));
     if (!current && key == L"schema_version") {
       if (raw != L"1") { error = L"未対応のprofiles schemaです。"; return false; }
+      schema_seen = true;
       continue;
     }
     if (!current) { error = L"profile fieldは[[profiles]]の後に指定してください。"; return false; }
+    if (current_input) {
+      if (key == L"required") {
+        if (raw == L"true") current_input->required = true;
+        else if (raw == L"false") current_input->required = false;
+        else { error = L"profile input requiredはtrueまたはfalseです。"; return false; }
+        continue;
+      }
+      const auto input_value = Unquote(raw);
+      if (!input_value) { error = L"profile input fieldは引用符で囲んでください。"; return false; }
+      if (key == L"id") current_input->id = *input_value;
+      else if (key == L"label") current_input->label = *input_value;
+      else if (key == L"default") current_input->default_value = *input_value;
+      else { error = L"未対応のprofile input fieldです: " + key; return false; }
+      continue;
+    }
     const auto value = Unquote(raw);
     if (!value) { error = L"profile fieldは引用符で囲んでください。"; return false; }
     if (key == L"id") current->id = *value;
@@ -237,6 +319,7 @@ bool LoadProfileFile(const std::filesystem::path& path, std::vector<ProfileDefin
       return false;
     }
   }
+  if (!schema_seen) { error = L"profiles.tomlにschema_versionがありません。"; return false; }
   std::map<std::wstring, bool> ids;
   for (const auto& profile : profiles) {
     if (!ValidateProfile(profile, error)) return false;
@@ -261,6 +344,13 @@ bool SaveProfileFile(const std::filesystem::path& path, const std::vector<Profil
     text += L"collision = \"" + std::wstring(profile.collision == ProfileCollision::Sequence
                                                    ? L"sequence" : L"open-existing") + L"\"\n";
     if (profile.collision == ProfileCollision::Sequence) text += L"sequence_format = \"_%02d\"\n";
+    for (const auto& input : profile.inputs) {
+      text += L"\n[[profiles.inputs]]\n";
+      text += L"id = \"" + input.id + L"\"\n";
+      text += L"label = \"" + input.label + L"\"\n";
+      text += L"default = \"" + input.default_value + L"\"\n";
+      text += L"required = " + std::wstring(input.required ? L"true" : L"false") + L"\n";
+    }
   }
   return WriteUtf8Atomic(path, text, error);
 }
@@ -286,9 +376,25 @@ std::optional<std::filesystem::path> PreviewProfilePath(const std::filesystem::p
                                                         const ProfileDefinition& profile,
                                                         const SYSTEMTIME& local_date,
                                                         std::wstring& error) {
+  return PreviewProfilePath(workspace, profile, local_date, {}, error);
+}
+
+std::optional<std::filesystem::path> PreviewProfilePath(const std::filesystem::path& workspace,
+                                                        const ProfileDefinition& profile,
+                                                        const SYSTEMTIME& local_date,
+                                                        const ProfileValues& values,
+                                                        std::wstring& error) {
   if (!ValidateProfile(profile, error)) return std::nullopt;
-  const auto relative = (std::filesystem::path(ExpandDate(profile.directory.generic_wstring(), local_date)) /
-                         ExpandDate(profile.filename.generic_wstring(), local_date)).lexically_normal();
+  auto directory = ExpandDate(profile.directory.generic_wstring(), local_date);
+  auto filename = ExpandDate(profile.filename.generic_wstring(), local_date);
+  if (!ExpandInputs(directory, profile, values, error) || !ExpandInputs(filename, profile, values, error)) {
+    return std::nullopt;
+  }
+  if (std::filesystem::path(filename).filename() != std::filesystem::path(filename)) {
+    error = L"展開後のfilenameにdirectory区切りを含められません。";
+    return std::nullopt;
+  }
+  const auto relative = (std::filesystem::path(directory) / filename).lexically_normal();
   if (HasUnsafePathPart(relative) || relative.generic_wstring().find_first_of(L"<>:\"|?*") != std::wstring::npos) {
     error = L"展開後のprofile pathがWorkspace外または禁止文字を含みます。";
     return std::nullopt;
@@ -319,7 +425,13 @@ bool CreateProfileNote(const std::filesystem::path& workspace, BuiltInProfile pr
 bool CreateProfileNote(const std::filesystem::path& workspace, const ProfileDefinition& profile,
                        const SYSTEMTIME& local_date, NoteCreationResult& result,
                        std::wstring& error) {
-  const auto preview = PreviewProfilePath(workspace, profile, local_date, error);
+  return CreateProfileNote(workspace, profile, local_date, {}, result, error);
+}
+
+bool CreateProfileNote(const std::filesystem::path& workspace, const ProfileDefinition& profile,
+                       const SYSTEMTIME& local_date, const ProfileValues& values,
+                       NoteCreationResult& result, std::wstring& error) {
+  const auto preview = PreviewProfilePath(workspace, profile, local_date, values, error);
   if (!preview) return false;
   const auto directory = preview->parent_path();
   std::error_code filesystem_error;
@@ -331,15 +443,23 @@ bool CreateProfileNote(const std::filesystem::path& workspace, const ProfileDefi
   std::wstring body;
   const auto template_path = workspace / L".mdlite" / profile.template_path;
   if (!ReadUtf8(template_path, body, error)) return false;
-  body = ExpandDate(std::move(body), local_date);
   const std::wstring marker = L"{{cursor}}";
-  result.cursor = body.find(marker);
-  if (result.cursor == std::wstring::npos) result.cursor = body.size();
-  else body.erase(result.cursor, marker.size());
-  if (body.find(marker) != std::wstring::npos) {
+  if (HasUnknownToken(body, profile, true)) {
+    error = L"テンプレートに未定義の変数があります。";
+    return false;
+  }
+  const auto marker_position = body.find(marker);
+  if (marker_position != std::wstring::npos && body.find(marker, marker_position + marker.size()) != std::wstring::npos) {
     error = L"テンプレートの{{cursor}}は一つだけ指定できます。";
     return false;
   }
+  std::wstring prefix = marker_position == std::wstring::npos ? body : body.substr(0, marker_position);
+  std::wstring suffix = marker_position == std::wstring::npos ? L"" : body.substr(marker_position + marker.size());
+  prefix = ExpandDate(std::move(prefix), local_date);
+  suffix = ExpandDate(std::move(suffix), local_date);
+  if (!ExpandInputs(prefix, profile, values, error) || !ExpandInputs(suffix, profile, values, error)) return false;
+  result.cursor = prefix.size();
+  body = std::move(prefix) + std::move(suffix);
 
   const std::wstring base_filename = preview->filename().wstring();
   for (unsigned number = 0; number < 10000; ++number) {

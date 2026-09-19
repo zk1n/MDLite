@@ -150,6 +150,7 @@ enum ControlId : int {
   kViewCalendar,
   kViewSettings,
   kViewSettingsFiles,
+  kViewProfiles,
   kViewCompact,
   kViewCommandPalette,
   kWorkspaceTrust,
@@ -801,6 +802,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       }
       else if (command == kViewSettings) OpenWorkspaceSettings();
       else if (command == kViewSettingsFiles) OpenWorkspaceSettingsFiles();
+      else if (command == kViewProfiles) ManageProfiles();
       else if (command == kViewCompact) ToggleCompactWindow();
       else if (command == kViewCommandPalette) ShowCommandPalette();
       else if (command == kTableRowBefore) ApplyTableAction(TableAction::InsertRowBefore);
@@ -958,6 +960,7 @@ void Application::CreateMenuBar() {
   AppendMenuW(view, MF_STRING, kViewCalendar, L"カレンダー");
   AppendMenuW(view, MF_STRING, kViewSettings, L"Workspace設定を開く");
   AppendMenuW(view, MF_STRING, kViewSettingsFiles, L"設定ファイルを詳細編集");
+  AppendMenuW(view, MF_STRING, kViewProfiles, L"作成プロファイルを管理…");
   AppendMenuW(view, MF_STRING, kViewCompact, L"現在の文書をコンパクト表示");
   AppendMenuW(view, MF_STRING, kViewCommandPalette, L"コマンドパレット…\tCtrl+Shift+P");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示");
@@ -2782,6 +2785,151 @@ void Application::OpenWorkspaceSettingsFiles() {
     const auto path = root / relative;
     if (std::filesystem::is_regular_file(path)) OpenDocument(path);
   }
+}
+
+void Application::ManageProfiles() {
+  if (!workspace_store_) {
+    MessageBoxW(window_, L"保存先previewとtemplate編集のため、先にWorkspaceを開いてください。",
+                L"作成プロファイル", MB_ICONINFORMATION);
+    return;
+  }
+  const auto common_path = CommonProfilesPath();
+  const auto workspace_path = workspace_store_->metadata_root() / L"profiles.toml";
+  std::vector<ProfileDefinition> effective;
+  std::wstring error;
+  if (!ResolveProfiles(common_path, workspace_path, effective, error)) {
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
+    return;
+  }
+  std::wstring list;
+  for (const auto& profile : effective) list += profile.id + L" — " + profile.name + L"\n";
+  std::wstring scope = L"workspace";
+  if (!PromptText(window_, instance_, L"作成プロファイル",
+                  L"編集範囲: common / workspace\nWorkspace上書きは同じidの共通定義を置き換えます。", scope)) return;
+  std::ranges::transform(scope, scope.begin(), towlower);
+  if (scope != L"common" && scope != L"workspace") {
+    MessageBoxW(window_, L"commonまたはworkspaceを指定してください。", L"作成プロファイル", MB_ICONWARNING);
+    return;
+  }
+  const auto target = scope == L"common" ? common_path : workspace_path;
+  std::vector<ProfileDefinition> layer;
+  if (!LoadProfileFile(target, layer, error)) {
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
+    return;
+  }
+  std::wstring action = L"edit";
+  if (!PromptText(window_, instance_, L"作成プロファイル",
+                  L"操作: add / edit / duplicate / delete / template\n\n現在の実効profile:\n" + list,
+                  action)) return;
+  std::ranges::transform(action, action.begin(), towlower);
+  if (action != L"add" && action != L"edit" && action != L"duplicate" &&
+      action != L"delete" && action != L"template") {
+    MessageBoxW(window_, L"未対応の操作です。", L"作成プロファイル", MB_ICONWARNING);
+    return;
+  }
+  std::wstring id = action == L"add" ? L"custom" : L"daily";
+  if (!PromptText(window_, instance_, L"作成プロファイル", L"profile id", id) || id.empty()) return;
+  const auto effective_item = std::ranges::find_if(effective, [&](const auto& item) { return item.id == id; });
+  if (action == L"template") {
+    if (effective_item == effective.end()) {
+      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING);
+      return;
+    }
+    const auto template_path = workspace_store_->metadata_root() / effective_item->template_path;
+    if (!std::filesystem::is_regular_file(template_path)) {
+      MessageBoxW(window_, (L"template fileがありません:\n" + template_path.wstring()).c_str(),
+                  L"作成プロファイル", MB_ICONWARNING);
+      return;
+    }
+    OpenDocument(template_path);
+    return;
+  }
+  if (action == L"delete") {
+    const auto item = std::ranges::find_if(layer, [&](const auto& profile) { return profile.id == id; });
+    if (item == layer.end()) {
+      MessageBoxW(window_, L"この範囲には定義がありません。継承元の範囲を選んでください。",
+                  L"作成プロファイル", MB_ICONINFORMATION);
+      return;
+    }
+    if (MessageBoxW(window_, (L"この範囲のprofile定義を削除しますか？\n" + id +
+                              L"\n下位または組込み定義があれば再び継承されます。").c_str(),
+                    L"作成プロファイル", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+    layer.erase(item);
+    if (!SaveProfileFile(target, layer, error)) {
+      MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
+      return;
+    }
+    MessageBoxW(window_, L"この範囲の定義を削除しました。", L"作成プロファイル", MB_ICONINFORMATION);
+    return;
+  }
+
+  ProfileDefinition profile;
+  if (action == L"add") {
+    if (std::ranges::any_of(effective, [&](const auto& item) { return item.id == id; })) {
+      MessageBoxW(window_, L"既存idです。上書きする場合はeditを選んでください。",
+                  L"作成プロファイル", MB_ICONWARNING);
+      return;
+    }
+    profile = {id, id, L"Notes/{{date:yyyy}}", L"{{date:yyyyMMdd}}.md",
+               L"templates/memo.md", ProfileCollision::Sequence};
+  } else {
+    if (effective_item == effective.end()) {
+      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING);
+      return;
+    }
+    profile = *effective_item;
+    if (action == L"duplicate") {
+      std::wstring duplicate_id = id + L"-copy";
+      if (!PromptText(window_, instance_, L"作成プロファイルを複製", L"新しいprofile id", duplicate_id) ||
+          duplicate_id.empty()) return;
+      if (std::ranges::any_of(effective, [&](const auto& item) { return item.id == duplicate_id; })) {
+        MessageBoxW(window_, L"複製先idは既に存在します。", L"作成プロファイル", MB_ICONWARNING);
+        return;
+      }
+      profile.id = duplicate_id;
+      profile.name += L" コピー";
+    }
+  }
+  std::wstring name = profile.name;
+  std::wstring directory = profile.directory.generic_wstring();
+  std::wstring filename = profile.filename.generic_wstring();
+  std::wstring template_path = profile.template_path.generic_wstring();
+  std::wstring collision = profile.collision == ProfileCollision::Sequence ? L"sequence" : L"open-existing";
+  if (!PromptText(window_, instance_, L"作成プロファイル", L"表示名", name) ||
+      !PromptText(window_, instance_, L"作成プロファイル", L"Workspace相対directory", directory) ||
+      !PromptText(window_, instance_, L"作成プロファイル", L"filename", filename) ||
+      !PromptText(window_, instance_, L"作成プロファイル", L".mdlite相対template path", template_path) ||
+      !PromptText(window_, instance_, L"作成プロファイル", L"collision: open-existing / sequence", collision)) return;
+  std::ranges::transform(collision, collision.begin(), towlower);
+  profile.name = name;
+  profile.directory = directory;
+  profile.filename = filename;
+  profile.template_path = template_path;
+  if (collision == L"sequence") profile.collision = ProfileCollision::Sequence;
+  else if (collision == L"open-existing") profile.collision = ProfileCollision::OpenExisting;
+  else {
+    MessageBoxW(window_, L"collision値が不正です。", L"作成プロファイル", MB_ICONWARNING);
+    return;
+  }
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  const auto preview = PreviewProfilePath(workspace_, profile, now, error);
+  if (!preview) {
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONWARNING);
+    return;
+  }
+  if (MessageBoxW(window_, (L"次の定義を保存しますか？\n\n範囲: " + scope + L"\nid: " + profile.id +
+                            L"\n今日の保存先preview:\n" + preview->wstring()).c_str(),
+                  L"作成プロファイル", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON1) != IDYES) return;
+  const auto existing = std::ranges::find_if(layer, [&](const auto& item) { return item.id == profile.id; });
+  if (existing == layer.end()) layer.push_back(profile);
+  else *existing = profile;
+  if (!SaveProfileFile(target, layer, error)) {
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
+    return;
+  }
+  MessageBoxW(window_, L"profileを保存しました。template操作で本文と{{cursor}}を編集できます。",
+              L"作成プロファイル", MB_ICONINFORMATION);
 }
 
 void Application::ShowCommandPalette() {

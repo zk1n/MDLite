@@ -109,7 +109,7 @@ bool WorkspaceStore::Initialize(std::wstring& error) const {
   static constexpr std::array<std::pair<const wchar_t*, std::string_view>, 10> files{{
       {L".gitignore", "/.cache/\n/.state/\n"},
       {L"workspace.toml", "schema_version = 1\n\n[creation]\ndefault_profile = \"memo\"\ndaily_profile = \"daily\"\n\n[calendar]\nweek_start = \"sunday\"\nholiday_region = \"JP\"\n"},
-      {L"profiles.toml", "schema_version = 1\n\n[[profiles]]\nid = \"daily\"\nname = \"デイリーノート\"\ndirectory = \"Dairy/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/daily.md\"\ncollision = \"open-existing\"\n\n[[profiles]]\nid = \"meeting\"\nname = \"Meeting\"\ndirectory = \"Meeting/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/meeting.md\"\ncollision = \"sequence\"\n\n[[profiles]]\nid = \"memo\"\nname = \"Memo\"\ndirectory = \"Memo/{{date:yyyy}}/{{date:yyyyMM}}/{{date:yyyyMMdd}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/memo.md\"\ncollision = \"sequence\"\nsequence_format = \"_%02d\"\n"},
+      {L"profiles.toml", "schema_version = 1\n# Workspace profile overrides are added by the profile manager.\n"},
       {L"keybindings.toml", "schema_version = 1\n"},
       {L"commands.toml", "schema_version = 1\n"},
       {L"settings.toml", "schema_version = 1\n# Workspace overrides: theme, font_face, font_size_pt, bind.<command>\n"},

@@ -32,7 +32,7 @@ Human操作、未検証を区別する。
 | A-07 | 正確な直接走査を採用。include/exclude glob・取消callbackを実装。初版では候補indexを採用せず直接走査をcanonical結果とする。 | UTF-8／CP932、regex、単語、glob unit PASS。index比較は非採用判断のため該当なし。 | 自動PASS・設計差異記録 |
 | A-08 | 未保存buffer、CP932、短語、記号、literal/ECMAScript regex、大小文字、単語、複数行を検索。GUI条件checkboxと置換欄を接続。 | Core検索・置換PASS。GUIクリック未検証。 | 実装済み・GUI未検証 |
 | A-09 | preview、適用直前の全文改訂照合、部分競合、`.state/replace` journal、再起動後の条件付きrollbackを実装。 | apply/rollback unit PASS。取消は検索callbackとprocess handle、置換適用中UI取消は未実装。 | 部分検証 |
-| A-10 | 日付展開、Dairy open-existing、Meeting／Memo連番、cursor除去。 | Core profile試験PASS。 | 自動PASS |
+| A-10 | 日付展開、Dairy open-existing、Meeting／Memo連番、cursor除去。組込み→共通→Workspaceのprofile定義を作成経路とpreviewで共用。未知token、禁止文字、path脱出を拒否。 | Core profile作成、TOML round-trip、階層上書き、preview、拒否試験PASS。 | 自動PASS（定義済み変数） |
 | A-11 | 750ms自動保存、Ctrl+S、改訂番号でDirty管理。 | Core save試験PASS。保存中の同時編集負荷試験未実施。 | 部分検証 |
 | A-12 | 指紋による外部変更拒否、同一フォルダーtemp、flush、ReplaceFileW。 | 外部変更unit PASS。ディスク満杯／権限障害未実施。 | 部分検証 |
 | A-13 | 未編集Saveは書込みなし。 | exact bytes unit PASS。 | 自動PASS |
@@ -51,12 +51,12 @@ Human操作、未検証を区別する。
 | A-26 | 公開投影なし。build、`.codex`、秘密拡張子をignore。 | 秘密／個人パスscan未実施。 | 部分検証 |
 | A-27 | Tab／Shift+Tab、末尾行追加、行列追加削除のsource transactionと同一面の罫線presentation。 | Table unit PASS。矢印境界／GUI Undoは未検証。 | 実装済み・実操作未検証 |
 | A-28 | 子見出しを含むsection move、子孫drop拒否、単一RichEdit Undo操作。 | section unit PASS。実ドラッグ／Undo Human Gate未実施。 | 部分検証 |
-| A-29 | 既定パス、原子的採番、cursor位置。メニュー作成。 | Profile unit PASS。GUI設定編集未実装。 | 部分実装 |
+| A-29 | 既定パス、原子的採番、cursor位置。共通／Workspace範囲のadd・edit・duplicate・delete、保存先preview、template本文を開くGUIを実装し、作成時に同じprofile定義を再読込。 | Profile unit PASS。連続prompt GUIの実操作と任意入力field定義は未実装／未検証。 | 部分実装 |
 | A-30 | 日曜始まりMonth Calendar、作成済み日／祝日bold、日付作成。hover tooltipに祝日名、Dairy有無、データ版・収録年、範囲外は不明と表示。 | 公式CSV 2026-02-02取得の2025〜2027をunit確認。tooltip実操作未検証。 | 実装済み・GUI未検証 |
 | A-31 | 5形式のD&D、assetsコピー、衝突回避、相対リンク、危険SVG拒否、native inline object、source mapping、clipboard bitmapの一意PNG保存、Markdownから限定HTML imgへのUndo可能な幅変更を実装。 | Asset／mapping／img width parser unit PASS。実decode 5形式、clipboard GUI、比率表示、GIF/animated WebP再生は未検証／未実装。 | 部分実装 |
 | A-32 | 明示GUI操作・Trust・設定可能なexternal command adapter、取消handle、失敗時local保持、実行前後hash、revision引数を実装。 | mock CLI成功とlocal不変 unit PASS。本番資格・通信は未使用。 | 自動PASS（mock） |
 | A-33 | 初回ローカル試験では署名保留。 | 公開packageを生成していない。 | Release時保留 |
-| A-34 | feature checkpointを両remote同名refへ通常push。 | `df1c34197f3188591057f9f9341bce4750787bd7`がForgejo/GitHubで一致。最終develop統合は未実施。 | checkpoint PASS |
+| A-34 | feature checkpointを両remote同名refへ通常push。 | `4702cf76c0abbb0af5ecf79188e9d26704dafd21`がForgejo/GitHubで一致。最終develop統合は未実施。 | checkpoint PASS |
 
 ## 現在の自動試験
 
@@ -69,5 +69,5 @@ GUIを呼ばないため、クリック、D&D、Undo/Redo、Microsoft IME、ATOK
 
 derived viewに対する実クリック、スクロール、hit test、画像resize／animation、Microsoft IME、ATOK、DPI、
 table矢印・Undoは未検証。Computer Use helperがnative app inventoryを返さなかったことは環境上の証拠であり、
-Human受入PASSを意味しない。A-16 compact配置復元、A-17競合補助／cancel、A-19設定prompt、A-30 tooltipは
-実GUI未検証。A-19 custom theme／専用フォーム、A-23大容量最適化、A-29 profile設定GUI、A-31 animationは実装未完として残す。
+Human受入PASSを意味しない。A-16 compact配置復元、A-17競合補助／cancel、A-19設定prompt、A-29 profile管理prompt、A-30 tooltipは
+実GUI未検証。A-19 custom theme／専用フォーム、A-23大容量最適化、A-29任意入力field、A-31 animationは実装未完として残す。

@@ -349,21 +349,58 @@ void TestProfiles(const std::filesystem::path& root) {
   date.wYear = 2026;
   date.wMonth = 9;
   date.wDay = 19;
+  const auto built_in_profiles = mdlite::DefaultProfiles();
   mdlite::NoteCreationResult first{};
-  Check(mdlite::CreateProfileNote(workspace, mdlite::BuiltInProfile::Daily, date, first, error),
+  Check(mdlite::CreateProfileNote(workspace, built_in_profiles[0], date, first, error),
         "daily note creates");
   Check(first.path == workspace / L"Dairy/2026/202609/20260919.md", "Dairy spelling and path are exact");
   mdlite::NoteCreationResult reopen{};
-  Check(mdlite::CreateProfileNote(workspace, mdlite::BuiltInProfile::Daily, date, reopen, error),
+  Check(mdlite::CreateProfileNote(workspace, built_in_profiles[0], date, reopen, error),
         "existing daily note opens without overwrite");
   Check(!reopen.created && reopen.path == first.path, "daily collision opens existing note");
   mdlite::NoteCreationResult memo1{};
   mdlite::NoteCreationResult memo2{};
-  Check(mdlite::CreateProfileNote(workspace, mdlite::BuiltInProfile::Memo, date, memo1, error),
+  Check(mdlite::CreateProfileNote(workspace, built_in_profiles[2], date, memo1, error),
         "first memo creates");
-  Check(mdlite::CreateProfileNote(workspace, mdlite::BuiltInProfile::Memo, date, memo2, error),
+  Check(mdlite::CreateProfileNote(workspace, built_in_profiles[2], date, memo2, error),
         "second memo creates");
   Check(memo2.path.filename() == L"20260919_01.md", "memo collision uses suffix before extension");
+
+  auto overrides = mdlite::DefaultProfiles();
+  overrides[0].directory = L"Journal/{{date:yyyy}}";
+  const auto profile_file = workspace / L"profile-overrides.toml";
+  Check(mdlite::SaveProfileFile(profile_file, {overrides[0]}, error),
+        "profile definitions save atomically");
+  std::vector<mdlite::ProfileDefinition> loaded;
+  Check(mdlite::LoadProfileFile(profile_file, loaded, error) && loaded.size() == 1,
+        "profile definitions round trip through TOML");
+  std::vector<mdlite::ProfileDefinition> effective;
+  Check(mdlite::ResolveProfiles({}, profile_file, effective, error),
+        "profile layer resolves over built-in definitions");
+  const auto daily = std::ranges::find_if(effective, [](const auto& item) { return item.id == L"daily"; });
+  const auto preview = daily == effective.end() ? std::optional<std::filesystem::path>{} :
+      mdlite::PreviewProfilePath(workspace, *daily, date, error);
+  Check(preview && *preview == workspace / L"Journal/2026/20260919.md",
+        "profile path preview uses the effective editable definition");
+  auto unsafe = overrides[0];
+  unsafe.directory = L"../outside";
+  Check(!mdlite::ValidateProfile(unsafe, error), "profile validation rejects Workspace path escape");
+  unsafe = overrides[0];
+  unsafe.filename = L"{{unknown}}.md";
+  Check(!mdlite::ValidateProfile(unsafe, error), "profile validation rejects undefined variables");
+  const auto unsupported_sequence = workspace / L"unsupported-sequence.toml";
+  WriteBytes(unsupported_sequence,
+             {'s','c','h','e','m','a','_','v','e','r','s','i','o','n',' ','=',' ','1','\n',
+              '[','[','p','r','o','f','i','l','e','s',']',']','\n',
+              'i','d',' ','=',' ','"','x','"','\n',
+              'n','a','m','e',' ','=',' ','"','x','"','\n',
+              'd','i','r','e','c','t','o','r','y',' ','=',' ','"','x','"','\n',
+              'f','i','l','e','n','a','m','e',' ','=',' ','"','x','.','m','d','"','\n',
+              't','e','m','p','l','a','t','e',' ','=',' ','"','t','e','m','p','l','a','t','e','s','/','m','e','m','o','.','m','d','"','\n',
+              'c','o','l','l','i','s','i','o','n',' ','=',' ','"','s','e','q','u','e','n','c','e','"','\n',
+              's','e','q','u','e','n','c','e','_','f','o','r','m','a','t',' ','=',' ','"','_','%','0','3','d','"','\n'});
+  Check(!mdlite::LoadProfileFile(unsupported_sequence, loaded, error),
+        "profile parser rejects unsupported sequence format instead of silently changing semantics");
 }
 
 void TestSearch(const std::filesystem::path& root) {

@@ -106,6 +106,7 @@ class Application {
   void SetExternalOperationActive(bool active);
   void OpenWorkspaceSettings();
   void OpenWorkspaceSettingsFiles();
+  void ManageProfiles();
   void ShowCommandPalette();
   void LoadAndApplySettings();
   void ApplySettings();

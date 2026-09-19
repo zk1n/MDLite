@@ -1,9 +1,13 @@
 #include "profiles/Profiles.h"
 
 #include <windows.h>
+#include <shlobj.h>
 
+#include <algorithm>
+#include <cwctype>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <sstream>
 
 namespace mdlite {
@@ -32,6 +36,66 @@ std::wstring ExpandDate(std::wstring value, const SYSTEMTIME& date) {
     }
   }
   return value;
+}
+
+std::wstring Trim(std::wstring value) {
+  while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+  while (!value.empty() && iswspace(value.back())) value.pop_back();
+  return value;
+}
+
+std::optional<std::wstring> Unquote(std::wstring value) {
+  value = Trim(std::move(value));
+  if (value.size() < 2 || value.front() != L'"' || value.back() != L'"') return std::nullopt;
+  return value.substr(1, value.size() - 2);
+}
+
+bool IsSafeString(std::wstring_view value) {
+  return value.find_first_of(L"\"\r\n") == std::wstring_view::npos;
+}
+
+bool HasUnsafePathPart(const std::filesystem::path& path) {
+  if (path.empty() || path.is_absolute() || path.has_root_path()) return true;
+  return std::ranges::any_of(path, [](const auto& part) { return part == L".." || part == L"."; });
+}
+
+bool HasUnknownToken(std::wstring_view value) {
+  std::size_t cursor{};
+  while ((cursor = value.find(L"{{", cursor)) != std::wstring_view::npos) {
+    const auto end = value.find(L"}}", cursor + 2);
+    if (end == std::wstring_view::npos) return true;
+    const auto token = value.substr(cursor, end + 2 - cursor);
+    if (token != L"{{date:yyyy}}" && token != L"{{date:yyyyMM}}" &&
+        token != L"{{date:yyyyMMdd}}" && token != L"{{date:yyyy-MM-dd}}") return true;
+    cursor = end + 2;
+  }
+  return false;
+}
+
+bool EncodeUtf8(std::wstring_view text, std::string& bytes);
+
+bool WriteUtf8Atomic(const std::filesystem::path& path, std::wstring_view text, std::wstring& error) {
+  std::string bytes;
+  if (!EncodeUtf8(text, bytes)) { error = L"プロファイル設定をUTF-8へ変換できません。"; return false; }
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(path.parent_path(), filesystem_error);
+  if (filesystem_error) { error = L"プロファイル設定フォルダーを作成できません。"; return false; }
+  auto temporary = path;
+  temporary += L".new";
+  HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) { error = L"プロファイル設定一時ファイルを作成できません。"; return false; }
+  DWORD written{};
+  const bool ok = bytes.size() <= MAXDWORD &&
+                  WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                  written == bytes.size() && FlushFileBuffers(file);
+  CloseHandle(file);
+  if (!ok || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary.c_str());
+    error = L"プロファイル設定を安全に保存できません。";
+    return false;
+  }
+  return true;
 }
 
 bool ReadUtf8(const std::filesystem::path& path, std::wstring& text, std::wstring& error) {
@@ -96,30 +160,168 @@ bool CreateNewUtf8(const std::filesystem::path& path, std::wstring_view text, bo
 
 }  // namespace
 
+std::vector<ProfileDefinition> DefaultProfiles() {
+  return {
+      {L"daily", L"デイリーノート", L"Dairy/{{date:yyyy}}/{{date:yyyyMM}}",
+       L"{{date:yyyyMMdd}}.md", L"templates/daily.md", ProfileCollision::OpenExisting},
+      {L"meeting", L"Meeting", L"Meeting/{{date:yyyy}}/{{date:yyyyMM}}",
+       L"{{date:yyyyMMdd}}.md", L"templates/meeting.md", ProfileCollision::Sequence},
+      {L"memo", L"Memo", L"Memo/{{date:yyyy}}/{{date:yyyyMM}}/{{date:yyyyMMdd}}",
+       L"{{date:yyyyMMdd}}.md", L"templates/memo.md", ProfileCollision::Sequence},
+  };
+}
+
+bool ValidateProfile(const ProfileDefinition& profile, std::wstring& error) {
+  const bool valid_id = !profile.id.empty() && std::ranges::all_of(profile.id, [](wchar_t character) {
+    return iswalnum(character) || character == L'.' || character == L'_' || character == L'-';
+  });
+  if (!valid_id || profile.name.empty() || !IsSafeString(profile.id) || !IsSafeString(profile.name)) {
+    error = L"profile idまたはnameが不正です。";
+    return false;
+  }
+  if (HasUnsafePathPart(profile.directory) || HasUnsafePathPart(profile.template_path) ||
+      profile.filename.empty() || profile.filename.filename() != profile.filename ||
+      !IsSafeString(profile.directory.generic_wstring()) || !IsSafeString(profile.filename.generic_wstring()) ||
+      !IsSafeString(profile.template_path.generic_wstring()) ||
+      HasUnknownToken(profile.directory.generic_wstring()) || HasUnknownToken(profile.filename.generic_wstring())) {
+    error = L"profile pathは既知の日付tokenを使うWorkspace内の相対pathで指定してください。";
+    return false;
+  }
+  return true;
+}
+
+bool LoadProfileFile(const std::filesystem::path& path, std::vector<ProfileDefinition>& profiles,
+                     std::wstring& error) {
+  profiles.clear();
+  if (path.empty() || !std::filesystem::exists(path)) return true;
+  std::wstring text;
+  if (!ReadUtf8(path, text, error)) return false;
+  std::wistringstream lines(text);
+  std::wstring line;
+  ProfileDefinition* current{};
+  while (std::getline(lines, line)) {
+    line = Trim(std::move(line));
+    if (line.empty() || line.front() == L'#') continue;
+    if (line == L"[[profiles]]") {
+      profiles.emplace_back();
+      current = &profiles.back();
+      continue;
+    }
+    const auto equals = line.find(L'=');
+    if (equals == std::wstring::npos) { error = L"profiles.tomlの行形式が不正です。"; return false; }
+    const auto key = Trim(line.substr(0, equals));
+    const auto raw = Trim(line.substr(equals + 1));
+    if (!current && key == L"schema_version") {
+      if (raw != L"1") { error = L"未対応のprofiles schemaです。"; return false; }
+      continue;
+    }
+    if (!current) { error = L"profile fieldは[[profiles]]の後に指定してください。"; return false; }
+    const auto value = Unquote(raw);
+    if (!value) { error = L"profile fieldは引用符で囲んでください。"; return false; }
+    if (key == L"id") current->id = *value;
+    else if (key == L"name") current->name = *value;
+    else if (key == L"directory") current->directory = *value;
+    else if (key == L"filename") current->filename = *value;
+    else if (key == L"template") current->template_path = *value;
+    else if (key == L"collision") {
+      if (*value == L"open-existing") current->collision = ProfileCollision::OpenExisting;
+      else if (*value == L"sequence") current->collision = ProfileCollision::Sequence;
+      else { error = L"collisionはopen-existingまたはsequenceです。"; return false; }
+    } else if (key == L"sequence_format") {
+      if (*value != L"_%02d") {
+        error = L"sequence_formatは_%02dのみ対応します。";
+        return false;
+      }
+    } else {
+      error = L"未対応のprofile fieldです: " + key;
+      return false;
+    }
+  }
+  std::map<std::wstring, bool> ids;
+  for (const auto& profile : profiles) {
+    if (!ValidateProfile(profile, error)) return false;
+    if (!ids.emplace(profile.id, true).second) { error = L"profile idが重複しています: " + profile.id; return false; }
+  }
+  return true;
+}
+
+bool SaveProfileFile(const std::filesystem::path& path, const std::vector<ProfileDefinition>& profiles,
+                     std::wstring& error) {
+  std::map<std::wstring, bool> ids;
+  std::wstring text = L"schema_version = 1\n";
+  for (const auto& profile : profiles) {
+    if (!ValidateProfile(profile, error)) return false;
+    if (!ids.emplace(profile.id, true).second) { error = L"profile idが重複しています: " + profile.id; return false; }
+    text += L"\n[[profiles]]\n";
+    text += L"id = \"" + profile.id + L"\"\n";
+    text += L"name = \"" + profile.name + L"\"\n";
+    text += L"directory = \"" + profile.directory.generic_wstring() + L"\"\n";
+    text += L"filename = \"" + profile.filename.generic_wstring() + L"\"\n";
+    text += L"template = \"" + profile.template_path.generic_wstring() + L"\"\n";
+    text += L"collision = \"" + std::wstring(profile.collision == ProfileCollision::Sequence
+                                                   ? L"sequence" : L"open-existing") + L"\"\n";
+    if (profile.collision == ProfileCollision::Sequence) text += L"sequence_format = \"_%02d\"\n";
+  }
+  return WriteUtf8Atomic(path, text, error);
+}
+
+bool ResolveProfiles(const std::filesystem::path& common_path,
+                     const std::filesystem::path& workspace_path,
+                     std::vector<ProfileDefinition>& profiles, std::wstring& error) {
+  profiles = DefaultProfiles();
+  const auto overlay = [&](const std::filesystem::path& path) {
+    std::vector<ProfileDefinition> layer;
+    if (!LoadProfileFile(path, layer, error)) return false;
+    for (auto& profile : layer) {
+      const auto existing = std::ranges::find_if(profiles, [&](const auto& item) { return item.id == profile.id; });
+      if (existing == profiles.end()) profiles.push_back(std::move(profile));
+      else *existing = std::move(profile);
+    }
+    return true;
+  };
+  return overlay(common_path) && overlay(workspace_path);
+}
+
+std::optional<std::filesystem::path> PreviewProfilePath(const std::filesystem::path& workspace,
+                                                        const ProfileDefinition& profile,
+                                                        const SYSTEMTIME& local_date,
+                                                        std::wstring& error) {
+  if (!ValidateProfile(profile, error)) return std::nullopt;
+  const auto relative = (std::filesystem::path(ExpandDate(profile.directory.generic_wstring(), local_date)) /
+                         ExpandDate(profile.filename.generic_wstring(), local_date)).lexically_normal();
+  if (HasUnsafePathPart(relative) || relative.generic_wstring().find_first_of(L"<>:\"|?*") != std::wstring::npos) {
+    error = L"展開後のprofile pathがWorkspace外または禁止文字を含みます。";
+    return std::nullopt;
+  }
+  return (workspace / relative).lexically_normal();
+}
+
+std::filesystem::path CommonProfilesPath() {
+  PWSTR path{};
+  if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &path))) return {};
+  std::filesystem::path result = std::filesystem::path(path) / L"MDLite" / L"profiles.toml";
+  CoTaskMemFree(path);
+  return result;
+}
+
 bool CreateProfileNote(const std::filesystem::path& workspace, BuiltInProfile profile,
                        const SYSTEMTIME& local_date, NoteCreationResult& result,
                        std::wstring& error) {
-  std::wstring directory_pattern;
-  std::wstring filename_pattern = L"{{date:yyyyMMdd}}.md";
-  std::filesystem::path template_path;
-  bool sequence = false;
-  switch (profile) {
-    case BuiltInProfile::Daily:
-      directory_pattern = L"Dairy/{{date:yyyy}}/{{date:yyyyMM}}";
-      template_path = workspace / L".mdlite/templates/daily.md";
-      break;
-    case BuiltInProfile::Meeting:
-      directory_pattern = L"Meeting/{{date:yyyy}}/{{date:yyyyMM}}";
-      template_path = workspace / L".mdlite/templates/meeting.md";
-      sequence = true;
-      break;
-    case BuiltInProfile::Memo:
-      directory_pattern = L"Memo/{{date:yyyy}}/{{date:yyyyMM}}/{{date:yyyyMMdd}}";
-      template_path = workspace / L".mdlite/templates/memo.md";
-      sequence = true;
-      break;
-  }
-  const auto directory = workspace / ExpandDate(directory_pattern, local_date);
+  const std::wstring id = profile == BuiltInProfile::Daily ? L"daily" :
+                          profile == BuiltInProfile::Meeting ? L"meeting" : L"memo";
+  std::vector<ProfileDefinition> profiles;
+  if (!ResolveProfiles(CommonProfilesPath(), workspace / L".mdlite/profiles.toml", profiles, error)) return false;
+  const auto found = std::ranges::find_if(profiles, [&](const auto& item) { return item.id == id; });
+  if (found == profiles.end()) { error = L"組込みprofileが見つかりません: " + id; return false; }
+  return CreateProfileNote(workspace, *found, local_date, result, error);
+}
+
+bool CreateProfileNote(const std::filesystem::path& workspace, const ProfileDefinition& profile,
+                       const SYSTEMTIME& local_date, NoteCreationResult& result,
+                       std::wstring& error) {
+  const auto preview = PreviewProfilePath(workspace, profile, local_date, error);
+  if (!preview) return false;
+  const auto directory = preview->parent_path();
   std::error_code filesystem_error;
   std::filesystem::create_directories(directory, filesystem_error);
   if (filesystem_error) {
@@ -127,6 +329,7 @@ bool CreateProfileNote(const std::filesystem::path& workspace, BuiltInProfile pr
     return false;
   }
   std::wstring body;
+  const auto template_path = workspace / L".mdlite" / profile.template_path;
   if (!ReadUtf8(template_path, body, error)) return false;
   body = ExpandDate(std::move(body), local_date);
   const std::wstring marker = L"{{cursor}}";
@@ -138,10 +341,10 @@ bool CreateProfileNote(const std::filesystem::path& workspace, BuiltInProfile pr
     return false;
   }
 
-  const std::wstring base_filename = ExpandDate(filename_pattern, local_date);
+  const std::wstring base_filename = preview->filename().wstring();
   for (unsigned number = 0; number < 10000; ++number) {
     std::wstring filename = base_filename;
-    if (sequence && number != 0) {
+    if (profile.collision == ProfileCollision::Sequence && number != 0) {
       const auto extension = std::filesystem::path(filename).extension().wstring();
       filename.resize(filename.size() - extension.size());
       filename += L"_" + Number(number, 2) + extension;
@@ -153,7 +356,7 @@ bool CreateProfileNote(const std::filesystem::path& workspace, BuiltInProfile pr
       return true;
     }
     if (!exists) return false;
-    if (!sequence) {
+    if (profile.collision == ProfileCollision::OpenExisting) {
       result.created = false;
       return true;
     }

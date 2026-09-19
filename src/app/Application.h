@@ -2,8 +2,10 @@
 
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
+#include "git/Conflict.h"
 #include "markdown/Markdown.h"
 #include "profiles/Profiles.h"
+#include "settings/Settings.h"
 #include "table/Table.h"
 #include "workspace/Workspace.h"
 
@@ -20,6 +22,7 @@ namespace mdlite {
 class Application {
  public:
   explicit Application(HINSTANCE instance);
+  ~Application();
   bool Initialize(int show_command);
   int Run();
   void OpenInitialPath(const std::filesystem::path& path);
@@ -44,6 +47,10 @@ class Application {
   static LRESULT CALLBACK CompactWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   static LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                           UINT_PTR subclass_id, DWORD_PTR reference);
+  static LRESULT CALLBACK CalendarSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                            UINT_PTR subclass_id, DWORD_PTR reference);
+  static LRESULT CALLBACK TreeDragSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                            UINT_PTR subclass_id, DWORD_PTR reference);
   LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
   void CreateControls();
@@ -84,20 +91,34 @@ class Application {
   void CopySelectedFile();
   void PasteCopiedFile();
   void RenameOrMoveSelected();
+  void MoveWorkspaceSelectionTo(const std::filesystem::path& directory);
   void DeleteSelected();
   void CopySelectedPathToClipboard();
   void ShowSelectedInExplorer();
   void SetWorkspaceTrust(bool trusted);
   void RunGitStatus();
   void RunGitAction(int command);
+  bool QueryGitConflicts(std::vector<std::filesystem::path>& files, std::wstring& error);
+  void ShowGitConflicts();
+  void NavigateGitConflict(bool previous);
+  void ResolveGitConflict(ConflictChoice choice);
+  void MarkGitConflictResolved();
+  void SetExternalOperationActive(bool active);
   void OpenWorkspaceSettings();
+  void OpenWorkspaceSettingsFiles();
   void ShowCommandPalette();
+  void LoadAndApplySettings();
+  void ApplySettings();
+  void RebuildAccelerators();
   void ToggleCompactWindow();
   void UploadImageAtCaret();
   bool PasteClipboardImage();
   void ResizeImageAtCaret(unsigned width_dip);
+  void OpenLinkAtSourcePosition(DocumentView& view, std::size_t source_position, bool activate);
+  void UpdateCalendarTooltip(POINT point);
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
+  std::vector<std::filesystem::path> SelectedTreePaths() const;
 
   HINSTANCE instance_{};
   HWND window_{};
@@ -115,17 +136,25 @@ class Application {
   HWND find_regex_{};
   HWND find_word_{};
   HWND calendar_{};
+  HWND calendar_tooltip_{};
   std::filesystem::path workspace_;
-  std::filesystem::path copied_file_;
+  std::vector<std::filesystem::path> copied_files_;
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
   std::vector<std::unique_ptr<DocumentView>> documents_;
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
+  bool external_operation_active_{};
   bool ime_composing_{};
   bool outline_dragging_{};
+  bool workspace_dragging_{};
   std::size_t outline_drag_source_{};
+  std::vector<std::filesystem::path> workspace_drag_sources_;
   std::shared_ptr<WorkspaceStore> workspace_store_;
   HANDLE workspace_mutex_{};
+  HACCEL accelerator_table_{};
+  HFONT editor_font_{};
+  EffectiveSettings settings_;
+  std::wstring calendar_tooltip_text_;
 };
 
 }  // namespace mdlite

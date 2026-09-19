@@ -9,6 +9,11 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(MSVC)
+  # Local/F5 and unsigned verification builds must run on a clean Windows 11
+  # machine without requiring an administrator-installed VC redistributable.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 add_library(mdlite_core
   src/assets/Assets.cpp
@@ -21,6 +26,8 @@ add_library(mdlite_core
   src/core/Document.h
   src/editor/EditorAdapter.cpp
   src/editor/EditorAdapter.h
+  src/git/Conflict.cpp
+  src/git/Conflict.h
   src/markdown/Markdown.cpp
   src/markdown/Markdown.h
   src/profiles/Profiles.cpp
@@ -31,6 +38,8 @@ add_library(mdlite_core
   src/search/Search.h
   src/search/Replace.cpp
   src/search/Replace.h
+  src/settings/Settings.cpp
+  src/settings/Settings.h
   src/table/Table.cpp
   src/table/Table.h
   src/workspace/Workspace.cpp
@@ -41,8 +50,10 @@ add_library(mdlite_core
 target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mdlite_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(mdlite_core PUBLIC shell32 ole32)
 
 add_executable(MDLite WIN32
+  src/app/MDLite.manifest
   src/main.cpp
   src/app/Application.cpp
   src/app/Application.h

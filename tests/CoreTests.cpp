@@ -1,5 +1,6 @@
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
+#include "git/Conflict.h"
 #include "assets/Assets.h"
 #include "assets/StorageAdapter.h"
 #include "calendar/JapaneseHolidays.h"
@@ -8,6 +9,7 @@
 #include "process/ProcessRunner.h"
 #include "search/Search.h"
 #include "search/Replace.h"
+#include "settings/Settings.h"
 #include "table/Table.h"
 #include "workspace/Workspace.h"
 #include "workspace/Trust.h"
@@ -19,6 +21,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -225,6 +228,10 @@ void TestMarkdown() {
   Check(visual.images.size() == 1 && visual.images.front().target == L"assets/a.png",
         "image references retain source ranges and targets");
   Check(visual.tables.size() == 1, "GFM table blocks are identified for native presentation");
+  const auto links = mdlite::ParseMarkdown(L"[local](notes/a.md#heading) ![image](a.png) <https://example.test/>\n");
+  Check(links.links.size() == 2 && links.links[0].target == L"notes/a.md#heading" &&
+            links.links[1].target == L"https://example.test/",
+        "Markdown and autolinks are parsed while image syntax stays separate");
   const auto resized = mdlite::ParseMarkdown(
       L"<img src=\"assets/a.png\" alt=\"sample\" width=\"480\">\n");
   Check(resized.images.size() == 1 && resized.images.front().target == L"assets/a.png" &&
@@ -247,6 +254,8 @@ void TestMarkdown() {
 void TestEditorAdapter() {
   const auto snapshot = mdlite::BuildEditorSnapshot(L"a\nb😀\r\nc");
   Check(snapshot.view == L"a\r\nb😀\r\nc", "editor view expands only lone LF to CRLF");
+  Check(snapshot.inserted_crs.size() == 1 && snapshot.source_size == 8,
+        "editor mapping stores one compact index only for each inserted CR");
   Check(snapshot.SourceToView(2) == 3, "source-to-view mapping accounts for expanded LF");
   Check(snapshot.ViewToSource(2) == 1, "inserted CR maps to the source LF boundary");
 
@@ -257,8 +266,12 @@ void TestEditorAdapter() {
   Check(deleted.source == L"b\nc", "range transaction keeps the surviving mixed line ending");
   const auto image = mdlite::BuildMarkdownEditorSnapshot(L"before ![alt](img.png) after");
   Check(image.view == L"before \uFFFC after", "derived editor view represents an image without changing source");
+  Check(image.SourceToView(22) == 8 && image.ViewToSource(8) == 22,
+        "compact mapping resumes immediately after a collapsed image range");
   const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
   Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
+  Check(mdlite::ParseMarkdownImages(L"```\n![not-image](code.png)\n```\n![image](real.png)").size() == 1,
+        "image-only scan keeps fenced code out of derived image objects");
 }
 
 void TestWorkspaceState(const std::filesystem::path& root) {
@@ -278,6 +291,21 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   Check(store.ReadSession(restored, error), "session file reads");
   Check(restored.size() == 1 && restored.front() == document,
         "session restore includes only existing documents inside the workspace");
+  mdlite::SessionState session;
+  session.active_index = 0;
+  session.main_x = 40;
+  session.main_y = 50;
+  session.main_width = 1100;
+  session.main_height = 700;
+  session.documents.push_back({document, 1, 2, 3, true, 100, 120, 640, 480});
+  Check(store.WriteSessionState(session, error), "detailed session state writes");
+  mdlite::SessionState detailed;
+  Check(store.ReadSessionState(detailed, error), "detailed session state reads");
+  Check(detailed.documents.size() == 1 && detailed.documents[0].selection_begin == 1 &&
+            detailed.documents[0].selection_end == 2 && detailed.documents[0].first_visible_line == 3 &&
+            detailed.documents[0].compact && detailed.documents[0].width == 640 &&
+            detailed.main_width == 1100,
+        "session preserves selection, scroll, compact placement, and main placement");
   Check(store.RemoveRecovery(document, error), "recovery is removed after successful save");
   Check(store.RecoveryFiles().empty(), "recovery removal is visible");
 }
@@ -297,6 +325,18 @@ void TestTrustAndProcess(const std::filesystem::path& root) {
         "process runner starts an argument-array command");
   Check(process.exit_code == 0 && process.output.find(L"MDLite process") != std::wstring::npos,
         "process runner captures bounded output");
+  HANDLE cancellation = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::thread cancel_thread([&] {
+    Sleep(100);
+    SetEvent(cancellation);
+  });
+  error.clear();
+  Check(mdlite::RunProcess(L"C:\\Windows\\System32\\ping.exe", {L"-n", L"10", L"127.0.0.1"},
+                           workspace, 4096, 10000, process, error, cancellation),
+        "process runner accepts an explicit cancellation handle");
+  cancel_thread.join();
+  CloseHandle(cancellation);
+  Check(process.cancelled, "process cancellation terminates its job and reports cancellation");
 }
 
 void TestProfiles(const std::filesystem::path& root) {
@@ -446,6 +486,72 @@ void TestStorageAdapter(const std::filesystem::path& root) {
         "invalid storage timeout is reported without terminating the app");
 }
 
+void TestSettings(const std::filesystem::path& root) {
+  const auto directory = root / L"settings";
+  const auto common_path = directory / L"common.toml";
+  const auto workspace_path = directory / L"workspace.toml";
+  mdlite::SettingsLayer common;
+  common.theme = mdlite::ThemeMode::Dark;
+  common.font_face = L"Yu Gothic UI";
+  common.keybindings[L"file.save"] = L"Ctrl+Shift+S";
+  std::wstring error;
+  Check(mdlite::SaveSettingsLayer(common_path, common, error), "common settings save atomically");
+  mdlite::SettingsLayer workspace;
+  workspace.theme = mdlite::ThemeMode::Light;
+  workspace.font_size_pt = 14;
+  Check(mdlite::SaveSettingsLayer(workspace_path, workspace, error), "workspace settings save atomically");
+  mdlite::EffectiveSettings effective;
+  Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
+  Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
+            effective.font_size_pt == 14,
+        "workspace overrides common while inherited values remain");
+  Check(effective.origins[L"theme"] == L"Workspace上書き" &&
+            effective.origins[L"font_face"] == L"共通設定",
+        "effective settings expose their origins");
+  workspace.keybindings[L"file.save"] = L"Ctrl+O";
+  Check(mdlite::SaveSettingsLayer(workspace_path, workspace, error), "individual layer accepts a shortcut used only in another layer");
+  error.clear();
+  Check(!mdlite::ResolveSettings(common_path, workspace_path, effective, error) && !error.empty(),
+        "effective keybinding conflicts are rejected");
+  mdlite::SettingsLayer invalid;
+  invalid.font_face = L"Broken\"Font";
+  error.clear();
+  Check(!mdlite::SaveSettingsLayer(directory / L"invalid.toml", invalid, error),
+        "settings serializer rejects unsafe quoted strings");
+  invalid = {};
+  invalid.keybindings[L"file.open"] = L"Ctrl+Shift+NotAKey";
+  error.clear();
+  Check(!mdlite::SaveSettingsLayer(directory / L"invalid-shortcut.toml", invalid, error),
+        "settings reject shortcuts the accelerator parser cannot apply");
+  const std::string malformed = "font_size_pt = 12junk\n";
+  WriteBytes(directory / L"malformed.toml",
+             std::vector<unsigned char>(malformed.begin(), malformed.end()));
+  error.clear();
+  Check(!mdlite::LoadSettingsLayer(directory / L"malformed.toml", invalid, error),
+        "settings reject numeric values with trailing characters");
+}
+
+void TestGitConflicts() {
+  const std::wstring source =
+      L"before\r\n<<<<<<< HEAD\r\ncurrent\r\n||||||| base\r\nold\r\n=======\r\nincoming\r\n>>>>>>> topic\r\nafter\r\n"
+      L"<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> topic\n";
+  const auto blocks = mdlite::ParseConflictBlocks(source);
+  Check(blocks.size() == 2, "normal and diff3 conflict blocks parse");
+  const auto next = mdlite::FindConflictBlock(source, 1, false);
+  const auto previous = mdlite::FindConflictBlock(source, 1, true);
+  Check(next && *next == 0 && previous && *previous == 1, "conflict navigation wraps in both directions");
+  const auto current = mdlite::ResolveConflictBlock(source, 0, mdlite::ConflictChoice::Current);
+  Check(current.changed && current.text.find(L"current\r\n") != std::wstring::npos &&
+            current.text.find(L"old\r\n") == std::wstring::npos &&
+            current.text.find(L"incoming\r\n") == std::wstring::npos,
+        "current-side resolution excludes diff3 base and incoming text");
+  const auto both = mdlite::ResolveConflictBlock(source, 1, mdlite::ConflictChoice::Both);
+  Check(both.changed && both.text.find(L"left\nright\n") != std::wstring::npos,
+        "both-side resolution preserves side order and line endings");
+  Check(mdlite::ParseConflictBlocks(L"literal <<<<<<< text\n").empty(),
+        "inline marker-like text is not a conflict block");
+}
+
 }  // namespace
 
 int wmain() {
@@ -470,6 +576,8 @@ int wmain() {
   TestJapaneseHolidays();
   TestAssets(root);
   TestStorageAdapter(root);
+  TestSettings(root);
+  TestGitConflicts();
   std::filesystem::remove_all(root, error);
   if (failures == 0) std::cout << "All MDLite core tests passed.\n";
   return failures == 0 ? 0 : 1;

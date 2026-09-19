@@ -1,16 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace mdlite {
-
-struct MappingPoint {
-  std::size_t source{};
-  std::size_t view{};
-};
 
 struct CollapsedRange {
   std::size_t source_begin{};
@@ -20,8 +16,8 @@ struct CollapsedRange {
 
 struct EditorSnapshot {
   std::wstring view;
-  std::vector<MappingPoint> source_map;
-  std::vector<MappingPoint> view_map;
+  std::size_t source_size{};
+  std::vector<std::uint32_t> inserted_crs;
   std::vector<CollapsedRange> collapsed;
 
   [[nodiscard]] std::size_t SourceToView(std::size_t position) const noexcept;

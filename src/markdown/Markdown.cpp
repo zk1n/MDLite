@@ -72,6 +72,36 @@ void ParseImages(std::wstring_view line, std::size_t line_offset, MarkdownParseR
   }
 }
 
+void ParseLinks(std::wstring_view line, std::size_t line_offset, MarkdownParseResult& result) {
+  std::size_t cursor{};
+  while ((cursor = line.find(L'[', cursor)) != std::wstring_view::npos) {
+    if (cursor > 0 && line[cursor - 1] == L'!') { ++cursor; continue; }
+    const auto label_end = line.find(L"](", cursor + 1);
+    if (label_end == std::wstring_view::npos) break;
+    const auto target_end = line.find(L')', label_end + 2);
+    if (target_end == std::wstring_view::npos) break;
+    const auto text_begin = line_offset + cursor + 1;
+    const auto text_end = line_offset + label_end;
+    result.links.push_back({line_offset + cursor, line_offset + target_end + 1,
+                            text_begin, text_end,
+                            std::wstring(line.substr(label_end + 2, target_end - label_end - 2))});
+    result.spans.push_back({SpanKind::Link, text_begin, text_end, 0});
+    cursor = target_end + 1;
+  }
+  cursor = 0;
+  while ((cursor = line.find(L'<', cursor)) != std::wstring_view::npos) {
+    const auto end = line.find(L'>', cursor + 1);
+    if (end == std::wstring_view::npos) break;
+    const auto target = line.substr(cursor + 1, end - cursor - 1);
+    if (target.starts_with(L"http://") || target.starts_with(L"https://") || target.starts_with(L"mailto:")) {
+      result.links.push_back({line_offset + cursor, line_offset + end + 1,
+                              line_offset + cursor + 1, line_offset + end, std::wstring(target)});
+      result.spans.push_back({SpanKind::Link, line_offset + cursor + 1, line_offset + end, 0});
+    }
+    cursor = end + 1;
+  }
+}
+
 bool LooksLikeTableDelimiter(std::wstring_view line) {
   if (line.find(L'|') == std::wstring_view::npos) return false;
   bool dash{};
@@ -163,6 +193,7 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
     ParseDelimited(line, line_begin, L"~~", SpanKind::Strike, result);
     ParseDelimited(line, line_begin, L"`", SpanKind::Code, result);
     ParseImages(line, line_begin, result);
+    ParseLinks(line, line_begin, result);
 
     previous_line_begin = line_begin;
     previous_has_pipe = has_pipe;
@@ -172,6 +203,37 @@ MarkdownParseResult ParseMarkdown(std::wstring_view source) {
   std::sort(result.spans.begin(), result.spans.end(),
             [](const StyleSpan& a, const StyleSpan& b) { return a.begin < b.begin; });
   return result;
+}
+
+std::vector<ImageReference> ParseMarkdownImages(std::wstring_view source) {
+  MarkdownParseResult result;
+  bool in_fence{};
+  wchar_t fence_char{};
+  bool in_front_matter{};
+  bool first_line{true};
+  std::size_t line_begin{};
+  while (line_begin <= source.size()) {
+    auto line_end = source.find(L'\n', line_begin);
+    if (line_end == std::wstring_view::npos) line_end = source.size();
+    const auto line = source.substr(line_begin, line_end - line_begin);
+    const auto trimmed = TrimRight(line);
+    if (first_line && trimmed == L"---") in_front_matter = true;
+    else if (in_front_matter && (trimmed == L"---" || trimmed == L"...")) in_front_matter = false;
+    else if (!in_front_matter) {
+      std::size_t indent{};
+      while (indent < trimmed.size() && indent < 4 && trimmed[indent] == L' ') ++indent;
+      const auto rest = trimmed.substr(indent);
+      if (rest.starts_with(L"```") || rest.starts_with(L"~~~")) {
+        if (!in_fence) { in_fence = true; fence_char = rest.front(); }
+        else if (rest.front() == fence_char) in_fence = false;
+      } else if (!in_fence) {
+        ParseImages(line, line_begin, result);
+      }
+    }
+    first_line = false;
+    line_begin = line_end == source.size() ? source.size() + 1 : line_end + 1;
+  }
+  return std::move(result.images);
 }
 
 SectionMoveResult MoveHeadingSection(std::wstring_view source, std::size_t source_begin,

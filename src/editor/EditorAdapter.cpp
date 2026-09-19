@@ -33,80 +33,72 @@ std::wstring NormalizeReplacement(std::wstring_view value, bool crlf) {
 }  // namespace
 
 std::size_t EditorSnapshot::SourceToView(std::size_t position) const noexcept {
+  position = std::min(position, source_size);
   const auto collapsed_range = std::ranges::upper_bound(
       collapsed, position, {}, &CollapsedRange::source_begin);
   if (collapsed_range != collapsed.begin()) {
     const auto& range = *std::prev(collapsed_range);
     if (position < range.source_end) return range.view;
+    const auto cr_begin = std::ranges::lower_bound(inserted_crs, range.source_end);
+    const auto cr_end = std::ranges::lower_bound(inserted_crs, position);
+    return range.view + 1 + position - range.source_end +
+           static_cast<std::size_t>(cr_end - cr_begin);
   }
-  const auto point = std::ranges::upper_bound(source_map, position, {}, &MappingPoint::source);
-  if (point == source_map.begin()) return position;
-  const auto& base = *std::prev(point);
-  return base.view + position - base.source;
+  const auto cr_end = std::ranges::lower_bound(inserted_crs, position);
+  return position + static_cast<std::size_t>(cr_end - inserted_crs.begin());
 }
 
 std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
   const auto collapsed_range = std::ranges::lower_bound(collapsed, position, {}, &CollapsedRange::view);
   if (collapsed_range != collapsed.end() && collapsed_range->view == position)
     return collapsed_range->source_begin;
-  const auto point = std::ranges::upper_bound(view_map, position, {}, &MappingPoint::view);
-  if (point == view_map.begin()) return position;
-  const auto& base = *std::prev(point);
-  return base.source + position - base.view;
+  std::size_t low{};
+  std::size_t high = source_size;
+  while (low < high) {
+    const auto middle = low + (high - low + 1) / 2;
+    if (SourceToView(middle) <= position) low = middle;
+    else high = middle - 1;
+  }
+  return low;
 }
 
 EditorSnapshot BuildEditorSnapshot(std::wstring_view source) {
   EditorSnapshot result;
-  result.source_map.push_back({0, 0});
-  result.view_map.push_back({0, 0});
+  result.source_size = source.size();
+  result.view.reserve(source.size());
   for (std::size_t index = 0; index < source.size(); ++index) {
     if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
-      const std::size_t before = result.view.size();
+      result.inserted_crs.push_back(static_cast<std::uint32_t>(index));
       result.view.push_back(L'\r');
-      result.view_map.push_back({index, before});
-      result.view_map.push_back({index, before + 1});
     }
     result.view.push_back(source[index]);
-    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
-      result.source_map.push_back({index + 1, result.view.size()});
-      result.view_map.push_back({index + 1, result.view.size()});
-    }
   }
   return result;
 }
 
 EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source) {
-  const auto parsed = ParseMarkdown(source);
-  if (parsed.images.empty()) return BuildEditorSnapshot(source);
+  const auto images = ParseMarkdownImages(source);
+  if (images.empty()) return BuildEditorSnapshot(source);
   EditorSnapshot result;
-  result.source_map.push_back({0, 0});
-  result.view_map.push_back({0, 0});
+  result.source_size = source.size();
+  result.view.reserve(source.size());
   std::size_t image_index{};
   for (std::size_t index = 0; index < source.size();) {
-    if (image_index < parsed.images.size() && index == parsed.images[image_index].begin &&
-        parsed.images[image_index].target.find(L"://") != std::wstring::npos) ++image_index;
-    if (image_index < parsed.images.size() && index == parsed.images[image_index].begin) {
-      const auto& image = parsed.images[image_index++];
+    if (image_index < images.size() && index == images[image_index].begin &&
+        images[image_index].target.find(L"://") != std::wstring::npos) ++image_index;
+    if (image_index < images.size() && index == images[image_index].begin) {
+      const auto& image = images[image_index++];
       const std::size_t view_position = result.view.size();
       result.collapsed.push_back({image.begin, image.end, view_position});
       result.view.push_back(0xFFFC);
-      result.source_map.push_back({image.end, result.view.size()});
-      result.view_map.push_back({image.begin, view_position});
-      result.view_map.push_back({image.end, result.view.size()});
       index = image.end;
       continue;
     }
     if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
-      const std::size_t before = result.view.size();
+      result.inserted_crs.push_back(static_cast<std::uint32_t>(index));
       result.view.push_back(L'\r');
-      result.view_map.push_back({index, before});
-      result.view_map.push_back({index, before + 1});
     }
     result.view.push_back(source[index]);
-    if (source[index] == L'\n' && (index == 0 || source[index - 1] != L'\r')) {
-      result.source_map.push_back({index + 1, result.view.size()});
-      result.view_map.push_back({index + 1, result.view.size()});
-    }
     ++index;
   }
   return result;

@@ -59,7 +59,14 @@ try {
             $path = Join-Path $workspace 'large.md'
             $stream = [IO.File]::Create($path)
             try {
-                $block = [Text.Encoding]::UTF8.GetBytes("# Large`n日本語 content line`n")
+                $heading = [Text.Encoding]::UTF8.GetBytes("# Large document`n")
+                $stream.Write($heading, 0, $heading.Length)
+                # P3 includes a genuinely large single line without turning every
+                # repeated block into a heading (which would measure outline-node
+                # cardinality instead of large-document copy and mapping cost).
+                $giant = [Text.Encoding]::UTF8.GetBytes(('x' * 1MB) + "`n")
+                $stream.Write($giant, 0, $giant.Length)
+                $block = [Text.Encoding]::UTF8.GetBytes("日本語 content line with plain markdown text`n")
                 $target = $sizeMiB * 1MB
                 while ($stream.Length -lt $target) { $stream.Write($block, 0, $block.Length) }
             } finally { $stream.Dispose() }

@@ -3,6 +3,8 @@
 #include <windows.h>
 
 #include <array>
+#include <algorithm>
+#include <cwctype>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -104,12 +106,13 @@ bool WorkspaceStore::Initialize(std::wstring& error) const {
     }
   }
 
-  static constexpr std::array<std::pair<const wchar_t*, std::string_view>, 9> files{{
+  static constexpr std::array<std::pair<const wchar_t*, std::string_view>, 10> files{{
       {L".gitignore", "/.cache/\n/.state/\n"},
       {L"workspace.toml", "schema_version = 1\n\n[creation]\ndefault_profile = \"memo\"\ndaily_profile = \"daily\"\n\n[calendar]\nweek_start = \"sunday\"\nholiday_region = \"JP\"\n"},
       {L"profiles.toml", "schema_version = 1\n\n[[profiles]]\nid = \"daily\"\nname = \"デイリーノート\"\ndirectory = \"Dairy/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/daily.md\"\ncollision = \"open-existing\"\n\n[[profiles]]\nid = \"meeting\"\nname = \"Meeting\"\ndirectory = \"Meeting/{{date:yyyy}}/{{date:yyyyMM}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/meeting.md\"\ncollision = \"sequence\"\n\n[[profiles]]\nid = \"memo\"\nname = \"Memo\"\ndirectory = \"Memo/{{date:yyyy}}/{{date:yyyyMM}}/{{date:yyyyMMdd}}\"\nfilename = \"{{date:yyyyMMdd}}.md\"\ntemplate = \"templates/memo.md\"\ncollision = \"sequence\"\nsequence_format = \"_%02d\"\n"},
       {L"keybindings.toml", "schema_version = 1\n"},
       {L"commands.toml", "schema_version = 1\n"},
+      {L"settings.toml", "schema_version = 1\n# Workspace overrides: theme, font_face, font_size_pt, bind.<command>\n"},
       {L"storage.toml", "schema_version = 1\n# executable = \"C:/path/to/adapter.exe\"\n# argument = \"upload\"\n# argument = \"{file}\"\n# argument = \"{revision}\"\n# The adapter prints one https URL on stdout and reads credentials from its own protected store.\n"},
       {L"templates\\daily.md", "# {{date:yyyy-MM-dd}}\n\n{{cursor}}\n"},
       {L"templates\\meeting.md", "# Meeting {{date:yyyy-MM-dd}}\n\n## 参加者\n\n## 議題\n\n{{cursor}}\n"},
@@ -160,19 +163,45 @@ std::vector<std::filesystem::path> WorkspaceStore::RecoveryFiles() const {
 
 bool WorkspaceStore::WriteSession(const std::vector<std::filesystem::path>& open_documents,
                                   std::wstring& error) const {
-  std::wstring session = L"schema_version = 1\n";
-  for (const auto& path : open_documents) {
+  SessionState state;
+  for (const auto& path : open_documents) state.documents.push_back({path});
+  return WriteSessionState(state, error);
+}
+
+bool WorkspaceStore::WriteSessionState(const SessionState& state, std::wstring& error) const {
+  std::wstring session = L"schema_version = 2\nactive_index = " + std::to_wstring(state.active_index) +
+                         L"\nmain_x = " + std::to_wstring(state.main_x) +
+                         L"\nmain_y = " + std::to_wstring(state.main_y) +
+                         L"\nmain_width = " + std::to_wstring(state.main_width) +
+                         L"\nmain_height = " + std::to_wstring(state.main_height) + L"\n";
+  for (const auto& document : state.documents) {
     std::error_code relative_error;
-    const auto relative = std::filesystem::relative(path, root_, relative_error);
+    const auto relative = std::filesystem::relative(document.path, root_, relative_error);
     if (relative_error || relative.empty() || relative.native().starts_with(L"..")) continue;
-    session += L"open = \"" + relative.generic_wstring() + L"\"\n";
+    session += L"\n[[document]]\npath = \"" + relative.generic_wstring() + L"\"\n" +
+               L"selection_begin = " + std::to_wstring(document.selection_begin) + L"\n" +
+               L"selection_end = " + std::to_wstring(document.selection_end) + L"\n" +
+               L"first_visible_line = " + std::to_wstring(document.first_visible_line) + L"\n" +
+               L"compact = " + std::wstring(document.compact ? L"true" : L"false") + L"\n" +
+               L"x = " + std::to_wstring(document.x) + L"\n" +
+               L"y = " + std::to_wstring(document.y) + L"\n" +
+               L"width = " + std::to_wstring(document.width) + L"\n" +
+               L"height = " + std::to_wstring(document.height) + L"\n";
   }
   return AtomicWriteUtf8(state_root() / L"session.toml", session, error);
 }
 
 bool WorkspaceStore::ReadSession(std::vector<std::filesystem::path>& open_documents,
                                  std::wstring& error) const {
+  SessionState state;
+  if (!ReadSessionState(state, error)) return false;
   open_documents.clear();
+  for (const auto& document : state.documents) open_documents.push_back(document.path);
+  return true;
+}
+
+bool WorkspaceStore::ReadSessionState(SessionState& state, std::wstring& error) const {
+  state = {};
   const auto path = state_root() / L"session.toml";
   std::ifstream input(path, std::ios::binary);
   if (!input) return true;
@@ -191,18 +220,51 @@ bool WorkspaceStore::ReadSession(std::vector<std::filesystem::path>& open_docume
   }
   std::wistringstream lines(text);
   std::wstring line;
+  SessionDocument* current{};
+  const auto number = [](std::wstring_view value, long long fallback = 0) {
+    try { return std::stoll(std::wstring(value)); } catch (const std::exception&) { return fallback; }
+  };
   while (std::getline(lines, line)) {
-    static constexpr std::wstring_view prefix = L"open = \"";
-    if (!line.starts_with(prefix) || line.size() <= prefix.size() || line.back() != L'\"') continue;
-    const auto relative_text = line.substr(prefix.size(), line.size() - prefix.size() - 1);
-    const std::filesystem::path relative(relative_text);
-    if (relative.is_absolute()) continue;
-    const auto normalized = relative.lexically_normal();
-    if (normalized.empty() || normalized.native().starts_with(L"..")) continue;
-    const auto candidate = (root_ / normalized).lexically_normal();
-    std::error_code filesystem_error;
-    if (std::filesystem::is_regular_file(candidate, filesystem_error)) open_documents.push_back(candidate);
+    if (line == L"[[document]]") { state.documents.emplace_back(); current = &state.documents.back(); continue; }
+    const auto equals = line.find(L'=');
+    if (equals == std::wstring::npos) continue;
+    std::wstring key = line.substr(0, equals);
+    std::wstring value = line.substr(equals + 1);
+    while (!key.empty() && iswspace(key.back())) key.pop_back();
+    while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+    if (key == L"open") {
+      state.documents.emplace_back();
+      current = &state.documents.back();
+      key = L"path";
+    }
+    if (!current) {
+      if (key == L"active_index") state.active_index = static_cast<std::size_t>(std::max(0LL, number(value)));
+      else if (key == L"main_x") state.main_x = static_cast<int>(number(value));
+      else if (key == L"main_y") state.main_y = static_cast<int>(number(value));
+      else if (key == L"main_width") state.main_width = static_cast<int>(number(value, 1280));
+      else if (key == L"main_height") state.main_height = static_cast<int>(number(value, 800));
+      else continue;
+    }
+    if (key == L"path" || key == L"open") {
+      if (value.size() < 2 || value.front() != L'\"' || value.back() != L'\"') continue;
+      const std::filesystem::path relative(value.substr(1, value.size() - 2));
+      if (relative.is_absolute()) continue;
+      const auto normalized = relative.lexically_normal();
+      if (normalized.empty() || normalized.native().starts_with(L"..")) continue;
+      const auto candidate = (root_ / normalized).lexically_normal();
+      std::error_code filesystem_error;
+      if (std::filesystem::is_regular_file(candidate, filesystem_error)) current->path = candidate;
+    } else if (key == L"selection_begin") current->selection_begin = static_cast<std::size_t>(std::max(0LL, number(value)));
+    else if (key == L"selection_end") current->selection_end = static_cast<std::size_t>(std::max(0LL, number(value)));
+    else if (key == L"first_visible_line") current->first_visible_line = static_cast<int>(std::max(0LL, number(value)));
+    else if (key == L"compact") current->compact = value == L"true";
+    else if (key == L"x") current->x = static_cast<int>(number(value));
+    else if (key == L"y") current->y = static_cast<int>(number(value));
+    else if (key == L"width") current->width = static_cast<int>(number(value, 720));
+    else if (key == L"height") current->height = static_cast<int>(number(value, 520));
   }
+  std::erase_if(state.documents, [](const SessionDocument& item) { return item.path.empty(); });
+  state.active_index = state.documents.empty() ? 0 : std::min(state.active_index, state.documents.size() - 1);
   return true;
 }
 

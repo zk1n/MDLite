@@ -1,11 +1,15 @@
 #include "core/Document.h"
+#include "editor/EditorAdapter.h"
 #include "assets/Assets.h"
 #include "calendar/JapaneseHolidays.h"
 #include "markdown/Markdown.h"
 #include "profiles/Profiles.h"
+#include "process/ProcessRunner.h"
 #include "search/Search.h"
+#include "search/Replace.h"
 #include "table/Table.h"
 #include "workspace/Workspace.h"
+#include "workspace/Trust.h"
 
 #include <windows.h>
 
@@ -54,6 +58,32 @@ void TestUtf8NoOp(const std::filesystem::path& root) {
   Check(ReadBytes(path) == original, "unmodified save preserves exact bytes");
 }
 
+void TestSaveAs(const std::filesystem::path& root) {
+  const auto source = root / L"save-as-source.md";
+  const auto destination = root / L"save-as-copy.md";
+  WriteBytes(source, {'o', 'l', 'd'});
+  mdlite::Document document;
+  std::wstring error;
+  Check(document.Load(source, error), "save-as fixture loads");
+  document.MarkEdited(L"new content");
+  Check(document.SaveAs(destination, error), "save-as creates a distinct new file");
+  Check(document.path() == std::filesystem::absolute(destination).lexically_normal(),
+        "save-as updates the document path");
+  Check(ReadBytes(source) == std::vector<unsigned char>({'o', 'l', 'd'}),
+        "save-as leaves the original file unchanged");
+  Check(ReadBytes(destination) ==
+            std::vector<unsigned char>({'n', 'e', 'w', ' ', 'c', 'o', 'n', 't', 'e', 'n', 't'}),
+        "save-as writes the edited bytes");
+
+  mdlite::Document second;
+  Check(second.Load(source, error), "overwrite-refusal fixture loads");
+  second.MarkEdited(L"blocked");
+  Check(!second.SaveAs(destination, error), "save-as refuses an existing destination");
+  Check(ReadBytes(destination) ==
+            std::vector<unsigned char>({'n', 'e', 'w', ' ', 'c', 'o', 'n', 't', 'e', 'n', 't'}),
+        "save-as refusal does not overwrite the destination");
+}
+
 void TestCp932RoundTrip(const std::filesystem::path& root) {
   const auto path = root / L"cp932.md";
   const std::string source = "\x83\x65\x83\x58\x83\x67\r\n";
@@ -83,6 +113,53 @@ void TestExternalConflict(const std::filesystem::path& root) {
   Check(!document.Save(error), "external modification blocks overwrite");
   Check(ReadBytes(path) == std::vector<unsigned char>({'e', 'x', 't', 'e', 'r', 'n', 'a', 'l'}),
         "external bytes remain intact");
+
+  const auto stealth_path = root / L"same-size-time.md";
+  WriteBytes(stealth_path, {'o', 'l', 'd'});
+  mdlite::Document stealth_document;
+  Check(stealth_document.Load(stealth_path, error), "same-size conflict fixture loads");
+  const auto original_time = std::filesystem::last_write_time(stealth_path);
+  stealth_document.MarkEdited(L"app");
+  WriteBytes(stealth_path, {'n', 'e', 'w'});
+  std::filesystem::last_write_time(stealth_path, original_time);
+  Check(!stealth_document.Save(error), "same-size and restored-time external edit is detected");
+  Check(ReadBytes(stealth_path) == std::vector<unsigned char>({'n', 'e', 'w'}),
+        "same-size external bytes remain intact");
+}
+
+void TestEmptyEncodingAndInvalidBom(const std::filesystem::path& root) {
+  std::wstring error;
+  const auto utf8_path = root / L"empty-utf8.md";
+  WriteBytes(utf8_path, {'t', 'e', 'x', 't'});
+  mdlite::Document utf8;
+  Check(utf8.Load(utf8_path, error), "UTF-8 empty-save fixture loads");
+  utf8.MarkEdited(L"");
+  Check(utf8.Save(error), "UTF-8 document can be saved empty");
+  Check(ReadBytes(utf8_path).empty(), "empty UTF-8 has zero bytes");
+
+  const auto bom_path = root / L"empty-bom.md";
+  WriteBytes(bom_path, {0xEF, 0xBB, 0xBF, 'x'});
+  mdlite::Document bom;
+  Check(bom.Load(bom_path, error), "UTF-8 BOM empty-save fixture loads");
+  bom.MarkEdited(L"");
+  Check(bom.Save(error), "UTF-8 BOM document can be saved empty");
+  Check(ReadBytes(bom_path) == std::vector<unsigned char>({0xEF, 0xBB, 0xBF}),
+        "empty UTF-8 BOM retains only the BOM");
+
+  const auto cp932_path = root / L"empty-cp932.md";
+  WriteBytes(cp932_path, {0x83, 0x65, 0x83, 0x58, 0x83, 0x67});
+  mdlite::Document cp932;
+  Check(cp932.Load(cp932_path, error) && cp932.encoding() == mdlite::TextEncoding::Cp932,
+        "CP932 empty-save fixture loads as CP932");
+  cp932.MarkEdited(L"");
+  Check(cp932.Save(error), "CP932 document can be saved empty");
+  Check(ReadBytes(cp932_path).empty(), "empty CP932 has zero bytes");
+
+  const auto invalid_bom_path = root / L"invalid-bom.md";
+  WriteBytes(invalid_bom_path, {0xEF, 0xBB, 0xBF, 0x83, 0x65});
+  mdlite::Document invalid_bom;
+  Check(!invalid_bom.Load(invalid_bom_path, error),
+        "invalid UTF-8 after BOM is not silently reclassified as CP932");
 }
 
 void TestEditorLineEndingBoundary(const std::filesystem::path& root) {
@@ -115,6 +192,25 @@ void TestEditorLineEndingBoundary(const std::filesystem::path& root) {
   Check(ReadBytes(mixed_path) ==
             std::vector<unsigned char>({'a', ' ', 'c', 'h', 'a', 'n', 'g', 'e', 'd', '\r', '\n', 'b', '\n', 'c'}),
         "existing mixed line-ending sequence survives editor expansion");
+
+  const auto mixed_delete_path = root / L"mixed-delete.md";
+  WriteBytes(mixed_delete_path, {'a', '\r', '\n', 'b', '\n', 'c'});
+  mdlite::Document mixed_delete;
+  Check(mixed_delete.Load(mixed_delete_path, error), "mixed delete fixture loads");
+  mixed_delete.MarkEditedFromEditor(L"b\r\nc");
+  Check(mixed_delete.Save(error), "mixed document saves after deleting first line");
+  Check(ReadBytes(mixed_delete_path) == std::vector<unsigned char>({'b', '\n', 'c'}),
+        "deleting a CRLF line does not transfer CRLF to the next LF line");
+
+  const auto mixed_insert_path = root / L"mixed-insert.md";
+  WriteBytes(mixed_insert_path, {'a', '\r', '\n', 'b', '\n', 'c'});
+  mdlite::Document mixed_insert;
+  Check(mixed_insert.Load(mixed_insert_path, error), "mixed insert fixture loads");
+  mixed_insert.MarkEditedFromEditor(L"a\r\nnew\r\nb\r\nc");
+  Check(mixed_insert.Save(error), "mixed document saves after inserting a line");
+  Check(ReadBytes(mixed_insert_path) ==
+            std::vector<unsigned char>({'a', '\r', '\n', 'n', 'e', 'w', '\r', '\n', 'b', '\n', 'c'}),
+        "insertion keeps unchanged mixed endings attached to their source lines");
 }
 
 void TestMarkdown() {
@@ -135,6 +231,19 @@ void TestMarkdown() {
         "outline move keeps child heading content with its parent");
 }
 
+void TestEditorAdapter() {
+  const auto snapshot = mdlite::BuildEditorSnapshot(L"a\nb😀\r\nc");
+  Check(snapshot.view == L"a\r\nb😀\r\nc", "editor view expands only lone LF to CRLF");
+  Check(snapshot.SourceToView(2) == 3, "source-to-view mapping accounts for expanded LF");
+  Check(snapshot.ViewToSource(2) == 1, "inserted CR maps to the source LF boundary");
+
+  const auto edited = mdlite::ApplyEditorText(snapshot, L"a\r\nnew\r\nb😀\r\nc");
+  Check(edited.changed && edited.source == L"a\nnew\nb😀\r\nc",
+        "range transaction preserves LF and existing CRLF without whole-document normalization");
+  const auto deleted = mdlite::ApplyEditorText(mdlite::BuildEditorSnapshot(L"a\r\nb\nc"), L"b\r\nc");
+  Check(deleted.source == L"b\nc", "range transaction keeps the surviving mixed line ending");
+}
+
 void TestWorkspaceState(const std::filesystem::path& root) {
   const auto workspace = root / L"workspace";
   std::filesystem::create_directories(workspace);
@@ -148,8 +257,29 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   Check(store.WriteRecovery(document, L"編集中", error), "recovery content writes inside workspace state");
   Check(store.RecoveryFiles().size() == 1, "recovery file is discoverable");
   Check(store.WriteSession({document, L"C:\\outside.md"}, error), "session file writes");
+  std::vector<std::filesystem::path> restored;
+  Check(store.ReadSession(restored, error), "session file reads");
+  Check(restored.size() == 1 && restored.front() == document,
+        "session restore includes only existing documents inside the workspace");
   Check(store.RemoveRecovery(document, error), "recovery is removed after successful save");
   Check(store.RecoveryFiles().empty(), "recovery removal is visible");
+}
+
+void TestTrustAndProcess(const std::filesystem::path& root) {
+  const auto workspace = root / L"trust";
+  std::filesystem::create_directories(workspace / L".mdlite/.state");
+  std::wstring error;
+  Check(!mdlite::IsWorkspaceTrusted(workspace), "workspace starts untrusted");
+  Check(mdlite::SetWorkspaceTrusted(workspace, true, error) && mdlite::IsWorkspaceTrusted(workspace),
+        "workspace trust is local and explicit");
+  Check(mdlite::SetWorkspaceTrusted(workspace, false, error) && !mdlite::IsWorkspaceTrusted(workspace),
+        "workspace trust can be revoked");
+  mdlite::ProcessResult process;
+  Check(mdlite::RunProcess(L"C:\\Windows\\System32\\cmd.exe", {L"/d", L"/c", L"echo", L"MDLite process"},
+                           workspace, 4096, 5000, process, error),
+        "process runner starts an argument-array command");
+  Check(process.exit_code == 0 && process.output.find(L"MDLite process") != std::wstring::npos,
+        "process runner captures bounded output");
 }
 
 void TestProfiles(const std::filesystem::path& root) {
@@ -194,6 +324,29 @@ void TestSearch(const std::filesystem::path& root) {
   Check(mdlite::SearchWorkspace(workspace, {L"x.z", true, true}, {}, matches, error),
         "workspace regex search runs");
   Check(matches.size() == 1, "regex matches disk text");
+
+  WriteBytes(workspace / L"words.md", {'c','a','t',' ','s','c','a','t','t','e','r',' ','c','a','t'});
+  mdlite::SearchQuery whole{L"cat", true, false};
+  whole.whole_word = true;
+  whole.include_globs = {L"*.md"};
+  Check(mdlite::SearchWorkspace(workspace, whole, {}, matches, error), "whole-word glob search runs");
+  Check(matches.size() == 2, "whole-word search excludes embedded words");
+
+  mdlite::ReplacePlan plan;
+  Check(mdlite::PreviewWorkspaceReplace(workspace, whole, L"dog", {}, plan, error),
+        "replace preview succeeds");
+  Check(plan.files.size() == 1 && plan.files.front().replacement_count == 2,
+        "replace preview records exact changes");
+  mdlite::ReplaceApplyResult applied;
+  Check(mdlite::ApplyWorkspaceReplace(workspace, plan, applied, error), "replace apply succeeds");
+  mdlite::Document replaced;
+  Check(replaced.Load(workspace / L"words.md", error) && replaced.text() == L"dog scatter dog",
+        "replace applies only previewed whole words");
+  mdlite::ReplaceApplyResult rolled_back;
+  Check(mdlite::RollbackWorkspaceReplace(applied.journal, rolled_back, error),
+        "replace journal rollback succeeds");
+  Check(replaced.Load(workspace / L"words.md", error) && replaced.text() == L"cat scatter cat",
+        "rollback restores the preview baseline");
 }
 
 void TestTableEditing() {
@@ -254,11 +407,15 @@ int wmain() {
   std::filesystem::remove_all(root, error);
   std::filesystem::create_directories(root);
   TestUtf8NoOp(root);
+  TestSaveAs(root);
   TestCp932RoundTrip(root);
   TestExternalConflict(root);
+  TestEmptyEncodingAndInvalidBom(root);
   TestEditorLineEndingBoundary(root);
   TestMarkdown();
+  TestEditorAdapter();
   TestWorkspaceState(root);
+  TestTrustAndProcess(root);
   TestProfiles(root);
   TestSearch(root);
   TestTableEditing();

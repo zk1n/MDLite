@@ -17,16 +17,24 @@ add_library(mdlite_core
   src/calendar/JapaneseHolidays.h
   src/core/Document.cpp
   src/core/Document.h
+  src/editor/EditorAdapter.cpp
+  src/editor/EditorAdapter.h
   src/markdown/Markdown.cpp
   src/markdown/Markdown.h
   src/profiles/Profiles.cpp
   src/profiles/Profiles.h
+  src/process/ProcessRunner.cpp
+  src/process/ProcessRunner.h
   src/search/Search.cpp
   src/search/Search.h
+  src/search/Replace.cpp
+  src/search/Replace.h
   src/table/Table.cpp
   src/table/Table.h
   src/workspace/Workspace.cpp
   src/workspace/Workspace.h
+  src/workspace/Trust.cpp
+  src/workspace/Trust.h
 )
 target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)

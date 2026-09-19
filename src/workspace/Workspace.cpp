@@ -169,4 +169,40 @@ bool WorkspaceStore::WriteSession(const std::vector<std::filesystem::path>& open
   return AtomicWriteUtf8(state_root() / L"session.toml", session, error);
 }
 
+bool WorkspaceStore::ReadSession(std::vector<std::filesystem::path>& open_documents,
+                                 std::wstring& error) const {
+  open_documents.clear();
+  const auto path = state_root() / L"session.toml";
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return true;
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  std::wstring text;
+  if (!bytes.empty()) {
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                         static_cast<int>(bytes.size()), nullptr, 0);
+    if (size <= 0) {
+      error = L"セッション状態が正しいUTF-8ではありません。";
+      return false;
+    }
+    text.resize(static_cast<std::size_t>(size));
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()),
+                        text.data(), size);
+  }
+  std::wistringstream lines(text);
+  std::wstring line;
+  while (std::getline(lines, line)) {
+    static constexpr std::wstring_view prefix = L"open = \"";
+    if (!line.starts_with(prefix) || line.size() <= prefix.size() || line.back() != L'\"') continue;
+    const auto relative_text = line.substr(prefix.size(), line.size() - prefix.size() - 1);
+    const std::filesystem::path relative(relative_text);
+    if (relative.is_absolute()) continue;
+    const auto normalized = relative.lexically_normal();
+    if (normalized.empty() || normalized.native().starts_with(L"..")) continue;
+    const auto candidate = (root_ / normalized).lexically_normal();
+    std::error_code filesystem_error;
+    if (std::filesystem::is_regular_file(candidate, filesystem_error)) open_documents.push_back(candidate);
+  }
+  return true;
+}
+
 }  // namespace mdlite

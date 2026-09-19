@@ -3,6 +3,9 @@
 #include "assets/Assets.h"
 #include "calendar/JapaneseHolidays.h"
 #include "search/Search.h"
+#include "search/Replace.h"
+#include "process/ProcessRunner.h"
+#include "workspace/Trust.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -24,10 +27,12 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"MDLite.MainWindow";
 constexpr UINT_PTR kAutosaveTimer = 1;
 constexpr UINT kAutosaveDelayMs = 750;
+constexpr UINT kTimerPollMs = 250;
+constexpr UINT kRecoveryDelayMs = 5000;
 constexpr int kTreeWidth = 250;
 constexpr int kOutlineWidth = 230;
 constexpr int kTabHeight = 30;
-constexpr int kFindHeight = 34;
+constexpr int kFindHeight = 66;
 
 enum ControlId : int {
   kWorkspaceTree = 100,
@@ -37,9 +42,18 @@ enum ControlId : int {
   kFindBar,
   kFindEdit,
   kFindNext,
+  kFindReplaceEdit,
+  kFindWorkspace,
+  kReplaceWorkspace,
+  kFindCase,
+  kFindRegex,
+  kFindWord,
   kFileOpenWorkspace = 1000,
   kFileOpen,
+  kFileQuickOpen,
+  kFileClose,
   kFileSave,
+  kFileSaveAs,
   kFileDaily,
   kFileMeeting,
   kFileMemo,
@@ -55,7 +69,12 @@ enum ControlId : int {
   kEditFind,
   kEditFindNext,
   kEditFindWorkspace,
+  kEditReplaceWorkspace,
   kViewCalendar,
+  kViewSettings,
+  kWorkspaceTrust,
+  kWorkspaceUntrust,
+  kGitStatus,
   kTableRowBefore,
   kTableRowAfter,
   kTableRowDelete,
@@ -70,6 +89,24 @@ bool IsTextFile(const std::filesystem::path& path) {
   static constexpr std::array extensions{L".md", L".markdown", L".txt", L".log", L".json",
                                           L".toml", L".yaml", L".yml"};
   return std::ranges::find(extensions, extension) != extensions.end();
+}
+
+bool IsMarkdownFile(const std::filesystem::path& path) {
+  std::wstring extension = path.extension().wstring();
+  std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
+  return extension == L".md" || extension == L".markdown";
+}
+
+std::wstring WorkspaceMutexName(const std::filesystem::path& path) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  const auto normalized = std::filesystem::absolute(path).lexically_normal().wstring();
+  for (const wchar_t character : normalized) {
+    hash ^= static_cast<std::uint16_t>(towlower(character));
+    hash *= 1099511628211ULL;
+  }
+  wchar_t name[64]{};
+  swprintf_s(name, L"Local\\MDLite.Workspace.%016llx", static_cast<unsigned long long>(hash));
+  return name;
 }
 
 class PresentationUndoGuard {
@@ -131,6 +168,8 @@ int Application::Run() {
       {FVIRTKEY | FCONTROL, 'O', kFileOpen},
       {FVIRTKEY | FCONTROL, 'S', kFileSave},
       {FVIRTKEY | FCONTROL, 'F', kEditFind},
+      {FVIRTKEY | FCONTROL, 'P', kFileQuickOpen},
+      {FVIRTKEY | FCONTROL, 'W', kFileClose},
       {FVIRTKEY, VK_F3, kEditFindNext},
   };
   HACCEL table = CreateAcceleratorTableW(const_cast<ACCEL*>(accelerators),
@@ -173,10 +212,11 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
   if (message == WM_IME_STARTCOMPOSITION) app->ime_composing_ = true;
   if (message == WM_IME_ENDCOMPOSITION) {
     app->ime_composing_ = false;
-    SetTimer(app->window_, kAutosaveTimer, kAutosaveDelayMs, nullptr);
+    app->OnEditorChanged(window);
   }
   if (message == WM_KEYDOWN && wparam == VK_TAB && !app->ime_composing_ &&
       app->active_document_ < app->documents_.size() &&
+      IsMarkdownFile(app->documents_[app->active_document_]->document.path()) &&
       app->documents_[app->active_document_]->editor == window) {
     CHARRANGE selection{};
     SendMessageW(window, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
@@ -211,11 +251,28 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     case WM_TIMER:
       if (wparam == kAutosaveTimer) {
-        KillTimer(window_, kAutosaveTimer);
-        if (!ime_composing_ && active_document_ < documents_.size()) {
-          SaveRecovery(*documents_[active_document_]);
-          SaveDocument(*documents_[active_document_], false);
+        const ULONGLONG now = GetTickCount64();
+        bool pending = false;
+        for (auto& view : documents_) {
+          if (!view->document.dirty()) continue;
+          pending = true;
+          const bool composing_this_view = ime_composing_ && active_document_ < documents_.size() &&
+                                           documents_[active_document_].get() == view.get();
+          if (composing_this_view) continue;
+          if (view->recovery_due != 0 && now >= view->recovery_due) {
+            SaveRecovery(*view);
+            view->recovery_due = now + kRecoveryDelayMs;
+          }
+          if (view->autosave_due != 0 && now >= view->autosave_due) {
+            if (SaveDocument(*view, false)) {
+              view->autosave_due = 0;
+              view->recovery_due = 0;
+            } else {
+              view->autosave_due = now + kRecoveryDelayMs;
+            }
+          }
         }
+        if (!pending) KillTimer(window_, kAutosaveTimer);
       }
       return 0;
     case WM_DROPFILES: {
@@ -227,6 +284,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         DragQueryFileW(drop, index, path.data(), length + 1);
         path.resize(length);
         if (IsSupportedImage(path) && !workspace_.empty() && active_document_ < documents_.size()) {
+          if (ime_composing_ || !IsMarkdownFile(documents_[active_document_]->document.path())) continue;
           AssetImportResult imported{};
           std::wstring error;
           const auto& document_path = documents_[active_document_]->document.path();
@@ -262,9 +320,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return DefWindowProcW(window_, message, wparam, lparam);
     case WM_LBUTTONUP:
       if (outline_dragging_) {
-        ReleaseCapture();
-        outline_dragging_ = false;
         const HTREEITEM target = TreeView_GetDropHilight(outline_);
+        outline_dragging_ = false;
+        ReleaseCapture();
         TreeView_SelectDropTarget(outline_, nullptr);
         if (target) {
           TVITEMW item{};
@@ -276,12 +334,22 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         return 0;
       }
       return DefWindowProcW(window_, message, wparam, lparam);
+    case WM_CAPTURECHANGED:
+      if (outline_dragging_) {
+        outline_dragging_ = false;
+        TreeView_SelectDropTarget(outline_, nullptr);
+      }
+      return 0;
     case WM_COMMAND: {
       const int command = LOWORD(wparam);
       if (command == kFileOpenWorkspace) OpenWorkspaceDialog();
       else if (command == kFileOpen) OpenFileDialog();
+      else if (command == kFileQuickOpen) QuickOpen();
+      else if (command == kFileClose && active_document_ < documents_.size()) CloseDocument(active_document_);
       else if (command == kFileSave && active_document_ < documents_.size())
         SaveDocument(*documents_[active_document_], true);
+      else if (command == kFileSaveAs && active_document_ < documents_.size())
+        SaveDocumentAs(*documents_[active_document_]);
       else if (command == kFileDaily) CreateProfile(BuiltInProfile::Daily);
       else if (command == kFileMeeting) CreateProfile(BuiltInProfile::Meeting);
       else if (command == kFileMemo) CreateProfile(BuiltInProfile::Memo);
@@ -293,14 +361,21 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kWorkspaceDelete) DeleteSelected();
       else if (command == kWorkspaceCopyPath) CopySelectedPathToClipboard();
       else if (command == kWorkspaceShowExplorer) ShowSelectedInExplorer();
+      else if (command == kWorkspaceTrust) SetWorkspaceTrust(true);
+      else if (command == kWorkspaceUntrust) SetWorkspaceTrust(false);
+      else if (command == kGitStatus) RunGitStatus();
       else if (command == kFileExit) SendMessageW(window_, WM_CLOSE, 0, 0);
       else if (command == kEditFind) ShowFindBar();
       else if (command == kEditFindNext || command == kFindNext) FindNext();
       else if (command == kEditFindWorkspace) SearchWorkspaceFromFindBar();
+      else if (command == kEditReplaceWorkspace || command == kReplaceWorkspace)
+        ReplaceWorkspaceFromFindBar();
+      else if (command == kFindWorkspace) SearchWorkspaceFromFindBar();
       else if (command == kViewCalendar) {
         ShowWindow(calendar_, IsWindowVisible(calendar_) ? SW_HIDE : SW_SHOW);
         LayoutControls();
       }
+      else if (command == kViewSettings) OpenWorkspaceSettings();
       else if (command == kTableRowBefore) ApplyTableAction(TableAction::InsertRowBefore);
       else if (command == kTableRowAfter) ApplyTableAction(TableAction::InsertRowAfter);
       else if (command == kTableRowDelete) ApplyTableAction(TableAction::DeleteRow);
@@ -371,6 +446,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       DestroyWindow(window_);
       return 0;
     case WM_DESTROY:
+      if (workspace_mutex_) {
+        CloseHandle(workspace_mutex_);
+        workspace_mutex_ = nullptr;
+      }
       PostQuitMessage(0);
       return 0;
     default:
@@ -383,7 +462,10 @@ void Application::CreateMenuBar() {
   HMENU file = CreatePopupMenu();
   AppendMenuW(file, MF_STRING, kFileOpenWorkspace, L"Workspaceを開く…");
   AppendMenuW(file, MF_STRING, kFileOpen, L"ファイルを開く…\tCtrl+O");
+  AppendMenuW(file, MF_STRING, kFileQuickOpen, L"Quick Open…\tCtrl+P");
+  AppendMenuW(file, MF_STRING, kFileClose, L"タブを閉じる\tCtrl+W");
   AppendMenuW(file, MF_STRING, kFileSave, L"保存\tCtrl+S");
+  AppendMenuW(file, MF_STRING, kFileSaveAs, L"別名で保存…");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file, MF_STRING, kFileDaily, L"今日のDairyを開く");
   AppendMenuW(file, MF_STRING, kFileMeeting, L"Meetingノートを作成");
@@ -402,14 +484,19 @@ void Application::CreateMenuBar() {
   AppendMenuW(workspace, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(workspace, MF_STRING, kWorkspaceCopyPath, L"パスをコピー");
   AppendMenuW(workspace, MF_STRING, kWorkspaceShowExplorer, L"Explorerで表示");
+  AppendMenuW(workspace, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(workspace, MF_STRING, kWorkspaceTrust, L"このWorkspaceを信頼する…");
+  AppendMenuW(workspace, MF_STRING, kWorkspaceUntrust, L"信頼を解除");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(workspace), L"Workspace");
   HMENU edit = CreatePopupMenu();
   AppendMenuW(edit, MF_STRING, kEditFind, L"検索…\tCtrl+F");
   AppendMenuW(edit, MF_STRING, kEditFindNext, L"次を検索\tF3");
   AppendMenuW(edit, MF_STRING, kEditFindWorkspace, L"Workspaceを検索");
+  AppendMenuW(edit, MF_STRING, kEditReplaceWorkspace, L"Workspaceを置換…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), L"編集");
   HMENU view = CreatePopupMenu();
   AppendMenuW(view, MF_STRING, kViewCalendar, L"カレンダー");
+  AppendMenuW(view, MF_STRING, kViewSettings, L"Workspace設定を開く");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示");
   HMENU table = CreatePopupMenu();
   AppendMenuW(table, MF_STRING, kTableRowBefore, L"上に行を追加");
@@ -420,6 +507,9 @@ void Application::CreateMenuBar() {
   AppendMenuW(table, MF_STRING, kTableColumnAfter, L"右に列を追加");
   AppendMenuW(table, MF_STRING, kTableColumnDelete, L"列を削除");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(table), L"表");
+  HMENU git = CreatePopupMenu();
+  AppendMenuW(git, MF_STRING, kGitStatus, L"Status / Branches…");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(git), L"Git");
   SetMenu(window_, menu);
 }
 
@@ -432,22 +522,35 @@ void Application::CreateControls() {
                           0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kTabs), instance_, nullptr);
   outline_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, nullptr,
                              WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES |
-                                 TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_DISABLEDRAGDROP,
+                                 TVS_LINESATROOT | TVS_SHOWSELALWAYS,
                              0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kOutline), instance_, nullptr);
   status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE,
                             0, 0, 0, 0, window_, nullptr, instance_, nullptr);
   find_bar_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr, WS_CHILD,
                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindBar), instance_, nullptr);
-  find_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                               8, 5, 260, 24, find_bar_, reinterpret_cast<HMENU>(kFindEdit), instance_, nullptr);
-  find_next_ = CreateWindowExW(0, L"BUTTON", L"次を検索", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                               276, 4, 90, 25, find_bar_, reinterpret_cast<HMENU>(kFindNext), instance_, nullptr);
+  find_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindEdit), instance_, nullptr);
+  find_next_ = CreateWindowExW(0, L"BUTTON", L"次を検索", WS_CHILD | BS_PUSHBUTTON,
+                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindNext), instance_, nullptr);
+  replace_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+                                  0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindReplaceEdit), instance_, nullptr);
+  find_workspace_ = CreateWindowExW(0, L"BUTTON", L"全体検索", WS_CHILD | BS_PUSHBUTTON,
+                                    0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindWorkspace), instance_, nullptr);
+  replace_workspace_ = CreateWindowExW(0, L"BUTTON", L"Preview→置換", WS_CHILD | BS_PUSHBUTTON,
+                                       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceWorkspace), instance_, nullptr);
+  find_case_ = CreateWindowExW(0, L"BUTTON", L"大小文字", WS_CHILD | BS_AUTOCHECKBOX,
+                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindCase), instance_, nullptr);
+  find_regex_ = CreateWindowExW(0, L"BUTTON", L"Regex", WS_CHILD | BS_AUTOCHECKBOX,
+                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindRegex), instance_, nullptr);
+  find_word_ = CreateWindowExW(0, L"BUTTON", L"単語", WS_CHILD | BS_AUTOCHECKBOX,
+                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindWord), instance_, nullptr);
   calendar_ = CreateWindowExW(WS_EX_CLIENTEDGE, MONTHCAL_CLASSW, nullptr,
                               WS_CHILD | MCS_DAYSTATE | MCS_WEEKNUMBERS,
                               0, 0, 0, 0, window_, nullptr, instance_, nullptr);
   SendMessageW(calendar_, MCM_SETFIRSTDAYOFWEEK, 0, 6);
   HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-  for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_})
+  for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_, replace_edit_,
+                       find_workspace_, replace_workspace_, find_case_, find_regex_, find_word_})
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 }
 
@@ -466,6 +569,17 @@ void Application::LayoutControls() {
   MoveWindow(outline_, client.right - kOutlineWidth, 0, kOutlineWidth, content_height, TRUE);
   MoveWindow(tabs_, center_left, 0, center_width, kTabHeight, TRUE);
   MoveWindow(find_bar_, center_left, kTabHeight, center_width, find_visible ? kFindHeight : 0, TRUE);
+  const int options_width = 210;
+  const int button_width = 100;
+  const int input_width = std::max(80, center_width - options_width - button_width - 24);
+  MoveWindow(find_edit_, center_left + 8, kTabHeight + 4, input_width, 24, TRUE);
+  MoveWindow(find_next_, center_left + 12 + input_width, kTabHeight + 3, button_width, 25, TRUE);
+  MoveWindow(find_case_, center_left + 116 + input_width, kTabHeight + 5, 72, 22, TRUE);
+  MoveWindow(find_regex_, center_left + 188 + input_width, kTabHeight + 5, 62, 22, TRUE);
+  MoveWindow(find_word_, center_left + 250 + input_width, kTabHeight + 5, 58, 22, TRUE);
+  MoveWindow(replace_edit_, center_left + 8, kTabHeight + 36, input_width, 24, TRUE);
+  MoveWindow(find_workspace_, center_left + 12 + input_width, kTabHeight + 35, button_width, 25, TRUE);
+  MoveWindow(replace_workspace_, center_left + 116 + input_width, kTabHeight + 35, 118, 25, TRUE);
   const int editor_top = kTabHeight + (find_visible ? kFindHeight : 0);
   for (auto& view : documents_)
     MoveWindow(view->editor, center_left, editor_top, center_width,
@@ -517,6 +631,20 @@ void Application::OpenFileDialog() {
   }
 }
 
+void Application::QuickOpen() {
+  wchar_t path[32768]{};
+  OPENFILENAMEW dialog{sizeof(dialog)};
+  dialog.hwndOwner = window_;
+  dialog.lpstrTitle = L"Quick Open — Workspace内の文書を選択";
+  dialog.lpstrFilter = L"Markdown・テキスト\0*.md;*.markdown;*.txt;*.log;*.json;*.toml;*.yaml;*.yml\0すべて\0*.*\0";
+  dialog.lpstrFile = path;
+  dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+  const std::wstring initial = workspace_.wstring();
+  dialog.lpstrInitialDir = initial.empty() ? nullptr : initial.c_str();
+  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+  if (GetOpenFileNameW(&dialog)) OpenDocument(path);
+}
+
 void Application::OpenWorkspace(const std::filesystem::path& path) {
   std::error_code error;
   const auto absolute = std::filesystem::weakly_canonical(path, error);
@@ -524,8 +652,22 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
     MessageBoxW(window_, L"Workspaceフォルダーを開けません。", L"MDLite", MB_ICONERROR);
     return;
   }
+  if (workspace_ == absolute) return;
+  HANDLE new_mutex = CreateMutexW(nullptr, FALSE, WorkspaceMutexName(absolute).c_str());
+  if (new_mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (new_mutex) CloseHandle(new_mutex);
+    MessageBoxW(window_, L"このWorkspaceは別のMDLiteウィンドウで既に開かれています。",
+                L"Workspace重複起動", MB_ICONWARNING);
+    return;
+  }
+  if (!workspace_.empty() && !CloseDocumentsForWorkspaceSwitch()) {
+    CloseHandle(new_mutex);
+    return;
+  }
+  if (workspace_mutex_) CloseHandle(workspace_mutex_);
+  workspace_mutex_ = new_mutex;
   workspace_ = absolute;
-  workspace_store_ = std::make_unique<WorkspaceStore>(workspace_);
+  workspace_store_ = std::make_shared<WorkspaceStore>(workspace_);
   if (!std::filesystem::exists(workspace_ / L".mdlite")) {
     if (MessageBoxW(window_, L"このWorkspace用の設定・復旧領域 .mdlite を作成しますか？\n"
                              L"文書本文や復旧データをAppDataへ保存することはありません。",
@@ -544,6 +686,12 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
             L"前回の復旧スナップショットがあります。内容を別タブで開きますか？",
             L"MDLite 復旧", MB_ICONWARNING | MB_YESNO) == IDYES) {
         for (const auto& recovery : recoveries) OpenDocument(recovery);
+      }
+      std::vector<std::filesystem::path> session_documents;
+      if (!workspace_store_->ReadSession(session_documents, initialize_error)) {
+        MessageBoxW(window_, initialize_error.c_str(), L"セッション復元", MB_ICONWARNING);
+      } else {
+        for (const auto& document : session_documents) OpenDocument(document);
       }
     }
   }
@@ -597,11 +745,13 @@ void Application::OpenDocument(const std::filesystem::path& path) {
     }
   }
   auto view = std::make_unique<DocumentView>();
+  view->workspace_store = workspace_store_;
   std::wstring load_error;
   if (!view->document.Load(absolute, load_error)) {
     MessageBoxW(window_, load_error.c_str(), L"ファイルを開けません", MB_ICONERROR);
     return;
   }
+  view->editor_snapshot = BuildEditorSnapshot(view->document.text());
   view->editor = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, nullptr,
                                   WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                       ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL |
@@ -611,7 +761,7 @@ void Application::OpenDocument(const std::filesystem::path& path) {
   SendMessageW(view->editor, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
   SetWindowSubclass(view->editor, EditorSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   suppress_editor_change_ = true;
-  SetWindowTextW(view->editor, view->document.text().c_str());
+  SetWindowTextW(view->editor, view->editor_snapshot.view.c_str());
   suppress_editor_change_ = false;
 
   TCITEMW tab{};
@@ -635,51 +785,169 @@ void Application::ActivateDocument(std::size_t index) {
   UpdateStatus();
 }
 
+bool Application::CloseDocument(std::size_t index) {
+  if (index >= documents_.size() || ime_composing_) return false;
+  auto& view = *documents_[index];
+  SyncDocumentFromEditor(view);
+  if (view.document.dirty()) {
+    const int answer = MessageBoxW(window_,
+        (L"変更を保存してタブを閉じますか？\n" + view.document.path().wstring()).c_str(),
+        L"タブを閉じる", MB_ICONQUESTION | MB_YESNOCANCEL | MB_DEFBUTTON1);
+    if (answer == IDCANCEL) return false;
+    if (answer == IDYES && !SaveDocument(view, true)) return false;
+    if (answer == IDNO && view.workspace_store) {
+      std::wstring ignored;
+      view.workspace_store->RemoveRecovery(view.document.path(), ignored);
+    }
+  }
+  DestroyWindow(view.editor);
+  TabCtrl_DeleteItem(tabs_, static_cast<int>(index));
+  documents_.erase(documents_.begin() + static_cast<std::ptrdiff_t>(index));
+  if (documents_.empty()) {
+    active_document_ = static_cast<std::size_t>(-1);
+    TreeView_DeleteAllItems(outline_);
+    UpdateStatus();
+  } else {
+    ActivateDocument(std::min(index, documents_.size() - 1));
+  }
+  SaveSession();
+  return true;
+}
+
 bool Application::SaveDocument(DocumentView& view, bool interactive) {
   if (ime_composing_) return false;
-  view.document.MarkEditedFromEditor(EditorText(view.editor));
+  SyncDocumentFromEditor(view);
   if (!view.document.dirty()) return true;
   std::wstring error;
   if (!view.document.Save(error)) {
+    const bool recovered = SaveRecovery(view, false);
     UpdateStatus();
-    if (interactive) MessageBoxW(window_, error.c_str(), L"保存できません", MB_ICONWARNING);
+    if (interactive) {
+      if (recovered) error += L"\n最新の編集内容はWorkspaceの復旧領域へ保存しました。";
+      else error += L"\n復旧領域への保存にも失敗しました。別名保存するか編集を続けてください。";
+      MessageBoxW(window_, error.c_str(), L"保存できません", MB_ICONWARNING);
+    }
     return false;
   }
-  if (workspace_store_) {
+  if (view.workspace_store) {
     std::wstring recovery_error;
-    workspace_store_->RemoveRecovery(view.document.path(), recovery_error);
+    view.workspace_store->RemoveRecovery(view.document.path(), recovery_error);
   }
+  UpdateStatus();
+  return true;
+}
+
+bool Application::SaveDocumentAs(DocumentView& view) {
+  if (ime_composing_) return false;
+  SyncDocumentFromEditor(view);
+  wchar_t path[32768]{};
+  std::wstring suggested = view.document.path().stem().wstring() + L"-recovered" +
+                           view.document.path().extension().wstring();
+  wcsncpy_s(path, suggested.c_str(), _TRUNCATE);
+  OPENFILENAMEW dialog{sizeof(dialog)};
+  dialog.hwndOwner = window_;
+  dialog.lpstrFilter = L"Markdown・テキスト\0*.md;*.markdown;*.txt;*.log;*.json;*.toml;*.yaml;*.yml\0すべて\0*.*\0";
+  dialog.lpstrFile = path;
+  dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+  const std::wstring initial_directory = view.document.path().parent_path().wstring();
+  dialog.lpstrInitialDir = initial_directory.c_str();
+  dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+  if (!GetSaveFileNameW(&dialog)) return false;
+  const auto old_path = view.document.path();
+  std::wstring error;
+  if (!view.document.SaveAs(path, error)) {
+    MessageBoxW(window_, error.c_str(), L"別名保存できません", MB_ICONWARNING);
+    return false;
+  }
+  if (view.workspace_store) {
+    std::wstring ignored;
+    view.workspace_store->RemoveRecovery(old_path, ignored);
+  }
+  for (std::size_t i = 0; i < documents_.size(); ++i) {
+    if (documents_[i].get() != &view) continue;
+    TCITEMW tab{TCIF_TEXT};
+    std::wstring name = view.document.path().filename().wstring();
+    tab.pszText = name.data();
+    TabCtrl_SetItem(tabs_, static_cast<int>(i), &tab);
+    break;
+  }
+  view.autosave_due = 0;
+  view.recovery_due = 0;
   UpdateStatus();
   return true;
 }
 
 bool Application::SaveAll(bool interactive) {
   bool result = true;
+  bool all_recovered = true;
   for (auto& view : documents_) {
-    if (!SaveDocument(*view, interactive)) result = false;
+    if (!SaveDocument(*view, interactive)) {
+      result = false;
+      all_recovered = SaveRecovery(*view, false) && all_recovered;
+    }
   }
   if (!result && interactive) {
-    return MessageBoxW(window_, L"保存できない文書があります。編集内容を保持したまま終了しますか？",
-                       L"MDLite", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
+    if (all_recovered) {
+      return MessageBoxW(window_,
+                         L"保存できない文書があります。最新内容は復旧領域に保存済みです。\n"
+                         L"復旧可能な状態で終了しますか？",
+                         L"MDLite", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
+    }
+    const int choice = MessageBoxW(
+        window_, L"文書保存と復旧保存の両方に失敗しました。\n"
+                 L"[はい] 別名保存  [いいえ] 編集内容を明示破棄して終了  [キャンセル] 編集へ戻る",
+        L"本文保護", MB_ICONERROR | MB_YESNOCANCEL | MB_DEFBUTTON3);
+    if (choice == IDCANCEL) return false;
+    if (choice == IDNO) return true;
+    for (auto& view : documents_) {
+      if (view->document.dirty() && !SaveDocumentAs(*view)) return false;
+    }
+    return true;
   }
   return result;
+}
+
+bool Application::CloseDocumentsForWorkspaceSwitch() {
+  if (!SaveAll(true)) return false;
+  for (auto& view : documents_) DestroyWindow(view->editor);
+  documents_.clear();
+  TabCtrl_DeleteAllItems(tabs_);
+  TreeView_DeleteAllItems(outline_);
+  active_document_ = static_cast<std::size_t>(-1);
+  return true;
 }
 
 void Application::OnEditorChanged(HWND editor) {
   if (suppress_editor_change_ || ime_composing_) return;
   for (auto& view : documents_) {
     if (view->editor != editor) continue;
-    view->document.MarkEditedFromEditor(EditorText(editor));
-    view->parse = ParseMarkdown(view->document.text());
-    ApplyMarkdownPresentation(*view, true);
-    if (active_document_ < documents_.size() && documents_[active_document_].get() == view.get()) RebuildOutline(*view);
-    SetTimer(window_, kAutosaveTimer, kAutosaveDelayMs, nullptr);
+    SyncDocumentFromEditor(*view);
+    if (IsMarkdownFile(view->document.path())) {
+      view->parse = ParseMarkdown(view->document.text());
+      ApplyMarkdownPresentation(*view, true);
+    } else {
+      view->parse = {};
+    }
+    if (active_document_ < documents_.size() && documents_[active_document_].get() == view.get())
+      RebuildOutline(*view);
+    const ULONGLONG now = GetTickCount64();
+    view->autosave_due = now + kAutosaveDelayMs;
+    if (view->recovery_due == 0) view->recovery_due = now + kRecoveryDelayMs;
+    SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
     UpdateStatus();
     break;
   }
 }
 
+void Application::SyncDocumentFromEditor(DocumentView& view) {
+  const auto transaction = ApplyEditorText(view.editor_snapshot, EditorText(view.editor));
+  if (!transaction.changed) return;
+  view.document.MarkEdited(transaction.source);
+  view.editor_snapshot = BuildEditorSnapshot(view.document.text());
+}
+
 void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
+  if (!IsMarkdownFile(view.document.path())) return;
   if (ime_composing_) return;
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
@@ -786,6 +1054,14 @@ void Application::UpdateStatus() {
 
 void Application::ShowFindBar() {
   ShowWindow(find_bar_, SW_SHOW);
+  ShowWindow(find_edit_, SW_SHOW);
+  ShowWindow(find_next_, SW_SHOW);
+  ShowWindow(replace_edit_, SW_SHOW);
+  ShowWindow(find_workspace_, SW_SHOW);
+  ShowWindow(replace_workspace_, SW_SHOW);
+  ShowWindow(find_case_, SW_SHOW);
+  ShowWindow(find_regex_, SW_SHOW);
+  ShowWindow(find_word_, SW_SHOW);
   LayoutControls();
   SetFocus(find_edit_);
   SendMessageW(find_edit_, EM_SETSEL, 0, -1);
@@ -832,7 +1108,11 @@ void Application::SearchWorkspaceFromFindBar() {
   }
   std::vector<SearchMatch> matches;
   std::wstring error;
-  if (!SearchWorkspace(workspace_, {query_text, false, false}, unsaved, matches, error)) {
+  SearchQuery query{query_text,
+                    SendMessageW(find_case_, BM_GETCHECK, 0, 0) == BST_CHECKED,
+                    SendMessageW(find_regex_, BM_GETCHECK, 0, 0) == BST_CHECKED};
+  query.whole_word = SendMessageW(find_word_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  if (!SearchWorkspace(workspace_, query, unsaved, matches, error)) {
     MessageBoxW(window_, error.c_str(), L"Workspace検索", MB_ICONWARNING);
     return;
   }
@@ -853,6 +1133,62 @@ void Application::SearchWorkspaceFromFindBar() {
   const std::wstring message = std::to_wstring(matches.size()) +
                                L"件見つかりました。最初の一致を開きました。";
   MessageBoxW(window_, message.c_str(), L"Workspace検索", MB_ICONINFORMATION);
+}
+
+void Application::ReplaceWorkspaceFromFindBar() {
+  if (workspace_.empty()) return;
+  ShowFindBar();
+  wchar_t query_text[1024]{};
+  wchar_t replacement[1024]{};
+  GetWindowTextW(find_edit_, query_text, static_cast<int>(std::size(query_text)));
+  GetWindowTextW(replace_edit_, replacement, static_cast<int>(std::size(replacement)));
+  if (query_text[0] == L'\0') { SetFocus(find_edit_); return; }
+  if (!SaveAll(true)) {
+    MessageBoxW(window_, L"置換previewの前に全タブを保存してください。保存できない文書は変更しません。",
+                L"Workspace置換", MB_ICONWARNING);
+    return;
+  }
+  SearchQuery query{query_text,
+                    SendMessageW(find_case_, BM_GETCHECK, 0, 0) == BST_CHECKED,
+                    SendMessageW(find_regex_, BM_GETCHECK, 0, 0) == BST_CHECKED};
+  query.whole_word = SendMessageW(find_word_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  ReplacePlan plan;
+  std::wstring error;
+  if (!PreviewWorkspaceReplace(workspace_, query, replacement, {}, plan, error)) {
+    MessageBoxW(window_, error.c_str(), L"置換preview", MB_ICONWARNING);
+    return;
+  }
+  std::size_t replacements{};
+  for (const auto& file : plan.files) replacements += file.replacement_count;
+  if (replacements == 0) {
+    MessageBoxW(window_, L"置換対象はありません。", L"置換preview", MB_ICONINFORMATION);
+    return;
+  }
+  const std::wstring preview = std::to_wstring(plan.files.size()) + L"ファイル、" +
+      std::to_wstring(replacements) + L"箇所を置換します。\n"
+      L"適用直前に各文書の改訂を再確認し、journalから条件付きで戻せます。続行しますか？";
+  if (MessageBoxW(window_, preview.c_str(), L"置換preview", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+  ReplaceApplyResult result;
+  const bool complete = ApplyWorkspaceReplace(workspace_, plan, result, error);
+  for (auto& view : documents_) {
+    if (std::ranges::any_of(plan.files, [&](const auto& item) { return item.path == view->document.path(); })) {
+      Document reloaded;
+      std::wstring load_error;
+      if (reloaded.Load(view->document.path(), load_error)) {
+        view->document = std::move(reloaded);
+        view->editor_snapshot = BuildEditorSnapshot(view->document.text());
+        suppress_editor_change_ = true;
+        SetWindowTextW(view->editor, view->editor_snapshot.view.c_str());
+        suppress_editor_change_ = false;
+        ApplyMarkdownPresentation(*view, true);
+      }
+    }
+  }
+  PopulateWorkspaceTree();
+  const std::wstring message = std::to_wstring(result.applied_files) + L"ファイル、" +
+      std::to_wstring(result.applied_replacements) + L"箇所を置換しました。\njournal: " +
+      result.journal.wstring() + (complete ? L"" : L"\n競合したファイルは変更していません。");
+  MessageBoxW(window_, message.c_str(), L"Workspace置換", complete ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
 void Application::CreateProfile(BuiltInProfile profile) {
@@ -881,7 +1217,8 @@ void Application::CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME&
 }
 
 void Application::ApplyTableAction(TableAction action) {
-  if (active_document_ >= documents_.size()) return;
+  if (active_document_ >= documents_.size() || ime_composing_ ||
+      !IsMarkdownFile(documents_[active_document_]->document.path())) return;
   HWND editor = documents_[active_document_]->editor;
   CHARRANGE selection{};
   SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
@@ -909,7 +1246,8 @@ void Application::ApplyTableAction(TableAction action) {
 }
 
 void Application::MoveOutlineSection(std::size_t source_begin, std::size_t target_begin) {
-  if (active_document_ >= documents_.size() || source_begin == target_begin) return;
+  if (active_document_ >= documents_.size() || ime_composing_ || source_begin == target_begin ||
+      !IsMarkdownFile(documents_[active_document_]->document.path())) return;
   auto& view = *documents_[active_document_];
   const std::wstring source = EditorText(view.editor);
   const auto edit = MoveHeadingSection(source, source_begin, target_begin);
@@ -923,12 +1261,17 @@ void Application::MoveOutlineSection(std::size_t source_begin, std::size_t targe
   OnEditorChanged(view.editor);
 }
 
-void Application::SaveRecovery(DocumentView& view) {
-  if (!workspace_store_ || !view.document.dirty()) return;
+bool Application::SaveRecovery(DocumentView& view, bool interactive) {
+  if (!view.workspace_store || ime_composing_) return false;
+  SyncDocumentFromEditor(view);
+  if (!view.document.dirty()) return false;
   std::wstring error;
-  if (!workspace_store_->WriteRecovery(view.document.path(), view.document.text(), error)) {
+  if (!view.workspace_store->WriteRecovery(view.document.path(), view.document.text(), error)) {
     SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(error.c_str()));
+    if (interactive) MessageBoxW(window_, error.c_str(), L"復旧保存できません", MB_ICONERROR);
+    return false;
   }
+  return true;
 }
 
 void Application::SaveSession() {
@@ -1069,7 +1412,14 @@ void Application::RenameOrMoveSelected() {
 void Application::DeleteSelected() {
   const auto path = SelectedTreePath();
   if (path.empty()) return;
-  if (IsDocumentOpen(path)) {
+  const auto is_open_or_parent = [&](const auto& view) {
+    if (view->document.path() == path) return true;
+    if (!std::filesystem::is_directory(path)) return false;
+    std::error_code relative_error;
+    const auto relative = std::filesystem::relative(view->document.path(), path, relative_error);
+    return !relative_error && !relative.empty() && !relative.native().starts_with(L"..");
+  };
+  if (std::ranges::any_of(documents_, is_open_or_parent)) {
     MessageBoxW(window_, L"開いている文書は保存してタブを閉じてから削除してください。",
                 L"本文保護", MB_ICONWARNING);
     return;
@@ -1106,6 +1456,58 @@ void Application::ShowSelectedInExplorer() {
   if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &item, 0, nullptr))) {
     SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
     CoTaskMemFree(item);
+  }
+}
+
+void Application::SetWorkspaceTrust(bool trusted) {
+  if (workspace_.empty() || !workspace_store_) return;
+  if (trusted && MessageBoxW(window_,
+      L"このWorkspaceを信頼すると、明示したGit操作と外部storage adapterを実行できます。\n"
+      L"設定ファイルをGitで移しても、この端末localの信頼状態は引き継がれません。信頼しますか？",
+      L"Workspace Trust", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+  std::wstring error;
+  if (!SetWorkspaceTrusted(workspace_, trusted, error)) {
+    MessageBoxW(window_, error.c_str(), L"Workspace Trust", MB_ICONERROR);
+    return;
+  }
+  MessageBoxW(window_, trusted ? L"このWorkspaceを信頼しました。" : L"Workspaceの信頼を解除しました。",
+              L"Workspace Trust", MB_ICONINFORMATION);
+}
+
+void Application::RunGitStatus() {
+  if (workspace_.empty()) return;
+  if (!IsWorkspaceTrusted(workspace_)) {
+    MessageBoxW(window_, L"未信頼Workspaceでは外部processを実行しません。Workspaceメニューから明示的に信頼してください。",
+                L"Git", MB_ICONWARNING);
+    return;
+  }
+  wchar_t git_path[32768]{};
+  if (SearchPathW(nullptr, L"git.exe", nullptr, static_cast<DWORD>(std::size(git_path)), git_path, nullptr) == 0) {
+    MessageBoxW(window_, L"git.exeが見つかりません。PATHまたはGit for Windowsを確認してください。",
+                L"Git", MB_ICONWARNING);
+    return;
+  }
+  ProcessResult status;
+  std::wstring error;
+  if (!RunProcess(git_path, {L"-C", workspace_.wstring(), L"status", L"--short", L"--branch"},
+                  workspace_, 64 * 1024, 30000, status, error)) {
+    MessageBoxW(window_, error.c_str(), L"Git", MB_ICONERROR);
+    return;
+  }
+  ProcessResult branches;
+  RunProcess(git_path, {L"-C", workspace_.wstring(), L"branch", L"--format=%(HEAD) %(refname:short)"},
+             workspace_, 64 * 1024, 30000, branches, error);
+  std::wstring output = L"status\n" + status.output + L"\nbranches\n" + branches.output;
+  if (status.truncated || branches.truncated) output += L"\n(出力上限で省略しました)";
+  MessageBoxW(window_, output.c_str(), L"Git Status / Branches", status.exit_code == 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+void Application::OpenWorkspaceSettings() {
+  if (!workspace_store_) return;
+  const auto root = workspace_store_->metadata_root();
+  for (const auto& relative : {L"workspace.toml", L"profiles.toml", L"keybindings.toml", L"commands.toml"}) {
+    const auto path = root / relative;
+    if (std::filesystem::is_regular_file(path)) OpenDocument(path);
   }
 }
 

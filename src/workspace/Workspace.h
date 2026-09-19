@@ -17,6 +17,8 @@ class WorkspaceStore {
   std::vector<std::filesystem::path> RecoveryFiles() const;
   bool WriteSession(const std::vector<std::filesystem::path>& open_documents,
                     std::wstring& error) const;
+  bool ReadSession(std::vector<std::filesystem::path>& open_documents,
+                   std::wstring& error) const;
 
   [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
   [[nodiscard]] std::filesystem::path metadata_root() const { return root_ / L".mdlite"; }

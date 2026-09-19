@@ -6,6 +6,7 @@
 #include <atomic>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <system_error>
 
@@ -31,24 +32,56 @@ std::wstring WindowsError(const wchar_t* action, DWORD code = GetLastError()) {
   return result;
 }
 
-bool ReadBytes(const std::filesystem::path& path, std::vector<std::byte>& bytes, std::wstring& error) {
-  std::ifstream input(path, std::ios::binary | std::ios::ate);
-  if (!input) {
-    error = L"ファイルを開けません: " + path.wstring();
+std::uint64_t HashBytes(std::span<const std::byte> bytes) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (const std::byte value : bytes) {
+    hash ^= std::to_integer<unsigned char>(value);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+bool ReadSnapshot(const std::filesystem::path& path, std::vector<std::byte>& bytes,
+                  FileFingerprint& fingerprint, std::wstring& error) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                         FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    error = WindowsError(L"ファイルを開けません");
     return false;
   }
-  const auto end = input.tellg();
-  if (end < 0 || static_cast<std::uint64_t>(end) >
-                     static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    error = L"ファイルサイズを取得できません。";
+  BY_HANDLE_FILE_INFORMATION info{};
+  LARGE_INTEGER size{};
+  if (!GetFileInformationByHandle(file, &info) || !GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
+      static_cast<unsigned long long>(size.QuadPart) >
+          static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
+    error = WindowsError(L"ファイル状態を取得できません");
+    CloseHandle(file);
     return false;
   }
-  bytes.resize(static_cast<std::size_t>(end));
-  input.seekg(0, std::ios::beg);
-  if (!bytes.empty() && !input.read(reinterpret_cast<char*>(bytes.data()), end)) {
-    error = L"ファイルを最後まで読み込めません。";
-    return false;
+  bytes.resize(static_cast<std::size_t>(size.QuadPart));
+  std::size_t offset = 0;
+  while (offset < bytes.size()) {
+    const auto remaining = std::min<std::size_t>(bytes.size() - offset, 1U << 20U);
+    DWORD read{};
+    if (!ReadFile(file, bytes.data() + offset, static_cast<DWORD>(remaining), &read, nullptr) ||
+        read == 0) {
+      error = WindowsError(L"ファイルを最後まで読み込めません");
+      CloseHandle(file);
+      return false;
+    }
+    offset += read;
   }
+  fingerprint.size = static_cast<std::uint64_t>(size.QuadPart);
+  fingerprint.write_time =
+      (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32U) |
+      info.ftLastWriteTime.dwLowDateTime;
+  fingerprint.file_id = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32U) |
+                        info.nFileIndexLow;
+  fingerprint.content_hash = HashBytes(bytes);
+  fingerprint.volume_id = info.dwVolumeSerialNumber;
+  fingerprint.valid = true;
+  CloseHandle(file);
   return true;
 }
 
@@ -76,6 +109,16 @@ bool Encode(const std::wstring& text, TextEncoding encoding, std::vector<std::by
     error = L"文書が文字コード変換の上限を超えています。";
     return false;
   }
+  const std::size_t prefix = encoding == TextEncoding::Utf8Bom ? 3U : 0U;
+  if (text.empty()) {
+    bytes.assign(prefix, std::byte{});
+    if (prefix != 0U) {
+      bytes[0] = std::byte{0xEF};
+      bytes[1] = std::byte{0xBB};
+      bytes[2] = std::byte{0xBF};
+    }
+    return true;
+  }
   const int source_size = static_cast<int>(text.size());
   const int required = WideCharToMultiByte(code_page, flags, text.data(), source_size, nullptr, 0,
                                            nullptr, used_default_ptr);
@@ -85,7 +128,6 @@ bool Encode(const std::wstring& text, TextEncoding encoding, std::vector<std::by
                 : L"UTF-8へ変換できない文字があります。";
     return false;
   }
-  const std::size_t prefix = encoding == TextEncoding::Utf8Bom ? 3U : 0U;
   bytes.resize(prefix + static_cast<std::size_t>(required));
   if (prefix != 0U) {
     bytes[0] = std::byte{0xEF};
@@ -107,21 +149,10 @@ bool Encode(const std::wstring& text, TextEncoding encoding, std::vector<std::by
 }
 
 FileFingerprint Fingerprint(const std::filesystem::path& path) {
+  std::vector<std::byte> ignored;
   FileFingerprint result{};
-  HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) return result;
-  BY_HANDLE_FILE_INFORMATION info{};
-  if (GetFileInformationByHandle(file, &info)) {
-    result.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32U) | info.nFileSizeLow;
-    result.write_time = (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32U) |
-                        info.ftLastWriteTime.dwLowDateTime;
-    result.file_id = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32U) | info.nFileIndexLow;
-    result.volume_id = info.dwVolumeSerialNumber;
-    result.valid = true;
-  }
-  CloseHandle(file);
+  std::wstring ignored_error;
+  ReadSnapshot(path, ignored, result, ignored_error);
   return result;
 }
 
@@ -137,6 +168,78 @@ LineEnding DetectLineEnding(const std::wstring& text) {
   if (crlf) return LineEnding::CrLf;
   if (lf) return LineEnding::Lf;
   return LineEnding::None;
+}
+
+struct SourceLine {
+  std::wstring_view content;
+  bool has_break{};
+  bool crlf{};
+};
+
+std::vector<SourceLine> SplitLines(std::wstring_view text) {
+  std::vector<SourceLine> lines;
+  std::size_t begin = 0;
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    if (text[index] != L'\n') continue;
+    const bool crlf = index > begin && text[index - 1] == L'\r';
+    const std::size_t content_end = crlf ? index - 1 : index;
+    lines.push_back({text.substr(begin, content_end - begin), true, crlf});
+    begin = index + 1;
+  }
+  lines.push_back({text.substr(begin), false, false});
+  return lines;
+}
+
+std::wstring RestoreMixedLineEndings(std::wstring_view original, std::wstring_view editor_text) {
+  const auto old_lines = SplitLines(original);
+  const auto new_lines = SplitLines(editor_text);
+  std::vector<std::optional<std::size_t>> mapping(new_lines.size());
+  std::vector<bool> used(old_lines.size());
+
+  std::size_t prefix = 0;
+  while (prefix < old_lines.size() && prefix < new_lines.size() &&
+         old_lines[prefix].content == new_lines[prefix].content) {
+    mapping[prefix] = prefix;
+    used[prefix] = true;
+    ++prefix;
+  }
+  std::size_t old_suffix = old_lines.size();
+  std::size_t new_suffix = new_lines.size();
+  while (old_suffix > prefix && new_suffix > prefix &&
+         old_lines[old_suffix - 1].content == new_lines[new_suffix - 1].content) {
+    --old_suffix;
+    --new_suffix;
+    mapping[new_suffix] = old_suffix;
+    used[old_suffix] = true;
+  }
+  for (std::size_t next = prefix; next < new_suffix; ++next) {
+    for (std::size_t old = prefix; old < old_suffix; ++old) {
+      if (!used[old] && old_lines[old].content == new_lines[next].content) {
+        mapping[next] = old;
+        used[old] = true;
+        break;
+      }
+    }
+  }
+
+  std::wstring restored;
+  restored.reserve(editor_text.size());
+  bool fallback_crlf = std::ranges::any_of(old_lines, [](const SourceLine& line) {
+    return line.has_break && line.crlf;
+  });
+  for (std::size_t index = 0; index < new_lines.size(); ++index) {
+    restored.append(new_lines[index].content);
+    if (!new_lines[index].has_break) continue;
+    bool crlf = fallback_crlf;
+    if (mapping[index].has_value()) {
+      const SourceLine& original_line = old_lines[*mapping[index]];
+      if (original_line.has_break) crlf = original_line.crlf;
+    }
+    if (crlf) restored.push_back(L'\r');
+    restored.push_back(L'\n');
+    fallback_crlf = crlf;
+  }
+  return restored;
 }
 
 bool WriteAll(HANDLE file, std::span<const std::byte> bytes, std::wstring& error) {
@@ -155,7 +258,7 @@ bool WriteAll(HANDLE file, std::span<const std::byte> bytes, std::wstring& error
 }
 
 bool SafeReplace(const std::filesystem::path& target, std::span<const std::byte> bytes,
-                 std::wstring& error) {
+                 const FileFingerprint& expected, std::wstring& error) {
   static std::atomic_uint64_t counter{};
   std::filesystem::path temporary = target;
   temporary += L".mdlite-save-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -178,16 +281,47 @@ bool SafeReplace(const std::filesystem::path& target, std::span<const std::byte>
     return false;
   }
 
-  const DWORD attributes = GetFileAttributesW(target.c_str());
-  if (attributes != INVALID_FILE_ATTRIBUTES) {
-    if (!ReplaceFileW(target.c_str(), temporary.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS,
-                      nullptr, nullptr)) {
-      error = WindowsError(L"元ファイルを安全に置換できません");
-      DeleteFileW(temporary.c_str());
-      return false;
-    }
-  } else if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
-    error = WindowsError(L"新しいファイルを保存できません");
+  const FileFingerprint before_replace = Fingerprint(target);
+  if (!before_replace.valid || !(before_replace == expected)) {
+    error = L"一時ファイル作成中に元ファイルが変更または削除されました。上書きしていません。";
+    DeleteFileW(temporary.c_str());
+    return false;
+  }
+
+  if (!ReplaceFileW(target.c_str(), temporary.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS,
+                    nullptr, nullptr)) {
+    error = WindowsError(L"元ファイルを安全に置換できません");
+    DeleteFileW(temporary.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool SafeCreate(const std::filesystem::path& target, std::span<const std::byte> bytes,
+                std::wstring& error) {
+  if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    error = L"同名ファイルがあります。上書きしていません。";
+    return false;
+  }
+  static std::atomic_uint64_t counter{};
+  std::filesystem::path temporary = target;
+  temporary += L".mdlite-saveas-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+               std::to_wstring(++counter) + L".tmp";
+  HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    error = WindowsError(L"別名保存用の一時ファイルを作成できません");
+    return false;
+  }
+  bool ok = WriteAll(file, bytes, error);
+  if (ok && !FlushFileBuffers(file)) {
+    error = WindowsError(L"別名保存内容をディスクへ反映できません");
+    ok = false;
+  }
+  CloseHandle(file);
+  if (!ok || GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES ||
+      !MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    if (ok) error = WindowsError(L"別名保存先へ移動できません");
     DeleteFileW(temporary.c_str());
     return false;
   }
@@ -198,18 +332,24 @@ bool SafeReplace(const std::filesystem::path& target, std::span<const std::byte>
 
 bool Document::Load(const std::filesystem::path& path, std::wstring& error) {
   std::vector<std::byte> bytes;
-  if (!ReadBytes(path, bytes, error)) return false;
+  FileFingerprint fingerprint{};
+  if (!ReadSnapshot(path, bytes, fingerprint, error)) return false;
 
   std::span<const std::byte> payload(bytes);
   TextEncoding detected = TextEncoding::Utf8;
-  if (bytes.size() >= 3 && bytes[0] == std::byte{0xEF} && bytes[1] == std::byte{0xBB} &&
-      bytes[2] == std::byte{0xBF}) {
+  const bool has_utf8_bom = bytes.size() >= 3 && bytes[0] == std::byte{0xEF} &&
+                            bytes[1] == std::byte{0xBB} && bytes[2] == std::byte{0xBF};
+  if (has_utf8_bom) {
     detected = TextEncoding::Utf8Bom;
     payload = payload.subspan(3);
   }
 
   std::wstring decoded;
   if (!Decode(payload, CP_UTF8, MB_ERR_INVALID_CHARS, decoded)) {
+    if (has_utf8_bom) {
+      error = L"UTF-8 BOMがありますが、本文が正しいUTF-8ではありません。自動判定でCP932へ変更しません。";
+      return false;
+    }
     detected = TextEncoding::Cp932;
     if (!Decode(payload, 932U, MB_ERR_INVALID_CHARS, decoded)) {
       error = L"UTF-8またはCP932として安全に読み込めません。文字コードを確認してください。";
@@ -217,11 +357,6 @@ bool Document::Load(const std::filesystem::path& path, std::wstring& error) {
     }
   }
 
-  const FileFingerprint fingerprint = Fingerprint(path);
-  if (!fingerprint.valid) {
-    error = L"読み込み後のファイル状態を確認できません。";
-    return false;
-  }
   path_ = std::filesystem::absolute(path).lexically_normal();
   text_ = std::move(decoded);
   encoding_ = detected;
@@ -241,12 +376,27 @@ bool Document::Save(std::wstring& error) {
   }
   std::vector<std::byte> bytes;
   if (!Encode(text_, encoding_, bytes, error)) return false;
-  if (!SafeReplace(path_, bytes, error)) return false;
+  if (!SafeReplace(path_, bytes, disk_fingerprint_, error)) return false;
   disk_fingerprint_ = Fingerprint(path_);
   if (!disk_fingerprint_.valid) {
     error = L"保存後のファイル状態を確認できません。";
     return false;
   }
+  saved_revision_ = revision_;
+  return true;
+}
+
+bool Document::SaveAs(const std::filesystem::path& path, std::wstring& error) {
+  const auto absolute = std::filesystem::absolute(path).lexically_normal();
+  std::vector<std::byte> bytes;
+  if (!Encode(text_, encoding_, bytes, error) || !SafeCreate(absolute, bytes, error)) return false;
+  const FileFingerprint fingerprint = Fingerprint(absolute);
+  if (!fingerprint.valid) {
+    error = L"別名保存後のファイル状態を確認できません。";
+    return false;
+  }
+  path_ = absolute;
+  disk_fingerprint_ = fingerprint;
   saved_revision_ = revision_;
   return true;
 }
@@ -265,26 +415,7 @@ void Document::MarkEditedFromEditor(std::wstring text) {
     return;
   }
 
-  std::vector<bool> original_endings;
-  for (std::size_t index = 0; index < text_.size(); ++index) {
-    if (text_[index] != L'\n') continue;
-    original_endings.push_back(index != 0 && text_[index - 1] == L'\r');
-  }
-  std::wstring restored;
-  restored.reserve(text.size());
-  std::size_t line = 0;
-  for (std::size_t index = 0; index < text.size(); ++index) {
-    if (text[index] == L'\r' && index + 1 < text.size() && text[index + 1] == L'\n') {
-      const bool use_crlf = line < original_endings.size() ? original_endings[line] : true;
-      if (use_crlf) restored.push_back(L'\r');
-      restored.push_back(L'\n');
-      ++index;
-      ++line;
-    } else {
-      restored.push_back(text[index]);
-    }
-  }
-  MarkEdited(std::move(restored));
+  MarkEdited(RestoreMixedLineEndings(text_, text));
 }
 
 bool Document::HasExternalChange() const {

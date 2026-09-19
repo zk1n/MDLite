@@ -14,6 +14,7 @@ struct FileFingerprint {
   std::uint64_t size{};
   std::uint64_t write_time{};
   std::uint64_t file_id{};
+  std::uint64_t content_hash{};
   std::uint32_t volume_id{};
   bool valid{};
 
@@ -24,6 +25,7 @@ class Document {
  public:
   bool Load(const std::filesystem::path& path, std::wstring& error);
   bool Save(std::wstring& error);
+  bool SaveAs(const std::filesystem::path& path, std::wstring& error);
 
   void SetText(std::wstring text);
   void MarkEdited(std::wstring text);

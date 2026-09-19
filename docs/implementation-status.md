@@ -37,10 +37,10 @@ Human操作、未検証を区別する。
 | A-13 | 未編集Saveは書込みなし。 | exact bytes unit PASS。 | 自動PASS |
 | A-14 | CP932 best-fit禁止、変換不能文字を拒否。 | emoji拒否unit PASS。 | 自動PASS |
 | A-15 | `.state/recovery`へUTF-8原文を原子的保存し、起動時に検出。 | Core recovery試験PASS。実クラッシュ復元未実施。 | 部分検証 |
-| A-16 | session読書き、Ctrl+W tab close、Workspace正規path別mutexを実装。 | session範囲・Trust unit PASS。compact windowは未実装。 | 部分実装 |
-| A-17 | 信頼済みWorkspaceだけでGit CLIを引数配列実行し、status/branch一覧をGUI表示。 | bounded process unit PASS。branch作成・切替・merge/abort UIは未実装。 | 部分実装 |
+| A-16 | session読書き、Ctrl+W tab close、Workspace正規path別mutex、文書ごとに編集ビューを移送する複数compact windowを実装。 | session範囲・Trust unit PASS。compact配置のsession復元と実GUI操作は未検証。 | 実装済み・部分検証 |
+| A-17 | 信頼済みWorkspaceだけでGit CLIを引数配列実行。status/diff、stage/unstage、commit、branch作成/切替、merge/abort、fetch、ff-only pull、pushを確認付きGUIへ接続し、working tree変更前は全文書を保存する。 | bounded process unit PASS。実repository GUI操作、競合採用補助、実行中cancelは未検証／未実装。 | 実装済み・部分検証 |
 | A-18 | 未信頼Workspaceでは外部processを拒否。ProcessRunnerは引数配列、Job、timeout/cancel、64KiBログ上限。 | Trust／process unit PASS。Git変更操作は未実装なので無断実行なし。 | 自動PASS（実装範囲） |
-| A-19 | 共有設定4ファイルをGUIの編集tabへ開ける。検索条件UIを実装。 | theme、keybinding、command palette専用GUIは未実装。 | 未達 |
+| A-19 | 共有設定4ファイルをGUI tabへ開け、検索条件UIと実行可否理由を示す名称検索command palette（Ctrl+Shift+P）を実装。 | theme GUI、keybinding変更・重複検出、設定の階層GUIは未実装。 | 部分実装 |
 | A-20 | 共有設定と`.state`を分離し、Trustは`.state/trust.local`のpath固有tokenでGit移行されない。 | trust設定・解除unit PASS。 | 自動PASS |
 | A-21 | アプリ本体にネットワークAPIなし。祝日は同梱。 | Debug起動スモークで通信計測は未実施。 | 部分検証 |
 | A-22 | `tools/Measure-Performance.ps1`が隔離Workspaceを生成しReleaseを測定。 | 2026-09-19 fresh 5秒sample: P0 WS 13,996,032/private 2,449,408 bytes、2,000 files WS 15,126,528/private 3,309,568 bytes。通常目標50MB内。UI操作p95は未測定。 | 部分PASS |
@@ -52,7 +52,7 @@ Human操作、未検証を区別する。
 | A-28 | 子見出しを含むsection move、子孫drop拒否、単一RichEdit Undo操作。 | section unit PASS。実ドラッグ／Undo Human Gate未実施。 | 部分検証 |
 | A-29 | 既定パス、原子的採番、cursor位置。メニュー作成。 | Profile unit PASS。GUI設定編集未実装。 | 部分実装 |
 | A-30 | 日曜始まりMonth Calendar、作成済み日／祝日bold、日付作成。 | 公式CSV 2026-02-02取得の2025〜2027をunit確認。GUI tooltip未実装。 | 部分実装 |
-| A-31 | 5形式のD&D、assetsコピー、衝突回避、相対リンク、危険SVG拒否、native inline object、source mappingを実装。 | Asset／mapping unit PASS。実decode 5形式、clipboard paste、resize、GIF animationは未検証／未実装。 | 未達 |
+| A-31 | 5形式のD&D、assetsコピー、衝突回避、相対リンク、危険SVG拒否、native inline object、source mapping、clipboard bitmapの一意PNG保存、Markdownから限定HTML imgへのUndo可能な幅変更を実装。 | Asset／mapping／img width parser unit PASS。実decode 5形式、clipboard GUI、比率表示、GIF/animated WebP再生は未検証／未実装。 | 部分実装 |
 | A-32 | 明示GUI操作・Trust・設定可能なexternal command adapter、取消handle、失敗時local保持、実行前後hash、revision引数を実装。 | mock CLI成功とlocal不変 unit PASS。本番資格・通信は未使用。 | 自動PASS（mock） |
 | A-33 | 初回ローカル試験では署名保留。 | 公開packageを生成していない。 | Release時保留 |
 | A-34 | feature checkpointを両remote同名refへ通常push。 | `ed81de84044c4d3ea635372914c3b2ee333cd242`がForgejo/GitHubで一致。最終develop統合は未実施。 | checkpoint PASS |
@@ -68,5 +68,5 @@ GUIを呼ばないため、クリック、D&D、Undo/Redo、Microsoft IME、ATOK
 
 derived viewに対する実クリック、スクロール、hit test、画像resize／animation、Microsoft IME、ATOK、DPI、
 table矢印・Undoは未検証。Computer Use helperがnative app inventoryを返さなかったことは環境上の証拠であり、
-Human受入PASSを意味しない。A-16 compact window、A-17変更Git操作、A-19設定専用GUI、A-23大容量最適化、
-A-31 clipboard/resize/animationは実装未完として残す。
+Human受入PASSを意味しない。A-16 compact配置復元、A-17競合補助／cancel、A-19 theme・keybinding・設定階層GUI、
+A-23大容量最適化、A-31 animationは実装未完として残す。

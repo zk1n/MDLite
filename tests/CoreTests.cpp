@@ -225,6 +225,14 @@ void TestMarkdown() {
   Check(visual.images.size() == 1 && visual.images.front().target == L"assets/a.png",
         "image references retain source ranges and targets");
   Check(visual.tables.size() == 1, "GFM table blocks are identified for native presentation");
+  const auto resized = mdlite::ParseMarkdown(
+      L"<img src=\"assets/a.png\" alt=\"sample\" width=\"480\">\n");
+  Check(resized.images.size() == 1 && resized.images.front().target == L"assets/a.png" &&
+            resized.images.front().width_dip == 480,
+        "safe generated img markup retains target and display width");
+  Check(mdlite::BuildMarkdownEditorSnapshot(
+            L"<img src=\"assets/a.png\" alt=\"sample\" width=\"480\">").view == L"\uFFFC",
+        "resized img markup remains a native derived image object");
 
   const std::wstring outline = L"# First\nintro\n## Child\nchild\n# Second\nend\n# Third\nlast\n";
   const auto outline_parse = mdlite::ParseMarkdown(outline);
@@ -428,6 +436,14 @@ void TestStorageAdapter(const std::filesystem::path& root) {
         "mock storage adapter success is supported");
   Check(result.reference == L"https://example.invalid/asset" && ReadBytes(asset) == std::vector<unsigned char>({'P','N','G'}),
         "storage adapter keeps local asset and returns a reference");
+
+  const auto invalid_config = directory / L"storage-invalid.toml";
+  WriteBytes(invalid_config, std::vector<unsigned char>{
+      'e','x','e','c','u','t','a','b','l','e',' ','=',' ','"','c','m','d','.','e','x','e','"','\n',
+      't','i','m','e','o','u','t','_','m','s',' ','=',' ','n','o','t','-','a','-','n','u','m','b','e','r','\n'});
+  error.clear();
+  Check(!mdlite::LoadStorageAdapter(invalid_config, adapter, error) && !error.empty(),
+        "invalid storage timeout is reported without terminating the app");
 }
 
 }  // namespace

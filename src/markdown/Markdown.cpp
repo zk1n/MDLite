@@ -42,6 +42,34 @@ void ParseImages(std::wstring_view line, std::size_t line_offset, MarkdownParseR
                              std::wstring(line.substr(alt_end + 2, target_end - alt_end - 2)), 0});
     cursor = target_end + 1;
   }
+  cursor = 0;
+  while ((cursor = line.find(L"<img ", cursor)) != std::wstring_view::npos) {
+    const auto element_end = line.find(L'>', cursor + 5);
+    if (element_end == std::wstring_view::npos) break;
+    const auto element = line.substr(cursor, element_end - cursor + 1);
+    const auto attribute = [&](std::wstring_view name) -> std::wstring {
+      const auto marker = name.empty() ? std::wstring{} : std::wstring(name) + L"=\"";
+      const auto begin = element.find(marker);
+      if (begin == std::wstring_view::npos) return {};
+      const auto value_begin = begin + marker.size();
+      const auto value_end = element.find(L'"', value_begin);
+      return value_end == std::wstring_view::npos ? std::wstring{}
+                                                   : std::wstring(element.substr(value_begin, value_end - value_begin));
+    };
+    const auto target = attribute(L"src");
+    if (!target.empty()) {
+      unsigned width{};
+      try {
+        const auto width_text = attribute(L"width");
+        if (!width_text.empty()) width = static_cast<unsigned>(std::stoul(width_text));
+      } catch (const std::exception&) {
+        width = 0;
+      }
+      result.images.push_back({line_offset + cursor, line_offset + element_end + 1,
+                               attribute(L"alt"), target, width});
+    }
+    cursor = element_end + 1;
+  }
 }
 
 bool LooksLikeTableDelimiter(std::wstring_view line) {

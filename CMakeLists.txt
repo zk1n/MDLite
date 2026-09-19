@@ -49,7 +49,7 @@ add_executable(MDLite WIN32
 )
 target_compile_definitions(MDLite PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(MDLite PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid)
+target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs)
 
 include(CTest)
 if(BUILD_TESTING)

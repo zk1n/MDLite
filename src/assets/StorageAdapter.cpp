@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace mdlite {
@@ -62,7 +63,24 @@ bool LoadStorageAdapter(const std::filesystem::path& config, StorageAdapter& ada
     else if (line.starts_with(L"argument")) adapter.arguments.push_back(Unquote(line));
     else if (line.starts_with(L"timeout_ms")) {
       const auto equals = line.find(L'=');
-      if (equals != std::wstring::npos) adapter.timeout_ms = std::stoul(line.substr(equals + 1));
+      if (equals == std::wstring::npos) {
+        error = L"storage adapterのtimeout_msが不正です。";
+        return false;
+      }
+      try {
+        std::size_t parsed{};
+        const auto value = std::stoull(line.substr(equals + 1), &parsed);
+        const auto suffix = line.substr(equals + 1 + parsed);
+        if (suffix.find_first_not_of(L" \t\r") != std::wstring::npos || value == 0 ||
+            value > std::numeric_limits<DWORD>::max()) {
+          error = L"storage adapterのtimeout_msは1以上のミリ秒で指定してください。";
+          return false;
+        }
+        adapter.timeout_ms = static_cast<DWORD>(value);
+      } catch (const std::exception&) {
+        error = L"storage adapterのtimeout_msは1以上のミリ秒で指定してください。";
+        return false;
+      }
     }
   }
   if (adapter.executable.empty()) { error = L"storage adapterのexecutableが未設定です。"; return false; }

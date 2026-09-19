@@ -31,6 +31,7 @@ class Application {
     MarkdownParseResult parse;
     EditorSnapshot editor_snapshot;
     int active_line{-1};
+    HWND compact_window{};
     std::shared_ptr<WorkspaceStore> workspace_store;
     ULONGLONG autosave_due{};
     ULONGLONG recovery_due{};
@@ -40,6 +41,7 @@ class Application {
                            InsertColumnAfter, DeleteColumn };
 
   static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+  static LRESULT CALLBACK CompactWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   static LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                           UINT_PTR subclass_id, DWORD_PTR reference);
   LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
@@ -87,8 +89,13 @@ class Application {
   void ShowSelectedInExplorer();
   void SetWorkspaceTrust(bool trusted);
   void RunGitStatus();
+  void RunGitAction(int command);
   void OpenWorkspaceSettings();
+  void ShowCommandPalette();
+  void ToggleCompactWindow();
   void UploadImageAtCaret();
+  bool PasteClipboardImage();
+  void ResizeImageAtCaret(unsigned width_dip);
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
 

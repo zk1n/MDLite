@@ -17,6 +17,7 @@
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <tom.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,7 @@ namespace mdlite {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"MDLite.MainWindow";
+constexpr wchar_t kCompactWindowClass[] = L"MDLite.CompactWindow";
 constexpr UINT_PTR kAutosaveTimer = 1;
 constexpr UINT kAutosaveDelayMs = 750;
 constexpr UINT kTimerPollMs = 250;
@@ -74,10 +76,26 @@ enum ControlId : int {
   kEditReplaceWorkspace,
   kViewCalendar,
   kViewSettings,
+  kViewCompact,
+  kViewCommandPalette,
   kWorkspaceTrust,
   kWorkspaceUntrust,
   kGitStatus,
+  kGitDiff,
+  kGitStageAll,
+  kGitUnstageAll,
+  kGitCommit,
+  kGitBranchCreate,
+  kGitBranchSwitch,
+  kGitMerge,
+  kGitMergeAbort,
+  kGitFetch,
+  kGitPull,
+  kGitPush,
   kImageUpload,
+  kImageWidth320,
+  kImageWidth480,
+  kImageWidth640,
   kTableRowBefore,
   kTableRowAfter,
   kTableRowDelete,
@@ -141,6 +159,97 @@ class PresentationUndoGuard {
   ITextDocument* document_{};
 };
 
+struct PromptContext {
+  std::wstring label;
+  std::wstring value;
+  int height{155};
+  HWND edit{};
+  bool accepted{};
+  bool completed{};
+};
+
+LRESULT CALLBACK PromptWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto* context = reinterpret_cast<PromptContext*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+    context = static_cast<PromptContext*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
+  }
+  if (!context) return DefWindowProcW(window, message, wparam, lparam);
+  if (message == WM_CREATE) {
+    CreateWindowExW(0, L"STATIC", context->label.c_str(), WS_CHILD | WS_VISIBLE,
+                    12, 12, 436, context->height - 119, window, nullptr, nullptr, nullptr);
+    context->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context->value.c_str(),
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    12, context->height - 103, 436, 25, window, reinterpret_cast<HMENU>(100), nullptr, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                    280, context->height - 65, 80, 27, window, reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                    368, context->height - 65, 80, 27, window, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+    SetFocus(context->edit);
+    SendMessageW(context->edit, EM_SETSEL, 0, -1);
+    return 0;
+  }
+  if (message == WM_COMMAND && (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL)) {
+    if (LOWORD(wparam) == IDOK) {
+      const int length = GetWindowTextLengthW(context->edit);
+      context->value.resize(static_cast<std::size_t>(length) + 1);
+      GetWindowTextW(context->edit, context->value.data(), length + 1);
+      context->value.resize(static_cast<std::size_t>(length));
+      context->accepted = true;
+    }
+    context->completed = true;
+    DestroyWindow(window);
+    return 0;
+  }
+  if (message == WM_CLOSE) {
+    context->completed = true;
+    DestroyWindow(window);
+    return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool PromptText(HWND owner, HINSTANCE instance, std::wstring_view title, std::wstring_view label,
+                std::wstring& value) {
+  constexpr wchar_t prompt_class[] = L"MDLite.PromptWindow";
+  WNDCLASSEXW existing{sizeof(existing)};
+  if (!GetClassInfoExW(instance, prompt_class, &existing)) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.lpfnWndProc = PromptWindowProc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    window_class.lpszClassName = prompt_class;
+    if (!RegisterClassExW(&window_class)) return false;
+  }
+  const auto lines = static_cast<int>(std::count(label.begin(), label.end(), L'\n')) + 1;
+  const int height = std::clamp(130 + lines * 18, 155, 520);
+  PromptContext context{std::wstring(label), value, height};
+  RECT owner_rect{};
+  GetWindowRect(owner, &owner_rect);
+  const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - 480) / 2;
+  const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
+  HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, prompt_class, std::wstring(title).c_str(),
+                                 WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+                                 x, y, 480, height, owner, nullptr, instance, &context);
+  if (!dialog) return false;
+  EnableWindow(owner, FALSE);
+  MSG message{};
+  int message_result = 1;
+  while (!context.completed && (message_result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+    if (!IsDialogMessageW(dialog, &message)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  if (message_result == 0) PostQuitMessage(static_cast<int>(message.wParam));
+  EnableWindow(owner, TRUE);
+  SetForegroundWindow(owner);
+  if (context.accepted) value = std::move(context.value);
+  return context.accepted;
+}
+
 }  // namespace
 
 Application::Application(HINSTANCE instance) : instance_(instance) {}
@@ -163,6 +272,16 @@ bool Application::Initialize(int show_command) {
   window_class.lpszClassName = kWindowClass;
   if (RegisterClassExW(&window_class) == 0) return false;
 
+  WNDCLASSEXW compact_class{sizeof(compact_class)};
+  compact_class.style = CS_HREDRAW | CS_VREDRAW;
+  compact_class.lpfnWndProc = CompactWindowProc;
+  compact_class.hInstance = instance_;
+  compact_class.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+  compact_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  compact_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+  compact_class.lpszClassName = kCompactWindowClass;
+  if (RegisterClassExW(&compact_class) == 0) return false;
+
   window_ = CreateWindowExW(0, kWindowClass, L"MDLite", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                             CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, instance_, this);
   if (window_ == nullptr) return false;
@@ -177,6 +296,7 @@ int Application::Run() {
       {FVIRTKEY | FCONTROL, 'S', kFileSave},
       {FVIRTKEY | FCONTROL, 'F', kEditFind},
       {FVIRTKEY | FCONTROL, 'P', kFileQuickOpen},
+      {FVIRTKEY | FCONTROL | FSHIFT, 'P', kViewCommandPalette},
       {FVIRTKEY | FCONTROL, 'W', kFileClose},
       {FVIRTKEY, VK_F3, kEditFindNext},
   };
@@ -214,9 +334,42 @@ LRESULT CALLBACK Application::WindowProc(HWND window, UINT message, WPARAM wpara
                         : DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK Application::CompactWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  Application* app = reinterpret_cast<Application*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+    app = static_cast<Application*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+  }
+  if (app == nullptr) return DefWindowProcW(window, message, wparam, lparam);
+  auto view = std::ranges::find_if(app->documents_, [window](const auto& candidate) {
+    return candidate->compact_window == window;
+  });
+  if (message == WM_SIZE && view != app->documents_.end()) {
+    RECT client{};
+    GetClientRect(window, &client);
+    MoveWindow((*view)->editor, 0, 0, client.right, client.bottom, TRUE);
+    return 0;
+  }
+  if (message == WM_SETFOCUS && view != app->documents_.end()) {
+    SetFocus((*view)->editor);
+    return 0;
+  }
+  if (message == WM_CLOSE && view != app->documents_.end()) {
+    SetParent((*view)->editor, app->window_);
+    (*view)->compact_window = nullptr;
+    DestroyWindow(window);
+    app->LayoutControls();
+    if (app->active_document_ < app->documents_.size()) app->ActivateDocument(app->active_document_);
+    return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
 LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                                UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
+  if (message == WM_PASTE && app->PasteClipboardImage()) return 0;
   if (message == WM_IME_STARTCOMPOSITION) app->ime_composing_ = true;
   if (message == WM_IME_ENDCOMPOSITION) {
     app->ime_composing_ = false;
@@ -372,7 +525,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kWorkspaceTrust) SetWorkspaceTrust(true);
       else if (command == kWorkspaceUntrust) SetWorkspaceTrust(false);
       else if (command == kGitStatus) RunGitStatus();
+      else if (command >= kGitDiff && command <= kGitPush) RunGitAction(command);
       else if (command == kImageUpload) UploadImageAtCaret();
+      else if (command == kImageWidth320) ResizeImageAtCaret(320);
+      else if (command == kImageWidth480) ResizeImageAtCaret(480);
+      else if (command == kImageWidth640) ResizeImageAtCaret(640);
       else if (command == kFileExit) SendMessageW(window_, WM_CLOSE, 0, 0);
       else if (command == kEditFind) ShowFindBar();
       else if (command == kEditFindNext || command == kFindNext) FindNext();
@@ -385,6 +542,8 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         LayoutControls();
       }
       else if (command == kViewSettings) OpenWorkspaceSettings();
+      else if (command == kViewCompact) ToggleCompactWindow();
+      else if (command == kViewCommandPalette) ShowCommandPalette();
       else if (command == kTableRowBefore) ApplyTableAction(TableAction::InsertRowBefore);
       else if (command == kTableRowAfter) ApplyTableAction(TableAction::InsertRowAfter);
       else if (command == kTableRowDelete) ApplyTableAction(TableAction::DeleteRow);
@@ -453,6 +612,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_CLOSE:
       if (!SaveAll(true)) return 0;
       SaveSession();
+      for (auto& view : documents_) {
+        if (!view->compact_window) continue;
+        SetParent(view->editor, window_);
+        DestroyWindow(view->compact_window);
+        view->compact_window = nullptr;
+      }
       DestroyWindow(window_);
       return 0;
     case WM_DESTROY:
@@ -507,6 +672,8 @@ void Application::CreateMenuBar() {
   HMENU view = CreatePopupMenu();
   AppendMenuW(view, MF_STRING, kViewCalendar, L"カレンダー");
   AppendMenuW(view, MF_STRING, kViewSettings, L"Workspace設定を開く");
+  AppendMenuW(view, MF_STRING, kViewCompact, L"現在の文書をコンパクト表示");
+  AppendMenuW(view, MF_STRING, kViewCommandPalette, L"コマンドパレット…\tCtrl+Shift+P");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示");
   HMENU table = CreatePopupMenu();
   AppendMenuW(table, MF_STRING, kTableRowBefore, L"上に行を追加");
@@ -518,10 +685,28 @@ void Application::CreateMenuBar() {
   AppendMenuW(table, MF_STRING, kTableColumnDelete, L"列を削除");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(table), L"表");
   HMENU image = CreatePopupMenu();
+  AppendMenuW(image, MF_STRING, kImageWidth320, L"選択画像の表示幅を320 DIPにする");
+  AppendMenuW(image, MF_STRING, kImageWidth480, L"選択画像の表示幅を480 DIPにする");
+  AppendMenuW(image, MF_STRING, kImageWidth640, L"選択画像の表示幅を640 DIPにする");
+  AppendMenuW(image, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(image, MF_STRING, kImageUpload, L"カーソル位置の画像をstorageへupload…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image), L"画像");
   HMENU git = CreatePopupMenu();
   AppendMenuW(git, MF_STRING, kGitStatus, L"Status / Branches…");
+  AppendMenuW(git, MF_STRING, kGitDiff, L"差分を表示…");
+  AppendMenuW(git, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(git, MF_STRING, kGitStageAll, L"すべての変更をステージ…");
+  AppendMenuW(git, MF_STRING, kGitUnstageAll, L"すべてのステージを解除…");
+  AppendMenuW(git, MF_STRING, kGitCommit, L"コミット…");
+  AppendMenuW(git, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(git, MF_STRING, kGitBranchCreate, L"ブランチを作成して切替…");
+  AppendMenuW(git, MF_STRING, kGitBranchSwitch, L"ブランチを切替…");
+  AppendMenuW(git, MF_STRING, kGitMerge, L"ブランチをマージ…");
+  AppendMenuW(git, MF_STRING, kGitMergeAbort, L"マージを中止…");
+  AppendMenuW(git, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(git, MF_STRING, kGitFetch, L"Fetch…");
+  AppendMenuW(git, MF_STRING, kGitPull, L"Pull (fast-forward only)…");
+  AppendMenuW(git, MF_STRING, kGitPush, L"Push…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(git), L"Git");
   SetMenu(window_, menu);
 }
@@ -594,9 +779,11 @@ void Application::LayoutControls() {
   MoveWindow(find_workspace_, center_left + 12 + input_width, kTabHeight + 35, button_width, 25, TRUE);
   MoveWindow(replace_workspace_, center_left + 116 + input_width, kTabHeight + 35, 118, 25, TRUE);
   const int editor_top = kTabHeight + (find_visible ? kFindHeight : 0);
-  for (auto& view : documents_)
-    MoveWindow(view->editor, center_left, editor_top, center_width,
-               std::max(0, content_height - editor_top), TRUE);
+  for (auto& view : documents_) {
+    if (GetParent(view->editor) == window_)
+      MoveWindow(view->editor, center_left, editor_top, center_width,
+                 std::max(0, content_height - editor_top), TRUE);
+  }
   if (calendar_) {
     RECT required{};
     MonthCal_GetMinReqRect(calendar_, &required);
@@ -788,7 +975,10 @@ void Application::OpenDocument(const std::filesystem::path& path) {
 
 void Application::ActivateDocument(std::size_t index) {
   if (index >= documents_.size()) return;
-  for (std::size_t i = 0; i < documents_.size(); ++i) ShowWindow(documents_[i]->editor, i == index ? SW_SHOW : SW_HIDE);
+  for (std::size_t i = 0; i < documents_.size(); ++i) {
+    if (documents_[i]->compact_window == nullptr)
+      ShowWindow(documents_[i]->editor, i == index ? SW_SHOW : SW_HIDE);
+  }
   active_document_ = index;
   TabCtrl_SetCurSel(tabs_, static_cast<int>(index));
   ApplyMarkdownPresentation(*documents_[index], true);
@@ -812,6 +1002,11 @@ bool Application::CloseDocument(std::size_t index) {
       std::wstring ignored;
       view.workspace_store->RemoveRecovery(view.document.path(), ignored);
     }
+  }
+  if (view.compact_window) {
+    SetParent(view.editor, window_);
+    DestroyWindow(view.compact_window);
+    view.compact_window = nullptr;
   }
   DestroyWindow(view.editor);
   TabCtrl_DeleteItem(tabs_, static_cast<int>(index));
@@ -1592,6 +1787,72 @@ void Application::RunGitStatus() {
   MessageBoxW(window_, output.c_str(), L"Git Status / Branches", status.exit_code == 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
+void Application::RunGitAction(int command) {
+  if (workspace_.empty()) return;
+  if (!IsWorkspaceTrusted(workspace_)) {
+    MessageBoxW(window_, L"未信頼WorkspaceではGit操作を実行しません。", L"Git", MB_ICONWARNING);
+    return;
+  }
+  wchar_t git_path[32768]{};
+  if (SearchPathW(nullptr, L"git.exe", nullptr, static_cast<DWORD>(std::size(git_path)), git_path, nullptr) == 0) {
+    MessageBoxW(window_, L"git.exeが見つかりません。", L"Git", MB_ICONWARNING);
+    return;
+  }
+  std::vector<std::wstring> arguments{L"-C", workspace_.wstring()};
+  std::wstring value;
+  bool save_first{};
+  std::wstring action;
+  switch (command) {
+    case kGitDiff: arguments.insert(arguments.end(), {L"diff", L"--"}); action = L"差分表示"; break;
+    case kGitStageAll: arguments.insert(arguments.end(), {L"add", L"--all", L"--"}); action = L"全変更のステージ"; break;
+    case kGitUnstageAll: arguments.insert(arguments.end(), {L"restore", L"--staged", L"--", L":/"}); action = L"ステージ解除"; break;
+    case kGitCommit:
+      if (!PromptText(window_, instance_, L"Git commit", L"コミットメッセージ", value) || value.empty()) return;
+      arguments.insert(arguments.end(), {L"commit", L"-m", value}); action = L"コミット"; break;
+    case kGitBranchCreate:
+      if (!PromptText(window_, instance_, L"Git branch", L"作成するブランチ名", value) || value.empty()) return;
+      arguments.insert(arguments.end(), {L"switch", L"-c", value}); action = L"ブランチ作成・切替"; save_first = true; break;
+    case kGitBranchSwitch:
+      if (!PromptText(window_, instance_, L"Git switch", L"切り替える既存ブランチ名", value) || value.empty()) return;
+      arguments.insert(arguments.end(), {L"switch", L"--", value}); action = L"ブランチ切替"; save_first = true; break;
+    case kGitMerge:
+      if (!PromptText(window_, instance_, L"Git merge", L"現在のブランチへマージするbranch/ref", value) || value.empty()) return;
+      arguments.insert(arguments.end(), {L"merge", L"--no-edit", L"--", value}); action = L"マージ"; save_first = true; break;
+    case kGitMergeAbort: arguments.insert(arguments.end(), {L"merge", L"--abort"}); action = L"マージ中止"; save_first = true; break;
+    case kGitFetch: arguments.insert(arguments.end(), {L"fetch", L"--prune"}); action = L"Fetch"; break;
+    case kGitPull: arguments.insert(arguments.end(), {L"pull", L"--ff-only"}); action = L"Pull"; save_first = true; break;
+    case kGitPush: arguments.push_back(L"push"); action = L"Push"; break;
+    default: return;
+  }
+  if (save_first && !SaveAll(true)) {
+    MessageBoxW(window_, L"全文書を保存できなかったためGit操作を開始しません。", L"Git", MB_ICONWARNING);
+    return;
+  }
+  std::wstring command_text = L"git";
+  for (std::size_t index = 2; index < arguments.size(); ++index) command_text += L" " + arguments[index];
+  const auto question = action + L"を実行しますか？\n\n作業ディレクトリ: " + workspace_.wstring() +
+                        L"\nコマンド: " + command_text;
+  if (MessageBoxW(window_, question.c_str(), L"Git 明示操作", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+    return;
+  ProcessResult result;
+  std::wstring error;
+  if (!RunProcess(git_path, arguments, workspace_, 64 * 1024, 120000, result, error)) {
+    MessageBoxW(window_, error.c_str(), L"Git", MB_ICONERROR);
+    return;
+  }
+  std::wstring output = L"作業ディレクトリ: " + workspace_.wstring() + L"\nコマンド: " + command_text +
+                        L"\n終了コード: " + std::to_wstring(result.exit_code) + L"\n\n" + result.output;
+  if (result.truncated) output += L"\n(出力上限で省略しました)";
+  MessageBoxW(window_, output.c_str(), action.c_str(), result.exit_code == 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
+  if (result.exit_code == 0 && save_first) {
+    PopulateWorkspaceTree();
+    MessageBoxW(window_,
+                L"Git操作後の外部変更を検出できるよう、開いている文書の保存指紋は更新していません。"
+                L"変更された文書は閉じて開き直してください。",
+                L"Git", MB_ICONINFORMATION);
+  }
+}
+
 void Application::OpenWorkspaceSettings() {
   if (!workspace_store_) return;
   const auto root = workspace_store_->metadata_root();
@@ -1599,6 +1860,181 @@ void Application::OpenWorkspaceSettings() {
     const auto path = root / relative;
     if (std::filesystem::is_regular_file(path)) OpenDocument(path);
   }
+}
+
+void Application::ShowCommandPalette() {
+  struct Entry { const wchar_t* name; int command; bool enabled; const wchar_t* reason; };
+  const bool has_document = active_document_ < documents_.size();
+  const bool has_workspace = !workspace_.empty();
+  const bool trusted = has_workspace && IsWorkspaceTrusted(workspace_);
+  const std::array entries{
+      Entry{L"ファイル: 開く", kFileOpen, true, L""},
+      Entry{L"ファイル: Quick Open", kFileQuickOpen, has_workspace, L"Workspaceが未選択です"},
+      Entry{L"ファイル: 保存", kFileSave, has_document, L"文書が開かれていません"},
+      Entry{L"編集: 検索", kEditFind, has_document, L"文書が開かれていません"},
+      Entry{L"編集: Workspace検索", kEditFindWorkspace, has_workspace, L"Workspaceが未選択です"},
+      Entry{L"表示: コンパクト表示", kViewCompact, has_document, L"文書が開かれていません"},
+      Entry{L"表示: Workspace設定", kViewSettings, has_workspace, L"Workspaceが未選択です"},
+      Entry{L"Git: Status / Branches", kGitStatus, trusted, L"Workspaceの信頼が必要です"},
+      Entry{L"Git: ブランチ切替", kGitBranchSwitch, trusted, L"Workspaceの信頼が必要です"},
+      Entry{L"Git: Merge", kGitMerge, trusted, L"Workspaceの信頼が必要です"},
+      Entry{L"Git: Pull (fast-forward only)", kGitPull, trusted, L"Workspaceの信頼が必要です"},
+      Entry{L"画像: 表示幅480 DIP", kImageWidth480, has_document, L"Markdown文書が必要です"},
+      Entry{L"画像: Storageへupload", kImageUpload, trusted && has_document, L"信頼済みWorkspaceと文書が必要です"},
+  };
+  std::wstring label = L"コマンド名の一部を入力してください。\n";
+  for (const auto& entry : entries) {
+    label += L"・" + std::wstring(entry.name);
+    if (!entry.enabled) label += L"（実行不可: " + std::wstring(entry.reason) + L"）";
+    label += L"\n";
+  }
+  std::wstring query;
+  if (!PromptText(window_, instance_, L"MDLite コマンドパレット", label, query) || query.empty()) return;
+  std::ranges::transform(query, query.begin(), towlower);
+  const Entry* match{};
+  std::wstring candidates;
+  for (const auto& entry : entries) {
+    std::wstring name(entry.name);
+    std::ranges::transform(name, name.begin(), towlower);
+    if (name.find(query) == std::wstring::npos) continue;
+    if (!match) match = &entry;
+    else candidates += L"\n";
+    candidates += entry.name;
+  }
+  if (!match) {
+    MessageBoxW(window_, L"一致するコマンドがありません。", L"コマンドパレット", MB_ICONINFORMATION);
+    return;
+  }
+  if (candidates.find(L'\n') != std::wstring::npos) {
+    MessageBoxW(window_, (L"候補を一つに絞ってください。\n\n" + candidates).c_str(),
+                L"コマンドパレット", MB_ICONINFORMATION);
+    return;
+  }
+  if (!match->enabled) {
+    MessageBoxW(window_, match->reason, L"このコマンドは実行できません", MB_ICONWARNING);
+    return;
+  }
+  SendMessageW(window_, WM_COMMAND, MAKEWPARAM(match->command, 0), 0);
+}
+
+void Application::ToggleCompactWindow() {
+  if (active_document_ >= documents_.size()) return;
+  auto& view = *documents_[active_document_];
+  if (view.compact_window) {
+    SendMessageW(view.compact_window, WM_CLOSE, 0, 0);
+    return;
+  }
+  const auto title = view.document.path().filename().wstring() + L" — MDLite コンパクト";
+  view.compact_window = CreateWindowExW(WS_EX_TOOLWINDOW, kCompactWindowClass, title.c_str(),
+                                         WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
+                                         CW_USEDEFAULT, CW_USEDEFAULT, 720, 520, window_, nullptr,
+                                         instance_, this);
+  if (!view.compact_window) {
+    MessageBoxW(window_, L"コンパクトウィンドウを作成できません。", L"コンパクト表示",
+                MB_ICONERROR);
+    return;
+  }
+  SetParent(view.editor, view.compact_window);
+  ShowWindow(view.editor, SW_SHOW);
+  RECT client{};
+  GetClientRect(view.compact_window, &client);
+  MoveWindow(view.editor, 0, 0, client.right, client.bottom, TRUE);
+  SetFocus(view.editor);
+}
+
+bool Application::PasteClipboardImage() {
+  if (ime_composing_ || workspace_.empty() || active_document_ >= documents_.size()) return false;
+  auto& view = *documents_[active_document_];
+  if (!IsMarkdownFile(view.document.path()) || !IsClipboardFormatAvailable(CF_BITMAP)) return false;
+  if (!OpenClipboard(window_)) return true;
+  HBITMAP bitmap = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+  if (bitmap == nullptr) {
+    CloseClipboard();
+    MessageBoxW(window_, L"クリップボード画像を読み取れません。本文は変更していません。",
+                L"画像の貼り付け", MB_ICONWARNING);
+    return true;
+  }
+
+  std::error_code filesystem_error;
+  const auto directory = workspace_ / L"assets";
+  std::filesystem::create_directories(directory, filesystem_error);
+  std::filesystem::path path = directory / L"clipboard.png";
+  for (unsigned suffix = 1; std::filesystem::exists(path); ++suffix)
+    path = directory / (L"clipboard_" + std::to_wstring(suffix) + L".png");
+
+  IWICImagingFactory* factory{};
+  IWICBitmap* source{};
+  IWICStream* stream{};
+  IWICBitmapEncoder* encoder{};
+  IWICBitmapFrameEncode* frame{};
+  IPropertyBag2* properties{};
+  HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&factory));
+  if (SUCCEEDED(result)) result = factory->CreateBitmapFromHBITMAP(bitmap, nullptr,
+                                                                   WICBitmapUseAlpha, &source);
+  if (SUCCEEDED(result)) result = factory->CreateStream(&stream);
+  if (SUCCEEDED(result)) result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+  if (SUCCEEDED(result)) result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+  if (SUCCEEDED(result)) result = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+  if (SUCCEEDED(result)) result = encoder->CreateNewFrame(&frame, &properties);
+  if (SUCCEEDED(result)) result = frame->Initialize(properties);
+  UINT width{}, height{};
+  if (SUCCEEDED(result)) result = source->GetSize(&width, &height);
+  if (SUCCEEDED(result)) result = frame->SetSize(width, height);
+  WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+  if (SUCCEEDED(result)) result = frame->SetPixelFormat(&format);
+  if (SUCCEEDED(result)) result = frame->WriteSource(source, nullptr);
+  if (SUCCEEDED(result)) result = frame->Commit();
+  if (SUCCEEDED(result)) result = encoder->Commit();
+  if (properties) properties->Release();
+  if (frame) frame->Release();
+  if (encoder) encoder->Release();
+  if (stream) stream->Release();
+  if (source) source->Release();
+  if (factory) factory->Release();
+  CloseClipboard();
+
+  if (FAILED(result)) {
+    std::filesystem::remove(path, filesystem_error);
+    MessageBoxW(window_, L"クリップボード画像をPNGとして保存できません。本文は変更していません。",
+                L"画像の貼り付け", MB_ICONWARNING);
+    return true;
+  }
+  const auto relative = std::filesystem::relative(path, view.document.path().parent_path(), filesystem_error);
+  if (filesystem_error) {
+    std::filesystem::remove(path, filesystem_error);
+    MessageBoxW(window_, L"画像への相対パスを作成できません。本文は変更していません。",
+                L"画像の貼り付け", MB_ICONWARNING);
+    return true;
+  }
+  const auto markup = ImageMarkdown(L"clipboard", relative.generic_wstring());
+  SendMessageW(view.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(markup.c_str()));
+  PopulateWorkspaceTree();
+  return true;
+}
+
+void Application::ResizeImageAtCaret(unsigned width_dip) {
+  if (ime_composing_ || active_document_ >= documents_.size()) return;
+  auto& view = *documents_[active_document_];
+  if (!IsMarkdownFile(view.document.path())) return;
+  SyncDocumentFromEditor(view);
+  CHARRANGE selection{};
+  SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  const auto source_position = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const auto parsed = ParseMarkdown(view.document.text());
+  const auto image = std::ranges::find_if(parsed.images, [&](const auto& item) {
+    return source_position >= item.begin && source_position <= item.end;
+  });
+  if (image == parsed.images.end()) {
+    MessageBoxW(window_, L"カーソルをMarkdown画像の上へ移動してください。", L"画像サイズ",
+                MB_ICONINFORMATION);
+    return;
+  }
+  const auto replacement = ImageHtml(image->alternate_text, image->target, width_dip);
+  const auto begin = static_cast<LONG>(view.editor_snapshot.SourceToView(image->begin));
+  const auto end = static_cast<LONG>(view.editor_snapshot.SourceToView(image->end));
+  SendMessageW(view.editor, EM_SETSEL, begin, end);
+  SendMessageW(view.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
 }
 
 void Application::UploadImageAtCaret() {

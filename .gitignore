@@ -1,0 +1,38 @@
+# Build and dependency working directories
+/build/
+/out/
+/dist/
+/.cache/
+/.vs/
+/cmake-build-*/
+/vcpkg_installed/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.obj
+*.pdb
+*.ilk
+
+# Machine-local agent configuration and transient execution records
+/.codex/
+/.codex-shared/
+/.local/
+/AGENTS.override.md
+
+# User data / generated state; declarative .mdlite settings remain trackable
+**/.mdlite/.cache/
+**/.mdlite/.state/
+
+# Secrets (public sample configuration uses .example files)
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+*.pem
+*.dmp

@@ -58,7 +58,8 @@
 `92759b5d8955f0851cdc234696765ef1f886cd60`、休日policy/診断commit
 `de172b72f6c16f3f21da85340c953a56a3612fc5`、空本文診断修正commit
 `2f7401e224718752e98bd30eb72a0dd2ed2d8ece`、native canonicalization checkpoint
-`837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8` を origin (Forgejo) と github (GitHub) の
+`837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8`、`856a419e2890053a91c673e732e9113a4e39f103`、
+`40d88b73d556f994c9705f415685c0e0470b8477` を origin (Forgejo) と github (GitHub) の
 `fix/visual-rebuild-localfirst` へ非force通常pushし、各push時の対象OIDが両remoteで同一であることを
 `ls-remote` read-backで確認した。docsの参照更新commitは別途行い、main/tag/developは変更していない。
 であることを確認した。Human gate未実施のためdevelop統合は保留している。

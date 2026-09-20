@@ -53,7 +53,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-24 | `.cache`と`.state`を分離 | WorkspaceStore回帰 | 自動PASS |
 | A-25 | vswhere、CMake/Ninja/MSVC検出、VS Code task/launch、静的runtime、v6 manifest | Debug/Release build/testとexe起動。F5キー操作自体はHuman未実施 | 自動PASS・Human未確認 |
 | A-26 | 公開投影なし。build、`.codex`、秘密拡張子をignore | tracked fileの秘密形式／個人絶対path scan | 自動PASS |
-| A-27 | 同一RichEdit上のcell grid、表source transaction、Tab/Shift+Tab、矢印境界、行列操作、Undo接続 | grid cell解析、EOF/CRLF/escaped pipe/code pipe、Release GUI acceptanceの編集/Undo/Redo | 自動PASS・hit-testの操作感はHuman評価待ち |
+| A-27 | 同一RichEdit上のcell grid、表source transaction、Tab/Shift+Tab、矢印境界、行列操作、Undo接続 | grid cell解析、EOF/CRLF/escaped pipe/code pipe、可視行横断で共有する実測column boundary、Release GUI acceptanceの編集/Undo/Redo | 自動PASS・hit-testの操作感はHuman評価待ち |
 | A-28 | 子見出しを含むsection move、子孫drop拒否、単一Undo | section回帰。実dragはHuman未確認 | 実装済み・Human gate |
 | A-29 | Dairy/Meeting/Memo既定、採番、任意field、profile GUI、cursor | profile回帰 | 自動PASS・GUI promptはHuman未確認 |
 | A-30 | 日曜始まり、同梱日本休日、検証付きローカルCSV追加、common許可時の月次cache、既存Dairy、tooltip | 同梱データとCSV import、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少、cache last-known-goodのpolicy回帰。DPIごとの見え方はHuman未確認 | 自動・mock PASS・Human gate（実HTTPはWinHTTP 12185でBLOCKED） |

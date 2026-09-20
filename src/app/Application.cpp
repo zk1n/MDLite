@@ -3001,6 +3001,17 @@ void Application::DrawTableGrid(const DocumentView& view) {
     const std::size_t draw_end = std::min(table.end, visible_end);
     if (draw_begin >= draw_end) continue;
     const auto rows = ParseTableVisualRows(view.document.text(), draw_begin, draw_end);
+    struct RowGeometry {
+      std::vector<POINT> starts;
+      std::vector<POINT> ends;
+      int top{};
+      int bottom{};
+    };
+    std::vector<RowGeometry> row_geometry;
+    row_geometry.reserve(rows.size());
+    std::size_t column_count{};
+    int shared_left = client.right;
+    int shared_right = client.left;
     for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
       const auto& row = rows[row_index];
       if (row.cells.empty()) continue;
@@ -3026,19 +3037,47 @@ void Application::DrawTableGrid(const DocumentView& view) {
         bottom = static_cast<int>(next_start.y) - 3;
       }
       if (bottom <= top) bottom = top + line_height + 1;
+      row_geometry.push_back({std::move(starts), std::move(ends), top, bottom});
+      shared_left = std::min(shared_left, static_cast<int>(row_geometry.back().starts.front().x) - 5);
+      shared_right = std::max(shared_right, static_cast<int>(row_geometry.back().ends.back().x) + 5);
+      column_count = std::max(column_count, row.cells.size());
+    }
+    if (row_geometry.empty()) continue;
+    const int left = std::clamp(shared_left, static_cast<int>(client.left),
+                                static_cast<int>(client.right));
+    const int right = std::clamp(std::max(shared_right, left + 8),
+                                 left + 1, static_cast<int>(client.right));
+    std::vector<int> shared_boundaries(column_count > 0 ? column_count - 1 : 0, left + 1);
+    for (const auto& geometry : row_geometry) {
+      for (std::size_t cell_index = 0;
+           cell_index + 1 < geometry.ends.size() && cell_index < shared_boundaries.size();
+           ++cell_index) {
+        shared_boundaries[cell_index] = std::max(shared_boundaries[cell_index],
+                                                 static_cast<int>(geometry.ends[cell_index].x) + 4);
+      }
+    }
+    int previous_boundary = left;
+    for (std::size_t cell_index = 0; cell_index < shared_boundaries.size(); ++cell_index) {
+      const int remaining = static_cast<int>(shared_boundaries.size() - cell_index - 1);
+      const int maximum = std::max(previous_boundary + 1, right - 1 - remaining);
+      shared_boundaries[cell_index] = std::clamp(shared_boundaries[cell_index],
+                                                previous_boundary + 1, maximum);
+      previous_boundary = shared_boundaries[cell_index];
+    }
+    for (const auto& geometry : row_geometry) {
+      const int top = geometry.top;
+      const int bottom = geometry.bottom;
       if (bottom < client.top || top >= client.bottom) continue;
-      const int left = std::max(static_cast<int>(client.left), static_cast<int>(starts.front().x) - 5);
-      const int right = std::min(static_cast<int>(client.right),
-                                 std::max(left + 8, static_cast<int>(ends.back().x) + 5));
       MoveToEx(dc, left, top, nullptr);
       LineTo(dc, right, top);
       MoveToEx(dc, left, bottom, nullptr);
       LineTo(dc, right, bottom);
       MoveToEx(dc, left, top, nullptr);
       LineTo(dc, left, bottom);
-      for (std::size_t cell_index = 0; cell_index + 1 < ends.size(); ++cell_index) {
-        const int boundary = std::clamp(static_cast<int>(ends[cell_index].x) + 4,
-                                        left + 1, right - 1);
+      for (std::size_t cell_index = 0;
+           cell_index + 1 < geometry.ends.size() && cell_index < shared_boundaries.size();
+           ++cell_index) {
+        const int boundary = shared_boundaries[cell_index];
         MoveToEx(dc, boundary, top, nullptr);
         LineTo(dc, boundary, bottom);
       }

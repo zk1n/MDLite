@@ -143,7 +143,7 @@ class Application {
   static bool ReadImageFileIdentity(const std::filesystem::path& path,
                                     DocumentView::ImageFileIdentity& identity);
   void RebuildOutline(const DocumentView& view);
-  std::wstring EditorText(HWND editor, const EditorSnapshot& snapshot) const;
+  bool EditorText(HWND editor, const EditorSnapshot& snapshot, std::wstring& text) const;
   void UpdateStatus();
   void ShowFindBar();
   SearchQuery SearchQueryFromFindBar() const;

@@ -11,7 +11,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 ## 今回の変更と境界
 
 - Jev Initial Decision Gate は `sol_xhigh` を選択した。固定 specialist の判定は、既存の座標混同を解消してから UI/table を再構築するよう指示した。実行 provenance が要求 target と不一致だったため dispatch は fail-closed とし、model/effort を推測しない。
-- source/export/native の座標を分離し、CRLF/LF と Markdown image object は compact discontinuity で写像する。`EditorText` はraw native textを取得後、CRLF/lone LFをnative CRへcanonicalizeしてから差分・object復元へ渡す。同幅のlone LFはdiscontinuityへ記録せず、巨大文書で不要なmapを増やさない。
+- source/export/native の座標を分離し、CRLF/LF と Markdown image object は compact discontinuity で写像する。`EditorText` はraw native textを取得後、CRLF/lone LFをnative CRへcanonicalizeしてから差分・object復元へ渡す。同幅のlone LFはdiscontinuityへ記録せず、巨大文書で不要なmapを増やさない。native readbackの長さ／OLE位置不一致は推測補正せずfail-closedでsyncを再試行する。
 - presentation reset は underline/effects/paragraph spacing/border を明示的に解除し、表 grid は固定22px矩形でなく実測した行高・共有境界で描画する。
 - UI layout は DIP scaling、`WM_DPICHANGED`、PerMonitorV2 manifest、editor font 再生成を実装した。実機のDPI・IME・通常GUI画面はまだPASSにしない。
 - 祝日は同梱データを維持し、検証付きのローカルCSV取込みと user-wide `holiday_auto_update=false` 設定を追加した。明示許可時だけ既知の内閣府HTTPS CSVを月次確認し、Workspace cacheをlast-known-goodとして更新する。fake clockとmock HTTPの200/304/404/500/timeout/HTML/大幅減少をCoreTestsで確認した。opt-in実HTTPは試験環境のWinHTTP 12185（`ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY`）でTLS応答を受信できず、実HTTP受入はBLOCKED。
@@ -28,7 +28,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | ID | 実装・接続 | 今回の証拠 | 判定 |
 |---|---|---|---|
 | A-01 | native treeの作成・移動・rename・ごみ箱削除、同名／自己配下拒否 | Core回帰とbuild。複数選択D&DのHuman操作は未実施 | 実装済み・Human未確認 |
-| A-02 | 表示更新はsourceを書き換えず、アプリ管理source履歴だけをUndo/Redoとして公開。表示専用native Undoは通知抑止中に破棄。同一行で識別不能な複数画像はraw Markdownへfail-closedし、完全にcollapseしたsource rangeだけnative描画。source/export/nativeの座標境界と画像objectのdiscontinuityを明示 | Core byte/Dirty・複数画像identity・隣接画像・native transaction回帰、native newline canonicalization、Release GUI acceptanceのSave/Undo/Redo/隣接raw保存 | 自動PASS（Human IME/視認性は未確認） |
+| A-02 | 表示更新はsourceを書き換えず、アプリ管理source履歴だけをUndo/Redoとして公開。表示専用native Undoは通知抑止中に破棄。同一行で識別不能な複数画像はraw Markdownへfail-closedし、完全にcollapseしたsource rangeだけnative描画。source/export/nativeの座標境界と画像objectのdiscontinuityを明示し、native readback不一致は推測補正せず再試行する | Core byte/Dirty・複数画像identity・隣接画像・native transaction回帰、native newline canonicalization、Release GUI acceptanceのSave/Undo/Redo/隣接raw保存 | 自動PASS（Human IME/視認性は未確認） |
 | A-03 | IME状態を文書単位で保持し、合成中のsync／保存／表操作を停止 | compactを含むnotification経路を回帰。Microsoft IME／ATOK実変換は未実施 | 実装済み・Human gate |
 | A-04 | 見出し・本文・native image object・表presentationを同一RichEditへ統合 | parser/source/native座標回帰。実画像と表の自然な見え方はHuman未確認 | 実装済み・Human gate |
 | A-05 | Front Matter、CommonMark/GFM対象構文をsource範囲付き解析 | Core parser回帰 | 自動PASS（公式全corpusは対象外） |
@@ -60,7 +60,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-31 | PNG/JPEG/GIF/WebP/SVG経路、clipboard、D&D、比率固定resize、SVG XML安全判定、画像ごとのanimation期限 | 5形式のnative RichEdit挿入、GIF partial frame/offset/transparency/disposal 2/3、GIF/WebP異周期timing、SVG同一bytes検査、Release GUI acceptanceの複数object前後source保存、隣接raw保存、full P4 | 自動PASS・見え方はHuman gate |
 | A-32 | 明示Trust、external command adapter、取消、失敗時local保持、hash/revision | mock CLI回帰。本番資格情報は使用していない | 自動PASS（mock） |
 | A-33 | 公開package生成をrelease手順まで拒否 | 今回は署名・package・Releaseを実施しない | Release時保留 |
-| A-34 | feature checkpointをForgejo/GitHubへ非forceで同一OID配送 | 実装・検証・holiday診断・native canonicalizationの各commit（最新checkpoint `837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8`）を両remoteへ非force配送し、対象branch OID一致を`ls-remote`で照合。Human gate未実施のためdevelop統合は保留 | feature配送PASS・develop統合保留 |
+| A-34 | feature checkpointをForgejo/GitHubへ非forceで同一OID配送 | 実装・検証・holiday診断・native canonicalizationの各commit（最新pushはこのfail-closed修正後に実施）を両remoteへ非force配送し、対象branch OID一致を`ls-remote`で照合。Human gate未実施のためdevelop統合は保留 | feature配送PASS・develop統合保留 |
 
 ## Human専用の残り
 

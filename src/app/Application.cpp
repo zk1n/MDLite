@@ -2401,7 +2401,14 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   const std::size_t source_begin = native_snapshot.NativeToSource(selection.cpMin);
   const std::size_t source_end = native_snapshot.NativeToSource(selection.cpMax);
-  const std::wstring current_view = EditorText(view.editor, native_snapshot);
+  std::wstring current_view;
+  if (!EditorText(view.editor, native_snapshot, current_view)) {
+    // Never infer a source edit from a truncated/misaligned native readback.
+    // Keep the pending input alive for a later timer pass without showing a
+    // dialog or turning a presentation-only failure into data loss.
+    view.sync_due = GetTickCount64() + kEditorSyncDelayMs;
+    return;
+  }
   const auto transaction = ApplyEditorText(native_snapshot, view.document.text(), current_view);
   if (!transaction.changed) return;
   view.source_undo.push_back({transaction.begin,
@@ -3064,18 +3071,24 @@ void Application::RebuildOutline(const DocumentView& view) {
   TreeView_Expand(outline_, TreeView_GetRoot(outline_), TVE_EXPAND);
 }
 
-std::wstring Application::EditorText(HWND editor, const EditorSnapshot& snapshot) const {
+bool Application::EditorText(HWND editor, const EditorSnapshot& snapshot,
+                             std::wstring& text) const {
+  text.clear();
   GETTEXTLENGTHEX length_request{GTL_NUMCHARS | GTL_PRECISE, 1200};
   const auto length = static_cast<std::size_t>(std::max<LRESULT>(
       0, SendMessageW(editor, EM_GETTEXTLENGTHEX,
                       reinterpret_cast<WPARAM>(&length_request), 0)));
-  std::wstring text(length + 1, L'\0');
+  text.assign(length + 1, L'\0');
   GETTEXTEX text_request{static_cast<DWORD>(text.size() * sizeof(wchar_t)),
                          GT_RAWTEXT, 1200, nullptr, nullptr};
   const auto copied = static_cast<std::size_t>(std::max<LRESULT>(
       0, SendMessageW(editor, EM_GETTEXTEX,
                       reinterpret_cast<WPARAM>(&text_request),
                       reinterpret_cast<LPARAM>(text.data()))));
+  if (length != 0 && copied == 0) {
+    text.clear();
+    return false;
+  }
   text.resize(std::min(copied, length));
   // Keep every EM/TOM/OLE position in the same native space as the snapshot.
   // RichEdit normally returns one CR per paragraph with GT_RAWTEXT, but older
@@ -3132,14 +3145,18 @@ std::wstring Application::EditorText(HWND editor, const EditorSnapshot& snapshot
     const LONG count = rich_edit->GetObjectCount();
     for (LONG index = 0; index < count; ++index) {
       REOBJECT object{sizeof(object)};
-      if (SUCCEEDED(rich_edit->GetObject(index, &object, REO_GETOBJ_NO_INTERFACES)) &&
-          object.cp >= 0 && static_cast<std::size_t>(object.cp) < text.size()) {
+      if (SUCCEEDED(rich_edit->GetObject(index, &object, REO_GETOBJ_NO_INTERFACES))) {
+        if (object.cp < 0 || static_cast<std::size_t>(object.cp) >= text.size()) {
+          rich_edit->Release();
+          text.clear();
+          return false;
+        }
         text[static_cast<std::size_t>(object.cp)] = L'\uFFFC';
       }
     }
     rich_edit->Release();
   }
-  return text;
+  return true;
 }
 
 void Application::UpdateStatus() {

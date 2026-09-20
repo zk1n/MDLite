@@ -3077,6 +3077,10 @@ std::wstring Application::EditorText(HWND editor, const EditorSnapshot& snapshot
                       reinterpret_cast<WPARAM>(&text_request),
                       reinterpret_cast<LPARAM>(text.data()))));
   text.resize(std::min(copied, length));
+  // Keep every EM/TOM/OLE position in the same native space as the snapshot.
+  // RichEdit normally returns one CR per paragraph with GT_RAWTEXT, but older
+  // builds and alternate export paths can expose CRLF or lone LF instead.
+  text = CanonicalizeNativeText(text);
 
   // RichEdit exposes an embedded image as a space through its text APIs on some
   // builds.  TOM2 still exposes the raw character, so restore object markers

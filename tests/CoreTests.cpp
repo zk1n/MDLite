@@ -577,6 +577,12 @@ void TestEditorAdapter() {
   Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
             native_lines.NativeToSource(1) == 1,
         "native line-ending mapping remains compact and boundary-safe");
+  Check(mdlite::CanonicalizeNativeText(L"a\r\nb\nc") == L"a\rb\rc",
+        "native text canonicalization collapses CRLF and lone LF to one paragraph boundary");
+  const auto native_raw_edit = mdlite::ApplyEditorText(
+      native_lines, L"a\nb\r\nc", L"a\r\nx\nb\r\nc");
+  Check(native_raw_edit.source == L"a\nx\nb\r\nc",
+        "native transaction canonicalizes alternate newline export before source mapping");
   const auto native_image = mdlite::BuildNativeEditorSnapshot(L"a![x](p.png)\nb");
   Check(native_image.view == L"a\uFFFC\rb", "native Markdown snapshot collapses images and normalizes LF");
   Check(native_image.SourceToNative(1) == 1 && native_image.NativeToSource(1) == 1 &&

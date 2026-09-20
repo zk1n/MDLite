@@ -274,9 +274,10 @@ std::vector<NativeDiscontinuity> BuildNativeDiscontinuities(
       source_position += 2;
       continue;
     }
+    // A lone LF is one source UTF-16 unit and one native CR unit. It changes
+    // the character value but not the coordinate, so retaining a record here
+    // only bloats large-file maps without adding an offset discontinuity.
     if (source[source_position] == L'\n') {
-      result.push_back({source_position, source_position + 1, native_position,
-                        native_position + 1});
       ++native_position;
       ++source_position;
       continue;
@@ -308,6 +309,24 @@ std::wstring BuildNativeView(std::wstring_view source,
       ++source_position;
     } else {
       result.push_back(source[source_position++]);
+    }
+  }
+  return result;
+}
+
+std::wstring CanonicalizeNativeText(std::wstring_view native_text) {
+  std::wstring result;
+  result.reserve(native_text.size());
+  for (std::size_t index{}; index < native_text.size(); ++index) {
+    if (native_text[index] == L'\r') {
+      result.push_back(L'\r');
+      if (index + 1 < native_text.size() && native_text[index + 1] == L'\n') ++index;
+    } else if (native_text[index] == L'\n') {
+      // RichEdit's native paragraph boundary is CR. Treat a lone LF from an
+      // alternate text/export path as the same boundary.
+      result.push_back(L'\r');
+    } else {
+      result.push_back(native_text[index]);
     }
   }
   return result;
@@ -383,6 +402,11 @@ EditorSnapshot BuildNativeTextEditorSnapshot(std::wstring_view source) {
 
 SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view source,
                                   std::wstring_view new_view) {
+  std::wstring canonical_native;
+  if (before.native_coordinates) {
+    canonical_native = CanonicalizeNativeText(new_view);
+    new_view = canonical_native;
+  }
   SourceTransaction result;
   std::size_t prefix = 0;
   while (prefix < before.view.size() && prefix < new_view.size() &&

@@ -53,6 +53,10 @@ EditorSnapshot BuildEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildNativeEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildNativeTextEditorSnapshot(std::wstring_view source);
+// RichEdit's native coordinate space uses one CR per paragraph. Some control
+// builds/export flags can still return CRLF (or a lone LF), so callers reading
+// the control normalize through this boundary before diffing or mapping.
+std::wstring CanonicalizeNativeText(std::wstring_view native_text);
 SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view source,
                                   std::wstring_view new_view);
 

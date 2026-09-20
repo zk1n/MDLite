@@ -19,7 +19,7 @@
 | 項目 | 結果 | 証拠 |
 |---|---|---|
 | Debug build (`MDLite`, `mdlite_core_tests`) | PASS | MSVC/CMake build完了 |
-| Debug core checks | PASS | `All 300 MDLite core checks passed.` |
+| Debug core checks | PASS | `All 301 MDLite core checks passed.` |
 | Release build/test | PASS | `tools/Invoke-Build.ps1 -Preset release -Test`、CTest 1/1 |
 | Release quick performance | PASS | `build/verification/performance-release-holiday-policy-quick-final2.json`。P0 18.1MB WS、P1 six-document 29.5MB WS、P4 43.3MB WS、P5 20/20 failures 0、compact 3/3、theme 20/20、入力p95最大3.356ms。 |
 | Fresh bounded quick performance | PASS | `build/verification/performance-release-native-canonical-quick-final3.json`。P1 six-document 29,491,200 bytes、P4 42,496,000 bytes、compact 3/3、P5 20/20 failures 0、入力p95最大3.705ms。 |
@@ -46,7 +46,7 @@
 | QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings | 全設定・calendar連続promptは未実施 |
 | QA-08 | local Git staged-only proof、GUI TCP観測0、feature ref push/read-back | 実remote認証は今回のfeature配送で確認済み。develop統合はHuman gate後 |
 | QA-09 | 同梱/local CSV、重複/HTML/encoding拒否、OFF既定、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少、cache保全ポリシー | 実HTTPは `MDLITE_TEST_REAL_HOLIDAY_HTTP=1` で実行したが、WinHTTP 12185 によりBLOCKED。offline transport/timeoutの実WinHTTP matrixは未実施 |
-| QA-10 | 300 checks、Release CTest、silent P5 100/100、native screenshot evidence | ATOK・Human通知/視認性は未実施 |
+| QA-10 | 301 checks、Release CTest、silent P5 100/100、native screenshot evidence | ATOK・Human通知/視認性は未実施 |
 
 ## Git検証境界
 

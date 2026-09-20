@@ -577,6 +577,9 @@ void TestEditorAdapter() {
   Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
             native_lines.NativeToSource(1) == 1,
         "native line-ending mapping remains compact and boundary-safe");
+  const auto lone_native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\nc");
+  Check(lone_native_lines.native_discontinuities.empty(),
+        "same-width lone LF boundaries do not allocate native discontinuity records");
   Check(mdlite::CanonicalizeNativeText(L"a\r\nb\nc") == L"a\rb\rc",
         "native text canonicalization collapses CRLF and lone LF to one paragraph boundary");
   const auto native_raw_edit = mdlite::ApplyEditorText(

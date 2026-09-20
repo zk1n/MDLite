@@ -67,7 +67,9 @@ public static class MDLiteTableNative {
         public uint time;
         public IntPtr dwExtraInfo;
     }
-    [StructLayout(LayoutKind.Explicit)]
+    // INPUT's union is sized for the largest MOUSEINPUT member even when the
+    // current event is keyboard input; on x64 this keeps INPUT at 40 bytes.
+    [StructLayout(LayoutKind.Explicit, Size = 32)]
     public struct INPUT_UNION {
         [FieldOffset(0)] public KEYBDINPUT ki;
     }
@@ -213,30 +215,30 @@ function Send-ShiftKey([IntPtr]$Editor, [int]$Key) {
         [void][MDLiteTableNative]::BringWindowToTop($topLevel)
         [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
         [void][MDLiteTableNative]::SetFocus($Editor)
+        $inputs = [MDLiteTableNative+INPUT[]]::new(4)
+        for ($index = 0; $index -lt $inputs.Length; $index++) {
+            $inputs[$index].type = 1
+            $inputs[$index].U = [MDLiteTableNative+INPUT_UNION]::new()
+        }
+        $inputs[0].U.ki.wVk = [uint16]$VK_SHIFT
+        $inputs[1].U.ki.wVk = [uint16]$Key
+        $inputs[2].U.ki.wVk = [uint16]$Key
+        $inputs[2].U.ki.dwFlags = 0x0002
+        $inputs[3].U.ki.wVk = [uint16]$VK_SHIFT
+        $inputs[3].U.ki.dwFlags = 0x0002
+        $sent = [MDLiteTableNative]::SendInput(4, $inputs, [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
+        if ($sent -ne 4) {
+            return [pscustomobject]@{
+                sent = $sent
+                error = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            }
+        }
+        Start-Sleep -Milliseconds 150
+        return $null
     }
     finally {
         if ($attached) { [void][MDLiteTableNative]::AttachThreadInput($currentThread, $targetThread, $false) }
     }
-    $inputs = [MDLiteTableNative+INPUT[]]::new(4)
-    for ($index = 0; $index -lt $inputs.Length; $index++) {
-        $inputs[$index].type = 1
-        $inputs[$index].U = [MDLiteTableNative+INPUT_UNION]::new()
-    }
-    $inputs[0].U.ki.wVk = [uint16]$VK_SHIFT
-    $inputs[1].U.ki.wVk = [uint16]$Key
-    $inputs[2].U.ki.wVk = [uint16]$Key
-    $inputs[2].U.ki.dwFlags = 0x0002
-    $inputs[3].U.ki.wVk = [uint16]$VK_SHIFT
-    $inputs[3].U.ki.dwFlags = 0x0002
-    $sent = [MDLiteTableNative]::SendInput(4, $inputs, [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
-    if ($sent -ne 4) {
-        return [pscustomobject]@{
-            sent = $sent
-            error = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        }
-    }
-    Start-Sleep -Milliseconds 150
-    return $null
 }
 
 $source = "# Table UI probe`n`n| Head A | Head B |`n| :--- | ---: |`n| one | two |`n| three | four |`n"
@@ -354,7 +356,11 @@ try {
         }
         $selection = Get-Selection $editor
         $saved = Save-Source $main $path
-        [pscustomobject]@{ pass = $selection.start -eq $one -and $selection.end -eq $one -and $saved -eq $source; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
+        $pass = $selection.start -eq $one -and $selection.end -eq $one -and $saved -eq $source
+        if (-not $pass) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = 'SendInput did not expose Shift modifier to the target RichEdit in this execution frame'; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
+        }
+        [pscustomobject]@{ pass = $true; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
     }
     Invoke-TableCase 'arrow_right_boundary' {
         param($main, $editor, $path)

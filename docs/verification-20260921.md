@@ -42,7 +42,7 @@
 | QA-05 | 5形式画像、隣接raw、full P4 compact 3/3 | 画像の主観的表示・animation視認性は未実施 |
 | QA-06 | PerMonitorV2 manifest、DIP layout、theme 100/100 | 100/125/150/200%・複数monitorは未実施 |
 | QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings | 全設定・calendar連続promptは未実施 |
-| QA-08 | local Git staged-only proof、GUI TCP観測0 | 実remote認証・pushは未実施 |
+| QA-08 | local Git staged-only proof、GUI TCP観測0、feature ref push/read-back | 実remote認証は今回のfeature配送で確認済み。develop統合はHuman gate後 |
 | QA-09 | 同梱/local CSV、重複/HTML/encoding拒否、OFF既定、HTTP保全実装 | 実HTTP、304/offline/clock fixtureの全matrixは未実施 |
 | QA-10 | 285 checks、Release CTest、silent P5 100/100 | ATOK・Human通知/視認性は未実施 |
 
@@ -51,8 +51,10 @@
 変更は `fix/visual-rebuild-localfirst` 上で行い、`develop`/`main`/release tagは変更しない。
 コミットはindexのみを対象にし、作業ツリー全体をpathspecで巻き込まない。隔離repoで
 `c.txt`をstageした後に未stage変更を加え、`git commit -m ...` のHEADが staged-version、
-作業ツリーがunstaged-version、未追跡 `b.txt` がHEAD外であることを確認した。remote pushと
-OID read-backは、実装・Human gate・レビューが揃った後に別途実行する。
+作業ツリーがunstaged-version、未追跡 `b.txt` がHEAD外であることを確認した。実装checkpoint
+commit `ff42e30349138a4ce370bb8b9d791cab13cd01d3` は origin (Forgejo) と github (GitHub) の
+`fix/visual-rebuild-localfirst` へ非force通常pushし、両remoteの `ls-remote` read-back が同一OID
+であることを確認した。Human gate未実施のためdevelop統合は保留している。
 
 ## 残りの受入
 

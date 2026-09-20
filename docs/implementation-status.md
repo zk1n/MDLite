@@ -13,7 +13,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 - Jev Initial Decision Gate は `sol_xhigh` を選択した。固定 specialist の判定は、既存の座標混同を解消してから UI/table を再構築するよう指示した。実行 provenance が要求 target と不一致だったため dispatch は fail-closed とし、model/effort を推測しない。
 - source/export/native の座標を分離し、CRLF/LF と Markdown image object は compact discontinuity で写像する。`EditorText` はraw native textを取得後、CRLF/lone LFをnative CRへcanonicalizeしてから差分・object復元へ渡す。同幅のlone LFはdiscontinuityへ記録せず、巨大文書で不要なmapを増やさない。native readbackの長さ／コピー件数／OLE取得または位置不一致は推測補正せずfail-closedでsyncを再試行する。
 - presentation reset は underline/effects/paragraph spacing/border を明示的に解除し、表 grid は固定22px矩形でなく実測した行高・共有境界で描画する。mouse hit-test と source caret mapping も同じ共有geometryを使い、クリック時はnative caretへ変換する。
-- UI layout は DIP scaling、`WM_DPICHANGED`、PerMonitorV2 manifest、editor font 再生成を実装した。実機のDPI・IME・通常GUI画面はまだPASSにしない。
+- UI layout は DIP scaling、`WM_DPICHANGED`、PerMonitorV2 manifest、editor font 再生成を実装した。Workspace／Outline paneの明示折畳み、狭幅時の自動hide、Find/Replaceのresponsive配置を追加し、`responsive-layout-native-final9.json` と `responsive-find-native-final9.json` でclient boundsを実測した。実機のDPI・IME・通常GUI画面はまだPASSにしない。
 - 祝日は同梱データを維持し、検証付きのローカルCSV取込みと user-wide `holiday_auto_update=false` 設定を追加した。明示許可時だけ既知の内閣府HTTPS CSVを月次確認し、Workspace cacheをlast-known-goodとして更新する。fake clockとmock HTTPの200/304/404/500/timeout/HTML/大幅減少をCoreTestsで確認した。opt-in実HTTPは試験環境のWinHTTP 12185（`ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY`）でTLS応答を受信できず、実HTTP受入はBLOCKED。
 
 ## 現在の構成
@@ -51,9 +51,9 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-22 | ReleaseのP0〜P5測定scriptとJSONを作成し実行 | holiday-policy full: P1 six WS 47,894,528 bytes、P4 WS 42,967,040 bytes、P2 cancellation completed、入力p95最大6.4ms、compact 3/3、theme 100/100、P5 100/100失敗0。P3 20/100MiBは247.2/1,242.2MBで機能を無効化しない制約を記録 | 今回の通常1〜6文書の50,000,000-byte目標はP1 sixで達成。100MiBは機能維持による高使用量 |
 | A-23 | 大容量でも機能を無効化せず、入力時全文parse/decodeを遅延し、不変画像object/cacheを再利用 | 20MiB/100MiBと100回反復を実測。100MiB peak WS 1,242,210,304 bytesは高水準 | 測定済み・制約記録 |
 | A-24 | `.cache`と`.state`を分離 | WorkspaceStore回帰 | 自動PASS |
-| A-25 | vswhere、CMake/Ninja/MSVC検出、VS Code task/launch、静的runtime、v6 manifest | Debug/Release build/testとexe起動。F5キー操作自体はHuman未実施 | 自動PASS・Human未確認 |
+| A-25 | vswhere、CMake/Ninja/MSVC検出、VS Code task/launch、静的runtime、v6 manifest、DIP/responsive layout | Debug/Release build/testとexe起動、native responsive layout/find bounds probe。F5キー操作自体はHuman未実施 | 自動PASS・Human未確認 |
 | A-26 | 公開投影なし。build、`.codex`、秘密拡張子をignore | tracked fileの秘密形式／個人絶対path scan | 自動PASS |
-| A-27 | 同一RichEdit上のcell grid、表source transaction、Tab/Shift+Tab、矢印境界、行列操作、Undo接続 | grid cell解析、EOF/CRLF/escaped pipe/code pipe、可視行横断で共有する実測column boundary、描画・mouse hit-test・caret mappingの共通geometry、Release GUI acceptanceの編集/Undo/Redo | 自動PASS・実DPI/hit-testの操作感はHuman評価待ち |
+| A-27 | 同一RichEdit上のcell grid、表source transaction、Tab/Shift+Tab、矢印境界、行列操作、Undo接続 | grid cell解析、EOF/CRLF/escaped pipe/code pipe、可視行横断で共有する実測column boundary、描画・mouse hit-test・caret mappingの共通geometry、`table-hit-test-native-responsive-final9.json` 4/4、Release GUI acceptanceの編集/Undo/Redo | 自動PASS・実DPI/hit-testの操作感はHuman評価待ち |
 | A-28 | 子見出しを含むsection move、子孫drop拒否、単一Undo | section回帰。実dragはHuman未確認 | 実装済み・Human gate |
 | A-29 | Dairy/Meeting/Memo既定、採番、任意field、profile GUI、cursor | profile回帰 | 自動PASS・GUI promptはHuman未確認 |
 | A-30 | 日曜始まり、同梱日本休日、検証付きローカルCSV追加、common許可時の月次cache、既存Dairy、tooltip | 同梱データとCSV import、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少、cache last-known-goodのpolicy回帰。DPIごとの見え方はHuman未確認 | 自動・mock PASS・Human gate（実HTTPはWinHTTP 12185でBLOCKED） |

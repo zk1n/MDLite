@@ -44,6 +44,9 @@ constexpr int kOutlineWidth = 230;
 constexpr int kTabHeight = 30;
 constexpr int kFindHeight = 96;
 constexpr int kFindResultsHeight = 170;
+constexpr int kMinimumEditorWidth = 360;
+constexpr int kMinimumPaneWidth = 156;
+constexpr int kFindCompactWidth = 640;
 constexpr int kProcessDoneButton = 4400;
 constexpr UINT kWorkspaceSearchBatchMessage = WM_APP + 41;
 constexpr UINT kWorkspaceSearchCompleteMessage = WM_APP + 42;
@@ -452,6 +455,10 @@ enum ControlId : int {
   // performance/GUI harnesses send the numeric IDs directly.
   kCalendarImportHolidays,
   kCalendarUpdateHolidays,
+  // Keep pane toggles after the long-standing command IDs; automation sends
+  // existing numeric IDs directly.
+  kViewWorkspacePane,
+  kViewOutlinePane,
 };
 
 bool IsTextFile(const std::filesystem::path& path) {
@@ -1341,6 +1348,14 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kViewSettingsFiles) OpenWorkspaceSettingsFiles();
       else if (command == kViewProfiles) ManageProfiles();
       else if (command == kViewCompact) ToggleCompactWindow();
+      else if (command == kViewWorkspacePane) {
+        workspace_pane_collapsed_ = !workspace_pane_collapsed_;
+        LayoutControls();
+      }
+      else if (command == kViewOutlinePane) {
+        outline_pane_collapsed_ = !outline_pane_collapsed_;
+        LayoutControls();
+      }
       else if (command == kViewCommandPalette) ShowCommandPalette();
       else if (command == kTableRowBefore) ApplyTableAction(TableAction::InsertRowBefore);
       else if (command == kTableRowAfter) ApplyTableAction(TableAction::InsertRowAfter);
@@ -1568,6 +1583,8 @@ void Application::CreateMenuBar() {
   AppendMenuW(view, MF_STRING, kViewSettingsFiles, L"設定ファイルを詳細編集");
   AppendMenuW(view, MF_STRING, kViewProfiles, L"作成プロファイルを管理…");
   AppendMenuW(view, MF_STRING, kViewCompact, L"現在の文書をコンパクト表示");
+  AppendMenuW(view, MF_STRING, kViewWorkspacePane, L"Workspace paneを折り畳む／表示");
+  AppendMenuW(view, MF_STRING, kViewOutlinePane, L"Outline paneを折り畳む／表示");
   AppendMenuW(view, MF_STRING, kViewCommandPalette, L"コマンドパレット…\tCtrl+Shift+P");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示");
   HMENU table = CreatePopupMenu();
@@ -1712,34 +1729,113 @@ void Application::LayoutControls() {
   const int content_height = std::max(0L, client.bottom - status_height);
   const bool find_visible = IsWindowVisible(find_bar_) != FALSE;
   const bool results_visible = IsWindowVisible(find_results_) != FALSE;
-  const int tree_width = ScaleDip(window_, kTreeWidth);
-  const int outline_width = ScaleDip(window_, kOutlineWidth);
+  const int desired_tree_width = ScaleDip(window_, kTreeWidth);
+  const int desired_outline_width = ScaleDip(window_, kOutlineWidth);
+  const int minimum_editor_width = ScaleDip(window_, kMinimumEditorWidth);
+  const int minimum_pane_width = ScaleDip(window_, kMinimumPaneWidth);
+  const int pane_budget = std::max(0L, client.right - minimum_editor_width);
+  int tree_width = 0;
+  int outline_width = 0;
+  const bool want_tree = !workspace_pane_collapsed_;
+  const bool want_outline = !outline_pane_collapsed_;
+  if (want_tree && want_outline && pane_budget >= minimum_pane_width * 2) {
+    const int desired_total = desired_tree_width + desired_outline_width;
+    if (pane_budget >= desired_total) {
+      tree_width = desired_tree_width;
+      outline_width = desired_outline_width;
+    } else {
+      tree_width = std::max(minimum_pane_width,
+                            MulDiv(pane_budget, desired_tree_width, desired_total));
+      outline_width = pane_budget - tree_width;
+      if (outline_width < minimum_pane_width) {
+        outline_width = minimum_pane_width;
+        tree_width = pane_budget - outline_width;
+      }
+    }
+  } else if (want_tree && pane_budget >= minimum_pane_width) {
+    tree_width = std::min(desired_tree_width, pane_budget);
+  } else if (want_outline && pane_budget >= minimum_pane_width) {
+    outline_width = std::min(desired_outline_width, pane_budget);
+  }
+  // At very narrow widths keep one useful navigation pane only when there is
+  // enough room for its hit targets; otherwise the editor owns the full row.
+  if (tree_width == 0 && outline_width == 0 && pane_budget >= minimum_pane_width) {
+    if (want_tree) tree_width = std::min(desired_tree_width, pane_budget);
+    else if (want_outline) outline_width = std::min(desired_outline_width, pane_budget);
+  }
+  ShowWindow(workspace_tree_, tree_width > 0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(outline_, outline_width > 0 ? SW_SHOW : SW_HIDE);
   const int tab_height = ScaleDip(window_, kTabHeight);
-  const int find_height = ScaleDip(window_, kFindHeight);
-  const int results_height = ScaleDip(window_, kFindResultsHeight);
   const int center_left = tree_width;
   const int center_width = std::max(0L, client.right - tree_width - outline_width);
+  const int compact_find_width = ScaleDip(window_, kFindCompactWidth);
+  const bool compact_find = center_width < compact_find_width;
+  const int find_height = ScaleDip(window_, find_visible ? (compact_find ? 64 : kFindHeight) : 0);
+  const int results_height = ScaleDip(window_, kFindResultsHeight);
+  const int padding = ScaleDip(window_, 8);
+  const int gap = ScaleDip(window_, 4);
+  const int input_height = ScaleDip(window_, 24);
+  const int button_height = ScaleDip(window_, 25);
+  const int minimum_input_width = ScaleDip(window_, 80);
+  const int base_button_width = ScaleDip(window_, 100);
+  const bool show_advanced_find = find_visible && !compact_find;
+  const bool show_workspace_actions = show_advanced_find && center_width >= ScaleDip(window_, 720);
+  const bool show_globs = show_advanced_find && center_width >= ScaleDip(window_, 600);
+  auto place = [](HWND control, int x, int y, int width, int height, bool visible) {
+    if (!control) return;
+    MoveWindow(control, x, y, std::max(0, width), std::max(0, height), TRUE);
+    ShowWindow(control, visible && width > 0 && height > 0 ? SW_SHOW : SW_HIDE);
+  };
   MoveWindow(workspace_tree_, 0, 0, tree_width, content_height, TRUE);
   MoveWindow(outline_, client.right - outline_width, 0, outline_width, content_height, TRUE);
   MoveWindow(tabs_, center_left, 0, center_width, tab_height, TRUE);
   MoveWindow(find_bar_, center_left, tab_height, center_width, find_visible ? find_height : 0, TRUE);
-  const int options_width = ScaleDip(window_, 210);
-  const int button_width = ScaleDip(window_, 100);
-  const int input_width = std::max(ScaleDip(window_, 80), center_width - options_width - button_width - ScaleDip(window_, 24));
-  MoveWindow(find_edit_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 4), input_width, ScaleDip(window_, 24), TRUE);
-  MoveWindow(find_next_, center_left + ScaleDip(window_, 12) + input_width, tab_height + ScaleDip(window_, 3), button_width, ScaleDip(window_, 25), TRUE);
-  MoveWindow(find_case_, center_left + ScaleDip(window_, 116) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 72), ScaleDip(window_, 22), TRUE);
-  MoveWindow(find_regex_, center_left + ScaleDip(window_, 188) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 62), ScaleDip(window_, 22), TRUE);
-  MoveWindow(find_word_, center_left + ScaleDip(window_, 250) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 58), ScaleDip(window_, 22), TRUE);
-  MoveWindow(replace_edit_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 36), input_width, ScaleDip(window_, 24), TRUE);
-  MoveWindow(replace_one_, center_left + ScaleDip(window_, 12) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 82), ScaleDip(window_, 25), TRUE);
-  MoveWindow(replace_document_, center_left + ScaleDip(window_, 98) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 92), ScaleDip(window_, 25), TRUE);
-  MoveWindow(replace_workspace_, center_left + ScaleDip(window_, 194) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 118), ScaleDip(window_, 25), TRUE);
-  const int glob_width = std::max(ScaleDip(window_, 80), (center_width - button_width - ScaleDip(window_, 32)) / 2);
-  MoveWindow(find_include_glob_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 66), glob_width, ScaleDip(window_, 24), TRUE);
-  MoveWindow(find_exclude_glob_, center_left + ScaleDip(window_, 12) + glob_width, tab_height + ScaleDip(window_, 66), glob_width, ScaleDip(window_, 24), TRUE);
-  MoveWindow(find_workspace_, center_left + center_width - button_width - ScaleDip(window_, 8),
-             tab_height + ScaleDip(window_, 65), button_width, ScaleDip(window_, 25), TRUE);
+  const int option_cluster = show_advanced_find ?
+      ScaleDip(window_, 72 + 62 + 58 + 8) : 0;
+  const int first_row_available = std::max(0, center_width - padding * 2);
+  const int button_width = std::min(base_button_width,
+                                    std::max(0, first_row_available - minimum_input_width -
+                                                   option_cluster - gap * 2));
+  const int input_width = std::max(0, first_row_available - button_width - option_cluster - gap * 2);
+  place(find_edit_, center_left + padding, tab_height + ScaleDip(window_, 4), input_width,
+        input_height, find_visible);
+  const int find_next_x = center_left + padding + input_width + gap;
+  place(find_next_, find_next_x, tab_height + ScaleDip(window_, 3), button_width,
+        button_height, find_visible);
+  int option_x = find_next_x + button_width + gap;
+  place(find_case_, option_x, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 72),
+        ScaleDip(window_, 22), show_advanced_find);
+  option_x += ScaleDip(window_, 72) + gap;
+  place(find_regex_, option_x, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 62),
+        ScaleDip(window_, 22), show_advanced_find);
+  option_x += ScaleDip(window_, 62) + gap;
+  place(find_word_, option_x, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 58),
+        ScaleDip(window_, 22), show_advanced_find);
+
+  const int replacement_cluster = show_workspace_actions ?
+      ScaleDip(window_, 82 + 92 + 118 + 12) : ScaleDip(window_, 82);
+  const int replacement_width = std::max(0, first_row_available - replacement_cluster - gap);
+  place(replace_edit_, center_left + padding, tab_height + ScaleDip(window_, 36), replacement_width,
+        input_height, find_visible);
+  int replace_x = center_left + padding + replacement_width + gap;
+  place(replace_one_, replace_x, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 82),
+        button_height, find_visible);
+  replace_x += ScaleDip(window_, 82) + gap;
+  place(replace_document_, replace_x, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 92),
+        button_height, show_workspace_actions);
+  replace_x += ScaleDip(window_, 92) + gap;
+  place(replace_workspace_, replace_x, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 118),
+        button_height, show_workspace_actions);
+
+  const int glob_button_width = show_workspace_actions ? base_button_width : 0;
+  const int glob_width = show_globs ? std::max(0, (center_width - padding * 2 - glob_button_width - gap * 2) / 2) : 0;
+  place(find_include_glob_, center_left + padding, tab_height + ScaleDip(window_, 66), glob_width,
+        input_height, show_globs);
+  place(find_exclude_glob_, center_left + padding + glob_width + gap,
+        tab_height + ScaleDip(window_, 66), glob_width, input_height, show_globs);
+  place(find_workspace_, center_left + center_width - padding - glob_button_width,
+        tab_height + ScaleDip(window_, 65), glob_button_width, button_height,
+        show_workspace_actions);
   const int results_top = tab_height + (find_visible ? find_height : 0);
   MoveWindow(find_results_, center_left, results_top, center_width,
              results_visible ? results_height : 0, TRUE);

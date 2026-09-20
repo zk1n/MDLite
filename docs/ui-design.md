@@ -20,6 +20,11 @@ sourceを推測せず raw Markdown に留める。
 基準で、`WM_DPICHANGED` 時に font と layout を再生成する。左/右 pane、tab、検索 bar、結果、editor の
 順に余白を取り、狭い幅でも editor が負の幅や画面外にならないようにする。
 
+Workspace／Outline pane は View メニューから個別に折り畳み・復元できる。既定幅はDIPの初期値に留め、
+利用可能なclient幅からeditorの最小幅を先に確保し、残りへpaneを比例配分する。狭幅で両paneを維持できない
+場合はnavigationを自動的に隠し、editorへ負幅・clippingを渡さない。Find/Replaceもclient幅に応じて
+advanced option、glob、Workspace actionを折り畳み、検索と置換の基本入力を残す。
+
 Markdown presentation は全体を通常書式へ戻してから必要な span だけを再適用する。underline、hidden、
 link、background、paragraph spacing/border を明示的に解除し、source変更や公開Undoを発生させない。
 

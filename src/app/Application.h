@@ -264,6 +264,8 @@ class Application {
   bool external_operation_active_{};
   bool outline_dragging_{};
   bool workspace_dragging_{};
+  bool workspace_pane_collapsed_{};
+  bool outline_pane_collapsed_{};
   std::size_t outline_drag_source_{};
   std::vector<std::filesystem::path> workspace_drag_sources_;
   std::shared_ptr<WorkspaceStore> workspace_store_;

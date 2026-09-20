@@ -43,7 +43,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-14 | CP932 best-fitを許さず変換不能文字を拒否 | emoji拒否回帰 | 自動PASS |
 | A-15 | `.state/recovery`へ原文をatomic保存し、復元／破棄／保持 | Release GUIで5秒timer後に実process kill、disk不変、再起動promptから未保存本文復元 | 自動PASS |
 | A-16 | session v2、tab／選択／scroll／window位置、compact view移送、Workspace mutex | session回帰。複数monitor復元はHuman未確認 | 実装済み・Human gate |
-| A-17 | Trust後のGit status/diff/stage/commit/branch/merge/fetch/ff-only pull/push、diff3競合補助 | Process／cancel／conflict parser回帰。実repo GUI操作は未実施 | 実装済み・Human未確認 |
+| A-17 | Trust後のGit status/diff/stage/commit/branch/merge/fetch/ff-only pull/push、diff3競合補助 | Process／cancel／conflict parser回帰。`git-local-first-final11.json` でremoteなし隔離repoのlocal commitとindex-only境界を再実行。実repo GUI操作は未実施 | 自動PASS・Human未確認 |
 | A-18 | 未信頼Workspaceで外部processを拒否。引数配列、Job、timeout、log上限 | Trust identity copy/self-declare、process/cancel回帰 | 自動PASS |
 | A-19 | common／Workspace設定、由来、theme、font、keybinding、palette、未知field保持 | 設定階層・atomic save・競合回帰 | 自動PASS・連続promptはHuman未確認 |
 | A-20 | 設定はGit移行可能、Trustはuser-local identity storeで移行しない | copyされた設定／自己申告token拒否回帰 | 自動PASS |

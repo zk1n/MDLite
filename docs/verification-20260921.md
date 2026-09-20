@@ -45,16 +45,18 @@
 | QA-05 | 5形式画像、隣接raw、full P4 compact 3/3 | 画像の主観的表示・animation視認性は未実施 |
 | QA-06 | PerMonitorV2 manifest、DIP layout、responsive child bounds at 1266/800/520/420, theme 100/100 | 100/125/150/200%・複数monitorは未実施 |
 | QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings | 全設定・calendar連続promptは未実施 |
-| QA-08 | local Git staged-only proof、GUI TCP観測0、feature ref push/read-back | 実remote認証は今回のfeature配送で確認済み。develop統合はHuman gate後 |
+| QA-08 | `git-local-first-final11.json`（`Invoke-GitLocalAcceptance.ps1`）でremoteなし隔離repoのlocal commit、staged/unstaged/untracked分離、Application.cppのindex-only commit形を確認。GUI TCP観測0、feature ref push/read-back | 実remote認証は今回のfeature配送で確認済み。実repoのcredential/hook操作とdevelop統合はHuman gate後 |
 | QA-09 | 同梱/local CSV、重複/HTML/encoding拒否、OFF既定、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少、cache保全ポリシー | 実HTTPは `MDLITE_TEST_REAL_HOLIDAY_HTTP=1` で実行したが、WinHTTP 12185 によりBLOCKED。offline transport/timeoutの実WinHTTP matrixは未実施 |
 | QA-10 | 301 checks、Release CTest、silent P5 100/100、現行Release native screenshot evidence | ATOK・Human通知/視認性は未実施 |
 
 ## Git検証境界
 
 変更は `fix/visual-rebuild-localfirst` 上で行い、`develop`/`main`/release tagは変更しない。
-コミットはindexのみを対象にし、作業ツリー全体をpathspecで巻き込まない。隔離repoで
-`c.txt`をstageした後に未stage変更を加え、`git commit -m ...` のHEADが staged-version、
-作業ツリーがunstaged-version、未追跡 `b.txt` がHEAD外であることを確認した。実装checkpoint
+コミットはindexのみを対象にし、作業ツリー全体をpathspecで巻き込まない。`tools/Invoke-GitLocalAcceptance.ps1`
+をfresh実行し、`build/verification/git-local-first-final11.json` でremoteなし隔離repoの
+`git commit -m ...` がstaged-versionだけをHEADへ取り込み、作業ツリーのunstaged-versionと
+未追跡 `untracked.md` / `other.md` を保持すること、およびApplication.cppのcommit形がpathspecなしであることを確認した。
+実装checkpoint
 実装commit `ff42e30349138a4ce370bb8b9d791cab13cd01d3`、検証記録commit
 `92759b5d8955f0851cdc234696765ef1f886cd60`、休日policy/診断commit
 `de172b72f6c16f3f21da85340c953a56a3612fc5`、空本文診断修正commit

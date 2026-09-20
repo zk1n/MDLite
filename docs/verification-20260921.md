@@ -27,6 +27,7 @@
 | native座標・CRLF/LF・画像・表 transaction | PASS / 境界記録 | CoreTestsのnative snapshot/transaction回帰。表の描画・mouse hit-test・caret mappingは同じ可視行横断の共有列境界を使用。`build/verification/table-hit-test-native-responsive-final9.json` で隔離fixtureの4セルへ実native clickを送り、全4件が同一セル近傍のnative caretへ収束。`build/verification/table-edit-native-final10.json` で行列操作、セル編集Undo/Redo、Tab、末尾行追加、矢印を実native経路で確認（10/11）。Shift+Tabはこの実行枠でSendInputのShift modifierをRichEditへ観測できずBLOCKED、CoreTestsの逆移動ロジックはPASS |
 | responsive native layout | PASS (evidence only) | `build/verification/responsive-layout-native-final9.json` と `responsive-find-native-final9.json`。1266/800/520/420幅でeditor正幅・client内bounds、Workspace/Outlineの折畳み復元、Find/Replaceの狭幅再配置をnative child rectで確認。Human DPI/IME/主観受入とは分離 |
 | native screenshot | PASS (evidence only) | `build/verification/native-screenshot-responsive-final9.json` と `native-screenshot-responsive-final9.png`。隔離fixtureのRelease `MDLite.exe`（SHA-256 `495EBE4CEFFFE1C3E94F83065288D5D99CE291F088A7FBA62E70DCFD9FEBC7C9`）を1280x800でPrintWindow取得。Computer UseはMDLite window列挙後にWindowsロック画面で停止したため、操作・主観受入とは分離 |
+| native screenshot before/after | EVIDENCE | 修正前 `native-screenshot-final.json` / `.png`（Release hash `833C975470D9AA5A0B0439E6CAADA830E8883FCB9A9BC92379964197C45F583F`）と修正後 `native-screenshot-responsive-final9.json` / `.png`（Release hash `495EBE4CEFFFE1C3E94F83065288D5D99CE291F088A7FBA62E70DCFD9FEBC7C9`）を同じ隔離fixture・1280x800で取得。before/after画像は実native描画の比較証拠であり、Human視認性PASSではない |
 | 休日CSV import・重複拒否・既定OFF | PASS | CoreTests、local parser、fake clock 28日判定、mock HTTP 200/304/404/500/timeout/HTML/大幅減少 |
 | 無音回帰 | PASS（既存測定） | 100/100、失敗0。今回の表示変更で再現性を確認 |
 | GUI acceptance script | PASS | `build/verification/gui-acceptance-responsive-final9.json`、pass=true。Release exe hash `495ebe4cefffe1c3e94f83065288d5d99ce291f088a7fba62e70dcfd9febc7c9`。compact edit/Undo/Redo、Find/Replace、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
@@ -38,7 +39,7 @@
 
 | ID | 自動/API証拠 | Human/未実施境界 |
 |---|---|---|
-| QA-01 | GUI acceptanceのsource保存・recovery、Debug/Release build、native PrintWindow screenshot | クリック操作・主観的な文字位置は未実施 |
+| QA-01 | GUI acceptanceのsource保存・recovery、Debug/Release build、修正前後のnative PrintWindow screenshot | クリック操作・主観的な文字位置は未実施 |
 | QA-02 | native snapshotのCRLF/LF、画像object境界、GUI selection/保存 | IME・結合文字の実入力は未実施 |
 | QA-03 | native transaction、GUI Save/Undo/Redo、presentation reset | 構文切替の全視認確認は未実施 |
 | QA-04 | table parser、可視行横断の共有column geometry、描画とmouse/caret hit-testの共通経路、`table-hit-test-native-responsive-final9.json` 4/4、`table-edit-native-final10.json` の行列操作・Undo/Redo・Tab・矢印 10/11 | Shift+Tab実native入力（SendInput modifier未観測）と実DPIのcell hit-test/操作感は未実施 |

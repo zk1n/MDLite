@@ -22,14 +22,14 @@
 | Debug core checks | PASS | `All 301 MDLite core checks passed.` |
 | Release build/test | PASS | `tools/Invoke-Build.ps1 -Preset release -Test`、CTest 1/1 |
 | Release quick performance | PASS | `build/verification/performance-release-holiday-policy-quick-final2.json`。P0 18.1MB WS、P1 six-document 29.5MB WS、P4 43.3MB WS、P5 20/20 failures 0、compact 3/3、theme 20/20、入力p95最大3.356ms。 |
-| Fresh bounded quick performance | PASS | `build/verification/performance-release-table-hit-test-quick-final7.json`。P1 six-document 29,487,104 bytes、P4 42,893,312 bytes、compact 3/3、P5 100/100 failures 0、入力p95最大6.662ms。現行Release exe SHA-256は `e521e91434f27e0a9719c3cd2c009bbc7b312c130bf794dcee8f93c0492a38a0`。 |
+| Fresh bounded quick performance | PASS | `build/verification/performance-release-native-coordinate-quick-final8.json`。P1 six-document 29,487,104 bytes、P4 43,323,392 bytes、compact 3/3、P5 100/100 failures 0、入力p95最大6.516ms。現行Release exe SHA-256は `f44d8bc4f0ef12c8ba2ace8d36455085e07845b43c0bf26bbe4342135b1ce866`。 |
 | Release full performance | PASS / 制約記録 | `build/verification/performance-release-holiday-policy-full-final2.json`。P1 six-document 47,894,528 bytes、P4 42,967,040 bytes、P3 20/100MiB 247.2/1,242.2MB。P2 cancellation completed、P5 100/100 failures 0、compact 3/3、theme 100/100、入力p95最大6.4ms。今回のP1 sixは50MB目標内、100MiBは機能維持による高使用量 |
-| native座標・CRLF/LF・画像・表 transaction | PASS | CoreTestsのnative snapshot/transaction回帰。表の描画・mouse hit-test・caret mappingは同じ可視行横断の共有列境界を使用。`build/verification/table-hit-test-native-final7.json` で隔離fixtureの4セルへ実native clickを送り、全4件が同一セル近傍のnative caretへ収束 |
-| native screenshot | PASS (evidence only) | `build/verification/native-screenshot-table-hit-test-final7.json` と `native-screenshot-table-hit-test-final7.png`。隔離fixtureのRelease `MDLite.exe`（SHA-256 `E521E91434F27E0A9719C3CD2C009BBC7B312C130BF794DCEE8F93C0492A38A0`）を1280x800でPrintWindow取得。CUA列挙不可のため操作・主観受入とは分離 |
+| native座標・CRLF/LF・画像・表 transaction | PASS | CoreTestsのnative snapshot/transaction回帰。表の描画・mouse hit-test・caret mappingは同じ可視行横断の共有列境界を使用。`build/verification/table-hit-test-native-coordinate-final8.json` で隔離fixtureの4セルへ実native clickを送り、全4件が同一セル近傍のnative caretへ収束 |
+| native screenshot | PASS (evidence only) | `build/verification/native-screenshot-table-hit-test-final8.json` と `native-screenshot-table-hit-test-final8.png`。隔離fixtureのRelease `MDLite.exe`（SHA-256 `F44D8BC4F0EF12C8BA2ACE8D36455085E07845B43C0BF26BBE4342135B1CE866`）を1280x800でPrintWindow取得。CUA列挙不可のため操作・主観受入とは分離 |
 | 休日CSV import・重複拒否・既定OFF | PASS | CoreTests、local parser、fake clock 28日判定、mock HTTP 200/304/404/500/timeout/HTML/大幅減少 |
 | 無音回帰 | PASS（既存測定） | 100/100、失敗0。今回の表示変更で再現性を確認 |
-| GUI acceptance script | PASS | `build/verification/gui-acceptance-table-hit-test-final7.json`、pass=true。Release exe hash `e521e91434f27e0a9719c3cd2c009bbc7b312c130bf794dcee8f93c0492a38a0`。compact edit/Undo/Redo、Find/Replace、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
-| native screenshot / CUA操作 | PARTIAL | PrintWindowによる現行Releaseの実native画面は取得済み（`native-screenshot-table-hit-test-final7.json`）。CUAにはnative appが列挙されず、クリック・ドラッグ・Humanの視認性は未確認 |
+| GUI acceptance script | PASS | `build/verification/gui-acceptance-native-coordinate-final8.json`、pass=true。Release exe hash `f44d8bc4f0ef12c8ba2ace8d36455085e07845b43c0bf26bbe4342135b1ce866`。compact edit/Undo/Redo、Find/Replace、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
+| native screenshot / CUA操作 | PARTIAL | PrintWindowによる現行Releaseの実native画面は取得済み（`native-screenshot-table-hit-test-final8.json`）。CUAにはnative appが列挙されず、クリック・ドラッグ・Humanの視認性は未確認 |
 | IME/ATOK、DPI複数monitor、table操作感、画像視認性 | NOT RUN | Human gate。自動click-routing evidenceをHuman PASSへ昇格しない |
 | HTTP月次休日自動更新 | IMPLEMENTED / mock PASS / real HTTP BLOCKED | commonで明示許可した場合だけ、固定の内閣府HTTPS URLを非同期確認。WinHTTPのTLS、timeout、2MiB上限、redirect拒否、304、件数大幅減少拒否、原子的cache置換を実装。opt-in実HTTPを実行したが、試験環境のWinHTTPが `12185 (ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY)` でTLS応答を受信できず、status=0となった。資格情報・TLS設定は変更していない |
 
@@ -40,7 +40,7 @@
 | QA-01 | GUI acceptanceのsource保存・recovery、Debug/Release build、native PrintWindow screenshot | クリック操作・主観的な文字位置は未実施 |
 | QA-02 | native snapshotのCRLF/LF、画像object境界、GUI selection/保存 | IME・結合文字の実入力は未実施 |
 | QA-03 | native transaction、GUI Save/Undo/Redo、presentation reset | 構文切替の全視認確認は未実施 |
-| QA-04 | table parser、可視行横断の共有column geometry、描画とmouse/caret hit-testの共通経路、GUI編集経路 | 実DPIのcell hit-test/操作感は未実施 |
+| QA-04 | table parser、可視行横断の共有column geometry、描画とmouse/caret hit-testの共通経路、`table-hit-test-native-coordinate-final8.json` 4/4、GUI編集経路 | 実DPIのcell hit-test/操作感は未実施 |
 | QA-05 | 5形式画像、隣接raw、full P4 compact 3/3 | 画像の主観的表示・animation視認性は未実施 |
 | QA-06 | PerMonitorV2 manifest、DIP layout、theme 100/100 | 100/125/150/200%・複数monitorは未実施 |
 | QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings | 全設定・calendar連続promptは未実施 |
@@ -59,7 +59,7 @@
 `de172b72f6c16f3f21da85340c953a56a3612fc5`、空本文診断修正commit
 `2f7401e224718752e98bd30eb72a0dd2ed2d8ece`、native canonicalization checkpoint
 `837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8`、`856a419e2890053a91c673e732e9113a4e39f103`、
-`40d88b73d556f994c9705f415685c0e0470b8477`、`da86373fbd780252345ee8583cf64bd4c8742e57`、`7abd422641888e402463ee01581a1d875674c3c6` を origin (Forgejo) と github (GitHub) の
+`40d88b73d556f994c9705f415685c0e0470b8477`、`da86373fbd780252345ee8583cf64bd4c8742e57`、`7abd422641888e402463ee01581a1d875674c3c6`、`8ee82cc16b3a0fcf7b40b97effac939fe032d76a` を origin (Forgejo) と github (GitHub) の
 `fix/visual-rebuild-localfirst` へ非force通常pushし、各push時の対象OIDが両remoteで同一であることを
 `ls-remote` read-backで確認した。docsの参照更新commitは別途行い、main/tag/developは変更していない。
 であることを確認した。Human gate未実施のためdevelop統合は保留している。

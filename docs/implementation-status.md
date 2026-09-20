@@ -60,7 +60,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-31 | PNG/JPEG/GIF/WebP/SVG経路、clipboard、D&D、比率固定resize、SVG XML安全判定、画像ごとのanimation期限 | 5形式のnative RichEdit挿入、GIF partial frame/offset/transparency/disposal 2/3、GIF/WebP異周期timing、SVG同一bytes検査、Release GUI acceptanceの複数object前後source保存、隣接raw保存、full P4 | 自動PASS・見え方はHuman gate |
 | A-32 | 明示Trust、external command adapter、取消、失敗時local保持、hash/revision | mock CLI回帰。本番資格情報は使用していない | 自動PASS（mock） |
 | A-33 | 公開package生成をrelease手順まで拒否 | 今回は署名・package・Releaseを実施しない | Release時保留 |
-| A-34 | feature checkpointをForgejo/GitHubへ非forceで同一OID配送 | table shared-geometry/hit-testとnative caret mapping明示化（`8ee82cc16b3a0fcf7b40b97effac939fe032d76a`）を含むfeature checkpointを両remoteへ非force配送し、対象branch OID一致を`ls-remote`で照合。Human gate未実施のためdevelop統合は保留 | feature配送PASS・develop統合保留 |
+| A-34 | feature checkpointをForgejo/GitHubへ非forceで同一OID配送 | table shared-geometry/hit-testとnative caret mapping、responsive layout（`41303da2cc398f2f94efdfac595ac5f5ad5271ae`）を含むfeature checkpointを両remoteへ非force配送し、対象branch OID一致を`ls-remote`で照合。Human gate未実施のためdevelop統合は保留 | feature配送PASS・develop統合保留 |
 
 ## Human専用の残り
 

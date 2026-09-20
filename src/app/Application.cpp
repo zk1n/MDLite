@@ -2454,8 +2454,8 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
       SendMessageW(view.editor, EM_SETSEL, view_prefix, current_suffix);
       SendMessageW(view.editor, EM_REPLACESEL, FALSE,
                    reinterpret_cast<LPARAM>(replacement.c_str()));
-      const CHARRANGE restored{static_cast<LONG>(target_native.SourceToView(source_begin)),
-                               static_cast<LONG>(target_native.SourceToView(source_end))};
+      const CHARRANGE restored{static_cast<LONG>(target_native.SourceToNative(source_begin)),
+                               static_cast<LONG>(target_native.SourceToNative(source_end))};
       SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&restored));
       SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
       InvalidateRect(view.editor, nullptr, FALSE);
@@ -2505,8 +2505,8 @@ void Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
     SendMessageW(view.editor, EM_STOPGROUPTYPING, 0, 0);
     view.editor_snapshot = SnapshotFor(view.document);
     const CHARRANGE restored{
-        static_cast<LONG>(target_native.SourceToView(std::min(source_begin, view.document.text().size()))),
-        static_cast<LONG>(target_native.SourceToView(std::min(source_end, view.document.text().size())))};
+        static_cast<LONG>(target_native.SourceToNative(std::min(source_begin, view.document.text().size()))),
+        static_cast<LONG>(target_native.SourceToNative(std::min(source_end, view.document.text().size())))};
     SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&restored));
     SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(view.editor, nullptr, TRUE);

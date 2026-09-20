@@ -3690,7 +3690,7 @@ void Application::CompleteHolidayUpdate(void* raw_payload) {
       payload->result.csv);
   bool accepted = assessment.accepted;
   std::wstring error = assessment.error;
-  if (!accepted && payload->result.status == 0 && !payload->result.error.empty())
+  if (!accepted && !payload->result.error.empty())
     error = payload->result.error;
   if (accepted && assessment.replace_cache) {
     if (!WriteHolidayCache(payload->cache_path, payload->result.csv, error) ||

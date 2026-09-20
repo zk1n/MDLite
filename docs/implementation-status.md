@@ -48,8 +48,8 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 | A-19 | common／Workspace設定、由来、theme、font、keybinding、palette、未知field保持 | 設定階層・atomic save・競合回帰 | 自動PASS・連続promptはHuman未確認 |
 | A-20 | 設定はGit移行可能、Trustはuser-local identity storeで移行しない | copyされた設定／自己申告token拒否回帰 | 自動PASS |
 | A-21 | 通常起動は無通信、休日は同梱。更新は明示したローカルCSV取込みまたは、commonで明示許可した既知の内閣府HTTPS CSV月次確認のみ。Workspace設定は通信許可を引き上げない | 追跡依存／文字列scan、休日CSV parser／重複拒否／設定既定値、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少回帰。HTTPはWinHTTPの固定host・TLS・timeout・サイズ・redirect拒否経路。OS shell/外部CLIは明示操作のみ | 自動・local・mock policy PASS（実HTTPはWinHTTP 12185でBLOCKED、Human受入未実施） |
-| A-22 | ReleaseのP0〜P5測定scriptとJSONを作成し実行 | holiday-policy full: P1 six WS 50,372,608 bytes、P4 WS 41,848,832 bytes、P2 cancellation completed、入力p95最大6.57ms、compact 3/3、theme 100/100、P5 100/100失敗0。P3 20/100MiBは246.8/1,244.1MBで機能を無効化しない制約を記録 | 通常1〜6文書の50,000,000-byte目標は約0.37MB超過（未達を隠さない） |
-| A-23 | 大容量でも機能を無効化せず、入力時全文parse/decodeを遅延し、不変画像object/cacheを再利用 | 20MiB/100MiBと100回反復を実測。100MiB peak WS 1,244,098,560 bytesは高水準 | 測定済み・制約記録 |
+| A-22 | ReleaseのP0〜P5測定scriptとJSONを作成し実行 | holiday-policy full: P1 six WS 47,894,528 bytes、P4 WS 42,967,040 bytes、P2 cancellation completed、入力p95最大6.4ms、compact 3/3、theme 100/100、P5 100/100失敗0。P3 20/100MiBは247.2/1,242.2MBで機能を無効化しない制約を記録 | 今回の通常1〜6文書の50,000,000-byte目標はP1 sixで達成。100MiBは機能維持による高使用量 |
+| A-23 | 大容量でも機能を無効化せず、入力時全文parse/decodeを遅延し、不変画像object/cacheを再利用 | 20MiB/100MiBと100回反復を実測。100MiB peak WS 1,242,210,304 bytesは高水準 | 測定済み・制約記録 |
 | A-24 | `.cache`と`.state`を分離 | WorkspaceStore回帰 | 自動PASS |
 | A-25 | vswhere、CMake/Ninja/MSVC検出、VS Code task/launch、静的runtime、v6 manifest | Debug/Release build/testとexe起動。F5キー操作自体はHuman未実施 | 自動PASS・Human未確認 |
 | A-26 | 公開投影なし。build、`.codex`、秘密拡張子をignore | tracked fileの秘密形式／個人絶対path scan | 自動PASS |

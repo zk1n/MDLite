@@ -1187,6 +1187,9 @@ void TestJapaneseHolidays() {
   const auto timeout = mdlite::AssessJapaneseHolidayResponse(0, false, false, 11, {});
   Check(!timeout.accepted && !timeout.error.empty(),
         "mock timeout/network failure keeps the last-known-good holiday data");
+  const auto empty_body = mdlite::AssessJapaneseHolidayResponse(200, false, false, 11, {});
+  Check(!empty_body.accepted && !empty_body.replace_cache && !empty_body.error.empty(),
+        "mock HTTP empty bodies cannot replace the holiday cache");
   const auto html = mdlite::AssessJapaneseHolidayResponse(
       200, false, false, 11, L"<html><body>error</body></html>");
   Check(!html.accepted && !html.replace_cache,

@@ -254,7 +254,11 @@ JapaneseHolidayUpdateAssessment AssessJapaneseHolidayResponse(
         : L"内閣府CSVがHTTP " + std::to_wstring(status) + L"を返しました。";
     return assessment;
   }
-  if (csv.empty() || !ValidateJapaneseHolidayCsv(csv, assessment.info, assessment.error)) return assessment;
+  if (csv.empty()) {
+    assessment.error = L"内閣府CSVの本文が空です。";
+    return assessment;
+  }
+  if (!ValidateJapaneseHolidayCsv(csv, assessment.info, assessment.error)) return assessment;
   if (assessment.info.records < 10) {
     assessment.error = L"内閣府CSVの件数が想定より少ないためcacheを置換しません。";
     return assessment;

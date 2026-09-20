@@ -11,7 +11,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 ## 今回の変更と境界
 
 - Jev Initial Decision Gate は `sol_xhigh` を選択した。固定 specialist の判定は、既存の座標混同を解消してから UI/table を再構築するよう指示した。実行 provenance が要求 target と不一致だったため dispatch は fail-closed とし、model/effort を推測しない。
-- source/export/native の座標を分離し、CRLF/LF と Markdown image object は compact discontinuity で写像する。`EditorText` はraw native textを取得後、CRLF/lone LFをnative CRへcanonicalizeしてから差分・object復元へ渡す。同幅のlone LFはdiscontinuityへ記録せず、巨大文書で不要なmapを増やさない。native readbackの長さ／OLE位置不一致は推測補正せずfail-closedでsyncを再試行する。
+- source/export/native の座標を分離し、CRLF/LF と Markdown image object は compact discontinuity で写像する。`EditorText` はraw native textを取得後、CRLF/lone LFをnative CRへcanonicalizeしてから差分・object復元へ渡す。同幅のlone LFはdiscontinuityへ記録せず、巨大文書で不要なmapを増やさない。native readbackの長さ／コピー件数／OLE取得または位置不一致は推測補正せずfail-closedでsyncを再試行する。
 - presentation reset は underline/effects/paragraph spacing/border を明示的に解除し、表 grid は固定22px矩形でなく実測した行高・共有境界で描画する。
 - UI layout は DIP scaling、`WM_DPICHANGED`、PerMonitorV2 manifest、editor font 再生成を実装した。実機のDPI・IME・通常GUI画面はまだPASSにしない。
 - 祝日は同梱データを維持し、検証付きのローカルCSV取込みと user-wide `holiday_auto_update=false` 設定を追加した。明示許可時だけ既知の内閣府HTTPS CSVを月次確認し、Workspace cacheをlast-known-goodとして更新する。fake clockとmock HTTPの200/304/404/500/timeout/HTML/大幅減少をCoreTestsで確認した。opt-in実HTTPは試験環境のWinHTTP 12185（`ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY`）でTLS応答を受信できず、実HTTP受入はBLOCKED。

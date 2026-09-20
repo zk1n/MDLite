@@ -3075,21 +3075,26 @@ bool Application::EditorText(HWND editor, const EditorSnapshot& snapshot,
                              std::wstring& text) const {
   text.clear();
   GETTEXTLENGTHEX length_request{GTL_NUMCHARS | GTL_PRECISE, 1200};
-  const auto length = static_cast<std::size_t>(std::max<LRESULT>(
-      0, SendMessageW(editor, EM_GETTEXTLENGTHEX,
-                      reinterpret_cast<WPARAM>(&length_request), 0)));
+  const LRESULT raw_length = SendMessageW(editor, EM_GETTEXTLENGTHEX,
+                                          reinterpret_cast<WPARAM>(&length_request), 0);
+  if (raw_length < 0) return false;
+  const auto length = static_cast<std::size_t>(raw_length);
   text.assign(length + 1, L'\0');
   GETTEXTEX text_request{static_cast<DWORD>(text.size() * sizeof(wchar_t)),
                          GT_RAWTEXT, 1200, nullptr, nullptr};
-  const auto copied = static_cast<std::size_t>(std::max<LRESULT>(
-      0, SendMessageW(editor, EM_GETTEXTEX,
-                      reinterpret_cast<WPARAM>(&text_request),
-                      reinterpret_cast<LPARAM>(text.data()))));
-  if (length != 0 && copied == 0) {
+  const LRESULT raw_copied = SendMessageW(editor, EM_GETTEXTEX,
+                                          reinterpret_cast<WPARAM>(&text_request),
+                                          reinterpret_cast<LPARAM>(text.data()));
+  if (raw_copied < 0) {
     text.clear();
     return false;
   }
-  text.resize(std::min(copied, length));
+  const auto copied = static_cast<std::size_t>(raw_copied);
+  if (copied != length) {
+    text.clear();
+    return false;
+  }
+  text.resize(length);
   // Keep every EM/TOM/OLE position in the same native space as the snapshot.
   // RichEdit normally returns one CR per paragraph with GT_RAWTEXT, but older
   // builds and alternate export paths can expose CRLF or lone LF instead.
@@ -3145,14 +3150,13 @@ bool Application::EditorText(HWND editor, const EditorSnapshot& snapshot,
     const LONG count = rich_edit->GetObjectCount();
     for (LONG index = 0; index < count; ++index) {
       REOBJECT object{sizeof(object)};
-      if (SUCCEEDED(rich_edit->GetObject(index, &object, REO_GETOBJ_NO_INTERFACES))) {
-        if (object.cp < 0 || static_cast<std::size_t>(object.cp) >= text.size()) {
-          rich_edit->Release();
-          text.clear();
-          return false;
-        }
-        text[static_cast<std::size_t>(object.cp)] = L'\uFFFC';
+      if (FAILED(rich_edit->GetObject(index, &object, REO_GETOBJ_NO_INTERFACES)) ||
+          object.cp < 0 || static_cast<std::size_t>(object.cp) >= text.size()) {
+        rich_edit->Release();
+        text.clear();
+        return false;
       }
+      text[static_cast<std::size_t>(object.cp)] = L'\uFFFC';
     }
     rich_edit->Release();
   }

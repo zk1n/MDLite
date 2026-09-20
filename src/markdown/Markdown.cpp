@@ -62,7 +62,9 @@ void ParseImages(std::wstring_view line, std::size_t line_offset, MarkdownParseR
       unsigned width{};
       try {
         const auto width_text = attribute(L"width");
-        if (!width_text.empty()) width = static_cast<unsigned>(std::stoul(width_text));
+        if (!width_text.empty()) {
+          width = std::clamp(static_cast<unsigned>(std::stoul(width_text)), 16U, 8192U);
+        }
       } catch (const std::exception&) {
         width = 0;
       }

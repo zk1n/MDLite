@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mdlite {
 
@@ -14,6 +15,17 @@ struct TableEditResult {
 
 enum class TableCaretDirection { Left, Right, Up, Down };
 
+struct TableVisualCell {
+  std::size_t begin{};
+  std::size_t end{};
+};
+
+struct TableVisualRow {
+  std::size_t begin{};
+  std::size_t end{};
+  std::vector<TableVisualCell> cells;
+};
+
 TableEditResult MoveToAdjacentTableCell(std::wstring_view source, std::size_t caret, bool backwards);
 std::optional<std::size_t> MoveTableCaretAtBoundary(std::wstring_view source, std::size_t caret,
                                                     TableCaretDirection direction);
@@ -21,5 +33,8 @@ TableEditResult InsertTableRow(std::wstring_view source, std::size_t caret, bool
 TableEditResult DeleteTableRow(std::wstring_view source, std::size_t caret);
 TableEditResult InsertTableColumn(std::wstring_view source, std::size_t caret, bool after);
 TableEditResult DeleteTableColumn(std::wstring_view source, std::size_t caret);
+std::vector<TableVisualRow> ParseTableVisualRows(std::wstring_view source,
+                                                 std::size_t begin,
+                                                 std::size_t end);
 
 }  // namespace mdlite

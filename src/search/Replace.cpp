@@ -154,6 +154,69 @@ bool WriteJournal(const std::filesystem::path& path, const ReplacePlan& plan,
 
 }  // namespace
 
+bool ReplaceDocumentText(std::wstring_view source, const SearchQuery& query,
+                         std::wstring_view replacement, std::wstring& output,
+                         std::size_t& count, std::wstring& error) {
+  return ReplaceText(source, query, replacement, output, count, error);
+}
+
+bool ReplaceDocumentMatch(std::wstring_view source, const SearchQuery& query,
+                          std::wstring_view replacement, std::size_t start,
+                          std::wstring& output, std::size_t& replaced_begin,
+                          std::size_t& replaced_end, bool& replaced, std::wstring& error) {
+  output.assign(source);
+  replaced = false;
+  replaced_begin = replaced_end = std::min(start, source.size());
+  if (query.text.empty()) {
+    error = L"検索文字列を入力してください。";
+    return false;
+  }
+  start = std::min(start, source.size());
+  if (query.regular_expression) {
+    try {
+      const auto flags = std::regex_constants::ECMAScript |
+                         (query.match_case ? std::regex_constants::syntax_option_type{}
+                                           : std::regex_constants::icase);
+      const std::wregex expression(query.text, flags);
+      const std::wstring owned(source);
+      for (std::wsregex_iterator iterator(owned.begin(), owned.end(), expression), end;
+           iterator != end; ++iterator) {
+        const auto begin = static_cast<std::size_t>(iterator->position());
+        const auto finish = begin + static_cast<std::size_t>(iterator->length());
+        if (begin < start || (query.whole_word && !IsWholeWord(source, begin, finish))) continue;
+        const std::wstring formatted = iterator->format(std::wstring(replacement));
+        output.assign(source.substr(0, begin));
+        output += formatted;
+        output.append(source.substr(finish));
+        replaced_begin = begin;
+        replaced_end = begin + formatted.size();
+        replaced = true;
+        return true;
+      }
+      return true;
+    } catch (const std::regex_error&) {
+      error = L"正規表現または置換式が正しくありません。";
+      return false;
+    }
+  }
+
+  const std::wstring haystack = query.match_case ? std::wstring(source) : Fold(source);
+  const std::wstring needle = query.match_case ? query.text : Fold(query.text);
+  for (std::size_t found = haystack.find(needle, start); found != std::wstring::npos;
+       found = haystack.find(needle, found + 1)) {
+    const std::size_t finish = found + needle.size();
+    if (query.whole_word && !IsWholeWord(source, found, finish)) continue;
+    output.assign(source.substr(0, found));
+    output.append(replacement);
+    output.append(source.substr(finish));
+    replaced_begin = found;
+    replaced_end = found + replacement.size();
+    replaced = true;
+    return true;
+  }
+  return true;
+}
+
 bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuery& query,
                              std::wstring_view replacement,
                              const std::map<std::filesystem::path, std::wstring>& unsaved,
@@ -161,7 +224,8 @@ bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuer
                              const std::function<bool()>& cancelled) {
   plan = {query, std::wstring(replacement), {}};
   std::vector<SearchMatch> matches;
-  if (!SearchWorkspace(root, query, unsaved, matches, error, cancelled)) return false;
+  if (!SearchWorkspace(root, query, unsaved, matches, error, cancelled, {}, nullptr, {}))
+    return false;
   std::map<std::filesystem::path, std::size_t> counts;
   for (const auto& match : matches) ++counts[match.path];
   for (const auto& [path, expected_count] : counts) {

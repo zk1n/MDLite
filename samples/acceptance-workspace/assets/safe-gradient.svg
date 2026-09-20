@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#162447"/>
+      <stop offset="1" stop-color="#5c6bc0"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="120" rx="12" fill="url(#sky)"/>
+  <circle cx="250" cy="38" r="17" fill="#fff8c4"/>
+  <path d="M38 88 Q108 24 184 79" fill="none" stroke="#e9f5ff" stroke-width="4"/>
+  <text x="24" y="108" fill="#ffffff" font-family="sans-serif" font-size="14">Hoshimi Library</text>
+</svg>

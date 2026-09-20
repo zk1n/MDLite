@@ -5,6 +5,7 @@
 #include "git/Conflict.h"
 #include "markdown/Markdown.h"
 #include "profiles/Profiles.h"
+#include "search/Search.h"
 #include "settings/Settings.h"
 #include "table/Table.h"
 #include "workspace/Workspace.h"
@@ -12,11 +13,13 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mdlite {
@@ -31,6 +34,45 @@ class Application {
 
  private:
   struct DocumentView {
+    struct SourceEdit {
+      std::size_t begin{};
+      std::wstring before;
+      std::wstring after;
+    };
+
+    struct AnimatedImageState {
+      unsigned frame{};
+      ULONGLONG due{};
+    };
+
+    // This is deliberately a cheap identity check.  Decoding every image on
+    // each text/presentation update made ordinary typing proportional to the
+    // total image count.  A changed size or write time invalidates the cached
+    // render and causes the normal safety/decode path to run again.
+    struct ImageFileIdentity {
+      bool available{};
+      std::uint64_t size{};
+      std::uint64_t write_time{};
+
+      friend bool operator==(const ImageFileIdentity&, const ImageFileIdentity&) = default;
+    };
+
+    struct RenderedImage {
+      std::size_t source_begin{};
+      std::size_t source_end{};
+      std::wstring markup;
+      std::wstring target_text;
+      std::wstring alternate_text;
+      unsigned width_dip{};
+      std::filesystem::path target;
+      ImageFileIdentity file_identity;
+      unsigned raster_width{};
+      unsigned raster_height{};
+      unsigned frame_count{};
+      bool animated{};
+      bool inserted{};
+    };
+
     Document document;
     HWND editor{};
     MarkdownParseResult parse;
@@ -41,9 +83,19 @@ class Application {
     std::shared_ptr<WorkspaceStore> workspace_store;
     ULONGLONG autosave_due{};
     ULONGLONG recovery_due{};
-    std::map<std::size_t, unsigned> animated_image_frames;
+    ULONGLONG sync_due{};
+    ULONGLONG presentation_due{};
+    std::map<std::size_t, AnimatedImageState> animated_image_frames;
     ULONGLONG animation_due{};
+    std::wstring rendered_image_source;
+    std::vector<RenderedImage> rendered_images;
+    ULONGLONG image_asset_check_due{};
+    bool ime_composing{};
+    std::vector<SourceEdit> source_undo;
+    std::vector<SourceEdit> source_redo;
   };
+
+  enum class SaveAllResult { AllSaved, RecoveryOnly, Discarded, Cancelled };
 
   enum class TableAction { InsertRowBefore, InsertRowAfter, DeleteRow, InsertColumnBefore,
                            InsertColumnAfter, DeleteColumn };
@@ -76,18 +128,32 @@ class Application {
   bool SaveDocumentAs(DocumentView& view);
   void ReloadDocumentFromDisk();
   void CompareDocumentWithDisk();
-  bool SaveAll(bool interactive);
+  SaveAllResult SaveAllForExit(bool interactive);
+  bool SaveAllRequired(bool interactive);
+  DocumentView* FindDocumentView(HWND editor);
+  void SelectDocumentForEditor(HWND editor);
+  void ApplySourceTextWithUndo(DocumentView& view, std::wstring text, bool record_history = true);
+  bool ApplySourceHistory(DocumentView& view, bool redo);
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
+  void DrawTableGrid(const DocumentView& view);
   void RefreshDerivedImages(DocumentView& view);
   void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);
+  static bool ReadImageFileIdentity(const std::filesystem::path& path,
+                                    DocumentView::ImageFileIdentity& identity);
   void RebuildOutline(const DocumentView& view);
-  std::wstring EditorText(HWND editor) const;
+  std::wstring EditorText(HWND editor, const EditorSnapshot& snapshot) const;
   void UpdateStatus();
   void ShowFindBar();
+  SearchQuery SearchQueryFromFindBar() const;
   void FindNext(bool restart_from_beginning = false);
+  void ReplaceCurrentDocument(bool all);
   void SearchWorkspaceFromFindBar();
+  void ScheduleWorkspaceSearch();
+  void ApplyWorkspaceSearchBatch(void* payload);
+  void CompleteWorkspaceSearch(void* payload);
+  void OpenWorkspaceSearchResult(std::size_t index);
   void ReplaceWorkspaceFromFindBar();
   bool CloseDocument(std::size_t index);
   void CreateProfile(BuiltInProfile profile);
@@ -147,6 +213,11 @@ class Application {
   HWND find_case_{};
   HWND find_regex_{};
   HWND find_word_{};
+  HWND find_include_glob_{};
+  HWND find_exclude_glob_{};
+  HWND replace_one_{};
+  HWND replace_document_{};
+  HWND find_results_{};
   HWND calendar_{};
   HWND calendar_tooltip_{};
   std::filesystem::path workspace_;
@@ -154,10 +225,15 @@ class Application {
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
   std::vector<std::unique_ptr<DocumentView>> documents_;
   std::vector<std::filesystem::path> recent_documents_;
+  std::vector<SearchMatch> workspace_search_results_;
+  std::size_t workspace_search_issue_count_{};
+  std::jthread workspace_search_worker_;
+  std::uint64_t workspace_search_generation_{};
+  ULONGLONG workspace_search_due_{};
+  bool workspace_search_started_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
   bool external_operation_active_{};
-  bool ime_composing_{};
   bool outline_dragging_{};
   bool workspace_dragging_{};
   std::size_t outline_drag_source_{};

@@ -41,6 +41,15 @@ std::uint64_t HashBytes(std::span<const std::byte> bytes) {
   return hash;
 }
 
+std::uint64_t HashText(std::wstring_view text) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (const wchar_t value : text) {
+    hash ^= static_cast<std::uint16_t>(value);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
 bool ReadSnapshot(const std::filesystem::path& path, std::vector<std::byte>& bytes,
                   FileFingerprint& fingerprint, std::wstring& error) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
@@ -258,7 +267,8 @@ bool WriteAll(HANDLE file, std::span<const std::byte> bytes, std::wstring& error
 }
 
 bool SafeReplace(const std::filesystem::path& target, std::span<const std::byte> bytes,
-                 const FileFingerprint& expected, std::wstring& error) {
+                 const FileFingerprint& expected, const SaveStageHook& stage_hook,
+                 std::wstring& error) {
   static std::atomic_uint64_t counter{};
   std::filesystem::path temporary = target;
   temporary += L".mdlite-save-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -288,12 +298,38 @@ bool SafeReplace(const std::filesystem::path& target, std::span<const std::byte>
     return false;
   }
 
-  if (!ReplaceFileW(target.c_str(), temporary.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS,
-                    nullptr, nullptr)) {
-    error = WindowsError(L"元ファイルを安全に置換できません");
+  // Give fault-injection tests the same window an external writer has after
+  // the ordinary preflight.  Recheck after the hook so that this simulated
+  // write is not silently replaced.  ReplaceFileW is not a compare-and-swap,
+  // so the remaining system-call-sized race is documented rather than
+  // presented as complete cross-process exclusion.
+  if (stage_hook) stage_hook(SaveStage::BeforeReplace, target);
+  HANDLE replacement_guard = CreateFileW(
+      target.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (replacement_guard == INVALID_HANDLE_VALUE) {
+    error = WindowsError(L"置換直前の元ファイルを外部書換えから保護できません");
     DeleteFileW(temporary.c_str());
     return false;
   }
+  const FileFingerprint commit_guard = Fingerprint(target);
+  if (!commit_guard.valid || !(commit_guard == expected)) {
+    error = L"置換直前に元ファイルが変更または削除されました。上書きしていません。";
+    CloseHandle(replacement_guard);
+    DeleteFileW(temporary.c_str());
+    return false;
+  }
+  if (stage_hook) stage_hook(SaveStage::BeforeReplaceGuarded, target);
+
+  if (!ReplaceFileW(target.c_str(), temporary.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS,
+                    nullptr, nullptr)) {
+    error = WindowsError(L"元ファイルを安全に置換できません");
+    CloseHandle(replacement_guard);
+    DeleteFileW(temporary.c_str());
+    return false;
+  }
+  CloseHandle(replacement_guard);
+  if (stage_hook) stage_hook(SaveStage::AfterReplace, target);
   return true;
 }
 
@@ -365,6 +401,9 @@ bool Document::Load(const std::filesystem::path& path, std::wstring& error) {
   disk_fingerprint_ = fingerprint;
   revision_ = 1;
   saved_revision_ = 1;
+  current_content_hash_ = saved_content_hash_ = HashText(text_);
+  current_content_size_ = saved_content_size_ = text_.size();
+  saved_checkpoint_valid_ = true;
   return true;
 }
 
@@ -377,9 +416,12 @@ void Document::CreateUntitled(const std::filesystem::path& recovery_identity) {
   untitled_ = true;
   revision_ = 1;
   saved_revision_ = 0;
+  current_content_hash_ = HashText(text_);
+  current_content_size_ = text_.size();
+  saved_checkpoint_valid_ = false;
 }
 
-bool Document::Save(std::wstring& error) {
+bool Document::Save(std::wstring& error, const SaveStageHook& stage_hook) {
   if (!dirty()) return true;
   if (untitled_) {
     error = L"無題文書は最初に保存先を指定してください。";
@@ -392,13 +434,17 @@ bool Document::Save(std::wstring& error) {
   }
   std::vector<std::byte> bytes;
   if (!Encode(text_, encoding_, bytes, error)) return false;
-  if (!SafeReplace(path_, bytes, disk_fingerprint_, error)) return false;
-  disk_fingerprint_ = Fingerprint(path_);
-  if (!disk_fingerprint_.valid) {
-    error = L"保存後のファイル状態を確認できません。";
+  if (!SafeReplace(path_, bytes, disk_fingerprint_, stage_hook, error)) return false;
+  const FileFingerprint saved = Fingerprint(path_);
+  if (!saved.valid || saved.size != bytes.size() || saved.content_hash != HashBytes(bytes)) {
+    error = L"保存直後にファイルが外部変更されました。今回の内容を保存済みとは扱いません。";
     return false;
   }
+  disk_fingerprint_ = saved;
   saved_revision_ = revision_;
+  saved_content_hash_ = current_content_hash_;
+  saved_content_size_ = current_content_size_;
+  saved_checkpoint_valid_ = true;
   return true;
 }
 
@@ -407,22 +453,32 @@ bool Document::SaveAs(const std::filesystem::path& path, std::wstring& error) {
   std::vector<std::byte> bytes;
   if (!Encode(text_, encoding_, bytes, error) || !SafeCreate(absolute, bytes, error)) return false;
   const FileFingerprint fingerprint = Fingerprint(absolute);
-  if (!fingerprint.valid) {
-    error = L"別名保存後のファイル状態を確認できません。";
+  if (!fingerprint.valid || fingerprint.size != bytes.size() ||
+      fingerprint.content_hash != HashBytes(bytes)) {
+    error = L"別名保存後のファイル内容を確認できないか、直後に外部変更されました。";
     return false;
   }
   path_ = absolute;
   untitled_ = false;
   disk_fingerprint_ = fingerprint;
   saved_revision_ = revision_;
+  saved_content_hash_ = current_content_hash_;
+  saved_content_size_ = current_content_size_;
+  saved_checkpoint_valid_ = true;
   return true;
 }
 
-void Document::SetText(std::wstring text) { text_ = std::move(text); }
+void Document::SetText(std::wstring text) {
+  text_ = std::move(text);
+  current_content_hash_ = HashText(text_);
+  current_content_size_ = text_.size();
+}
 
 void Document::MarkEdited(std::wstring text) {
   if (text == text_) return;
   text_ = std::move(text);
+  current_content_hash_ = HashText(text_);
+  current_content_size_ = text_.size();
   ++revision_;
 }
 

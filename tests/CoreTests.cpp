@@ -16,11 +16,16 @@
 
 #include <windows.h>
 #include <wincodec.h>
+#include <richedit.h>
+#include <shlwapi.h>
+#include <webp/encode.h>
+#include <webp/mux.h>
 
 #include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
 #include <thread>
@@ -29,15 +34,20 @@
 namespace {
 
 int failures = 0;
+int checks = 0;
 
 void Check(bool condition, const char* message) {
+  ++checks;
   if (!condition) {
     std::cerr << "FAIL: " << message << '\n';
     ++failures;
   }
 }
 
-bool WriteValidPng(const std::filesystem::path& path) {
+void WriteBytes(const std::filesystem::path& path, const std::vector<unsigned char>& bytes);
+
+bool WriteValidRaster(const std::filesystem::path& path, REFGUID container,
+                      REFWICPixelFormatGUID requested_format) {
   IWICImagingFactory* factory{};
   IWICStream* stream{};
   IWICBitmapEncoder* encoder{};
@@ -47,15 +57,21 @@ bool WriteValidPng(const std::filesystem::path& path) {
                                     IID_PPV_ARGS(&factory));
   if (SUCCEEDED(result)) result = factory->CreateStream(&stream);
   if (SUCCEEDED(result)) result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
-  if (SUCCEEDED(result)) result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+  if (SUCCEEDED(result)) result = factory->CreateEncoder(container, nullptr, &encoder);
   if (SUCCEEDED(result)) result = encoder->Initialize(stream, WICBitmapEncoderNoCache);
   if (SUCCEEDED(result)) result = encoder->CreateNewFrame(&frame, &properties);
   if (SUCCEEDED(result)) result = frame->Initialize(properties);
   if (SUCCEEDED(result)) result = frame->SetSize(2, 1);
-  WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+  WICPixelFormatGUID format = requested_format;
   if (SUCCEEDED(result)) result = frame->SetPixelFormat(&format);
-  const std::array<unsigned char, 8> pixels{0, 0, 255, 255, 0, 255, 0, 255};
-  if (SUCCEEDED(result)) result = frame->WritePixels(1, 8, 8, const_cast<BYTE*>(pixels.data()));
+  const std::array<unsigned char, 8> bgra{0, 0, 255, 255, 0, 255, 0, 255};
+  const std::array<unsigned char, 6> bgr{0, 0, 255, 0, 255, 0};
+  if (SUCCEEDED(result) && format == GUID_WICPixelFormat32bppBGRA)
+    result = frame->WritePixels(1, 8, 8, const_cast<BYTE*>(bgra.data()));
+  else if (SUCCEEDED(result) && format == GUID_WICPixelFormat24bppBGR)
+    result = frame->WritePixels(1, 6, 6, const_cast<BYTE*>(bgr.data()));
+  else if (SUCCEEDED(result))
+    result = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
   if (SUCCEEDED(result)) result = frame->Commit();
   if (SUCCEEDED(result)) result = encoder->Commit();
   if (properties) properties->Release();
@@ -63,13 +79,181 @@ bool WriteValidPng(const std::filesystem::path& path) {
   if (encoder) encoder->Release();
   if (stream) stream->Release();
   if (factory) factory->Release();
-  if (FAILED(result)) std::cerr << "WIC PNG fixture HRESULT: 0x" << std::hex << static_cast<unsigned long>(result) << std::dec << '\n';
+  if (FAILED(result)) std::cerr << "WIC raster fixture HRESULT: 0x" << std::hex << static_cast<unsigned long>(result) << std::dec << '\n';
   return SUCCEEDED(result);
+}
+
+bool WriteAnimatedWebp(const std::filesystem::path& path) {
+  WebPAnimEncoderOptions animation_options;
+  WebPConfig config;
+  if (!WebPAnimEncoderOptionsInit(&animation_options) || !WebPConfigInit(&config)) return false;
+  animation_options.minimize_size = 1;
+  config.lossless = 1;
+  config.quality = 100.0F;
+  WebPAnimEncoder* encoder = WebPAnimEncoderNew(2, 1, &animation_options);
+  if (!encoder) return false;
+  bool succeeded = true;
+  const std::array<std::array<std::uint8_t, 8>, 2> frames{{
+      {0x00, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0x00, 0xFF},
+      {0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+  }};
+  const std::array<int, 2> timestamps{0, 100};
+  for (std::size_t index = 0; index < frames.size() && succeeded; ++index) {
+    WebPPicture picture;
+    succeeded = WebPPictureInit(&picture) != 0;
+    if (!succeeded) break;
+    picture.use_argb = 1;
+    picture.width = 2;
+    picture.height = 1;
+    succeeded = WebPPictureImportBGRA(&picture, frames[index].data(), 8) != 0 &&
+                WebPAnimEncoderAdd(encoder, &picture, timestamps[index], &config) != 0;
+    WebPPictureFree(&picture);
+  }
+  if (succeeded) succeeded = WebPAnimEncoderAdd(encoder, nullptr, 350, nullptr) != 0;
+  WebPData encoded;
+  WebPDataInit(&encoded);
+  if (succeeded) succeeded = WebPAnimEncoderAssemble(encoder, &encoded) != 0;
+  if (succeeded) {
+    WriteBytes(path, std::vector<unsigned char>(encoded.bytes, encoded.bytes + encoded.size));
+  }
+  WebPDataClear(&encoded);
+  WebPAnimEncoderDelete(encoder);
+  return succeeded;
+}
+
+bool InsertNativeRichEditImage(const std::filesystem::path& path, bool convert_to_png) {
+  HMODULE rich_edit_module = LoadLibraryW(L"Msftedit.dll");
+  if (!rich_edit_module) return false;
+  HWND editor = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_POPUP | ES_MULTILINE,
+                                0, 0, 200, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!editor) {
+    FreeLibrary(rich_edit_module);
+    return false;
+  }
+  IStream* stream{};
+  unsigned delay{};
+  std::wstring error;
+  HRESULT stream_result = S_OK;
+  if (convert_to_png) {
+    if (!mdlite::CreateRasterFramePngStream(path, 0, stream, delay, error)) stream_result = E_FAIL;
+  } else {
+    stream_result = SHCreateStreamOnFileEx(path.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE,
+                                          FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream);
+  }
+  HRESULT inserted = stream_result;
+  if (SUCCEEDED(stream_result)) {
+    RICHEDIT_IMAGE_PARAMETERS parameters{};
+    parameters.xWidth = 2540;
+    parameters.yHeight = 1270;
+    parameters.Ascent = parameters.yHeight;
+    parameters.Type = TA_BASELINE;
+    parameters.pwszAlternateText = L"native-insertion-test";
+    parameters.pIStream = stream;
+    inserted = static_cast<HRESULT>(
+        SendMessageW(editor, EM_INSERTIMAGE, 0, reinterpret_cast<LPARAM>(&parameters)));
+  }
+  const int text_length = GetWindowTextLengthW(editor);
+  if (stream) stream->Release();
+  DestroyWindow(editor);
+  FreeLibrary(rich_edit_module);
+  if (FAILED(inserted) || text_length != 1) {
+    std::cerr << "RichEdit insertion failed for " << path.filename().string()
+              << ": hr=0x" << std::hex << static_cast<unsigned long>(inserted)
+              << std::dec << ", inline-length=" << text_length << '\n';
+  }
+  return SUCCEEDED(inserted) && text_length == 1;
+}
+
+bool WritePartialDisposalGif(const std::filesystem::path& path) {
+  // 3x1 canvas, palette: black, red, green, blue, white. Each pixel is preceded by
+  // an LZW clear code so the tiny fixture does not depend on dictionary growth.
+  const std::vector<unsigned char> bytes{
+      'G','I','F','8','9','a', 0x03,0x00, 0x01,0x00, 0x82,0x00,0x00,
+      0x00,0x00,0x00, 0xFF,0x00,0x00, 0x00,0xFF,0x00, 0x00,0x00,0xFF,
+      0xFF,0xFF,0xFF, 0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+      // Frame 0: full red canvas, keep.
+      0x21,0xF9,0x04,0x04,0x0A,0x00,0x00,0x00,
+      0x2C,0x00,0x00,0x00,0x00,0x03,0x00,0x01,0x00,0x00,
+      0x03,0x04,0x18,0x18,0x18,0x09,0x00,
+      // Frame 1: transparent at x=0, green at x=1; restore its rect to background.
+      0x21,0xF9,0x04,0x09,0x14,0x00,0x00,0x00,
+      0x2C,0x00,0x00,0x00,0x00,0x02,0x00,0x01,0x00,0x00,
+      0x03,0x03,0x08,0x28,0x09,0x00,
+      // Frame 2: blue at x=2; restore the composed canvas that preceded it.
+      0x21,0xF9,0x04,0x0C,0x1E,0x00,0x00,0x00,
+      0x2C,0x02,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,
+      0x03,0x02,0x38,0x09,0x00,
+      // Frame 3: white at x=0, proving disposal 3 restored the pre-frame-2 canvas.
+      0x21,0xF9,0x04,0x04,0x28,0x00,0x00,0x00,
+      0x2C,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,
+      0x03,0x02,0x48,0x09,0x00, 0x3B};
+  WriteBytes(path, bytes);
+  return std::filesystem::file_size(path) == bytes.size();
+}
+
+bool DecodePngStream(IStream* stream, unsigned& width, unsigned& height,
+                     std::vector<unsigned char>& bgra) {
+  width = height = 0;
+  bgra.clear();
+  if (!stream) return false;
+  LARGE_INTEGER start{};
+  if (FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr))) return false;
+  IWICImagingFactory* factory{};
+  IWICBitmapDecoder* decoder{};
+  IWICBitmapFrameDecode* frame{};
+  IWICFormatConverter* converter{};
+  HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&factory));
+  if (SUCCEEDED(result)) {
+    result = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad,
+                                              &decoder);
+  }
+  if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
+  if (SUCCEEDED(result)) result = factory->CreateFormatConverter(&converter);
+  if (SUCCEEDED(result)) {
+    result = converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+  }
+  UINT decoded_width{}, decoded_height{};
+  if (SUCCEEDED(result)) result = converter->GetSize(&decoded_width, &decoded_height);
+  if (SUCCEEDED(result) && decoded_width != 0 && decoded_height != 0 &&
+      decoded_width <= std::numeric_limits<UINT>::max() / 4U &&
+      decoded_height <= std::numeric_limits<UINT>::max() / (decoded_width * 4U)) {
+    const UINT stride = decoded_width * 4U;
+    bgra.resize(static_cast<std::size_t>(stride) * decoded_height);
+    result = converter->CopyPixels(nullptr, stride, static_cast<UINT>(bgra.size()), bgra.data());
+  } else if (SUCCEEDED(result)) {
+    result = E_INVALIDARG;
+  }
+  if (converter) converter->Release();
+  if (frame) frame->Release();
+  if (decoder) decoder->Release();
+  if (factory) factory->Release();
+  if (FAILED(result)) {
+    bgra.clear();
+    return false;
+  }
+  width = decoded_width;
+  height = decoded_height;
+  return true;
+}
+
+bool WriteValidPng(const std::filesystem::path& path) {
+  return WriteValidRaster(path, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA);
+}
+
+bool WriteValidJpeg(const std::filesystem::path& path) {
+  return WriteValidRaster(path, GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR);
 }
 
 void WriteBytes(const std::filesystem::path& path, const std::vector<unsigned char>& bytes) {
   std::ofstream output(path, std::ios::binary);
   output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+void WriteAscii(const std::filesystem::path& path, std::string_view text) {
+  WriteBytes(path, std::vector<unsigned char>(text.begin(), text.end()));
 }
 
 std::vector<unsigned char> ReadBytes(const std::filesystem::path& path) {
@@ -92,6 +276,11 @@ void TestUtf8NoOp(const std::filesystem::path& root) {
   Check(document.line_ending() == mdlite::LineEnding::Lf, "LF is detected");
   Check(document.Save(error), "unmodified save is a no-op");
   Check(ReadBytes(path) == original, "unmodified save preserves exact bytes");
+  const auto saved_text = document.text();
+  document.MarkEdited(saved_text + L" temporary");
+  Check(document.dirty(), "an edited document becomes dirty");
+  document.MarkEdited(saved_text);
+  Check(!document.dirty(), "returning to the saved checkpoint clears Dirty without a write");
 }
 
 void TestUntitledDocument(const std::filesystem::path& root) {
@@ -176,6 +365,53 @@ void TestExternalConflict(const std::filesystem::path& root) {
   Check(!stealth_document.Save(error), "same-size and restored-time external edit is detected");
   Check(ReadBytes(stealth_path) == std::vector<unsigned char>({'n', 'e', 'w'}),
         "same-size external bytes remain intact");
+
+  const auto before_replace_path = root / L"before-replace.md";
+  WriteBytes(before_replace_path, {'o', 'l', 'd'});
+  mdlite::Document before_replace;
+  Check(before_replace.Load(before_replace_path, error), "before-replace fixture loads");
+  before_replace.MarkEdited(L"editor");
+  Check(!before_replace.Save(error, [&](mdlite::SaveStage stage, const auto& target) {
+          if (stage == mdlite::SaveStage::BeforeReplace) WriteBytes(target, {'r', 'a', 'c', 'e'});
+        }),
+        "external write after final preflight blocks replace");
+  Check(ReadBytes(before_replace_path) == std::vector<unsigned char>({'r', 'a', 'c', 'e'}),
+        "pre-replace race preserves the external bytes");
+
+  const auto guarded_replace_path = root / L"guarded-replace.md";
+  WriteBytes(guarded_replace_path, {'o', 'l', 'd'});
+  mdlite::Document guarded_replace;
+  Check(guarded_replace.Load(guarded_replace_path, error), "guarded-replace fixture loads");
+  guarded_replace.MarkEdited(L"editor");
+  bool competing_writer_blocked = false;
+  Check(guarded_replace.Save(error, [&](mdlite::SaveStage stage, const auto& target) {
+          if (stage != mdlite::SaveStage::BeforeReplaceGuarded) return;
+          const HANDLE writer = CreateFileW(target.c_str(), GENERIC_WRITE,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+          if (writer == INVALID_HANDLE_VALUE) {
+            competing_writer_blocked = GetLastError() == ERROR_SHARING_VIOLATION;
+          } else {
+            CloseHandle(writer);
+          }
+        }),
+        "save succeeds while the guarded target handle is held");
+  Check(competing_writer_blocked, "guarded replace excludes a competing writer");
+  Check(ReadBytes(guarded_replace_path) == std::vector<unsigned char>({'e', 'd', 'i', 't', 'o', 'r'}),
+        "guarded replace commits the editor bytes");
+
+  const auto after_replace_path = root / L"after-replace.md";
+  WriteBytes(after_replace_path, {'o', 'l', 'd'});
+  mdlite::Document after_replace;
+  Check(after_replace.Load(after_replace_path, error), "after-replace fixture loads");
+  after_replace.MarkEdited(L"editor");
+  Check(!after_replace.Save(error, [&](mdlite::SaveStage stage, const auto& target) {
+          if (stage == mdlite::SaveStage::AfterReplace) WriteBytes(target, {'r', 'a', 'c', 'e'});
+        }),
+        "external write after replace is not promoted to the saved baseline");
+  Check(after_replace.dirty(), "post-replace race leaves the editor revision dirty");
+  Check(ReadBytes(after_replace_path) == std::vector<unsigned char>({'r', 'a', 'c', 'e'}),
+        "post-replace race remains visible for conflict recovery");
 }
 
 void TestEmptyEncodingAndInvalidBom(const std::filesystem::path& root) {
@@ -284,6 +520,10 @@ void TestMarkdown() {
   Check(resized.images.size() == 1 && resized.images.front().target == L"assets/a.png" &&
             resized.images.front().width_dip == 480,
         "safe generated img markup retains target and display width");
+  const auto oversized = mdlite::ParseMarkdown(
+      L"<img src=\"assets/a.png\" alt=\"sample\" width=\"4294967295\">\n");
+  Check(oversized.images.size() == 1 && oversized.images.front().width_dip == 8192,
+        "extreme image display width is clamped before reaching native layout");
   Check(mdlite::BuildMarkdownEditorSnapshot(
             L"<img src=\"assets/a.png\" alt=\"sample\" width=\"480\">").view == L"\uFFFC",
         "resized img markup remains a native derived image object");
@@ -332,6 +572,40 @@ void TestEditorAdapter() {
         "compact mapping resumes immediately after a collapsed image range");
   const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
   Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
+  const std::wstring adjacent_source = L"A![x](p.png)B";
+  const auto adjacent_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_source);
+  const auto adjacent_edit = mdlite::ApplyEditorText(adjacent_snapshot, adjacent_source, L"a\uFFFCb");
+  Check(adjacent_edit.source == L"a![x](p.png)b",
+        "one coalesced edit on both sides preserves the unchanged image Markdown source");
+  const std::wstring two_images = L"A![1](1.png)X![2](2.png)B";
+  const auto two_image_snapshot = mdlite::BuildMarkdownEditorSnapshot(two_images);
+  const auto first_image_deleted = mdlite::ApplyEditorText(
+      two_image_snapshot, two_images, L"aX\uFFFCb");
+  Check(first_image_deleted.source == L"aX![2](2.png)b",
+        "deleting the first of two derived images preserves the surviving image identity");
+  const std::wstring adjacent_images = L"![1](1.png)![2](2.png)";
+  const auto adjacent_images_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_images);
+  Check(adjacent_images_snapshot.collapsed.empty() && adjacent_images_snapshot.view == adjacent_images,
+        "adjacent images stay as raw Markdown because identical object markers are ambiguous");
+  Check(!adjacent_images_snapshot.HasCollapsedSourceRange(0, std::wstring_view(L"![1](1.png)").size()),
+        "adjacent raw image ranges are excluded from native rendering");
+  const auto adjacent_first_deleted = mdlite::ApplyEditorText(
+      adjacent_images_snapshot, adjacent_images, L"![2](2.png)");
+  Check(adjacent_first_deleted.source == L"![2](2.png)",
+        "deleting the first adjacent image cannot substitute the wrong Markdown source");
+  const std::wstring whitespace_images = L"![1](1.png) \t ![2](2.png)";
+  const auto whitespace_images_snapshot = mdlite::BuildMarkdownEditorSnapshot(whitespace_images);
+  Check(whitespace_images_snapshot.collapsed.empty() &&
+            whitespace_images_snapshot.view == whitespace_images,
+        "whitespace-only image groups stay raw to preserve source identity");
+  const std::wstring line_separated_images = L"![1](1.png)\n\n![2](2.png)";
+  const auto line_separated_snapshot = mdlite::BuildMarkdownEditorSnapshot(line_separated_images);
+  Check(line_separated_snapshot.collapsed.size() == 2,
+        "line-separated images retain native presentation with newline identity anchors");
+  Check(line_separated_snapshot.HasCollapsedSourceRange(0, std::wstring_view(L"![1](1.png)").size()) &&
+            line_separated_snapshot.HasCollapsedSourceRange(
+                line_separated_images.find(L"![2]"), line_separated_images.size()),
+        "only exact collapsed image ranges are eligible for native rendering");
   Check(mdlite::ParseMarkdownImages(L"```\n![not-image](code.png)\n```\n![image](real.png)").size() == 1,
         "image-only scan keeps fenced code out of derived image objects");
   const std::wstring image_then_table =
@@ -401,11 +675,22 @@ void TestWorkspaceState(const std::filesystem::path& root) {
 
 void TestTrustAndProcess(const std::filesystem::path& root) {
   const auto workspace = root / L"trust";
+  const auto trust_store = root / L"user-trust-store";
+  mdlite::SetTrustStoreRootForTesting(trust_store);
   std::filesystem::create_directories(workspace / L".mdlite/.state");
   std::wstring error;
   Check(!mdlite::IsWorkspaceTrusted(workspace), "workspace starts untrusted");
   Check(mdlite::SetWorkspaceTrusted(workspace, true, error) && mdlite::IsWorkspaceTrusted(workspace),
         "workspace trust is local and explicit");
+  const auto copied = root / L"trust-copy";
+  std::filesystem::copy(workspace, copied, std::filesystem::copy_options::recursive);
+  Check(!mdlite::IsWorkspaceTrusted(copied),
+        "copying a workspace cannot copy the user's path and directory identity grant");
+  WriteBytes(copied / L".mdlite/.state/trust.local", {'f','o','r','g','e','d'});
+  Check(!mdlite::IsWorkspaceTrusted(copied),
+        "a workspace-owned legacy trust token cannot self-declare trust");
+  Check(!std::filesystem::is_regular_file(workspace / L".mdlite/.state/trust.local"),
+        "trust records are stored outside the workspace tree");
   Check(mdlite::SetWorkspaceTrusted(workspace, false, error) && !mdlite::IsWorkspaceTrusted(workspace),
         "workspace trust can be revoked");
   mdlite::ProcessResult process;
@@ -538,6 +823,44 @@ void TestSearch(const std::filesystem::path& root) {
   Check(mdlite::SearchWorkspace(workspace, {L"x.z", true, true}, {}, matches, error),
         "workspace regex search runs");
   Check(matches.size() == 1, "regex matches disk text");
+  const auto collection = workspace / L"collection";
+  std::filesystem::create_directories(collection);
+  const std::string filler(10 * 1024, 'x');
+  for (int index = 0; index < 200; ++index) {
+    std::ofstream output(collection / (L"note-" + std::to_wstring(index) + L".md"),
+                         std::ios::binary | std::ios::trunc);
+    output << "performance token\n" << filler;
+  }
+  const auto collection_start = GetTickCount64();
+  Check(mdlite::SearchWorkspace(collection, {L"performance token", true, false}, {},
+                                matches, error),
+        "200-file workspace search completes");
+  Check(matches.size() == 200, "200-file workspace search publishes every result");
+  Check(GetTickCount64() - collection_start < 10000,
+        "200-file workspace search avoids a progress-dialog-scale stall");
+  const std::wstring source = L"Alpha alpha\nline two 😀\nline three";
+  mdlite::SearchQuery document_query{L"alpha", false, false};
+  Check(mdlite::SearchDocumentText(workspace / L"open.md", source, document_query, matches, error) &&
+            matches.size() == 2,
+        "current-document source search shares case-insensitive workspace semantics");
+  document_query.match_case = true;
+  Check(mdlite::SearchDocumentText(workspace / L"open.md", source, document_query, matches, error) &&
+            matches.size() == 1,
+        "current-document source search honors match-case");
+  mdlite::SearchQuery multiline{L"two 😀\\nline (three)", true, true};
+  Check(mdlite::SearchDocumentText(workspace / L"open.md", source, multiline, matches, error) &&
+            matches.size() == 1,
+        "source regex search supports multiline Unicode matches");
+  std::wstring replaced_text;
+  std::size_t replaced_count{};
+  Check(mdlite::ReplaceDocumentText(source, multiline, L"$1 / $&", replaced_text,
+                                    replaced_count, error) && replaced_count == 1 &&
+            replaced_text.find(L"three / two 😀\nline three") != std::wstring::npos,
+        "source replacement supports ECMAScript capture and whole-match references");
+  mdlite::SearchQuery invalid{L"(", true, true};
+  error.clear();
+  Check(!mdlite::SearchDocumentText(workspace / L"open.md", source, invalid, matches, error),
+        "invalid current-document regex fails without changing text");
 
   WriteBytes(workspace / L"words.md", {'c','a','t',' ','s','c','a','t','t','e','r',' ','c','a','t'});
   mdlite::SearchQuery whole{L"cat", true, false};
@@ -590,6 +913,153 @@ void TestSearch(const std::filesystem::path& root) {
   mdlite::ReplaceApplyResult cancelled_rollback;
   Check(mdlite::RollbackWorkspaceReplace(cancelled_apply.journal, cancelled_rollback, error),
         "cancelled replace journal can roll back the partial apply");
+
+  const auto globs = workspace / L"globs";
+  std::filesystem::create_directories(globs / L"nested");
+  std::filesystem::create_directories(globs / L".hidden");
+  std::filesystem::create_directories(globs / L".mdlite/.state");
+  WriteBytes(globs / L"top.md", {'g','l','o','b','-','t','o','k','e','n'});
+  WriteBytes(globs / L"nested/deep.md", {'g','l','o','b','-','t','o','k','e','n'});
+  WriteBytes(globs / L".hidden/note.md", {'g','l','o','b','-','t','o','k','e','n'});
+  WriteBytes(globs / L".mdlite/.state/internal.md", {'g','l','o','b','-','t','o','k','e','n'});
+  mdlite::SearchQuery shallow{L"glob-token", true, false};
+  shallow.include_globs = {L"*.md"};
+  Check(mdlite::SearchWorkspace(globs, shallow, {}, matches, error) && matches.size() == 1 &&
+            matches.front().path.filename() == L"top.md",
+        "single-star glob does not cross a path separator and hidden/internal files stay excluded");
+  shallow.include_globs = {L"**/*.md"};
+  Check(mdlite::SearchWorkspace(globs, shallow, {}, matches, error) && matches.size() == 2,
+        "double-star glob includes root and nested path components");
+  std::size_t progressive_matches{};
+  Check(mdlite::SearchWorkspace(globs, shallow, {}, matches, error, {},
+                                [&](std::vector<mdlite::SearchMatch> batch) {
+                                  progressive_matches += batch.size();
+                                }) && progressive_matches == matches.size() &&
+            progressive_matches == 2,
+        "workspace search publishes progressive batches without losing final results");
+  shallow.exclude_globs = {L"nested/**"};
+  Check(mdlite::SearchWorkspace(globs, shallow, {}, matches, error) && matches.size() == 1 &&
+            matches.front().path.filename() == L"top.md",
+        "exclude glob takes precedence over include glob");
+  shallow.include_hidden = true;
+  shallow.exclude_globs.clear();
+  Check(mdlite::SearchWorkspace(globs, shallow, {}, matches, error) && matches.size() == 3,
+        "hidden search can be explicitly enabled while internal metadata remains excluded");
+
+  const auto ignored = workspace / L"gitignore-search";
+  std::filesystem::create_directories(ignored / L"ignored-dir");
+  std::filesystem::create_directories(ignored / L"nested/child");
+  std::filesystem::create_directories(ignored / L"generated/a");
+  std::filesystem::create_directories(ignored / L"other");
+  std::filesystem::create_directories(ignored / L"parent-blocked");
+  std::filesystem::create_directories(ignored / L"reopened");
+  WriteAscii(ignored / L".gitignore",
+             "ignored-dir/\nignored-*.md\n!ignored-keep.md\n*.log\n/root-only.md\n"
+             "temp?.md\ngenerated/**/draft*.md\nparent-blocked/\n"
+             "!parent-blocked/keep.md\nreopened/\n!reopened/\nreopened/*.md\n"
+             "!reopened/keep.md\n");
+  WriteAscii(ignored / L"nested/.gitignore", "*.md\n!important.md\n/deep-only.txt\n");
+  for (const auto& relative : {L"visible.md", L"ignored-dir/hidden.md", L"ignored-1.md",
+                               L"ignored-keep.md", L"trace.log", L"root-only.md",
+                               L"temp1.md", L"temp12.md", L"generated/a/draft1.md",
+                               L"generated/a/final.md", L"nested/blocked.md",
+                               L"nested/important.md", L"nested/deep-only.txt",
+                               L"nested/child/important.md", L"nested/child/deep-only.txt",
+                               L"other/root-only.md", L"parent-blocked/drop.md",
+                               L"parent-blocked/keep.md", L"reopened/drop.md",
+                               L"reopened/keep.md"})
+    WriteAscii(ignored / relative, "ignore-token");
+  WriteBytes(ignored / L"ignored-dir/.gitignore", {0xEF, 0xBB, 0xBF, 0xFF});
+  mdlite::SearchQuery ignored_query{L"ignore-token", true, false};
+  Check(mdlite::SearchWorkspace(ignored, ignored_query, {}, matches, error) && matches.size() == 9,
+        ".gitignore rules honor negation, directory, anchored, star, question, and double-star patterns");
+  Check(std::ranges::any_of(matches, [](const auto& match) {
+          return match.path.filename() == L"ignored-keep.md";
+        }) && std::ranges::any_of(matches, [](const auto& match) {
+          return match.path.generic_wstring().ends_with(L"nested/child/deep-only.txt");
+        }) && std::ranges::none_of(matches, [](const auto& match) {
+          return match.path.generic_wstring().ends_with(L"nested/deep-only.txt");
+        }) && std::ranges::none_of(matches, [](const auto& match) {
+          return match.path.generic_wstring().ends_with(L"parent-blocked/keep.md");
+        }) && std::ranges::any_of(matches, [](const auto& match) {
+          return match.path.generic_wstring().ends_with(L"reopened/keep.md");
+        }),
+        ".gitignore negation respects declaring scope and requires excluded parents to be reopened");
+  ignored_query.respect_gitignore = false;
+  Check(mdlite::SearchWorkspace(ignored, ignored_query, {}, matches, error) && matches.size() == 20,
+        ".gitignore filtering can be explicitly disabled");
+
+  const auto issue_workspace = workspace / L"search-issues";
+  std::filesystem::create_directories(issue_workspace);
+  WriteAscii(issue_workspace / L"good.md", "issue-token");
+  WriteBytes(issue_workspace / L"bad.md", {0xEF, 0xBB, 0xBF, 0xFF});
+  mdlite::SearchQuery issue_query{L"issue-token", true, false};
+  std::vector<mdlite::SearchIssue> issues;
+  std::size_t progressive_issues{};
+  error.clear();
+  Check(!mdlite::SearchWorkspace(issue_workspace, issue_query, {}, matches, error) &&
+            error.find(L"未処理") != std::wstring::npos,
+        "workspace search without an issue sink fails closed on an unreadable file");
+  error.clear();
+  Check(mdlite::SearchWorkspace(issue_workspace, issue_query, {}, matches, error, {}, {}, &issues,
+                                [&](std::vector<mdlite::SearchIssue> batch) {
+                                  progressive_issues += batch.size();
+                                }) && matches.size() == 1 && issues.size() == 1 &&
+            progressive_issues == 1 && issues.front().path.filename() == L"bad.md",
+        "workspace search reports unreadable files individually and continues with readable files");
+
+  const auto guarded_workspace = workspace / L"search-guarded";
+  std::filesystem::create_directories(guarded_workspace / L"uncertain");
+  std::filesystem::create_directories(guarded_workspace / L"readable");
+  WriteBytes(guarded_workspace / L"uncertain/.gitignore", {0xEF, 0xBB, 0xBF, 0xFF});
+  WriteAscii(guarded_workspace / L"uncertain/private.md", "guard-token");
+  WriteAscii(guarded_workspace / L"readable/public.md", "guard-token");
+  mdlite::SearchQuery guarded_query{L"guard-token", true, false};
+  issues.clear();
+  error.clear();
+  Check(mdlite::SearchWorkspace(guarded_workspace, guarded_query, {}, matches, error, {}, {},
+                                &issues) &&
+            matches.size() == 1 && matches.front().path.filename() == L"public.md" &&
+            issues.size() == 1 && issues.front().path.filename() == L".gitignore",
+        "an unreadable .gitignore fails closed for its subtree while readable siblings continue");
+
+  const auto locked_path = issue_workspace / L"locked.md";
+  WriteAscii(locked_path, "issue-token");
+  HANDLE locked = CreateFileW(locked_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Check(locked != INVALID_HANDLE_VALUE, "search issue fixture can hold an exclusive file lock");
+  if (locked != INVALID_HANDLE_VALUE) {
+    issues.clear();
+    progressive_issues = 0;
+    error.clear();
+    Check(mdlite::SearchWorkspace(issue_workspace, issue_query, {}, matches, error, {}, {}, &issues,
+                                  [&](std::vector<mdlite::SearchIssue> batch) {
+                                    progressive_issues += batch.size();
+                                  }) && matches.size() == 1 && issues.size() == 2 &&
+              progressive_issues == 2 &&
+              std::ranges::any_of(issues, [&](const auto& issue) {
+                return issue.path == locked_path;
+              }),
+          "workspace search reports a locked file and continues without silently omitting it");
+    CloseHandle(locked);
+  }
+
+  const std::wstring anchored = L"Alpha one\nAlpha two";
+  mdlite::SearchQuery anchored_query{L"^Alpha (one)", true, true};
+  std::size_t replace_begin{};
+  std::size_t replace_end{};
+  bool did_replace{};
+  Check(mdlite::ReplaceDocumentMatch(anchored, anchored_query, L"$1/$&", 0,
+                                     replaced_text, replace_begin, replace_end,
+                                     did_replace, error) && did_replace && replace_begin == 0 &&
+            replaced_text == L"one/Alpha one\nAlpha two",
+        "single document replacement expands captures in full source context");
+  anchored_query.text = L"^Alpha two";
+  Check(mdlite::ReplaceDocumentMatch(anchored, anchored_query, L"changed",
+                                     anchored.find(L"Alpha two"), replaced_text,
+                                     replace_begin, replace_end, did_replace, error) &&
+            !did_replace && replaced_text == anchored,
+        "single replacement does not reinterpret a suffix as the start of the document");
 }
 
 void TestTableEditing() {
@@ -614,6 +1084,28 @@ void TestTableEditing() {
       table, table.find(L"A"), mdlite::TableCaretDirection::Down);
   Check(down && *down == table.find(L"1"),
         "Down skips the GFM delimiter row and keeps the table column");
+  const auto backwards_from_eof_row = mdlite::MoveToAdjacentTableCell(table, table.find(L"1"), true);
+  Check(!backwards_from_eof_row.changed &&
+            backwards_from_eof_row.selection == table.rfind(L"---"),
+        "Shift+Tab from the first cell of an EOF row reaches the previous row");
+  const std::wstring crlf_table = L"| A | B |\r\n| --- | --- |\r\n| 1 | 2 |";
+  const auto crlf_insert = mdlite::InsertTableRow(crlf_table, crlf_table.find(L"1"), false);
+  Check(crlf_insert.changed && crlf_insert.text.find(L"|  |  |\r\n| 1 | 2 |") != std::wstring::npos,
+        "table row insertion preserves the surrounding CRLF convention");
+  const auto crlf_after = mdlite::InsertTableRow(crlf_table, crlf_table.find(L"A"), true);
+  Check(crlf_after.changed && crlf_after.text.find(L"| A | B |\r\n|  |  |\r\n| ---") != std::wstring::npos,
+        "table row insertion after a CRLF row does not split or duplicate the line ending");
+  const auto crlf_delete = mdlite::DeleteTableRow(crlf_table, crlf_table.find(L"1"));
+  Check(crlf_delete.changed && crlf_delete.text.ends_with(L"| --- | --- |") &&
+            crlf_delete.text.find(L"\n\n") == std::wstring::npos,
+        "table row deletion consumes the complete CRLF line ending");
+  const std::wstring escaped = L"| `a|b` | c\\|d | e |\n| --- | --- | --- |";
+  const auto escaped_move = mdlite::MoveToAdjacentTableCell(escaped, escaped.find(L"a|b"), false);
+  Check(!escaped_move.changed && escaped_move.selection == escaped.find(L"c\\|d"),
+        "escaped and code-span pipes do not split visual table cells");
+  const auto visual_rows = mdlite::ParseTableVisualRows(escaped, 0, escaped.size());
+  Check(visual_rows.size() == 2 && visual_rows[0].cells.size() == 3,
+        "visual table grid uses the same escaped/code-span separator semantics");
 }
 
 void TestJapaneseHolidays() {
@@ -635,8 +1127,50 @@ void TestAssets(const std::filesystem::path& root) {
   Check(mdlite::ReadRasterImageInfo(png, image_info, error) && image_info.width == 2 &&
             image_info.height == 1 && image_info.frame_count == 1,
         "real PNG is decoded with dimensions and frame count");
+  const auto jpeg = source_directory / L"image.jpg";
+  Check(WriteValidJpeg(jpeg) &&
+            mdlite::ReadRasterImageInfo(jpeg, image_info, error) && image_info.width == 2 &&
+            image_info.height == 1,
+        "real JPEG is encoded and decoded through the required native path");
+  const auto webp = source_directory / L"image.webp";
   IStream* frame_stream{};
   unsigned frame_delay{};
+  WriteBytes(webp, {0x52,0x49,0x46,0x46,0x1A,0x00,0x00,0x00,0x57,0x45,0x42,0x50,
+                    0x56,0x50,0x38,0x4C,0x0E,0x00,0x00,0x00,0x2F,0x00,0x00,0x00,
+                    0x10,0x07,0x10,0x11,0x11,0x88,0x88,0xFE,0x07,0x00});
+  error.clear();
+  const bool webp_decoded = mdlite::ReadRasterImageInfo(webp, image_info, error);
+  Check(webp_decoded && image_info.width == 1 && image_info.height == 1,
+        "real WebP is decoded through the bundled libwebp path");
+  frame_stream = nullptr;
+  frame_delay = 0;
+  Check(mdlite::CreateRasterFramePngStream(webp, 0, frame_stream, frame_delay, error) &&
+            frame_stream != nullptr && frame_delay >= 20,
+        "a real WebP frame is decoded and converted to a native PNG stream");
+  if (frame_stream) frame_stream->Release();
+  const auto animated_webp = source_directory / L"animated.webp";
+  Check(WriteAnimatedWebp(animated_webp), "animated WebP fixture is encoded by libwebp");
+  error.clear();
+  Check(mdlite::ReadRasterImageInfo(animated_webp, image_info, error) &&
+            image_info.width == 2 && image_info.height == 1 && image_info.frame_count == 2 &&
+            image_info.animated,
+        "animated WebP dimensions and frame count are decoded");
+  frame_stream = nullptr;
+  frame_delay = 0;
+  Check(mdlite::CreateRasterFramePngStream(animated_webp, 0, frame_stream, frame_delay, error) &&
+            frame_stream != nullptr && frame_delay == 100,
+        "animated WebP first frame is composited with its 100 ms timing");
+  if (frame_stream) frame_stream->Release();
+  frame_stream = nullptr;
+  frame_delay = 0;
+  const bool second_webp_frame = mdlite::CreateRasterFramePngStream(
+      animated_webp, 1, frame_stream, frame_delay, error);
+  if (second_webp_frame && frame_delay != 250) {
+    std::cerr << "animated WebP second frame delay: " << frame_delay << " ms\n";
+  }
+  Check(second_webp_frame && frame_stream != nullptr && frame_delay == 250,
+        "animated WebP second frame is composited with its distinct 250 ms timing");
+  if (frame_stream) frame_stream->Release();
   Check(mdlite::CreateRasterFramePngStream(png, 0, frame_stream, frame_delay, error) &&
             frame_stream != nullptr && frame_delay >= 20,
         "a WIC raster frame is converted to an in-memory PNG for native image refresh");
@@ -661,6 +1195,39 @@ void TestAssets(const std::filesystem::path& root) {
             frame_stream != nullptr,
         "a later animated GIF frame is converted for native playback");
   if (frame_stream) frame_stream->Release();
+  const auto partial_gif = source_directory / L"partial-disposal.gif";
+  Check(WritePartialDisposalGif(partial_gif), "partial-frame GIF fixture is written");
+  error.clear();
+  Check(mdlite::ReadRasterImageInfo(partial_gif, image_info, error) && image_info.animated &&
+            image_info.width == 3 && image_info.height == 1 && image_info.frame_count == 4,
+        "partial-frame GIF reports its logical canvas and frame count");
+  const auto check_gif_frame = [&](unsigned index, unsigned expected_delay,
+                                   const std::vector<unsigned char>& expected,
+                                   const char* message) {
+    IStream* composed{};
+    unsigned delay{};
+    unsigned width{}, height{};
+    std::vector<unsigned char> pixels;
+    error.clear();
+    const bool created = mdlite::CreateRasterFramePngStream(
+        partial_gif, index, composed, delay, error);
+    const bool decoded = created && DecodePngStream(composed, width, height, pixels);
+    Check(decoded && width == 3 && height == 1 && delay == expected_delay && pixels == expected,
+          message);
+    if (composed) composed->Release();
+  };
+  check_gif_frame(0, 100,
+                  {0,0,255,255, 0,0,255,255, 0,0,255,255},
+                  "GIF frame 0 fills the logical canvas");
+  check_gif_frame(1, 200,
+                  {0,0,255,255, 0,255,0,255, 0,0,255,255},
+                  "GIF partial frame honors offset and transparent pixels");
+  check_gif_frame(2, 300,
+                  {0,0,0,255, 0,0,0,255, 255,0,0,255},
+                  "GIF disposal 2 restores the previous frame rectangle to background");
+  check_gif_frame(3, 400,
+                  {255,255,255,255, 0,0,0,255, 0,0,255,255},
+                  "GIF disposal 3 restores the canvas saved before the previous frame");
   mdlite::AssetImportResult first{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", first, error),
         "supported image copies into workspace assets");
@@ -683,6 +1250,54 @@ void TestAssets(const std::filesystem::path& root) {
   Check(mdlite::ImportImageAsset(svg, workspace, workspace / L"note.md", svg_result, error),
         "unsafe SVG is preserved as a local asset");
   Check(!svg_result.safe_to_render, "unsafe SVG is disabled for rendering");
+  IStream* unsafe_svg_stream{};
+  unsigned unsafe_svg_delay{};
+  error.clear();
+  Check(!mdlite::CreateRasterFramePngStream(svg, 0, unsafe_svg_stream, unsafe_svg_delay, error) &&
+            unsafe_svg_stream == nullptr,
+        "the SVG rasterization entry point independently rejects unsafe bytes");
+  const auto inspect_svg = [&](std::wstring_view name, std::string_view body) {
+    const auto path = source_directory / std::filesystem::path(name);
+    WriteBytes(path, std::vector<unsigned char>(body.begin(), body.end()));
+    bool safe{};
+    std::wstring message;
+    error.clear();
+    Check(mdlite::InspectImageSafety(path, safe, message, error),
+          "SVG safety inspection completes without fetching references");
+    return safe;
+  };
+  Check(inspect_svg(L"safe.svg",
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"10\">"
+                    "<defs><linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient></defs>"
+                    "<rect width=\"20\" height=\"10\" fill=\"url(#g)\"/></svg>"),
+        "ordinary SVG with an internal paint reference is allowed");
+  Check(!inspect_svg(L"spaced-href.svg", "<svg><use href = \"https://example.invalid/a.svg#x\"/></svg>"),
+        "whitespace around external href is rejected structurally");
+  Check(!inspect_svg(L"spaced-event.svg", "<svg onload = \"alert(1)\"><path d=\"M0 0\"/></svg>"),
+        "all event attributes are rejected regardless of spacing");
+  Check(!inspect_svg(L"css-url.svg", "<svg><rect style=\"fill:url(https://example.invalid/a)\"/></svg>"),
+        "external CSS url references are rejected");
+  Check(!inspect_svg(L"entity.svg",
+                     "<!DOCTYPE svg [<!ENTITY xxe SYSTEM 'file:///Windows/win.ini'>]><svg>&xxe;</svg>"),
+        "DTD and external entities are rejected by the XML parser");
+  Check(!inspect_svg(L"xml-base.svg",
+                     "<svg xmlns=\"http://www.w3.org/2000/svg\" xml:base=\"https://example.invalid/\">"
+                     "<use href=\"#shape\"/></svg>"),
+        "external XML base cannot turn an internal fragment into a remote reference");
+  Check(!inspect_svg(L"xml-stylesheet.svg",
+                     "<?xml-stylesheet type=\"text/css\" href=\"https://example.invalid/x.css\"?>"
+                     "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"1\" height=\"1\"/></svg>"),
+        "external xml-stylesheet processing instructions are rejected");
+  Check(InsertNativeRichEditImage(png, false),
+        "PNG stream inserts one native RichEdit inline image");
+  Check(InsertNativeRichEditImage(jpeg, false),
+        "JPEG stream inserts one native RichEdit inline image");
+  Check(InsertNativeRichEditImage(gif, true),
+        "decoded GIF frame inserts one native RichEdit inline image");
+  Check(InsertNativeRichEditImage(webp, true),
+        "bundled WebP frame inserts one native RichEdit inline image");
+  Check(InsertNativeRichEditImage(source_directory / L"safe.svg", true),
+        "validated and rasterized SVG inserts one native RichEdit inline image");
   Check(mdlite::ImageHtml(L"a\"b", L"assets/x.png", 480).find(L"width=\"480\"") != std::wstring::npos,
         "image resize markup stores width without height");
 }
@@ -836,6 +1451,6 @@ int wmain() {
   TestGitConflicts();
   std::filesystem::remove_all(root, error);
   if (SUCCEEDED(com)) CoUninitialize();
-  if (failures == 0) std::cout << "All MDLite core tests passed.\n";
+  if (failures == 0) std::cout << "All " << checks << " MDLite core checks passed.\n";
   return failures == 0 ? 0 : 1;
 }

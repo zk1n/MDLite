@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.28)
 
 project(MDLite VERSION 0.1.0 LANGUAGES CXX)
 
+include(FetchContent)
+
 if(NOT WIN32)
   message(FATAL_ERROR "MDLite v0.1 targets Windows 11 x64.")
 endif()
@@ -14,6 +16,24 @@ if(MSVC)
   # machine without requiring an administrator-installed VC redistributable.
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
+
+# WebP is linked statically so the required five image formats work on a clean
+# Windows 11 installation without depending on the optional Store codec.
+set(WEBP_BUILD_ANIM_UTILS OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_CWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_DWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_GIF2WEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_IMG2WEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_VWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPINFO OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPMUX OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libwebp
+  URL https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz
+  URL_HASH SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(libwebp)
 
 add_library(mdlite_core
   src/assets/Assets.cpp
@@ -50,7 +70,8 @@ add_library(mdlite_core
 target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mdlite_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs)
+target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite webp webpdemux
+  d2d1 d3d11 dxgi)
 
 add_executable(MDLite WIN32
   src/app/MDLite.manifest
@@ -60,14 +81,14 @@ add_executable(MDLite WIN32
 )
 target_compile_definitions(MDLite PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(MDLite PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs)
+target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs wer)
 
 include(CTest)
 if(BUILD_TESTING)
   add_executable(mdlite_core_tests tests/CoreTests.cpp)
   target_compile_definitions(mdlite_core_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(mdlite_core_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
-  target_link_libraries(mdlite_core_tests PRIVATE mdlite_core)
+  target_link_libraries(mdlite_core_tests PRIVATE mdlite_core libwebpmux shlwapi)
   add_test(NAME mdlite_core_tests COMMAND mdlite_core_tests)
 endif()
 

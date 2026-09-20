@@ -22,6 +22,8 @@ struct EditorSnapshot {
 
   [[nodiscard]] std::size_t SourceToView(std::size_t position) const noexcept;
   [[nodiscard]] std::size_t ViewToSource(std::size_t position) const noexcept;
+  [[nodiscard]] bool HasCollapsedSourceRange(std::size_t begin,
+                                             std::size_t end) const noexcept;
 };
 
 struct SourceTransaction {

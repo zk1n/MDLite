@@ -31,6 +31,34 @@ std::pair<std::size_t, std::size_t> LineRange(std::wstring_view source, std::siz
   return {begin, end};
 }
 
+std::wstring_view PreferredLineBreak(std::wstring_view source, std::size_t position) {
+  auto newline = source.find(L'\n', position);
+  if (newline == std::wstring_view::npos && position != 0)
+    newline = source.rfind(L'\n', position - 1);
+  return newline != std::wstring_view::npos && newline > 0 && source[newline - 1] == L'\r'
+      ? std::wstring_view(L"\r\n")
+      : std::wstring_view(L"\n");
+}
+
+std::size_t NextLineStart(std::wstring_view source, std::size_t content_end) {
+  std::size_t position = std::min(content_end, source.size());
+  if (position < source.size() && source[position] == L'\r') ++position;
+  if (position < source.size() && source[position] == L'\n') ++position;
+  return position;
+}
+
+std::size_t NextCellSeparator(std::wstring_view line, std::size_t cursor) {
+  bool code{};
+  for (std::size_t index = cursor; index < line.size(); ++index) {
+    std::size_t slashes{};
+    for (std::size_t before = index; before > 0 && line[before - 1] == L'\\'; --before) ++slashes;
+    const bool escaped = slashes % 2 != 0;
+    if (line[index] == L'`' && !escaped) code = !code;
+    else if (line[index] == L'|' && !escaped && !code) return index;
+  }
+  return std::wstring_view::npos;
+}
+
 std::optional<Row> ParseRow(std::wstring_view source, std::size_t line_begin, std::size_t line_end) {
   const auto line = source.substr(line_begin, line_end - line_begin);
   if (line.find(L'|') == std::wstring_view::npos) return std::nullopt;
@@ -38,7 +66,7 @@ std::optional<Row> ParseRow(std::wstring_view source, std::size_t line_begin, st
   std::size_t cursor{};
   if (!line.empty() && line.front() == L'|') cursor = 1;
   while (cursor <= line.size()) {
-    std::size_t separator = line.find(L'|', cursor);
+    std::size_t separator = NextCellSeparator(line, cursor);
     if (separator == std::wstring_view::npos) separator = line.size();
     std::size_t begin = cursor;
     std::size_t end = separator;
@@ -106,8 +134,9 @@ std::optional<TableBlock> BlockAt(std::wstring_view source, std::size_t caret) {
     if (begin == current->begin) block.current_row = block.rows.size();
     block.rows.push_back(CellValues(source, *row));
     block.end = end;
-    if (end == source.size()) break;
-    line_begin = end + 1;
+    const std::size_t next = NextLineStart(source, end);
+    if (next == end) break;
+    line_begin = next;
   }
   return block.rows.size() >= 2 ? std::optional<TableBlock>(std::move(block)) : std::nullopt;
 }
@@ -115,9 +144,10 @@ std::optional<TableBlock> BlockAt(std::wstring_view source, std::size_t caret) {
 TableEditResult RenderBlock(std::wstring_view source, const TableBlock& block,
                             std::size_t selected_column) {
   std::wstring rendered;
+  const std::wstring line_break(PreferredLineBreak(source, block.begin));
   std::size_t selection_in_block{};
   for (std::size_t row_index = 0; row_index < block.rows.size(); ++row_index) {
-    if (row_index != 0) rendered.push_back(L'\n');
+    if (row_index != 0) rendered += line_break;
     const std::size_t row_begin = rendered.size();
     const std::wstring row_text = RenderRow(block.rows[row_index]);
     if (row_index == block.current_row) {
@@ -140,6 +170,35 @@ TableEditResult ReplaceLine(std::wstring_view source, const Row& row, std::wstri
 
 }  // namespace
 
+std::vector<TableVisualRow> ParseTableVisualRows(std::wstring_view source,
+                                                 std::size_t begin,
+                                                 std::size_t end) {
+  std::vector<TableVisualRow> rows;
+  begin = std::min(begin, source.size());
+  end = std::min(end, source.size());
+  for (std::size_t line_begin = begin; line_begin < end;) {
+    std::size_t line_end = source.find(L'\n', line_begin);
+    if (line_end == std::wstring_view::npos || line_end > end) line_end = end;
+    std::size_t content_end = line_end;
+    if (content_end > line_begin && source[content_end - 1] == L'\r') --content_end;
+    const auto line = source.substr(line_begin, content_end - line_begin);
+    TableVisualRow row{line_begin, content_end, {}};
+    std::size_t cursor = !line.empty() && line.front() == L'|' ? 1 : 0;
+    while (cursor <= line.size()) {
+      std::size_t separator = NextCellSeparator(line, cursor);
+      if (separator == std::wstring_view::npos) separator = line.size();
+      row.cells.push_back({line_begin + cursor, line_begin + separator});
+      if (separator == line.size()) break;
+      cursor = separator + 1;
+      if (cursor == line.size()) break;
+    }
+    if (row.cells.size() >= 2) rows.push_back(std::move(row));
+    if (line_end >= end) break;
+    line_begin = line_end + 1;
+  }
+  return rows;
+}
+
 TableEditResult MoveToAdjacentTableCell(std::wstring_view source, std::size_t caret, bool backwards) {
   const auto row = RowAt(source, caret);
   if (!row) return {std::wstring(source), caret, false};
@@ -151,9 +210,11 @@ TableEditResult MoveToAdjacentTableCell(std::wstring_view source, std::size_t ca
     if (row->begin == 0) return {std::wstring(source), caret, false};
     adjacent_position = row->begin - 1;
   } else {
-    adjacent_position = row->end < source.size() ? row->end + 1 : source.size();
+    adjacent_position = NextLineStart(source, row->end);
   }
-  const auto adjacent = row->end < source.size() ? RowAt(source, adjacent_position) : std::nullopt;
+  const auto adjacent = (backwards || adjacent_position > row->end)
+      ? RowAt(source, adjacent_position)
+      : std::nullopt;
   if (adjacent) return {std::wstring(source), backwards ? adjacent->cells.back().first : adjacent->cells.front().first, false};
   if (backwards) return {std::wstring(source), caret, false};
 
@@ -161,9 +222,13 @@ TableEditResult MoveToAdjacentTableCell(std::wstring_view source, std::size_t ca
   if (IsDelimiter(values)) return {std::wstring(source), caret, false};
   const std::wstring new_row = RenderRow(std::vector<std::wstring>(values.size(), L""));
   std::wstring result(source);
-  const std::wstring prefix = row->end == source.size() ? L"\n" : L"";
-  result.insert(row->end, prefix + new_row);
-  const std::size_t selection = row->end + prefix.size() + 2;
+  const std::wstring line_break(PreferredLineBreak(source, row->begin));
+  const std::size_t next = NextLineStart(source, row->end);
+  const bool at_eof = next == row->end;
+  const std::size_t insertion = at_eof ? row->end : next;
+  const std::wstring inserted = at_eof ? line_break + new_row : new_row + line_break;
+  result.insert(insertion, inserted);
+  const std::size_t selection = insertion + (at_eof ? line_break.size() : 0) + 2;
   return {std::move(result), selection, true};
 }
 
@@ -186,8 +251,8 @@ std::optional<std::size_t> MoveTableCaretAtBoundary(std::wstring_view source, st
     if (row->begin == 0) return std::nullopt;
     adjacent_position = row->begin - 1;
   } else {
-    if (row->end >= source.size()) return std::nullopt;
-    adjacent_position = row->end + 1;
+    adjacent_position = NextLineStart(source, row->end);
+    if (adjacent_position == row->end) return std::nullopt;
   }
   auto adjacent = RowAt(source, adjacent_position);
   if (adjacent && IsDelimiter(CellValues(source, *adjacent))) {
@@ -195,8 +260,9 @@ std::optional<std::size_t> MoveTableCaretAtBoundary(std::wstring_view source, st
       if (adjacent->begin == 0) return std::nullopt;
       adjacent = RowAt(source, adjacent->begin - 1);
     } else {
-      if (adjacent->end >= source.size()) return std::nullopt;
-      adjacent = RowAt(source, adjacent->end + 1);
+      const auto next = NextLineStart(source, adjacent->end);
+      if (next == adjacent->end) return std::nullopt;
+      adjacent = RowAt(source, next);
     }
   }
   if (!adjacent) return std::nullopt;
@@ -208,9 +274,18 @@ TableEditResult InsertTableRow(std::wstring_view source, std::size_t caret, bool
   if (!row) return {std::wstring(source), caret, false};
   const std::wstring new_row = RenderRow(std::vector<std::wstring>(row->cells.size(), L""));
   std::wstring result(source);
-  const std::size_t position = after ? row->end : row->begin;
-  result.insert(position, after ? L"\n" + new_row : new_row + L"\n");
-  return {std::move(result), after ? position + 3 : position + 2, true};
+  const std::wstring line_break(PreferredLineBreak(source, row->begin));
+  if (!after) {
+    result.insert(row->begin, new_row + line_break);
+    return {std::move(result), row->begin + 2, true};
+  }
+  const auto next = NextLineStart(source, row->end);
+  if (next == row->end) {
+    result.insert(row->end, line_break + new_row);
+    return {std::move(result), row->end + line_break.size() + 2, true};
+  }
+  result.insert(next, new_row + line_break);
+  return {std::move(result), next + 2, true};
 }
 
 TableEditResult DeleteTableRow(std::wstring_view source, std::size_t caret) {
@@ -218,8 +293,13 @@ TableEditResult DeleteTableRow(std::wstring_view source, std::size_t caret) {
   if (!row || IsDelimiter(CellValues(source, *row))) return {std::wstring(source), caret, false};
   std::size_t erase_begin = row->begin;
   std::size_t erase_end = row->end;
-  if (erase_end < source.size()) ++erase_end;
-  else if (erase_begin > 0) --erase_begin;
+  const auto next = NextLineStart(source, erase_end);
+  if (next > erase_end) erase_end = next;
+  else if (erase_begin > 0) {
+    --erase_begin;
+    if (erase_begin > 0 && source[erase_begin] == L'\n' && source[erase_begin - 1] == L'\r')
+      --erase_begin;
+  }
   std::wstring result(source);
   result.erase(erase_begin, erase_end - erase_begin);
   return {std::move(result), erase_begin, true};

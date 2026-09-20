@@ -29,6 +29,15 @@ struct ReplaceApplyResult {
   std::filesystem::path journal;
 };
 
+bool ReplaceDocumentText(std::wstring_view source, const SearchQuery& query,
+                         std::wstring_view replacement, std::wstring& output,
+                         std::size_t& count, std::wstring& error);
+
+bool ReplaceDocumentMatch(std::wstring_view source, const SearchQuery& query,
+                          std::wstring_view replacement, std::size_t start,
+                          std::wstring& output, std::size_t& replaced_begin,
+                          std::size_t& replaced_end, bool& replaced, std::wstring& error);
+
 bool PreviewWorkspaceReplace(const std::filesystem::path& root, const SearchQuery& query,
                              std::wstring_view replacement,
                              const std::map<std::filesystem::path, std::wstring>& unsaved,

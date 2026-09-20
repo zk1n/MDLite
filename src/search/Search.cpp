@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <map>
 #include <regex>
 
 namespace mdlite {
@@ -17,36 +18,235 @@ bool IsSearchable(const std::filesystem::path& path) {
   return std::ranges::find(extensions, extension) != std::end(extensions);
 }
 
-bool IsExcluded(const std::filesystem::path& relative) {
+bool IsExcluded(const std::filesystem::path& relative, const SearchQuery& query) {
   for (const auto& part : relative) {
-    if (part == L".git" || part == L"build" || part == L"out") return true;
-    if (part == L".cache" || part == L".state") return true;
+    const auto name = part.wstring();
+    if (name == L".git" || name == L".mdlite" || name == L"build" || name == L"out")
+      return true;
+    if (name == L".cache" || name == L".state") return true;
+    if (!query.include_hidden && name.size() > 1 && name.front() == L'.') return true;
   }
   return false;
 }
 
+bool IsPathSeparator(wchar_t character) { return character == L'/' || character == L'\\'; }
+
 bool GlobMatch(std::wstring_view value, std::wstring_view pattern) {
-  std::size_t value_index{};
-  std::size_t pattern_index{};
-  std::size_t star = std::wstring_view::npos;
-  std::size_t retry{};
-  while (value_index < value.size()) {
-    if (pattern_index < pattern.size() &&
-        (pattern[pattern_index] == L'?' || towlower(pattern[pattern_index]) == towlower(value[value_index]))) {
-      ++value_index;
-      ++pattern_index;
-    } else if (pattern_index < pattern.size() && pattern[pattern_index] == L'*') {
-      star = pattern_index++;
-      retry = value_index;
-    } else if (star != std::wstring_view::npos) {
-      pattern_index = star + 1;
-      value_index = ++retry;
-    } else {
-      return false;
+  // Workspace globs use the familiar path rules: '*' and '?' stay inside one
+  // path component, while '**' may cross separators. The memo table also
+  // bounds pathological patterns instead of relying on exponential backtracking.
+  const std::size_t columns = pattern.size() + 1;
+  std::vector<signed char> memo((value.size() + 1) * columns, -1);
+  const auto match = [&](const auto& self, std::size_t value_index,
+                         std::size_t pattern_index) -> bool {
+    auto& cached = memo[value_index * columns + pattern_index];
+    if (cached >= 0) return cached != 0;
+    bool result{};
+    if (pattern_index == pattern.size()) {
+      result = value_index == value.size();
+    } else if (pattern[pattern_index] == L'*') {
+      const bool recursive = pattern_index + 1 < pattern.size() &&
+                             pattern[pattern_index + 1] == L'*';
+      if (recursive) {
+        std::size_t next = pattern_index + 2;
+        while (next < pattern.size() && pattern[next] == L'*') ++next;
+        result = self(self, value_index, next);
+        if (!result && next < pattern.size() && IsPathSeparator(pattern[next]))
+          result = self(self, value_index, next + 1);
+        if (!result && value_index < value.size())
+          result = self(self, value_index + 1, pattern_index);
+      } else {
+        result = self(self, value_index, pattern_index + 1);
+        if (!result && value_index < value.size() && !IsPathSeparator(value[value_index]))
+          result = self(self, value_index + 1, pattern_index);
+      }
+    } else if (value_index < value.size() && pattern[pattern_index] == L'?' &&
+               !IsPathSeparator(value[value_index])) {
+      result = self(self, value_index + 1, pattern_index + 1);
+    } else if (value_index < value.size() &&
+               IsPathSeparator(pattern[pattern_index]) && IsPathSeparator(value[value_index])) {
+      result = self(self, value_index + 1, pattern_index + 1);
+    } else if (value_index < value.size() &&
+               towlower(pattern[pattern_index]) == towlower(value[value_index])) {
+      result = self(self, value_index + 1, pattern_index + 1);
     }
+    cached = result ? 1 : 0;
+    return result;
+  };
+  return match(match, 0, 0);
+}
+
+struct IgnoreRule {
+  std::filesystem::path base;
+  std::wstring pattern;
+  bool negated{};
+  bool directory_only{};
+  bool anchored{};
+  bool contains_separator{};
+};
+
+struct IgnoreCacheEntry {
+  std::vector<IgnoreRule> rules;
+  bool readable{true};
+};
+
+using IgnoreCache = std::map<std::filesystem::path, IgnoreCacheEntry>;
+
+enum class IgnoreDecision { Process, Ignore, Unprocessed };
+
+bool IsWithin(const std::filesystem::path& relative) {
+  if (relative.empty()) return true;
+  const auto first = *relative.begin();
+  return first != L"..";
+}
+
+std::vector<std::wstring> PathComponents(std::wstring_view value) {
+  std::vector<std::wstring> components;
+  std::size_t begin{};
+  while (begin < value.size()) {
+    const auto separator = value.find(L'/', begin);
+    const auto end = separator == std::wstring_view::npos ? value.size() : separator;
+    if (end != begin) components.emplace_back(value.substr(begin, end - begin));
+    if (separator == std::wstring_view::npos) break;
+    begin = separator + 1;
   }
-  while (pattern_index < pattern.size() && pattern[pattern_index] == L'*') ++pattern_index;
-  return pattern_index == pattern.size();
+  return components;
+}
+
+bool IgnoreRuleMatches(const IgnoreRule& rule, const std::filesystem::path& root_relative,
+                       bool is_directory) {
+  const auto scoped = root_relative.lexically_relative(rule.base);
+  if (!IsWithin(scoped) || scoped.empty()) return false;
+  const auto value = scoped.generic_wstring();
+  const auto components = PathComponents(value);
+  if (components.empty()) return false;
+
+  // A rule matching a directory also applies to all of its descendants.  We
+  // therefore check each directory prefix as well as the complete candidate.
+  std::vector<std::wstring> candidates;
+  std::wstring prefix;
+  for (std::size_t index = 0; index < components.size(); ++index) {
+    if (!prefix.empty()) prefix += L'/';
+    prefix += components[index];
+    const bool component_is_directory = index + 1 < components.size() || is_directory;
+    if (!rule.directory_only || component_is_directory) candidates.push_back(prefix);
+  }
+
+  if (rule.contains_separator) {
+    return std::ranges::any_of(candidates, [&](const auto& candidate) {
+      return GlobMatch(candidate, rule.pattern);
+    });
+  }
+  if (rule.anchored) {
+    return !candidates.empty() && GlobMatch(components.front(), rule.pattern);
+  }
+  const std::size_t component_limit = rule.directory_only && !is_directory
+                                          ? components.size() - 1
+                                          : components.size();
+  for (std::size_t index = 0; index < component_limit; ++index) {
+    if (GlobMatch(components[index], rule.pattern)) return true;
+  }
+  return false;
+}
+
+std::vector<IgnoreRule> ParseIgnoreRules(const std::filesystem::path& base,
+                                         std::wstring_view text) {
+  std::vector<IgnoreRule> rules;
+  std::size_t begin{};
+  while (begin <= text.size()) {
+    const auto newline = text.find(L'\n', begin);
+    const auto end = newline == std::wstring_view::npos ? text.size() : newline;
+    std::wstring line(text.substr(begin, end - begin));
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    while (!line.empty() && iswspace(line.back()) &&
+           (line.size() < 2 || line[line.size() - 2] != L'\\'))
+      line.pop_back();
+    if (!line.empty() && line.front() != L'#') {
+      bool escaped_initial = line.size() > 1 && line.front() == L'\\' &&
+                             (line[1] == L'#' || line[1] == L'!');
+      if (escaped_initial) line.erase(line.begin());
+      bool negated = !escaped_initial && !line.empty() && line.front() == L'!';
+      if (negated) line.erase(line.begin());
+      const bool directory_only = !line.empty() && line.back() == L'/';
+      if (directory_only) line.pop_back();
+      const bool anchored = !line.empty() && line.front() == L'/';
+      if (anchored) line.erase(line.begin());
+      for (std::size_t index = 0; index + 1 < line.size();) {
+        if (line[index] == L'\\' &&
+            (line[index + 1] == L' ' || line[index + 1] == L'#' || line[index + 1] == L'!'))
+          line.erase(index, 1);
+        else
+          ++index;
+      }
+      if (!line.empty()) {
+        rules.push_back({base, line, negated, directory_only, anchored,
+                         line.find(L'/') != std::wstring::npos});
+      }
+    }
+    if (newline == std::wstring_view::npos) break;
+    begin = newline + 1;
+  }
+  return rules;
+}
+
+IgnoreDecision EvaluateGitIgnore(const std::filesystem::path& root,
+                                 const std::filesystem::path& relative, bool is_directory,
+                                 IgnoreCache& cache,
+                                 const std::function<bool(const SearchIssue&)>& report_issue) {
+  std::vector<const IgnoreRule*> applicable_rules;
+  std::filesystem::path directory = root;
+  std::vector<std::filesystem::path> directories{root};
+  auto parent = relative.parent_path();
+  for (const auto& component : parent) {
+    directory /= component;
+    directories.push_back(directory);
+  }
+  for (const auto& current : directories) {
+    auto [cached, inserted] = cache.try_emplace(current);
+    if (inserted) {
+      std::error_code exists_error;
+      const auto ignore_path = current / L".gitignore";
+      const bool exists = std::filesystem::exists(ignore_path, exists_error);
+      if (exists_error) {
+        cached->second.readable = false;
+        report_issue({ignore_path, L".gitignore の状態を確認できないため、この配下は未処理です。"});
+      } else if (exists) {
+        Document ignore_document;
+        std::wstring load_error;
+        if (!ignore_document.Load(ignore_path, load_error)) {
+          cached->second.readable = false;
+          report_issue({ignore_path, L".gitignore を読み込めないため、この配下は未処理です: " +
+                                         load_error});
+        } else {
+          const auto base = std::filesystem::relative(current, root).lexically_normal();
+          cached->second.rules = ParseIgnoreRules(
+              base == L"." ? std::filesystem::path{} : base, ignore_document.text());
+        }
+      }
+    }
+    if (!cached->second.readable) return IgnoreDecision::Unprocessed;
+    for (const auto& rule : cached->second.rules) applicable_rules.push_back(&rule);
+  }
+  const auto evaluate = [&](const std::filesystem::path& candidate, bool candidate_is_directory) {
+    bool ignored{};
+    for (const auto* rule : applicable_rules) {
+      if (IgnoreRuleMatches(*rule, candidate, candidate_is_directory)) ignored = !rule->negated;
+    }
+    return ignored;
+  };
+  // Git cannot re-include a file while one of its parent directories remains
+  // excluded.  Checking every directory prefix preserves that rule while the
+  // enumerator itself keeps traversing, so a later `!parent/` can still reopen it.
+  std::filesystem::path prefix;
+  std::size_t index{};
+  const auto component_count = static_cast<std::size_t>(std::distance(relative.begin(), relative.end()));
+  for (const auto& component : relative) {
+    prefix /= component;
+    ++index;
+    if ((index < component_count || is_directory) && evaluate(prefix, true))
+      return IgnoreDecision::Ignore;
+  }
+  return evaluate(relative, is_directory) ? IgnoreDecision::Ignore : IgnoreDecision::Process;
 }
 
 bool MatchesGlobs(const std::filesystem::path& relative, const SearchQuery& query) {
@@ -118,44 +318,165 @@ bool SearchText(const std::filesystem::path& path, std::wstring_view text, const
 
 }  // namespace
 
-bool SearchWorkspace(const std::filesystem::path& root, const SearchQuery& query,
-                     const std::map<std::filesystem::path, std::wstring>& unsaved,
-                     std::vector<SearchMatch>& matches, std::wstring& error,
-                     const std::function<bool()>& cancelled) {
+bool SearchDocumentText(const std::filesystem::path& path, std::wstring_view text,
+                        const SearchQuery& query, std::vector<SearchMatch>& matches,
+                        std::wstring& error) {
   matches.clear();
   if (query.text.empty()) {
     error = L"検索文字列を入力してください。";
     return false;
   }
-  std::error_code filesystem_error;
-  for (std::filesystem::recursive_directory_iterator iterator(
-           root, std::filesystem::directory_options::skip_permission_denied, filesystem_error), end;
-       iterator != end && !filesystem_error; iterator.increment(filesystem_error)) {
+  return SearchText(path, text, query, matches, error);
+}
+
+bool SearchWorkspace(const std::filesystem::path& root, const SearchQuery& query,
+                     const std::map<std::filesystem::path, std::wstring>& unsaved,
+                     std::vector<SearchMatch>& matches, std::wstring& error,
+                     const std::function<bool()>& cancelled,
+                     const std::function<void(std::vector<SearchMatch>)>& progress,
+                     std::vector<SearchIssue>* issues,
+                     const std::function<void(std::vector<SearchIssue>)>& issue_progress) {
+  matches.clear();
+  if (issues) issues->clear();
+  if (query.text.empty()) {
+    error = L"検索文字列を入力してください。";
+    return false;
+  }
+  const bool can_report_issues = issues != nullptr || static_cast<bool>(issue_progress);
+  const auto report_issue = [&](const SearchIssue& issue) {
+    if (!can_report_issues) {
+      error = issue.message;
+      return false;
+    }
+    if (issues) issues->push_back(issue);
+    if (issue_progress) issue_progress({issue});
+    return true;
+  };
+  const auto absolute_root = std::filesystem::absolute(root).lexically_normal();
+  IgnoreCache ignore_cache;
+  std::vector<std::filesystem::path> pending_directories{absolute_root};
+  while (!pending_directories.empty()) {
+    const auto directory = std::move(pending_directories.back());
+    pending_directories.pop_back();
+    std::error_code filesystem_error;
+    std::filesystem::directory_iterator iterator(
+        directory, std::filesystem::directory_options::none, filesystem_error);
+    const std::filesystem::directory_iterator end;
+    if (filesystem_error) {
+      if (!report_issue({directory, L"ディレクトリを列挙できないため、この配下は未処理です。"}))
+        return false;
+      continue;
+    }
+    for (; iterator != end;) {
     if (cancelled && cancelled()) {
       error = L"検索を中止しました。";
       return false;
     }
-    const auto relative = std::filesystem::relative(iterator->path(), root, filesystem_error);
-    if (filesystem_error) break;
-    if (IsExcluded(relative)) {
-      if (iterator->is_directory()) iterator.disable_recursion_pending();
+    const auto current_path = iterator->path();
+    const auto relative = current_path.lexically_relative(absolute_root);
+    std::error_code type_error;
+    const auto status = iterator->symlink_status(type_error);
+    const bool is_directory = !std::filesystem::is_symlink(status) &&
+                              std::filesystem::is_directory(status);
+    if (type_error) {
+      if (!report_issue({current_path, L"ファイル種別を確認できないため未処理です。"})) return false;
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
       continue;
     }
-    if (!iterator->is_regular_file() || !IsSearchable(iterator->path()) ||
-        !MatchesGlobs(relative, query)) continue;
-    const auto absolute = std::filesystem::absolute(iterator->path()).lexically_normal();
+    if (IsExcluded(relative, query)) {
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
+      continue;
+    }
+    const auto ignore_decision = query.respect_gitignore
+        ? EvaluateGitIgnore(absolute_root, relative, is_directory, ignore_cache, report_issue)
+        : IgnoreDecision::Process;
+    if (ignore_decision == IgnoreDecision::Unprocessed) {
+      if (!can_report_issues) return false;
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
+      continue;
+    }
+    if (is_directory) {
+      // Git does not inspect nested ignore files below an excluded directory;
+      // a parent must first re-include that directory.  Avoid enumerating an
+      // ignored subtree (and avoid surfacing permission failures from content
+      // that is intentionally outside the search set).
+      if (ignore_decision == IgnoreDecision::Process) pending_directories.push_back(current_path);
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
+      continue;
+    }
+    if (ignore_decision == IgnoreDecision::Ignore) {
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
+      continue;
+    }
+    const bool is_regular = std::filesystem::is_regular_file(status);
+    if (!is_regular || !IsSearchable(current_path) || !MatchesGlobs(relative, query)) {
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
+      continue;
+    }
+    const std::size_t match_begin = matches.size();
+    const auto absolute = std::filesystem::absolute(current_path).lexically_normal();
     const auto unsaved_match = unsaved.find(absolute);
     if (unsaved_match != unsaved.end()) {
       if (!SearchText(absolute, unsaved_match->second, query, matches, error)) return false;
+      if (progress && matches.size() != match_begin)
+        progress(std::vector<SearchMatch>(matches.begin() + static_cast<std::ptrdiff_t>(match_begin),
+                                          matches.end()));
+      iterator.increment(filesystem_error);
+      if (filesystem_error) {
+        if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+          return false;
+        break;
+      }
       continue;
     }
     Document document;
-    if (!document.Load(absolute, error)) return false;
+    std::wstring load_error;
+    if (!document.Load(absolute, load_error)) {
+      if (!report_issue({absolute, L"読み込めないため未処理です: " + load_error})) return false;
+      iterator.increment(filesystem_error);
+      continue;
+    }
     if (!SearchText(absolute, document.text(), query, matches, error)) return false;
-  }
-  if (filesystem_error) {
-    error = L"Workspace検索中にファイルを列挙できませんでした。";
-    return false;
+    if (progress && matches.size() != match_begin)
+      progress(std::vector<SearchMatch>(matches.begin() + static_cast<std::ptrdiff_t>(match_begin),
+                                        matches.end()));
+    iterator.increment(filesystem_error);
+    if (filesystem_error) {
+      if (!report_issue({directory, L"ディレクトリの列挙を継続できず、残りは未処理です。"}))
+        return false;
+      break;
+    }
+    }
   }
   return true;
 }

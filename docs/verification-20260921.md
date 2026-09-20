@@ -30,7 +30,7 @@
 | 休日CSV import・重複拒否・既定OFF | PASS | CoreTests、local parser、fake clock 28日判定、mock HTTP 200/304/404/500/timeout/HTML/大幅減少 |
 | 無音回帰 | PASS（既存測定） | 100/100、失敗0。今回の表示変更で再現性を確認 |
 | GUI acceptance script | PASS | `build/verification/gui-acceptance-responsive-final9.json`、pass=true。Release exe hash `495ebe4cefffe1c3e94f83065288d5d99ce291f088a7fba62e70dcfd9febc7c9`。compact edit/Undo/Redo、Find/Replace、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
-| native screenshot / CUA操作 | PARTIAL | PrintWindowによる現行Releaseの実native画面は取得済み（`native-screenshot-responsive-final9.json`）。CUAにはnative appが列挙されず、クリック・ドラッグ・Humanの視認性は未確認 |
+| native screenshot / CUA操作 | PARTIAL / BLOCKED | PrintWindowによる現行Releaseの実native画面は取得済み（`native-screenshot-responsive-final9.json`）。Computer UseではMDLiteの実window列挙まではできたが、画面取得がWindowsロック画面となり前面化に失敗したため、クリック・ドラッグ・Humanの視認性は未確認 |
 | IME/ATOK、DPI複数monitor、table操作感、画像視認性 | NOT RUN | Human gate。自動click-routing evidenceをHuman PASSへ昇格しない |
 | HTTP月次休日自動更新 | IMPLEMENTED / mock PASS / real HTTP BLOCKED | commonで明示許可した場合だけ、固定の内閣府HTTPS URLを非同期確認。WinHTTPのTLS、timeout、2MiB上限、redirect拒否、304、件数大幅減少拒否、原子的cache置換を実装。opt-in実HTTPを実行したが、試験環境のWinHTTPが `12185 (ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY)` でTLS応答を受信できず、status=0となった。資格情報・TLS設定は変更していない |
 

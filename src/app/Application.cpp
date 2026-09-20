@@ -664,6 +664,163 @@ bool PromptText(HWND owner, HINSTANCE instance, std::wstring_view title, std::ws
   return context.accepted;
 }
 
+std::wstring ControlText(HWND control);
+
+// Settings and profile editing use one native form instead of a chain of
+// prompt/message-box interactions.  The form deliberately stays small and
+// data-oriented: each field owns its control and the caller performs the
+// domain validation only after Apply.  This keeps Cancel side-effect free and
+// lets the same keyboard/focus behavior serve both settings and profiles.
+enum class NativeFormFieldKind { Text, Combo, Multiline };
+
+struct NativeFormField {
+  std::wstring label;
+  std::wstring value;
+  NativeFormFieldKind kind{NativeFormFieldKind::Text};
+  std::vector<std::wstring> options;
+  HWND control{};
+};
+
+struct NativeFormContext {
+  std::vector<NativeFormField>* fields{};
+  int width{680};
+  int height{220};
+  bool accepted{};
+  bool completed{};
+};
+
+LRESULT CALLBACK NativeFormWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto* context = reinterpret_cast<NativeFormContext*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+    context = static_cast<NativeFormContext*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
+  }
+  if (!context || !context->fields) return DefWindowProcW(window, message, wparam, lparam);
+  if (message == WM_CREATE) {
+    const int margin = ScaleDip(window, 16);
+    const int label_height = ScaleDip(window, 19);
+    const int control_height = ScaleDip(window, 27);
+    const int field_width = context->width - margin * 2;
+    int y = margin;
+    const HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    for (std::size_t index = 0; index < context->fields->size(); ++index) {
+      auto& field = (*context->fields)[index];
+      const int label_id = 1000 + static_cast<int>(index) * 2;
+      const int control_id = label_id + 1;
+      const int field_height = field.kind == NativeFormFieldKind::Multiline ? ScaleDip(window, 78) : control_height;
+      const int label_y = y;
+      HWND label = CreateWindowExW(0, L"STATIC", field.label.c_str(), WS_CHILD | WS_VISIBLE,
+                                   margin, label_y, field_width, label_height, window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(label_id)), nullptr, nullptr);
+      if (label) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+      DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+      if (field.kind == NativeFormFieldKind::Multiline)
+        style |= ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL;
+      else if (field.kind == NativeFormFieldKind::Combo)
+        style |= CBS_DROPDOWNLIST | WS_VSCROLL;
+      if (field.kind == NativeFormFieldKind::Combo) {
+        field.control = CreateWindowExW(WS_EX_CLIENTEDGE, WC_COMBOBOXW, nullptr, style,
+                                        margin, label_y + label_height, field_width, ScaleDip(window, 170),
+                                        window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)), nullptr, nullptr);
+        if (field.control) {
+          for (const auto& option : field.options)
+            SendMessageW(field.control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option.c_str()));
+          const LRESULT found = SendMessageW(field.control, CB_FINDSTRINGEXACT, static_cast<WPARAM>(-1),
+                                              reinterpret_cast<LPARAM>(field.value.c_str()));
+          SendMessageW(field.control, CB_SETCURSEL, found >= 0 ? static_cast<WPARAM>(found) : 0, 0);
+        }
+      } else {
+        field.control = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", field.value.c_str(),
+                                        style | ES_AUTOHSCROLL, margin, label_y + label_height,
+                                        field_width, field_height, window,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)), nullptr, nullptr);
+      }
+      if (field.control) SendMessageW(field.control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+      y += label_height + field_height + ScaleDip(window, 11);
+    }
+    const int button_y = context->height - margin - ScaleDip(window, 30);
+    HWND apply = CreateWindowExW(0, L"BUTTON", L"適用", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                 context->width - margin - ScaleDip(window, 190), button_y,
+                                 ScaleDip(window, 84), ScaleDip(window, 30), window,
+                                 reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                  context->width - margin - ScaleDip(window, 94), button_y,
+                                  ScaleDip(window, 84), ScaleDip(window, 30), window,
+                                  reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+    if (apply) SendMessageW(apply, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    if (cancel) SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    for (auto& field : *context->fields)
+      if (field.control) {
+        SetFocus(field.control);
+        if (field.kind == NativeFormFieldKind::Text || field.kind == NativeFormFieldKind::Multiline)
+          SendMessageW(field.control, EM_SETSEL, 0, -1);
+        break;
+      }
+    return 0;
+  }
+  if (message == WM_COMMAND && (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL)) {
+    if (LOWORD(wparam) == IDOK) {
+      for (auto& field : *context->fields) {
+        if (!field.control) continue;
+        field.value = ControlText(field.control);
+      }
+      context->accepted = true;
+    }
+    context->completed = true;
+    DestroyWindow(window);
+    return 0;
+  }
+  if (message == WM_CLOSE) {
+    context->completed = true;
+    DestroyWindow(window);
+    return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool RunNativeForm(HWND owner, HINSTANCE instance, std::wstring_view title,
+                   std::vector<NativeFormField>& fields) {
+  constexpr wchar_t form_class[] = L"MDLite.NativeFormWindow";
+  WNDCLASSEXW existing{sizeof(existing)};
+  if (!GetClassInfoExW(instance, form_class, &existing)) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.lpfnWndProc = NativeFormWindowProc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    window_class.lpszClassName = form_class;
+    if (!RegisterClassExW(&window_class)) return false;
+  }
+  const int width = ScaleDip(owner, 680);
+  int height = ScaleDip(owner, 132);
+  for (const auto& field : fields)
+    height += ScaleDip(owner, field.kind == NativeFormFieldKind::Multiline ? 108 : 57);
+  height = std::clamp(height, ScaleDip(owner, 220), ScaleDip(owner, 760));
+  NativeFormContext context{&fields, width, height};
+  RECT owner_rect{};
+  GetWindowRect(owner, &owner_rect);
+  const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
+  const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
+  HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, form_class, std::wstring(title).c_str(),
+                                WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+                                x, y, width, height, owner, nullptr, instance, &context);
+  if (!dialog) return false;
+  EnableWindow(owner, FALSE);
+  MSG message{};
+  while (!context.completed) {
+    const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+    if (result <= 0) break;
+    if (!IsDialogMessageW(dialog, &message)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetForegroundWindow(owner);
+  return context.accepted;
+}
+
 std::optional<ACCEL> ParseAccelerator(std::wstring value, WORD command) {
   value.erase(std::remove_if(value.begin(), value.end(), iswspace), value.end());
   std::ranges::transform(value, value.begin(), towupper);
@@ -4821,132 +4978,130 @@ void Application::OpenWorkspaceSettings() {
   const auto common_path = CommonSettingsPath();
   const auto workspace_path = workspace_store_ ? workspace_store_->metadata_root() / L"settings.toml"
                                                 : std::filesystem::path{};
-  std::wstring summary = L"現在の実効値と継承元\n"
-      L"auto save: " + std::wstring(settings_.auto_save ? L"on" : L"off") + L" / " +
-      std::to_wstring(settings_.auto_save_delay_ms) + L"ms (" + settings_.origins[L"auto_save"] + L" / " +
-      settings_.origins[L"auto_save_delay_ms"] + L")\n" +
-      L"theme: " + ThemeName(settings_.theme) + L" (" + settings_.origins[L"theme"] + L")\n" +
-      L"font: " + settings_.font_face + L" " + std::to_wstring(settings_.font_size_pt) + L"pt (" +
-      settings_.origins[L"font_face"] + L" / " + settings_.origins[L"font_size_pt"] + L")\n" +
-      L"祝日更新: " + std::wstring(settings_.holiday_auto_update ? L"月1回確認を許可" : L"OFF（同梱/取込みのみ）") +
-      L" (commonのみ / " + settings_.origins[L"holiday_auto_update"] + L")\n" +
-      L"default memo Workspace: " +
-      (settings_.default_memo_workspace.empty() ? std::wstring(L"未設定") : settings_.default_memo_workspace.wstring()) +
-      L" (" + settings_.origins[L"default_memo_workspace"] + L")\n\n" +
-      L"編集範囲を common または workspace で指定します。\n"
-      L"範囲全体を既定へ戻す場合は reset-common / reset-workspace。";
   std::wstring scope = workspace_store_ ? L"workspace" : L"common";
-  if (!PromptText(window_, instance_, L"MDLite 設定", summary, scope)) return;
-  std::ranges::transform(scope, scope.begin(), towlower);
-  if ((scope == L"workspace" || scope == L"reset-workspace") && workspace_path.empty()) {
-    MessageBoxW(window_, L"Workspaceが開かれていません。", L"設定", MB_ICONWARNING);
-    return;
-  }
-  const auto target = (scope == L"common" || scope == L"reset-common") ? common_path : workspace_path;
-  if (scope == L"reset-common" || scope == L"reset-workspace") {
-    if (MessageBoxW(window_, (target.wstring() + L"\nの上書きを解除して継承へ戻しますか？").c_str(),
-                    L"設定を既定へ戻す", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
-    std::error_code remove_error;
-    std::filesystem::remove(target, remove_error);
-    if (remove_error) { MessageBoxW(window_, L"設定上書きを削除できません。", L"設定", MB_ICONERROR); return; }
-    LoadAndApplySettings();
-    return;
-  }
-  if (scope != L"common" && scope != L"workspace") {
-    MessageBoxW(window_, L"common / workspace / reset-common / reset-workspace のいずれかを指定してください。",
-                L"設定", MB_ICONWARNING);
-    return;
-  }
+  const auto target = scope == L"common" ? common_path : workspace_path;
+  if (target.empty()) return;
   SettingsLayer layer;
   std::wstring error;
   if (!LoadSettingsLayer(target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
-  std::wstring auto_save = layer.auto_save ? (*layer.auto_save ? L"on" : L"off") : L"inherit";
-  if (!PromptText(window_, instance_, L"編集", L"auto save: on / off / inherit", auto_save)) return;
-  std::ranges::transform(auto_save, auto_save.begin(), towlower);
+  std::wstring colors;
+  for (const auto& [name, value] : layer.colors) colors += name + L"=" + value + L"\r\n";
+  std::wstring bindings;
+  for (const auto& [command, shortcut] : layer.keybindings) bindings += command + L"=" + shortcut + L"\r\n";
+  std::vector<NativeFormField> fields{
+      {L"編集範囲（Applyで一括保存）", scope, NativeFormFieldKind::Combo,
+       {L"common", L"workspace", L"reset-common", L"reset-workspace"}},
+      {L"自動保存", layer.auto_save ? (*layer.auto_save ? L"on" : L"off") : L"inherit",
+       NativeFormFieldKind::Combo, {L"inherit", L"on", L"off"}},
+      {L"自動保存待機時間（100〜60000ms、inherit可）",
+       layer.auto_save_delay_ms ? std::to_wstring(*layer.auto_save_delay_ms) : L"inherit"},
+      {L"テーマ", layer.theme ? ThemeName(*layer.theme) : L"inherit", NativeFormFieldKind::Combo,
+       {L"inherit", L"system", L"light", L"dark", L"custom"}},
+      {L"フォント名（inherit可）", layer.font_face.value_or(L"inherit")},
+      {L"フォントサイズ（6〜96pt、inherit可）",
+       layer.font_size_pt ? std::to_wstring(*layer.font_size_pt) : L"inherit"},
+      {L"祝日更新許可（commonのみ。inherit可）",
+       layer.holiday_auto_update ? (*layer.holiday_auto_update ? L"on" : L"off") : L"inherit",
+       NativeFormFieldKind::Combo, {L"inherit", L"on", L"off"}},
+      {L"既定メモWorkspaceの絶対path（inherit可）",
+       layer.default_memo_workspace ? layer.default_memo_workspace->wstring() : L"inherit"},
+      {L"カスタム色（1行1件: name=#RRGGBB。削除は行を消す）", colors, NativeFormFieldKind::Multiline},
+      {L"キー割当て（1行1件: command=shortcut。noneで解除）", bindings, NativeFormFieldKind::Multiline},
+  };
+  if (!RunNativeForm(window_, instance_, L"MDLite 設定", fields)) return;
+  scope = fields[0].value;
+  std::ranges::transform(scope, scope.begin(), towlower);
+  if (scope == L"reset-common" || scope == L"reset-workspace") {
+    const auto reset_target = scope == L"reset-common" ? common_path : workspace_path;
+    if (reset_target.empty()) {
+      MessageBoxW(window_, L"Workspaceが開かれていません。", L"設定", MB_ICONWARNING); return;
+    }
+    if (MessageBoxW(window_, (reset_target.wstring() + L"\nの上書きを解除して継承へ戻しますか？").c_str(),
+                    L"設定を既定へ戻す", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+    std::error_code remove_error;
+    std::filesystem::remove(reset_target, remove_error);
+    if (remove_error) {
+      MessageBoxW(window_, L"設定上書きを削除できません。", L"設定", MB_ICONERROR); return;
+    }
+    LoadAndApplySettings();
+    return;
+  }
+  if ((scope == L"workspace" && workspace_path.empty()) || (scope != L"common" && scope != L"workspace")) {
+    MessageBoxW(window_, L"保存先の編集範囲が不正か、Workspaceが開かれていません。", L"設定", MB_ICONWARNING);
+    return;
+  }
+  const auto save_target = scope == L"common" ? common_path : workspace_path;
+  // The form starts from the selected layer.  If the user changes scope, load
+  // that layer now and apply the entered values as an explicit override.
+  if (save_target != target && !LoadSettingsLayer(save_target, layer, error)) {
+    MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return;
+  }
+  auto lower = [](std::wstring value) { std::ranges::transform(value, value.begin(), towlower); return value; };
+  const auto auto_save = lower(fields[1].value);
   if (auto_save == L"inherit") layer.auto_save.reset();
   else if (auto_save == L"on") layer.auto_save = true;
   else if (auto_save == L"off") layer.auto_save = false;
-  else { MessageBoxW(window_, L"auto save値が不正です。", L"設定", MB_ICONWARNING); return; }
-  std::wstring auto_save_delay = layer.auto_save_delay_ms ? std::to_wstring(*layer.auto_save_delay_ms) : L"inherit";
-  if (!PromptText(window_, instance_, L"編集", L"auto save delay (100〜60000ms)。継承はinherit", auto_save_delay)) return;
-  if (auto_save_delay == L"inherit") layer.auto_save_delay_ms.reset();
+  else { MessageBoxW(window_, L"自動保存の値が不正です。", L"設定", MB_ICONWARNING); return; }
+  const auto delay = lower(fields[2].value);
+  if (delay == L"inherit") layer.auto_save_delay_ms.reset();
   else {
-    try {
-      std::size_t consumed{};
-      const auto parsed = std::stoul(auto_save_delay, &consumed);
-      if (consumed != auto_save_delay.size()) throw std::invalid_argument("trailing characters");
+    try { std::size_t consumed{}; const auto parsed = std::stoul(delay, &consumed);
+      if (consumed != delay.size()) throw std::invalid_argument("trailing characters");
       layer.auto_save_delay_ms = static_cast<unsigned>(parsed);
-    } catch (const std::exception&) {
-      MessageBoxW(window_, L"auto save delayが数値ではありません。", L"設定", MB_ICONWARNING); return;
-    }
+    } catch (...) { MessageBoxW(window_, L"自動保存待機時間が数値ではありません。", L"設定", MB_ICONWARNING); return; }
   }
-  std::wstring theme = layer.theme ? ThemeName(*layer.theme) : L"inherit";
-  if (!PromptText(window_, instance_, L"外観", L"theme: system / light / dark / custom / inherit", theme)) return;
+  const auto theme = lower(fields[3].value);
   if (theme == L"inherit") layer.theme.reset();
   else {
     const auto parsed = ParseTheme(theme);
-    if (!parsed) { MessageBoxW(window_, L"theme値が不正です。", L"設定", MB_ICONWARNING); return; }
+    if (!parsed) { MessageBoxW(window_, L"テーマの値が不正です。", L"設定", MB_ICONWARNING); return; }
     layer.theme = *parsed;
   }
-  std::wstring color;
-  if (!PromptText(window_, instance_, L"カスタムテーマ",
-      L"任意: color.name=#RRGGBB を1件指定。nameは background / foreground / link / heading / marker / code_background / table_background。\n"
-      L"継承へ戻す場合は color.name=inherit。空欄なら変更しません。", color)) return;
-  if (!color.empty()) {
-    const auto equals = color.find(L'=');
-    if (!color.starts_with(L"color.") || equals == std::wstring::npos || equals <= 6) {
-      MessageBoxW(window_, L"color.name=#RRGGBB形式で指定してください。", L"設定", MB_ICONWARNING); return;
-    }
-    const auto name = color.substr(6, equals - 6);
-    const auto value = color.substr(equals + 1);
-    if (value == L"inherit") layer.colors.erase(name);
-    else layer.colors[name] = value;
-  }
-  std::wstring font = layer.font_face.value_or(L"inherit");
-  if (!PromptText(window_, instance_, L"外観", L"font face。継承する場合は inherit", font)) return;
-  if (font == L"inherit") layer.font_face.reset(); else layer.font_face = font;
-  std::wstring size = layer.font_size_pt ? std::to_wstring(*layer.font_size_pt) : L"inherit";
-  if (!PromptText(window_, instance_, L"外観", L"font size (6〜96)。継承する場合は inherit", size)) return;
+  const auto font = fields[4].value;
+  if (lower(font) == L"inherit") layer.font_face.reset(); else layer.font_face = font;
+  const auto size = lower(fields[5].value);
   if (size == L"inherit") layer.font_size_pt.reset();
   else {
-    try { layer.font_size_pt = static_cast<unsigned>(std::stoul(size)); }
-    catch (const std::exception&) { MessageBoxW(window_, L"font sizeが数値ではありません。", L"設定", MB_ICONWARNING); return; }
+    try { std::size_t consumed{}; const auto parsed = std::stoul(size, &consumed);
+      if (consumed != size.size()) throw std::invalid_argument("trailing characters");
+      layer.font_size_pt = static_cast<unsigned>(parsed);
+    } catch (...) { MessageBoxW(window_, L"フォントサイズが数値ではありません。", L"設定", MB_ICONWARNING); return; }
   }
   if (scope == L"common") {
-    std::wstring holiday_update = layer.holiday_auto_update
-        ? (*layer.holiday_auto_update ? L"on" : L"off") : L"inherit";
-    if (!PromptText(window_, instance_, L"祝日更新",
-                    L"内閣府の公開CSVを月1回確認する許可。on / off / inherit\n"
-                    L"既定値はoff。Workspace設定では変更できません。", holiday_update)) return;
-    std::ranges::transform(holiday_update, holiday_update.begin(), towlower);
-    if (holiday_update == L"inherit") layer.holiday_auto_update.reset();
-    else if (holiday_update == L"on") layer.holiday_auto_update = true;
-    else if (holiday_update == L"off") layer.holiday_auto_update = false;
-    else { MessageBoxW(window_, L"祝日更新の値が不正です。", L"設定", MB_ICONWARNING); return; }
+    const auto holiday = lower(fields[6].value);
+    if (holiday == L"inherit") layer.holiday_auto_update.reset();
+    else if (holiday == L"on") layer.holiday_auto_update = true;
+    else if (holiday == L"off") layer.holiday_auto_update = false;
+    else { MessageBoxW(window_, L"祝日更新許可の値が不正です。", L"設定", MB_ICONWARNING); return; }
+    const auto memo = fields[7].value;
+    if (lower(memo) == L"inherit" || memo.empty()) layer.default_memo_workspace.reset();
+    else layer.default_memo_workspace = std::filesystem::path(memo);
   }
-  if (scope == L"common") {
-    std::wstring memo_workspace = layer.default_memo_workspace
-        ? layer.default_memo_workspace->wstring() : L"inherit";
-    if (!PromptText(window_, instance_, L"ファイル",
-                    L"既定のメモ用Workspaceの絶対path。未設定へ戻す場合は inherit",
-                    memo_workspace)) return;
-    if (memo_workspace == L"inherit") layer.default_memo_workspace.reset();
-    else layer.default_memo_workspace = std::filesystem::path(memo_workspace);
-  }
-  std::wstring binding;
-  if (!PromptText(window_, instance_, L"キー割当て",
-      L"任意: command=shortcut を1件指定。例 file.save=Ctrl+Shift+S\n"
-      L"解除は command=none。空欄なら変更しません。", binding)) return;
-  if (!binding.empty()) {
-    const auto equals = binding.find(L'=');
-    if (equals == std::wstring::npos) { MessageBoxW(window_, L"command=shortcut形式で指定してください。", L"設定", MB_ICONWARNING); return; }
-    const auto command = binding.substr(0, equals);
-    static constexpr std::array known{L"file.new", L"file.open", L"file.save", L"file.quickOpen", L"file.close",
-                                      L"edit.find", L"edit.findNext", L"view.commandPalette"};
-    if (std::ranges::find(known, command) == known.end()) {
-      MessageBoxW(window_, L"未対応のcommand名です。", L"設定", MB_ICONWARNING); return;
+  layer.colors.clear();
+  {
+    std::wistringstream stream(fields[8].value);
+    std::wstring line;
+    while (std::getline(stream, line)) {
+      if (!line.empty() && line.back() == L'\r') line.pop_back();
+      if (line.empty()) continue;
+      const auto equals = line.find(L'=');
+      if (equals == std::wstring::npos) { MessageBoxW(window_, L"カスタム色はname=#RRGGBB形式で入力してください。", L"設定", MB_ICONWARNING); return; }
+      const auto name = line.substr(0, equals);
+      const auto value = line.substr(equals + 1);
+      if (value != L"inherit") layer.colors[name] = value;
     }
-    layer.keybindings[command] = binding.substr(equals + 1);
+  }
+  layer.keybindings.clear();
+  {
+    std::wistringstream stream(fields[9].value);
+    std::wstring line;
+    while (std::getline(stream, line)) {
+      if (!line.empty() && line.back() == L'\r') line.pop_back();
+      if (line.empty()) continue;
+      const auto equals = line.find(L'=');
+      if (equals == std::wstring::npos) { MessageBoxW(window_, L"キー割当てはcommand=shortcut形式で入力してください。", L"設定", MB_ICONWARNING); return; }
+      layer.keybindings[line.substr(0, equals)] = line.substr(equals + 1);
+    }
   }
   if (!ValidateSettingsLayer(layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONWARNING); return; }
   SettingsLayer common, workspace_layer;
@@ -4961,7 +5116,7 @@ void Application::OpenWorkspaceSettings() {
   if (!ValidateKeybindingConflicts(effective_bindings, error)) {
     MessageBoxW(window_, error.c_str(), L"キー割当て競合", MB_ICONWARNING); return;
   }
-  if (!SaveSettingsLayer(target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
+  if (!SaveSettingsLayer(save_target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
   LoadAndApplySettings();
   if (!TestAutomationSilent())
     MessageBoxW(window_, L"設定を保存して適用しました。", L"設定", MB_ICONINFORMATION);
@@ -4990,144 +5145,124 @@ void Application::ManageProfiles() {
     MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
     return;
   }
-  std::wstring list;
-  for (const auto& profile : effective) list += profile.id + L" — " + profile.name + L"\n";
   std::wstring scope = L"workspace";
-  if (!PromptText(window_, instance_, L"作成プロファイル",
-                  L"編集範囲: common / workspace\nWorkspace上書きは同じidの共通定義を置き換えます。", scope)) return;
+  ProfileDefinition seed;
+  if (const auto daily = std::ranges::find_if(effective, [](const auto& item) { return item.id == L"daily"; });
+      daily != effective.end()) seed = *daily;
+  else if (!effective.empty()) seed = effective.front();
+  else seed = {L"custom", L"Custom", L"Notes/{{date:yyyy}}", L"{{date:yyyyMMdd}}.md",
+               L"templates/memo.md", ProfileCollision::Sequence};
+  std::wstring inputs;
+  for (const auto& input : seed.inputs)
+    inputs += input.id + L"|" + input.label + L"|" + (input.required ? L"yes" : L"no") + L"|" + input.default_value + L"\r\n";
+  std::vector<NativeFormField> fields{
+      {L"編集範囲（Applyで保存）", scope, NativeFormFieldKind::Combo, {L"common", L"workspace"}},
+      {L"操作", L"edit", NativeFormFieldKind::Combo, {L"add", L"edit", L"duplicate", L"delete", L"template"}},
+      {L"元のprofile id（edit／template／delete／duplicate）", seed.id},
+      {L"保存するprofile id（add／edit／duplicate）", seed.id},
+      {L"表示名", seed.name},
+      {L"Workspace相対directory", seed.directory.generic_wstring()},
+      {L"filename", seed.filename.generic_wstring()},
+      {L".mdlite相対template path", seed.template_path.generic_wstring()},
+      {L"collision", seed.collision == ProfileCollision::Sequence ? L"sequence" : L"open-existing",
+       NativeFormFieldKind::Combo, {L"open-existing", L"sequence"}},
+      {L"入力項目（1行: id|表示名|required(yes/no)|既定値、最大8行）", inputs, NativeFormFieldKind::Multiline},
+  };
+  if (!RunNativeForm(window_, instance_, L"作成プロファイル", fields)) return;
+  scope = fields[0].value;
   std::ranges::transform(scope, scope.begin(), towlower);
-  if (scope != L"common" && scope != L"workspace") {
-    MessageBoxW(window_, L"commonまたはworkspaceを指定してください。", L"作成プロファイル", MB_ICONWARNING);
-    return;
+  const auto action = [&] { auto value = fields[1].value; std::ranges::transform(value, value.begin(), towlower); return value; }();
+  const auto source_id = fields[2].value;
+  const auto id = fields[3].value;
+  if ((scope != L"common" && scope != L"workspace") || source_id.empty() || id.empty()) {
+    MessageBoxW(window_, L"編集範囲またはprofile idが不正です。", L"作成プロファイル", MB_ICONWARNING); return;
   }
   const auto target = scope == L"common" ? common_path : workspace_path;
   std::vector<ProfileDefinition> layer;
   if (!LoadProfileFile(target, layer, error)) {
-    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
-    return;
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR); return;
   }
-  std::wstring action = L"edit";
-  if (!PromptText(window_, instance_, L"作成プロファイル",
-                  L"操作: add / edit / duplicate / delete / template\n\n現在の実効profile:\n" + list,
-                  action)) return;
-  std::ranges::transform(action, action.begin(), towlower);
-  if (action != L"add" && action != L"edit" && action != L"duplicate" &&
-      action != L"delete" && action != L"template") {
-    MessageBoxW(window_, L"未対応の操作です。", L"作成プロファイル", MB_ICONWARNING);
-    return;
-  }
-  std::wstring id = action == L"add" ? L"custom" : L"daily";
-  if (!PromptText(window_, instance_, L"作成プロファイル", L"profile id", id) || id.empty()) return;
-  const auto effective_item = std::ranges::find_if(effective, [&](const auto& item) { return item.id == id; });
+  const auto effective_item = std::ranges::find_if(effective, [&](const auto& item) { return item.id == source_id; });
   if (action == L"template") {
     if (effective_item == effective.end()) {
-      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING);
-      return;
+      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING); return;
     }
     const auto template_path = workspace_store_->metadata_root() / effective_item->template_path;
     if (!std::filesystem::is_regular_file(template_path)) {
       MessageBoxW(window_, (L"template fileがありません:\n" + template_path.wstring()).c_str(),
-                  L"作成プロファイル", MB_ICONWARNING);
-      return;
+                  L"作成プロファイル", MB_ICONWARNING); return;
     }
-    OpenDocument(template_path);
-    return;
+    OpenDocument(template_path); return;
   }
   if (action == L"delete") {
-    const auto item = std::ranges::find_if(layer, [&](const auto& profile) { return profile.id == id; });
+    const auto item = std::ranges::find_if(layer, [&](const auto& profile) { return profile.id == source_id; });
     if (item == layer.end()) {
-      MessageBoxW(window_, L"この範囲には定義がありません。継承元の範囲を選んでください。",
-                  L"作成プロファイル", MB_ICONINFORMATION);
-      return;
+      MessageBoxW(window_, L"この範囲には定義がありません。", L"作成プロファイル", MB_ICONINFORMATION); return;
     }
-    if (MessageBoxW(window_, (L"この範囲のprofile定義を削除しますか？\n" + id +
-                              L"\n下位または組込み定義があれば再び継承されます。").c_str(),
+    if (MessageBoxW(window_, (L"この範囲のprofile定義を削除しますか？\n" + source_id).c_str(),
                     L"作成プロファイル", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
     layer.erase(item);
     if (!SaveProfileFile(target, layer, error)) {
-      MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR);
-      return;
+      MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONERROR); return;
     }
-    MessageBoxW(window_, L"この範囲の定義を削除しました。", L"作成プロファイル", MB_ICONINFORMATION);
     return;
   }
-
+  if (action != L"add" && action != L"edit" && action != L"duplicate") {
+    MessageBoxW(window_, L"未対応の操作です。", L"作成プロファイル", MB_ICONWARNING); return;
+  }
+  if (action == L"edit" && source_id != id) {
+    MessageBoxW(window_, L"editでは元のprofile idと保存するidを一致させてください。",
+                L"作成プロファイル", MB_ICONWARNING); return;
+  }
   ProfileDefinition profile;
   if (action == L"add") {
     if (std::ranges::any_of(effective, [&](const auto& item) { return item.id == id; })) {
-      MessageBoxW(window_, L"既存idです。上書きする場合はeditを選んでください。",
-                  L"作成プロファイル", MB_ICONWARNING);
-      return;
+      MessageBoxW(window_, L"既存idです。上書きする場合はeditを選んでください。", L"作成プロファイル", MB_ICONWARNING); return;
     }
-    profile = {id, id, L"Notes/{{date:yyyy}}", L"{{date:yyyyMMdd}}.md",
-               L"templates/memo.md", ProfileCollision::Sequence};
+    profile = {id, id, L"Notes/{{date:yyyy}}", L"{{date:yyyyMMdd}}.md", L"templates/memo.md", ProfileCollision::Sequence};
   } else {
     if (effective_item == effective.end()) {
-      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING);
-      return;
+      MessageBoxW(window_, L"指定したprofileが見つかりません。", L"作成プロファイル", MB_ICONWARNING); return;
     }
     profile = *effective_item;
     if (action == L"duplicate") {
-      std::wstring duplicate_id = id + L"-copy";
-      if (!PromptText(window_, instance_, L"作成プロファイルを複製", L"新しいprofile id", duplicate_id) ||
-          duplicate_id.empty()) return;
-      if (std::ranges::any_of(effective, [&](const auto& item) { return item.id == duplicate_id; })) {
-        MessageBoxW(window_, L"複製先idは既に存在します。", L"作成プロファイル", MB_ICONWARNING);
-        return;
+      if (std::ranges::any_of(effective, [&](const auto& item) { return item.id == id; })) {
+        MessageBoxW(window_, L"複製先idは既に存在します。", L"作成プロファイル", MB_ICONWARNING); return;
       }
-      profile.id = duplicate_id;
-      profile.name += L" コピー";
+      profile.id = id; profile.name += L" コピー";
     }
   }
-  std::wstring name = profile.name;
-  std::wstring directory = profile.directory.generic_wstring();
-  std::wstring filename = profile.filename.generic_wstring();
-  std::wstring template_path = profile.template_path.generic_wstring();
-  std::wstring collision = profile.collision == ProfileCollision::Sequence ? L"sequence" : L"open-existing";
-  if (!PromptText(window_, instance_, L"作成プロファイル", L"表示名", name) ||
-      !PromptText(window_, instance_, L"作成プロファイル", L"Workspace相対directory", directory) ||
-      !PromptText(window_, instance_, L"作成プロファイル", L"filename", filename) ||
-      !PromptText(window_, instance_, L"作成プロファイル", L".mdlite相対template path", template_path) ||
-      !PromptText(window_, instance_, L"作成プロファイル", L"collision: open-existing / sequence", collision)) return;
+  profile.id = id;
+  profile.name = fields[4].value;
+  profile.directory = fields[5].value;
+  profile.filename = fields[6].value;
+  profile.template_path = fields[7].value;
+  auto collision = fields[8].value;
   std::ranges::transform(collision, collision.begin(), towlower);
-  profile.name = name;
-  profile.directory = directory;
-  profile.filename = filename;
-  profile.template_path = template_path;
   if (collision == L"sequence") profile.collision = ProfileCollision::Sequence;
   else if (collision == L"open-existing") profile.collision = ProfileCollision::OpenExisting;
-  else {
-    MessageBoxW(window_, L"collision値が不正です。", L"作成プロファイル", MB_ICONWARNING);
-    return;
-  }
-  std::wstring input_count = std::to_wstring(profile.inputs.size());
-  if (!PromptText(window_, instance_, L"作成プロファイル",
-                  L"任意入力項目数（0～8）。titleというidは{{title}}、その他は{{input:id}}でtemplate／pathに使用できます。",
-                  input_count)) return;
-  if (input_count.empty() || !std::ranges::all_of(input_count, [](wchar_t value) { return iswdigit(value) != 0; }) || input_count.size() > 1 ||
-      input_count.front() > L'8') {
-    MessageBoxW(window_, L"入力項目数は0～8で指定してください。", L"作成プロファイル", MB_ICONWARNING);
-    return;
-  }
-  const auto requested_inputs = static_cast<std::size_t>(input_count.front() - L'0');
-  profile.inputs.resize(requested_inputs);
-  for (std::size_t index = 0; index < profile.inputs.size(); ++index) {
-    auto& input = profile.inputs[index];
-    if (input.id.empty()) input.id = index == 0 ? L"title" : L"field" + std::to_wstring(index + 1);
-    if (input.label.empty()) input.label = input.id;
-    std::wstring required = input.required ? L"yes" : L"no";
-    const auto number = std::to_wstring(index + 1);
-    if (!PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" id", input.id) ||
-        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 表示名", input.label) ||
-        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 既定値（空でも可）", input.default_value) ||
-        !PromptText(window_, instance_, L"作成プロファイル", L"入力" + number + L" 必須: yes / no", required)) return;
-    std::ranges::transform(required, required.begin(), towlower);
-    if (required == L"yes") input.required = true;
-    else if (required == L"no") input.required = false;
-    else {
-      MessageBoxW(window_, L"必須はyesまたはnoで指定してください。", L"作成プロファイル", MB_ICONWARNING);
-      return;
+  else { MessageBoxW(window_, L"collision値が不正です。", L"作成プロファイル", MB_ICONWARNING); return; }
+  profile.inputs.clear();
+  std::wistringstream input_stream(fields[9].value);
+  std::wstring line;
+  while (std::getline(input_stream, line)) {
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) continue;
+    std::array<std::wstring, 4> parts;
+    std::size_t begin{};
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+      const auto end = line.find(L'|', begin);
+      parts[index] = line.substr(begin, end == std::wstring::npos ? line.size() - begin : end - begin);
+      if (end == std::wstring::npos) { begin = line.size(); break; }
+      begin = end + 1;
     }
+    if (parts[0].empty() || parts[1].empty() || (parts[2] != L"yes" && parts[2] != L"no") || profile.inputs.size() >= 8) {
+      MessageBoxW(window_, L"入力項目は id|表示名|required(yes/no)|既定値 の形式で最大8行です。", L"作成プロファイル", MB_ICONWARNING); return;
+    }
+    profile.inputs.push_back({parts[0], parts[1], parts[3], parts[2] == L"yes"});
+  }
+  if (!ValidateProfile(profile, error)) {
+    MessageBoxW(window_, error.c_str(), L"作成プロファイル", MB_ICONWARNING); return;
   }
   SYSTEMTIME now{};
   GetLocalTime(&now);

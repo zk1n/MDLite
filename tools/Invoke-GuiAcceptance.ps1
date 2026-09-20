@@ -65,6 +65,8 @@ $BM_CLICK = 0x00F5
 $LVM_GETITEMCOUNT = 0x1004
 $BST_UNCHECKED = 0
 $BST_CHECKED = 1
+$IDOK = 1
+$IDCANCEL = 2
 
 function Wait-ProcessWindow([Diagnostics.Process]$Process, [int]$TimeoutMs = 10000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -251,6 +253,20 @@ try {
     [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]108, [IntPtr]::Zero)
     $pendingCount = Wait-ListItemCount $results 1
     $checks.workspace_search_syncs_pending_input = $pendingCount -eq 1
+
+    # Settings and profile editing are native one-form dialogs.  Exercise the
+    # real modal window creation and Cancel/Apply paths instead of relying on
+    # source inspection of the old prompt sequence.
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1027, [IntPtr]::Zero)
+    $settingsForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.settings_native_form = $settingsForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($settingsForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1029, [IntPtr]::Zero)
+    $profilesForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.profiles_native_form = $profilesForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($profilesForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
 
     [void][MDLiteNative]::SendMessage($findEdit, $WM_SETTEXT, [IntPtr]::Zero, 'PendingHit')
     $replaceEdit = Wait-Control $main 107 'Edit'

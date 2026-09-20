@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,6 +96,21 @@ class Application {
     std::vector<SourceEdit> source_redo;
   };
 
+  struct TableGridRow {
+    std::size_t begin{};
+    std::size_t end{};
+    std::vector<TableVisualCell> cells;
+    int top{};
+    int bottom{};
+  };
+
+  struct TableGridGeometry {
+    int left{};
+    int right{};
+    std::vector<int> boundaries;
+    std::vector<TableGridRow> rows;
+  };
+
   enum class SaveAllResult { AllSaved, RecoveryOnly, Discarded, Cancelled };
 
   enum class TableAction { InsertRowBefore, InsertRowAfter, DeleteRow, InsertColumnBefore,
@@ -137,6 +153,9 @@ class Application {
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
+  std::vector<TableGridGeometry> BuildTableGridGeometry(const DocumentView& view,
+                                                        const RECT& client) const;
+  std::optional<std::size_t> HitTestTableCell(const DocumentView& view, POINT point) const;
   void DrawTableGrid(const DocumentView& view);
   void RefreshDerivedImages(DocumentView& view);
   void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);

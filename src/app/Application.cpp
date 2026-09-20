@@ -1024,6 +1024,17 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       }
     }
   }
+  if (message == WM_LBUTTONDOWN && view && !view->ime_composing &&
+      view->sync_due == 0 && IsMarkdownFile(view->document.path())) {
+    const POINT point{static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
+    if (const auto source = app->HitTestTableCell(*view, point)) {
+      const auto native = view->editor_snapshot.SourceToNative(*source);
+      app->SelectDocumentForEditor(window);
+      SendMessageW(window, EM_SETSEL, static_cast<WPARAM>(native), static_cast<LPARAM>(native));
+      SetFocus(window);
+      return 0;
+    }
+  }
   if (message == WM_NCDESTROY) RemoveWindowSubclass(window, EditorSubclass, 1);
   const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
   if (message == WM_PAINT && view) app->DrawTableGrid(*view);
@@ -2969,12 +2980,12 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   InvalidateRect(view.editor, nullptr, TRUE);
 }
 
-void Application::DrawTableGrid(const DocumentView& view) {
-  if (!IsMarkdownFile(view.document.path()) || view.parse.tables.empty()) return;
+std::vector<Application::TableGridGeometry> Application::BuildTableGridGeometry(
+    const DocumentView& view, const RECT& client) const {
+  if (!IsMarkdownFile(view.document.path()) || view.parse.tables.empty() ||
+      client.right <= client.left || client.bottom <= client.top) return {};
   HDC dc = GetDC(view.editor);
-  if (!dc) return;
-  RECT client{};
-  GetClientRect(view.editor, &client);
+  if (!dc) return {};
   POINTL first_point{client.left, client.top};
   POINTL last_point{std::max(client.left, client.right - 1),
                     std::max(client.top, client.bottom - 1)};
@@ -2987,27 +2998,21 @@ void Application::DrawTableGrid(const DocumentView& view) {
   visible_begin = visible_begin == 0 ? 0 : view.document.text().rfind(L'\n', visible_begin - 1) + 1;
   const auto next_line = view.document.text().find(L'\n', visible_end);
   visible_end = next_line == std::wstring::npos ? view.document.text().size() : next_line + 1;
-  const bool dark = settings_.theme == ThemeMode::Dark ||
-                    (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
-  HPEN pen = CreatePen(PS_SOLID, 1, dark ? RGB(105, 116, 128) : RGB(158, 169, 181));
-  const HGDIOBJ previous_pen = SelectObject(dc, pen);
   const HFONT font = reinterpret_cast<HFONT>(SendMessageW(view.editor, WM_GETFONT, 0, 0));
   const HGDIOBJ previous_font = font ? SelectObject(dc, font) : nullptr;
   TEXTMETRICW metrics{};
   GetTextMetricsW(dc, &metrics);
   const int line_height = std::max(1, static_cast<int>(metrics.tmHeight));
+  if (previous_font) SelectObject(dc, previous_font);
+  ReleaseDC(view.editor, dc);
+
+  std::vector<TableGridGeometry> result;
   for (const auto& table : view.parse.tables) {
     const std::size_t draw_begin = std::max(table.begin, visible_begin);
     const std::size_t draw_end = std::min(table.end, visible_end);
     if (draw_begin >= draw_end) continue;
     const auto rows = ParseTableVisualRows(view.document.text(), draw_begin, draw_end);
-    struct RowGeometry {
-      std::vector<POINT> starts;
-      std::vector<POINT> ends;
-      int top{};
-      int bottom{};
-    };
-    std::vector<RowGeometry> row_geometry;
+    std::vector<TableGridRow> row_geometry;
     row_geometry.reserve(rows.size());
     std::size_t column_count{};
     int shared_left = client.right;
@@ -3037,9 +3042,9 @@ void Application::DrawTableGrid(const DocumentView& view) {
         bottom = static_cast<int>(next_start.y) - 3;
       }
       if (bottom <= top) bottom = top + line_height + 1;
-      row_geometry.push_back({std::move(starts), std::move(ends), top, bottom});
-      shared_left = std::min(shared_left, static_cast<int>(row_geometry.back().starts.front().x) - 5);
-      shared_right = std::max(shared_right, static_cast<int>(row_geometry.back().ends.back().x) + 5);
+      row_geometry.push_back({row.begin, row.end, row.cells, top, bottom});
+      shared_left = std::min(shared_left, static_cast<int>(starts.front().x) - 5);
+      shared_right = std::max(shared_right, static_cast<int>(ends.back().x) + 5);
       column_count = std::max(column_count, row.cells.size());
     }
     if (row_geometry.empty()) continue;
@@ -3048,12 +3053,21 @@ void Application::DrawTableGrid(const DocumentView& view) {
     const int right = std::clamp(std::max(shared_right, left + 8),
                                  left + 1, static_cast<int>(client.right));
     std::vector<int> shared_boundaries(column_count > 0 ? column_count - 1 : 0, left + 1);
-    for (const auto& geometry : row_geometry) {
+    for (const auto& row_geometry_entry : row_geometry) {
+      const auto& cells = row_geometry_entry.cells;
+      if (cells.empty()) continue;
+      std::vector<POINT> ends(cells.size());
+      for (std::size_t cell_index = 0; cell_index < cells.size(); ++cell_index) {
+        const auto& cell = cells[cell_index];
+        SendMessageW(view.editor, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&ends[cell_index]),
+                     static_cast<LONG>(view.editor_snapshot.SourceToNative(cell.end)));
+      }
       for (std::size_t cell_index = 0;
-           cell_index + 1 < geometry.ends.size() && cell_index < shared_boundaries.size();
+           cell_index + 1 < ends.size() && cell_index < shared_boundaries.size();
            ++cell_index) {
         shared_boundaries[cell_index] = std::max(shared_boundaries[cell_index],
-                                                 static_cast<int>(geometry.ends[cell_index].x) + 4);
+                                                 static_cast<int>(ends[cell_index].x) + 4);
       }
     }
     int previous_boundary = left;
@@ -3064,28 +3078,63 @@ void Application::DrawTableGrid(const DocumentView& view) {
                                                 previous_boundary + 1, maximum);
       previous_boundary = shared_boundaries[cell_index];
     }
-    for (const auto& geometry : row_geometry) {
-      const int top = geometry.top;
-      const int bottom = geometry.bottom;
-      if (bottom < client.top || top >= client.bottom) continue;
-      MoveToEx(dc, left, top, nullptr);
-      LineTo(dc, right, top);
-      MoveToEx(dc, left, bottom, nullptr);
-      LineTo(dc, right, bottom);
-      MoveToEx(dc, left, top, nullptr);
-      LineTo(dc, left, bottom);
-      for (std::size_t cell_index = 0;
-           cell_index + 1 < geometry.ends.size() && cell_index < shared_boundaries.size();
-           ++cell_index) {
-        const int boundary = shared_boundaries[cell_index];
-        MoveToEx(dc, boundary, top, nullptr);
-        LineTo(dc, boundary, bottom);
-      }
-      MoveToEx(dc, right, top, nullptr);
-      LineTo(dc, right, bottom);
+    result.push_back({left, right, std::move(shared_boundaries), std::move(row_geometry)});
+  }
+  return result;
+}
+
+std::optional<std::size_t> Application::HitTestTableCell(const DocumentView& view, POINT point) const {
+  if (view.sync_due != 0 || !IsMarkdownFile(view.document.path())) return std::nullopt;
+  RECT client{};
+  GetClientRect(view.editor, &client);
+  const auto geometry = BuildTableGridGeometry(view, client);
+  for (const auto& table : geometry) {
+    if (point.x < table.left || point.x > table.right) continue;
+    for (const auto& row : table.rows) {
+      if (point.y < row.top || point.y > row.bottom || row.cells.empty()) continue;
+      std::size_t cell_index{};
+      while (cell_index < table.boundaries.size() && point.x >= table.boundaries[cell_index]) ++cell_index;
+      cell_index = std::min(cell_index, row.cells.size() - 1);
+      POINT hit = point;
+      const auto native = static_cast<std::size_t>(std::max<LRESULT>(
+          0, SendMessageW(view.editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&hit))));
+      const auto source = view.editor_snapshot.NativeToSource(native);
+      return std::clamp(source, row.cells[cell_index].begin, row.cells[cell_index].end);
     }
   }
-  if (previous_font) SelectObject(dc, previous_font);
+  return std::nullopt;
+}
+
+void Application::DrawTableGrid(const DocumentView& view) {
+  if (!IsMarkdownFile(view.document.path()) || view.parse.tables.empty()) return;
+  HDC dc = GetDC(view.editor);
+  if (!dc) return;
+  RECT client{};
+  GetClientRect(view.editor, &client);
+  const auto geometry = BuildTableGridGeometry(view, client);
+  const bool dark = settings_.theme == ThemeMode::Dark ||
+                    (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
+  HPEN pen = CreatePen(PS_SOLID, 1, dark ? RGB(105, 116, 128) : RGB(158, 169, 181));
+  const HGDIOBJ previous_pen = SelectObject(dc, pen);
+  for (const auto& table : geometry) {
+    for (const auto& row : table.rows) {
+      if (row.bottom < client.top || row.top >= client.bottom) continue;
+      MoveToEx(dc, table.left, row.top, nullptr);
+      LineTo(dc, table.right, row.top);
+      MoveToEx(dc, table.left, row.bottom, nullptr);
+      LineTo(dc, table.right, row.bottom);
+      MoveToEx(dc, table.left, row.top, nullptr);
+      LineTo(dc, table.left, row.bottom);
+      for (std::size_t cell_index = 0;
+           cell_index + 1 < row.cells.size() && cell_index < table.boundaries.size();
+           ++cell_index) {
+        MoveToEx(dc, table.boundaries[cell_index], row.top, nullptr);
+        LineTo(dc, table.boundaries[cell_index], row.bottom);
+      }
+      MoveToEx(dc, table.right, row.top, nullptr);
+      LineTo(dc, table.right, row.bottom);
+    }
+  }
   SelectObject(dc, previous_pen);
   DeleteObject(pen);
   ReleaseDC(view.editor, dc);

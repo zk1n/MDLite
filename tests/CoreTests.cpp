@@ -1155,6 +1155,65 @@ void TestJapaneseHolidays() {
   Check(mdlite::ValidateJapaneseHolidayCsv(L"date,name\n2028-05-01,祝日\n", info, error) &&
             info.first_year == 2028 && info.last_year == 2028,
         "online holiday validation accepts strict ISO-like date fixtures");
+  Check(mdlite::JapaneseHolidayUpdateDue(0, 0, 1),
+        "fake clock treats an empty holiday update state as due");
+  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 27 * 24 * 60 * 60),
+        "fake clock suppresses a holiday update before the 28-day interval");
+  Check(mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 28 * 24 * 60 * 60),
+        "fake clock schedules a holiday update at the 28-day interval");
+  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 900),
+        "clock rollback does not turn every startup into a network retry");
+  const std::wstring online_fixture =
+      L"date,name\n2028/01/01,元日\n2028/02/11,建国記念の日\n"
+      L"2028/02/23,天皇誕生日\n2028/03/20,春分の日\n2028/04/29,昭和の日\n"
+      L"2028/05/03,憲法記念日\n2028/05/04,みどりの日\n2028/05/05,こどもの日\n"
+      L"2028/07/17,海の日\n2028/08/11,山の日\n2028/09/18,敬老の日\n";
+  const auto accepted = mdlite::AssessJapaneseHolidayResponse(
+      200, false, false, 10, online_fixture);
+  Check(accepted.accepted && accepted.replace_cache && accepted.info.records == 11,
+        "mock HTTP 200 accepts a validated holiday payload for atomic cache replacement");
+  const auto unchanged = mdlite::AssessJapaneseHolidayResponse(304, true, true, 11, {});
+  Check(unchanged.accepted && !unchanged.replace_cache,
+        "mock HTTP 304 accepts only when a verified last-known-good cache exists");
+  const auto missing_cache = mdlite::AssessJapaneseHolidayResponse(304, true, false, 11, {});
+  Check(!missing_cache.accepted && !missing_cache.error.empty(),
+        "mock HTTP 304 without a verified cache fails closed");
+  const auto not_found = mdlite::AssessJapaneseHolidayResponse(404, false, false, 11, {});
+  Check(!not_found.accepted && not_found.error.find(L"404") != std::wstring::npos,
+        "mock HTTP 404 preserves the existing holiday data");
+  const auto server_error = mdlite::AssessJapaneseHolidayResponse(500, false, false, 11, {});
+  Check(!server_error.accepted && server_error.error.find(L"500") != std::wstring::npos,
+        "mock HTTP 500 preserves the existing holiday data");
+  const auto timeout = mdlite::AssessJapaneseHolidayResponse(0, false, false, 11, {});
+  Check(!timeout.accepted && !timeout.error.empty(),
+        "mock timeout/network failure keeps the last-known-good holiday data");
+  const auto html = mdlite::AssessJapaneseHolidayResponse(
+      200, false, false, 11, L"<html><body>error</body></html>");
+  Check(!html.accepted && !html.replace_cache,
+        "mock HTTP HTML error pages cannot replace the holiday cache");
+  const auto shrink = mdlite::AssessJapaneseHolidayResponse(200, false, false, 30,
+                                                             online_fixture);
+  Check(!shrink.accepted && shrink.error.find(L"減少") != std::wstring::npos,
+        "mock HTTP large record reductions are rejected");
+  wchar_t real_http[2]{};
+  if (GetEnvironmentVariableW(L"MDLITE_TEST_REAL_HOLIDAY_HTTP", real_http, 2) == 1 &&
+      real_http[0] == L'1') {
+    mdlite::JapaneseHolidayOnlineResult result;
+    const bool fetched = mdlite::FetchJapaneseHolidayCsv(std::stop_token{}, {}, {}, result);
+    if (!fetched) {
+      // Keep the diagnostic ASCII-safe even when the test process has the
+      // default "C" locale and cannot render the Japanese product text.
+      std::string error_ascii;
+      for (const wchar_t character : result.error) {
+        error_ascii += character < 0x80 ? static_cast<char>(character) : '?';
+      }
+      std::cerr << "real holiday HTTP status=" << result.status
+                << " error_length=" << result.error.size()
+                << " error_ascii=" << error_ascii << "\n";
+    }
+    Check(fetched && result.status == 200 && !result.csv.empty() && result.error.empty(),
+          "opt-in real WinHTTP holiday probe receives the official CSV");
+  }
   mdlite::ClearImportedJapaneseHolidays();
 }
 

@@ -176,11 +176,6 @@ std::int64_t HolidayNowUnix() {
              std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-bool HolidayUpdateDue(const HolidayUpdateState& state, std::int64_t now) {
-  const auto last = std::max(state.last_attempt_unix, state.last_successful_check_unix);
-  return last <= 0 || now - last >= 28 * 24 * 60 * 60;
-}
-
 bool ReadHolidayState(const std::filesystem::path& path, HolidayUpdateState& state) {
   state = {};
   std::ifstream input(path, std::ios::binary);
@@ -3631,7 +3626,8 @@ void Application::ScheduleHolidayUpdate() {
     holiday_update_status_ = L"祝日更新状態を読めません。自動確認は保留します。";
     return;
   }
-  if (!HolidayUpdateDue(state, HolidayNowUnix())) return;
+  if (!JapaneseHolidayUpdateDue(state.last_attempt_unix, state.last_successful_check_unix,
+                                HolidayNowUnix())) return;
   StartHolidayUpdate(false);
 }
 
@@ -3650,7 +3646,9 @@ void Application::StartHolidayUpdate(bool manual) {
   const auto state_path = holiday_root / kHolidayStateName;
   HolidayUpdateState state;
   if (!ReadHolidayState(state_path, state)) state = {};
-  if (!manual && !HolidayUpdateDue(state, HolidayNowUnix())) return;
+  if (!manual && !JapaneseHolidayUpdateDue(state.last_attempt_unix,
+                                            state.last_successful_check_unix,
+                                            HolidayNowUnix())) return;
   state.last_attempt_unix = HolidayNowUnix();
   state.error.clear();
   std::wstring state_error;
@@ -3682,28 +3680,23 @@ void Application::CompleteHolidayUpdate(void* raw_payload) {
   HolidayUpdateState state;
   if (!ReadHolidayState(payload->state_path, state)) state = {};
   state.last_attempt_unix = std::max(state.last_attempt_unix, HolidayNowUnix());
-  std::wstring error;
-  bool accepted = false;
   JapaneseHolidayImportInfo info;
-  if (payload->result.not_modified) {
-    if (std::filesystem::exists(payload->cache_path) &&
-        ImportJapaneseHolidayCsvFile(payload->cache_path, info, error)) {
-      accepted = true;
-    } else {
-      error = L"304応答でしたが、検証済みの祝日cacheがありません。";
+  std::wstring cache_error;
+  const bool verified_cache = payload->result.not_modified &&
+      std::filesystem::exists(payload->cache_path) &&
+      ImportJapaneseHolidayCsvFile(payload->cache_path, info, cache_error);
+  auto assessment = AssessJapaneseHolidayResponse(
+      payload->result.status, payload->result.not_modified, verified_cache, state.records,
+      payload->result.csv);
+  bool accepted = assessment.accepted;
+  std::wstring error = assessment.error;
+  if (!accepted && payload->result.status == 0 && !payload->result.error.empty())
+    error = payload->result.error;
+  if (accepted && assessment.replace_cache) {
+    if (!WriteHolidayCache(payload->cache_path, payload->result.csv, error) ||
+        !ImportJapaneseHolidayCsv(payload->result.csv, info, error)) {
+      accepted = false;
     }
-  } else if (payload->result.status == 200 && !payload->result.csv.empty() &&
-             ValidateJapaneseHolidayCsv(payload->result.csv, info, error)) {
-    if (info.records < 10) {
-      error = L"内閣府CSVの件数が想定より少ないためcacheを置換しません。";
-    } else if (state.records > 0 && info.records * 2 < state.records) {
-      error = L"内閣府CSVの件数が既存cacheから大幅に減少したため置換しません。";
-    } else if (WriteHolidayCache(payload->cache_path, payload->result.csv, error) &&
-               ImportJapaneseHolidayCsv(payload->result.csv, info, error)) {
-      accepted = true;
-    }
-  } else if (error.empty()) {
-    error = payload->result.error.empty() ? L"内閣府CSVの取得に失敗しました。" : payload->result.error;
   }
   if (accepted) {
     state.last_successful_check_unix = HolidayNowUnix();

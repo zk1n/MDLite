@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <filesystem>
 #include <stop_token>
@@ -31,6 +32,22 @@ struct JapaneseHolidayOnlineResult {
   std::wstring last_modified;
   std::wstring error;
 };
+
+struct JapaneseHolidayUpdateAssessment {
+  bool accepted{};
+  bool replace_cache{};
+  JapaneseHolidayImportInfo info;
+  std::wstring error;
+};
+
+// Pure scheduler/response policy hooks keep fake-clock and mock-HTTP tests
+// independent from WinHTTP and the application window thread.
+bool JapaneseHolidayUpdateDue(std::int64_t last_attempt_unix,
+                              std::int64_t last_successful_check_unix,
+                              std::int64_t now_unix) noexcept;
+JapaneseHolidayUpdateAssessment AssessJapaneseHolidayResponse(
+    std::uint32_t status, bool not_modified, bool verified_cache_available,
+    std::size_t existing_records, std::wstring_view csv);
 
 bool ValidateJapaneseHolidayCsv(std::wstring_view csv, JapaneseHolidayImportInfo& info,
                                 std::wstring& error);

@@ -52,9 +52,10 @@
 コミットはindexのみを対象にし、作業ツリー全体をpathspecで巻き込まない。隔離repoで
 `c.txt`をstageした後に未stage変更を加え、`git commit -m ...` のHEADが staged-version、
 作業ツリーがunstaged-version、未追跡 `b.txt` がHEAD外であることを確認した。実装checkpoint
-実装commit `ff42e30349138a4ce370bb8b9d791cab13cd01d3` と検証記録commit
-`92759b5d8955f0851cdc234696765ef1f886cd60` を origin (Forgejo) と github (GitHub) の
-`fix/visual-rebuild-localfirst` へ非force通常pushし、最終OID `92759b5d8955f0851cdc234696765ef1f886cd60` の
+実装commit `ff42e30349138a4ce370bb8b9d791cab13cd01d3`、検証記録commit
+`92759b5d8955f0851cdc234696765ef1f886cd60`、休日policy/診断commit
+`de172b72f6c16f3f21da85340c953a56a3612fc5` を origin (Forgejo) と github (GitHub) の
+`fix/visual-rebuild-localfirst` へ非force通常pushし、最終OID `de172b72f6c16f3f21da85340c953a56a3612fc5` の
 `ls-remote` read-back が同一であることを確認した。
 であることを確認した。Human gate未実施のためdevelop統合は保留している。
 

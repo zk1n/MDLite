@@ -572,6 +572,16 @@ void TestEditorAdapter() {
         "compact mapping resumes immediately after a collapsed image range");
   const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
   Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
+  const auto native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\r\nc");
+  Check(native_lines.view == L"a\rb\rc", "native editor snapshot uses one CR per paragraph");
+  Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
+            native_lines.NativeToSource(1) == 1,
+        "native line-ending mapping remains compact and boundary-safe");
+  const auto native_image = mdlite::BuildNativeEditorSnapshot(L"a![x](p.png)\nb");
+  Check(native_image.view == L"a\uFFFC\rb", "native Markdown snapshot collapses images and normalizes LF");
+  Check(native_image.SourceToNative(1) == 1 && native_image.NativeToSource(1) == 1 &&
+            native_image.NativeToSource(2) == std::wstring_view(L"a![x](p.png)").size(),
+        "native image mapping anchors object boundaries without a dense map");
   const std::wstring adjacent_source = L"A![x](p.png)B";
   const auto adjacent_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_source);
   const auto adjacent_edit = mdlite::ApplyEditorText(adjacent_snapshot, adjacent_source, L"a\uFFFCb");
@@ -618,6 +628,12 @@ void TestEditorAdapter() {
       mixed_snapshot, image_then_table, target_snapshot.view);
   Check(mapped_transaction.source == table_edit.text,
         "table transaction after a derived image maps back to the exact Markdown source");
+  const auto mixed_native = mdlite::BuildNativeEditorSnapshot(image_then_table);
+  const auto target_native = mdlite::BuildNativeEditorSnapshot(table_edit.text);
+  const auto native_transaction = mdlite::ApplyEditorText(
+      mixed_native, image_then_table, target_native.view);
+  Check(native_transaction.source == table_edit.text,
+        "native transaction after a derived image maps back to the exact Markdown source");
 }
 
 void TestWorkspaceState(const std::filesystem::path& root) {
@@ -1111,8 +1127,35 @@ void TestTableEditing() {
 void TestJapaneseHolidays() {
   const auto name = mdlite::JapaneseHolidayName(2026, 9, 22);
   Check(name && *name == L"休日", "Cabinet Office holiday data includes 2026-09-22");
+  Check(mdlite::JapaneseHolidayName(2026, 5, 6) &&
+            *mdlite::JapaneseHolidayName(2026, 5, 6) == L"休日" &&
+            mdlite::JapaneseHolidayName(2027, 3, 22) &&
+            *mdlite::JapaneseHolidayName(2027, 3, 22) == L"休日",
+        "bundled holiday fixtures include 2026-05-06 and 2027-03-22");
   Check(mdlite::JapaneseHolidayYearSupported(2027), "last bundled holiday year is supported");
   Check(!mdlite::JapaneseHolidayYearSupported(2028), "out-of-range holiday year remains unknown");
+  mdlite::JapaneseHolidayImportInfo info;
+  std::wstring error;
+  Check(mdlite::ImportJapaneseHolidayCsv(L"date,name\n2028/01/01,元日\n2028/02/11,建国記念の日\n",
+                                         info, error) && info.records == 2 &&
+            mdlite::JapaneseHolidayName(2028, 1, 1) &&
+            *mdlite::JapaneseHolidayName(2028, 1, 1) == L"元日",
+        "local holiday CSV import atomically accepts a validated fixture");
+  Check(mdlite::JapaneseHolidayYearSupported(2028) && mdlite::JapaneseHolidayLastYear() >= 2028,
+        "imported holiday years become known without network access");
+  error.clear();
+  Check(!mdlite::ImportJapaneseHolidayCsv(L"date,name\n2028/01/01,元日\n2028/01/01,重複\n",
+                                          info, error) && !error.empty(),
+        "holiday CSV duplicate dates are rejected without replacing data");
+  error.clear();
+  Check(!mdlite::ValidateJapaneseHolidayCsv(L"<html><body>error</body></html>", info, error) &&
+            !error.empty(),
+        "HTML error pages are rejected as holiday data");
+  error.clear();
+  Check(mdlite::ValidateJapaneseHolidayCsv(L"date,name\n2028-05-01,祝日\n", info, error) &&
+            info.first_year == 2028 && info.last_year == 2028,
+        "online holiday validation accepts strict ISO-like date fixtures");
+  mdlite::ClearImportedJapaneseHolidays();
 }
 
 void TestAssets(const std::filesystem::path& root) {
@@ -1355,6 +1398,7 @@ void TestSettings(const std::filesystem::path& root) {
   Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
   Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
             effective.font_size_pt == 14 && !effective.auto_save && effective.auto_save_delay_ms == 1500 &&
+            !effective.holiday_auto_update &&
             effective.colors[L"link"] == L"#80A0FF" &&
             effective.default_memo_workspace == *common.default_memo_workspace,
         "workspace overrides common while inherited values remain");

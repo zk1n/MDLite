@@ -193,6 +193,11 @@ class Application {
   bool PasteClipboardImage();
   void ResizeImageAtCaret(unsigned width_dip);
   void OpenLinkAtSourcePosition(DocumentView& view, std::size_t source_position, bool activate);
+  void ImportHolidayData();
+  void StartHolidayUpdate(bool manual);
+  void LoadHolidayCache();
+  void CompleteHolidayUpdate(void* payload);
+  void ScheduleHolidayUpdate();
   void UpdateCalendarTooltip(POINT point);
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
@@ -228,9 +233,13 @@ class Application {
   std::vector<SearchMatch> workspace_search_results_;
   std::size_t workspace_search_issue_count_{};
   std::jthread workspace_search_worker_;
+  std::jthread holiday_update_worker_;
   std::uint64_t workspace_search_generation_{};
+  std::uint64_t holiday_update_generation_{};
   ULONGLONG workspace_search_due_{};
   bool workspace_search_started_{};
+  bool holiday_cache_loaded_{};
+  bool holiday_update_running_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
   bool external_operation_active_{};
@@ -247,6 +256,7 @@ class Application {
   COLORREF theme_foreground_{RGB(24, 24, 24)};
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
+  std::wstring holiday_update_status_;
 };
 
 }  // namespace mdlite

@@ -16,6 +16,7 @@ struct SettingsLayer {
   std::optional<ThemeMode> theme;
   std::optional<std::wstring> font_face;
   std::optional<unsigned> font_size_pt;
+  std::optional<bool> holiday_auto_update;
   std::optional<std::filesystem::path> default_memo_workspace;
   std::map<std::wstring, std::wstring> keybindings;
   std::map<std::wstring, std::wstring> colors;
@@ -28,6 +29,7 @@ struct EffectiveSettings {
   ThemeMode theme{ThemeMode::System};
   std::wstring font_face{L"Segoe UI"};
   unsigned font_size_pt{11};
+  bool holiday_auto_update{false};
   std::filesystem::path default_memo_workspace;
   std::map<std::wstring, std::wstring> keybindings;
   std::map<std::wstring, std::wstring> colors;

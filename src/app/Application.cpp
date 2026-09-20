@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cwctype>
+#include <fstream>
 #include <map>
 #include <thread>
 
@@ -46,6 +48,15 @@ constexpr int kProcessDoneButton = 4400;
 constexpr UINT kWorkspaceSearchBatchMessage = WM_APP + 41;
 constexpr UINT kWorkspaceSearchCompleteMessage = WM_APP + 42;
 constexpr UINT kTestThemeChangeMessage = WM_APP + 43;
+constexpr UINT kHolidayUpdateMessage = WM_APP + 44;
+constexpr wchar_t kHolidayCacheName[] = L"japanese-holidays.csv";
+constexpr wchar_t kHolidayStateName[] = L"japanese-holidays.toml";
+constexpr wchar_t kHolidayProvider[] = L"内閣府 国民の祝日・休日CSV";
+
+int ScaleDip(HWND window, int value) {
+  const UINT dpi = window == nullptr ? 96U : GetDpiForWindow(window);
+  return MulDiv(value, dpi == 0 ? 96 : static_cast<int>(dpi), 96);
+}
 
 bool TestAutomationSilent() {
   wchar_t enabled[2]{};
@@ -86,6 +97,168 @@ struct WorkspaceSearchCompleteMessage {
   bool completed{};
   std::wstring error;
 };
+
+struct HolidayUpdateMessage {
+  std::uint64_t generation{};
+  std::filesystem::path cache_path;
+  std::filesystem::path state_path;
+  JapaneseHolidayOnlineResult result;
+};
+
+struct HolidayUpdateState {
+  std::int64_t last_attempt_unix{};
+  std::int64_t last_successful_check_unix{};
+  std::size_t records{};
+  int first_year{};
+  int last_year{};
+  std::wstring etag;
+  std::wstring last_modified;
+  std::wstring error;
+};
+
+std::wstring TrimHoliday(std::wstring value) {
+  while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+  while (!value.empty() && iswspace(value.back())) value.pop_back();
+  return value;
+}
+
+std::optional<std::wstring> UnquoteHoliday(std::wstring value) {
+  value = TrimHoliday(std::move(value));
+  if (value.size() < 2 || value.front() != L'"' || value.back() != L'"') return std::nullopt;
+  value = value.substr(1, value.size() - 2);
+  std::wstring result;
+  result.reserve(value.size());
+  bool escaped{};
+  for (wchar_t ch : value) {
+    if (escaped) {
+      if (ch == L'n') result.push_back(L'\n');
+      else result.push_back(ch);
+      escaped = false;
+    } else if (ch == L'\\') escaped = true;
+    else result.push_back(ch);
+  }
+  return escaped ? std::nullopt : std::optional<std::wstring>(std::move(result));
+}
+
+std::wstring QuoteHoliday(std::wstring_view value) {
+  std::wstring result = L"\"";
+  for (wchar_t ch : value) {
+    if (ch == L'\\' || ch == L'"') result.push_back(L'\\');
+    if (ch == L'\n') { result += L"\\n"; continue; }
+    result.push_back(ch);
+  }
+  result.push_back(L'"');
+  return result;
+}
+
+bool DecodeUtf8Holiday(const std::string& bytes, std::wstring& value) {
+  if (bytes.empty()) { value.clear(); return true; }
+  const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                       static_cast<int>(bytes.size()), nullptr, 0);
+  if (size <= 0) return false;
+  value.resize(static_cast<std::size_t>(size));
+  return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                             static_cast<int>(bytes.size()), value.data(), size) == size;
+}
+
+bool EncodeUtf8Holiday(std::wstring_view text, std::string& bytes) {
+  if (text.empty()) { bytes.clear(); return true; }
+  const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                                       static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+  if (size <= 0) return false;
+  bytes.resize(static_cast<std::size_t>(size));
+  return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                             static_cast<int>(text.size()), bytes.data(), size, nullptr, nullptr) == size;
+}
+
+std::int64_t HolidayNowUnix() {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool HolidayUpdateDue(const HolidayUpdateState& state, std::int64_t now) {
+  const auto last = std::max(state.last_attempt_unix, state.last_successful_check_unix);
+  return last <= 0 || now - last >= 28 * 24 * 60 * 60;
+}
+
+bool ReadHolidayState(const std::filesystem::path& path, HolidayUpdateState& state) {
+  state = {};
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return true;
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  std::wstring text;
+  if (!DecodeUtf8Holiday(bytes, text)) return false;
+  std::wistringstream lines(text);
+  std::wstring line;
+  while (std::getline(lines, line)) {
+    const auto equals = line.find(L'=');
+    if (equals == std::wstring::npos) continue;
+    const auto key = TrimHoliday(line.substr(0, equals));
+    const auto raw = TrimHoliday(line.substr(equals + 1));
+    try {
+      if (key == L"last_attempt_unix") state.last_attempt_unix = std::stoll(raw);
+      else if (key == L"last_successful_check_unix") state.last_successful_check_unix = std::stoll(raw);
+      else if (key == L"records") state.records = static_cast<std::size_t>(std::stoull(raw));
+      else if (key == L"first_year") state.first_year = std::stoi(raw);
+      else if (key == L"last_year") state.last_year = std::stoi(raw);
+      else if (key == L"etag") { if (const auto value = UnquoteHoliday(raw)) state.etag = *value; }
+      else if (key == L"last_modified") { if (const auto value = UnquoteHoliday(raw)) state.last_modified = *value; }
+      else if (key == L"error") { if (const auto value = UnquoteHoliday(raw)) state.error = *value; }
+    } catch (...) { return false; }
+  }
+  return true;
+}
+
+bool WriteHolidayState(const std::filesystem::path& path, const HolidayUpdateState& state,
+                       std::wstring& error) {
+  const std::wstring text = L"schema_version = 1\n"
+      L"provider = " + QuoteHoliday(kHolidayProvider) + L"\n"
+      L"last_attempt_unix = " + std::to_wstring(state.last_attempt_unix) + L"\n"
+      L"last_successful_check_unix = " + std::to_wstring(state.last_successful_check_unix) + L"\n"
+      L"records = " + std::to_wstring(state.records) + L"\n"
+      L"first_year = " + std::to_wstring(state.first_year) + L"\n"
+      L"last_year = " + std::to_wstring(state.last_year) + L"\n"
+      L"etag = " + QuoteHoliday(state.etag) + L"\n"
+      L"last_modified = " + QuoteHoliday(state.last_modified) + L"\n"
+      L"error = " + QuoteHoliday(state.error) + L"\n";
+  std::string bytes;
+  if (!EncodeUtf8Holiday(text, bytes)) { error = L"祝日更新状態をUTF-8へ変換できません。"; return false; }
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(path.parent_path(), filesystem_error);
+  if (filesystem_error) { error = L"祝日更新状態フォルダーを作成できません。"; return false; }
+  auto temporary = path; temporary += L".new";
+  HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) { error = L"祝日更新状態を保存できません。"; return false; }
+  DWORD written{};
+  const bool ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                  written == bytes.size() && FlushFileBuffers(file);
+  CloseHandle(file);
+  if (!ok || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary.c_str()); error = L"祝日更新状態を安全に保存できません。"; return false;
+  }
+  return true;
+}
+
+bool WriteHolidayCache(const std::filesystem::path& path, std::wstring_view csv, std::wstring& error) {
+  std::string bytes;
+  if (!EncodeUtf8Holiday(csv, bytes)) { error = L"祝日CSVをUTF-8へ変換できません。"; return false; }
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(path.parent_path(), filesystem_error);
+  if (filesystem_error) { error = L"祝日cacheフォルダーを作成できません。"; return false; }
+  auto temporary = path; temporary += L".new";
+  HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) { error = L"祝日CSV cacheを保存できません。"; return false; }
+  DWORD written{};
+  const bool ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                  written == bytes.size() && FlushFileBuffers(file);
+  CloseHandle(file);
+  if (!ok || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary.c_str()); error = L"祝日CSV cacheを安全に保存できません。"; return false;
+  }
+  return true;
+}
 
 struct ProcessDialogContext {
   HANDLE cancellation{};
@@ -280,6 +453,10 @@ enum ControlId : int {
   kTableColumnBefore,
   kTableColumnAfter,
   kTableColumnDelete,
+  // Keep newly added calendar commands after the long-standing command IDs;
+  // performance/GUI harnesses send the numeric IDs directly.
+  kCalendarImportHolidays,
+  kCalendarUpdateHolidays,
 };
 
 bool IsTextFile(const std::filesystem::path& path) {
@@ -333,6 +510,16 @@ bool LaunchMDLite(const std::filesystem::path& target, std::wstring& error) {
 EditorSnapshot SnapshotFor(const Document& document) {
   return IsMarkdownFile(document.path()) ? BuildMarkdownEditorSnapshot(document.text())
                                          : BuildEditorSnapshot(document.text());
+}
+
+EditorSnapshot NativeSnapshotFor(const Document& document) {
+  return IsMarkdownFile(document.path()) ? BuildNativeEditorSnapshot(document.text())
+                                         : BuildNativeTextEditorSnapshot(document.text());
+}
+
+EditorSnapshot NativeSnapshotFor(const std::filesystem::path& path, std::wstring_view text) {
+  return IsMarkdownFile(path) ? BuildNativeEditorSnapshot(text)
+                              : BuildNativeTextEditorSnapshot(text);
 }
 
 std::uint64_t FileTimeValue(const FILETIME& value) {
@@ -639,6 +826,10 @@ Application::~Application() {
     workspace_search_worker_.request_stop();
     workspace_search_worker_.join();
   }
+  if (holiday_update_worker_.joinable()) {
+    holiday_update_worker_.request_stop();
+    holiday_update_worker_.join();
+  }
   if (accelerator_table_) DestroyAcceleratorTable(accelerator_table_);
   if (editor_font_) DeleteObject(editor_font_);
   if (background_brush_) DeleteObject(background_brush_);
@@ -763,7 +954,7 @@ LRESULT CALLBACK Application::CompactWindowProc(HWND window, UINT message, WPARA
     }
     if (header && header->hwndFrom == (*view)->editor && header->code == EN_LINK) {
       const auto* link = reinterpret_cast<const ENLINK*>(lparam);
-      const auto source_position = (*view)->editor_snapshot.ViewToSource(link->chrg.cpMin);
+      const auto source_position = (*view)->editor_snapshot.NativeToSource(link->chrg.cpMin);
       if (link->msg == WM_LBUTTONUP) app->OpenLinkAtSourcePosition(*(*view), source_position, true);
       else if (link->msg == WM_MOUSEMOVE)
         app->OpenLinkAtSourcePosition(*(*view), source_position, false);
@@ -806,14 +997,14 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     app->SyncDocumentFromEditor(*view);
     CHARRANGE selection{};
     SendMessageW(window, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const auto source_caret = view->editor_snapshot.ViewToSource(selection.cpMin);
+    const auto source_caret = view->editor_snapshot.NativeToSource(selection.cpMin);
     const auto edit = MoveToAdjacentTableCell(view->document.text(), source_caret,
                                               (GetKeyState(VK_SHIFT) & 0x8000) != 0);
     if (edit.changed) {
       app->ApplySourceTextWithUndo(*view, edit.text);
     }
     if (edit.selection != source_caret || edit.changed) {
-      const auto view_caret = view->editor_snapshot.SourceToView(edit.selection);
+      const auto view_caret = view->editor_snapshot.SourceToNative(edit.selection);
       SendMessageW(window, EM_SETSEL, view_caret, view_caret);
       return 0;
     }
@@ -830,9 +1021,9 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
           wparam == VK_RIGHT ? TableCaretDirection::Right :
           wparam == VK_UP ? TableCaretDirection::Up : TableCaretDirection::Down;
       const auto destination = MoveTableCaretAtBoundary(
-          view->document.text(), view->editor_snapshot.ViewToSource(selection.cpMin), direction);
+          view->document.text(), view->editor_snapshot.NativeToSource(selection.cpMin), direction);
       if (destination) {
-        const auto view_caret = view->editor_snapshot.SourceToView(*destination);
+        const auto view_caret = view->editor_snapshot.SourceToNative(*destination);
         SendMessageW(window, EM_SETSEL, view_caret, view_caret);
         return 0;
       }
@@ -882,6 +1073,17 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_SIZE:
       LayoutControls();
       return 0;
+    case WM_DPICHANGED: {
+      const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+      if (suggested) {
+        SetWindowPos(window_, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left, suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+      }
+      ApplySettings();
+      LayoutControls();
+      return 0;
+    }
     case WM_TIMER:
       if (wparam == kAutosaveTimer) {
         if (external_operation_active_) return 0;
@@ -1060,6 +1262,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case kWorkspaceSearchCompleteMessage:
       CompleteWorkspaceSearch(reinterpret_cast<void*>(lparam));
       return 0;
+    case kHolidayUpdateMessage:
+      CompleteHolidayUpdate(reinterpret_cast<void*>(lparam));
+      return 0;
     case kTestThemeChangeMessage: {
       if (!TestAutomationSilent() || !workspace_store_ || (wparam != 1 && wparam != 2)) return FALSE;
       const auto path = workspace_store_->metadata_root() / L"settings.toml";
@@ -1124,6 +1329,8 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         ShowWindow(calendar_, IsWindowVisible(calendar_) ? SW_HIDE : SW_SHOW);
         LayoutControls();
       }
+      else if (command == kCalendarImportHolidays) ImportHolidayData();
+      else if (command == kCalendarUpdateHolidays) StartHolidayUpdate(true);
       else if (command == kViewSettings) OpenWorkspaceSettings();
       else if (command == kViewSettingsFiles) OpenWorkspaceSettingsFiles();
       else if (command == kViewProfiles) ManageProfiles();
@@ -1188,7 +1395,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         item.mask = TVIF_PARAM;
         item.hItem = TreeView_GetSelection(outline_);
         if (item.hItem && TreeView_GetItem(outline_, &item)) {
-          const auto position = static_cast<LONG>(documents_[active_document_]->editor_snapshot.SourceToView(
+          const auto position = static_cast<LONG>(documents_[active_document_]->editor_snapshot.SourceToNative(
               static_cast<std::size_t>(item.lParam)));
           SendMessageW(documents_[active_document_]->editor, EM_SETSEL, position, position);
           SetFocus(documents_[active_document_]->editor);
@@ -1236,7 +1443,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                  header->code == EN_LINK) {
         const auto* link = reinterpret_cast<const ENLINK*>(lparam);
         auto& view = *documents_[active_document_];
-        const auto source_position = view.editor_snapshot.ViewToSource(link->chrg.cpMin);
+        const auto source_position = view.editor_snapshot.NativeToSource(link->chrg.cpMin);
         if (link->msg == WM_LBUTTONUP) OpenLinkAtSourcePosition(view, source_position, true);
         else if (link->msg == WM_MOUSEMOVE) OpenLinkAtSourcePosition(view, source_position, false);
       }
@@ -1248,7 +1455,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         workspace_search_worker_.request_stop();
         workspace_search_worker_.join();
       }
+      if (holiday_update_worker_.joinable()) {
+        holiday_update_worker_.request_stop();
+        holiday_update_worker_.join();
+      }
       ++workspace_search_generation_;
+      ++holiday_update_generation_;
       MSG pending_search{};
       while (PeekMessageW(&pending_search, window_, kWorkspaceSearchBatchMessage,
                           kWorkspaceSearchCompleteMessage, PM_REMOVE)) {
@@ -1257,6 +1469,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         else if (pending_search.message == kWorkspaceSearchCompleteMessage)
           delete reinterpret_cast<WorkspaceSearchCompleteMessage*>(pending_search.lParam);
       }
+      MSG pending_holiday{};
+      while (PeekMessageW(&pending_holiday, window_, kHolidayUpdateMessage,
+                          kHolidayUpdateMessage, PM_REMOVE))
+        delete reinterpret_cast<HolidayUpdateMessage*>(pending_holiday.lParam);
       SaveSession();
       for (auto& view : documents_) {
         if (!view->compact_window) continue;
@@ -1340,6 +1556,8 @@ void Application::CreateMenuBar() {
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), L"編集");
   HMENU view = CreatePopupMenu();
   AppendMenuW(view, MF_STRING, kViewCalendar, L"カレンダー");
+  AppendMenuW(view, MF_STRING, kCalendarImportHolidays, L"祝日CSVをローカル取込み…");
+  AppendMenuW(view, MF_STRING, kCalendarUpdateHolidays, L"祝日を内閣府から今すぐ確認");
   AppendMenuW(view, MF_STRING, kViewSettings, L"Workspace設定を開く");
   AppendMenuW(view, MF_STRING, kViewSettingsFiles, L"設定ファイルを詳細編集");
   AppendMenuW(view, MF_STRING, kViewProfiles, L"作成プロファイルを管理…");
@@ -1488,33 +1706,38 @@ void Application::LayoutControls() {
   const int content_height = std::max(0L, client.bottom - status_height);
   const bool find_visible = IsWindowVisible(find_bar_) != FALSE;
   const bool results_visible = IsWindowVisible(find_results_) != FALSE;
-  const int center_left = kTreeWidth;
-  const int center_width = std::max(0L, client.right - kTreeWidth - kOutlineWidth);
-  MoveWindow(workspace_tree_, 0, 0, kTreeWidth, content_height, TRUE);
-  MoveWindow(outline_, client.right - kOutlineWidth, 0, kOutlineWidth, content_height, TRUE);
-  MoveWindow(tabs_, center_left, 0, center_width, kTabHeight, TRUE);
-  MoveWindow(find_bar_, center_left, kTabHeight, center_width, find_visible ? kFindHeight : 0, TRUE);
-  const int options_width = 210;
-  const int button_width = 100;
-  const int input_width = std::max(80, center_width - options_width - button_width - 24);
-  MoveWindow(find_edit_, center_left + 8, kTabHeight + 4, input_width, 24, TRUE);
-  MoveWindow(find_next_, center_left + 12 + input_width, kTabHeight + 3, button_width, 25, TRUE);
-  MoveWindow(find_case_, center_left + 116 + input_width, kTabHeight + 5, 72, 22, TRUE);
-  MoveWindow(find_regex_, center_left + 188 + input_width, kTabHeight + 5, 62, 22, TRUE);
-  MoveWindow(find_word_, center_left + 250 + input_width, kTabHeight + 5, 58, 22, TRUE);
-  MoveWindow(replace_edit_, center_left + 8, kTabHeight + 36, input_width, 24, TRUE);
-  MoveWindow(replace_one_, center_left + 12 + input_width, kTabHeight + 35, 82, 25, TRUE);
-  MoveWindow(replace_document_, center_left + 98 + input_width, kTabHeight + 35, 92, 25, TRUE);
-  MoveWindow(replace_workspace_, center_left + 194 + input_width, kTabHeight + 35, 118, 25, TRUE);
-  const int glob_width = std::max(80, (center_width - button_width - 32) / 2);
-  MoveWindow(find_include_glob_, center_left + 8, kTabHeight + 66, glob_width, 24, TRUE);
-  MoveWindow(find_exclude_glob_, center_left + 12 + glob_width, kTabHeight + 66, glob_width, 24, TRUE);
-  MoveWindow(find_workspace_, center_left + center_width - button_width - 8,
-             kTabHeight + 65, button_width, 25, TRUE);
-  const int results_top = kTabHeight + (find_visible ? kFindHeight : 0);
+  const int tree_width = ScaleDip(window_, kTreeWidth);
+  const int outline_width = ScaleDip(window_, kOutlineWidth);
+  const int tab_height = ScaleDip(window_, kTabHeight);
+  const int find_height = ScaleDip(window_, kFindHeight);
+  const int results_height = ScaleDip(window_, kFindResultsHeight);
+  const int center_left = tree_width;
+  const int center_width = std::max(0L, client.right - tree_width - outline_width);
+  MoveWindow(workspace_tree_, 0, 0, tree_width, content_height, TRUE);
+  MoveWindow(outline_, client.right - outline_width, 0, outline_width, content_height, TRUE);
+  MoveWindow(tabs_, center_left, 0, center_width, tab_height, TRUE);
+  MoveWindow(find_bar_, center_left, tab_height, center_width, find_visible ? find_height : 0, TRUE);
+  const int options_width = ScaleDip(window_, 210);
+  const int button_width = ScaleDip(window_, 100);
+  const int input_width = std::max(ScaleDip(window_, 80), center_width - options_width - button_width - ScaleDip(window_, 24));
+  MoveWindow(find_edit_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 4), input_width, ScaleDip(window_, 24), TRUE);
+  MoveWindow(find_next_, center_left + ScaleDip(window_, 12) + input_width, tab_height + ScaleDip(window_, 3), button_width, ScaleDip(window_, 25), TRUE);
+  MoveWindow(find_case_, center_left + ScaleDip(window_, 116) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 72), ScaleDip(window_, 22), TRUE);
+  MoveWindow(find_regex_, center_left + ScaleDip(window_, 188) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 62), ScaleDip(window_, 22), TRUE);
+  MoveWindow(find_word_, center_left + ScaleDip(window_, 250) + input_width, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 58), ScaleDip(window_, 22), TRUE);
+  MoveWindow(replace_edit_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 36), input_width, ScaleDip(window_, 24), TRUE);
+  MoveWindow(replace_one_, center_left + ScaleDip(window_, 12) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 82), ScaleDip(window_, 25), TRUE);
+  MoveWindow(replace_document_, center_left + ScaleDip(window_, 98) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 92), ScaleDip(window_, 25), TRUE);
+  MoveWindow(replace_workspace_, center_left + ScaleDip(window_, 194) + input_width, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 118), ScaleDip(window_, 25), TRUE);
+  const int glob_width = std::max(ScaleDip(window_, 80), (center_width - button_width - ScaleDip(window_, 32)) / 2);
+  MoveWindow(find_include_glob_, center_left + ScaleDip(window_, 8), tab_height + ScaleDip(window_, 66), glob_width, ScaleDip(window_, 24), TRUE);
+  MoveWindow(find_exclude_glob_, center_left + ScaleDip(window_, 12) + glob_width, tab_height + ScaleDip(window_, 66), glob_width, ScaleDip(window_, 24), TRUE);
+  MoveWindow(find_workspace_, center_left + center_width - button_width - ScaleDip(window_, 8),
+             tab_height + ScaleDip(window_, 65), button_width, ScaleDip(window_, 25), TRUE);
+  const int results_top = tab_height + (find_visible ? find_height : 0);
   MoveWindow(find_results_, center_left, results_top, center_width,
-             results_visible ? kFindResultsHeight : 0, TRUE);
-  const int editor_top = results_top + (results_visible ? kFindResultsHeight : 0);
+             results_visible ? results_height : 0, TRUE);
+  const int editor_top = results_top + (results_visible ? results_height : 0);
   for (auto& view : documents_) {
     if (GetParent(view->editor) == window_)
       MoveWindow(view->editor, center_left, editor_top, center_width,
@@ -1525,8 +1748,8 @@ void Application::LayoutControls() {
     MonthCal_GetMinReqRect(calendar_, &required);
     const int width = required.right - required.left;
     const int height = required.bottom - required.top;
-    MoveWindow(calendar_, std::max(center_left, static_cast<int>(client.right) - kOutlineWidth - width - 8),
-               editor_top + 8, width, height, TRUE);
+    MoveWindow(calendar_, std::max(center_left, static_cast<int>(client.right) - outline_width - width - ScaleDip(window_, 8)),
+               editor_top + ScaleDip(window_, 8), width, height, TRUE);
     if (calendar_tooltip_) {
       TTTOOLINFOW tool{sizeof(tool)};
       tool.hwnd = calendar_;
@@ -1735,8 +1958,8 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
           const auto index = static_cast<std::size_t>(std::distance(documents_.begin(), found));
           ActivateDocument(index);
           CHARRANGE selection{
-              static_cast<LONG>((*found)->editor_snapshot.SourceToView(item.selection_begin)),
-              static_cast<LONG>((*found)->editor_snapshot.SourceToView(item.selection_end))};
+              static_cast<LONG>((*found)->editor_snapshot.SourceToNative(item.selection_begin)),
+              static_cast<LONG>((*found)->editor_snapshot.SourceToNative(item.selection_end))};
           SendMessageW((*found)->editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
           SendMessageW((*found)->editor, EM_LINESCROLL, 0, item.first_visible_line);
           if (item.compact) {
@@ -1846,7 +2069,8 @@ void Application::OpenDocumentView(Document document, std::wstring tab_name) {
   SetWindowSubclass(view->editor, EditorSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
-    SetWindowTextW(view->editor, view->editor_snapshot.view.c_str());
+    const auto native_snapshot = NativeSnapshotFor(view->document);
+    SetWindowTextW(view->editor, native_snapshot.view.c_str());
   }
 
   TCITEMW tab{};
@@ -1883,7 +2107,8 @@ void Application::OpenRecoverySnapshot(const std::filesystem::path& path) {
     documents_[index]->derived_image_revision = std::numeric_limits<std::uint64_t>::max();
     {
       ScopedEditorChangeSuppression suppression(suppress_editor_change_);
-      SetWindowTextW(documents_[index]->editor, documents_[index]->editor_snapshot.view.c_str());
+      const auto native_snapshot = NativeSnapshotFor(documents_[index]->document);
+      SetWindowTextW(documents_[index]->editor, native_snapshot.view.c_str());
     }
     ActivateDocument(index);
     return;
@@ -2064,7 +2289,8 @@ void Application::ReloadDocumentFromDisk() {
   view.derived_image_revision = std::numeric_limits<std::uint64_t>::max();
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
-    SetWindowTextW(view.editor, view.editor_snapshot.view.c_str());
+    const auto native_snapshot = NativeSnapshotFor(view.document);
+    SetWindowTextW(view.editor, native_snapshot.view.c_str());
   }
   ApplyMarkdownPresentation(view, true);
   RebuildOutline(view);
@@ -2175,12 +2401,13 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
   // back as Markdown source (RichEdit may expose an image object as a space).
   if (view.sync_due == 0) return;
   view.sync_due = 0;
+  const auto native_snapshot = NativeSnapshotFor(view.document);
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const std::size_t source_begin = view.editor_snapshot.ViewToSource(selection.cpMin);
-  const std::size_t source_end = view.editor_snapshot.ViewToSource(selection.cpMax);
-  const std::wstring current_view = EditorText(view.editor, view.editor_snapshot);
-  const auto transaction = ApplyEditorText(view.editor_snapshot, view.document.text(), current_view);
+  const std::size_t source_begin = native_snapshot.NativeToSource(selection.cpMin);
+  const std::size_t source_end = native_snapshot.NativeToSource(selection.cpMax);
+  const std::wstring current_view = EditorText(view.editor, native_snapshot);
+  const auto transaction = ApplyEditorText(native_snapshot, view.document.text(), current_view);
   if (!transaction.changed) return;
   view.source_undo.push_back({transaction.begin,
       view.document.text().substr(transaction.begin, transaction.old_end - transaction.begin),
@@ -2189,32 +2416,33 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
   view.source_redo.clear();
   view.document.MarkEdited(transaction.source);
   view.editor_snapshot = SnapshotFor(view.document);
+  const auto target_native = NativeSnapshotFor(view.document);
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
     PresentationUndoGuard undo_guard(view.editor);
     if (!undo_guard) return;
-    if (current_view != view.editor_snapshot.view) {
+    if (current_view != target_native.view) {
       std::size_t view_prefix{};
       while (view_prefix < current_view.size() &&
-             view_prefix < view.editor_snapshot.view.size() &&
-             current_view[view_prefix] == view.editor_snapshot.view[view_prefix]) {
+             view_prefix < target_native.view.size() &&
+             current_view[view_prefix] == target_native.view[view_prefix]) {
         ++view_prefix;
       }
       std::size_t current_suffix = current_view.size();
-      std::size_t target_suffix = view.editor_snapshot.view.size();
+      std::size_t target_suffix = target_native.view.size();
       while (current_suffix > view_prefix && target_suffix > view_prefix &&
-             current_view[current_suffix - 1] == view.editor_snapshot.view[target_suffix - 1]) {
+             current_view[current_suffix - 1] == target_native.view[target_suffix - 1]) {
         --current_suffix;
         --target_suffix;
       }
-      const std::wstring replacement = view.editor_snapshot.view.substr(
+      const std::wstring replacement = target_native.view.substr(
           view_prefix, target_suffix - view_prefix);
       SendMessageW(view.editor, WM_SETREDRAW, FALSE, 0);
       SendMessageW(view.editor, EM_SETSEL, view_prefix, current_suffix);
       SendMessageW(view.editor, EM_REPLACESEL, FALSE,
                    reinterpret_cast<LPARAM>(replacement.c_str()));
-      const CHARRANGE restored{static_cast<LONG>(view.editor_snapshot.SourceToView(source_begin)),
-                               static_cast<LONG>(view.editor_snapshot.SourceToView(source_end))};
+      const CHARRANGE restored{static_cast<LONG>(target_native.SourceToView(source_begin)),
+                               static_cast<LONG>(target_native.SourceToView(source_end))};
       SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&restored));
       SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
       InvalidateRect(view.editor, nullptr, FALSE);
@@ -2232,10 +2460,9 @@ void Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
   if (text == view.document.text()) return;
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const std::size_t source_begin = view.editor_snapshot.ViewToSource(selection.cpMin);
-  const std::size_t source_end = view.editor_snapshot.ViewToSource(selection.cpMax);
-  const auto target = IsMarkdownFile(view.document.path()) ? BuildMarkdownEditorSnapshot(text)
-                                                           : BuildEditorSnapshot(text);
+  const std::size_t source_begin = view.editor_snapshot.NativeToSource(selection.cpMin);
+  const std::size_t source_end = view.editor_snapshot.NativeToSource(selection.cpMax);
+  const auto target_native = NativeSnapshotFor(view.document.path(), text);
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
     PresentationUndoGuard undo_guard(view.editor);
@@ -2260,12 +2487,13 @@ void Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
     SendMessageW(view.editor, WM_SETREDRAW, FALSE, 0);
     SendMessageW(view.editor, EM_STOPGROUPTYPING, 0, 0);
     SendMessageW(view.editor, EM_SETSEL, 0, -1);
-    SendMessageW(view.editor, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(target.view.c_str()));
+    SendMessageW(view.editor, EM_REPLACESEL, FALSE,
+                 reinterpret_cast<LPARAM>(target_native.view.c_str()));
     SendMessageW(view.editor, EM_STOPGROUPTYPING, 0, 0);
-    view.editor_snapshot = target;
+    view.editor_snapshot = SnapshotFor(view.document);
     const CHARRANGE restored{
-        static_cast<LONG>(view.editor_snapshot.SourceToView(std::min(source_begin, view.document.text().size()))),
-        static_cast<LONG>(view.editor_snapshot.SourceToView(std::min(source_end, view.document.text().size())))};
+        static_cast<LONG>(target_native.SourceToView(std::min(source_begin, view.document.text().size()))),
+        static_cast<LONG>(target_native.SourceToView(std::min(source_end, view.document.text().size())))};
     SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&restored));
     SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(view.editor, nullptr, TRUE);
@@ -2463,7 +2691,7 @@ void Application::RefreshDerivedImages(DocumentView& view) {
       if (!render_needed[index]) continue;
       auto& current = view.rendered_images[index];
       const auto& image = *renderable_images[index];
-      const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToView(image.begin));
+  const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToNative(image.begin));
       const std::size_t previous_index = matched_previous[index];
       const bool replaces_existing = previous_index < previous_images.size();
       if (!current.file_identity.available) {
@@ -2580,7 +2808,7 @@ void Application::AdvanceAnimatedImages(DocumentView& view, ULONGLONG now) {
       next_due = std::min(next_due, frame->second.due);
       continue;
     }
-    const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToView(image.begin));
+  const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToNative(image.begin));
     POINT point{};
     SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), position);
     if (point.y < client.top || point.y >= client.bottom ||
@@ -2655,20 +2883,30 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
   CHARFORMAT2W normal{sizeof(normal)};
   normal.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_STRIKEOUT |
-                  CFM_HIDDEN | CFM_BACKCOLOR | CFM_LINK;
+                  CFM_UNDERLINE | CFM_EFFECTS | CFM_HIDDEN | CFM_BACKCOLOR | CFM_LINK;
   normal.dwEffects = 0;
   normal.crTextColor = foreground;
   normal.crBackColor = background;
   normal.yHeight = static_cast<LONG>(settings_.font_size_pt * 20);
   wcsncpy_s(normal.szFaceName, settings_.font_face.c_str(), _TRUNCATE);
   SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&normal));
+  PARAFORMAT2 base_paragraph{sizeof(base_paragraph)};
+  base_paragraph.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING | PFM_BORDER;
+  base_paragraph.dySpaceBefore = 0;
+  base_paragraph.dySpaceAfter = 0;
+  base_paragraph.bLineSpacingRule = 0;
+  base_paragraph.wBorders = 0;
+  base_paragraph.wBorderWidth = 0;
+  base_paragraph.wBorderSpace = 0;
+  SendMessageW(view.editor, EM_SETPARAFORMAT, 0,
+               reinterpret_cast<LPARAM>(&base_paragraph));
 
   const LONG active_start = static_cast<LONG>(SendMessageW(view.editor, EM_LINEINDEX, active_line, 0));
   const LONG active_length = static_cast<LONG>(SendMessageW(view.editor, EM_LINELENGTH, active_start, 0));
   const LONG active_end = active_start + active_length;
   for (const auto& span : view.parse.spans) {
-    const auto view_begin = view.editor_snapshot.SourceToView(span.begin);
-    const auto view_end = view.editor_snapshot.SourceToView(span.end);
+  const auto view_begin = view.editor_snapshot.SourceToNative(span.begin);
+  const auto view_end = view.editor_snapshot.SourceToNative(span.end);
     if (view_begin >= static_cast<std::size_t>(length) || view_end <= view_begin) continue;
     SendMessageW(view.editor, EM_SETSEL, static_cast<WPARAM>(view_begin), static_cast<LPARAM>(view_end));
     CHARFORMAT2W format{sizeof(format)};
@@ -2709,8 +2947,8 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
     SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
   }
   for (const auto& table : view.parse.tables) {
-    const LONG begin = static_cast<LONG>(view.editor_snapshot.SourceToView(table.begin));
-    const LONG end = static_cast<LONG>(view.editor_snapshot.SourceToView(table.end));
+  const LONG begin = static_cast<LONG>(view.editor_snapshot.SourceToNative(table.begin));
+  const LONG end = static_cast<LONG>(view.editor_snapshot.SourceToNative(table.end));
     SendMessageW(view.editor, EM_SETSEL, begin, end);
     CHARFORMAT2W table_format{sizeof(table_format)};
     table_format.dwMask = CFM_FACE | CFM_BACKCOLOR;
@@ -2718,13 +2956,10 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
     table_format.crBackColor = ThemeColor(settings_, L"table_background", dark ? RGB(38, 42, 48) : RGB(244, 247, 250));
     SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&table_format));
     PARAFORMAT2 paragraph{sizeof(paragraph)};
-    paragraph.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING | PFM_BORDER;
+    paragraph.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING;
     paragraph.dySpaceBefore = 40;
     paragraph.dySpaceAfter = 40;
     paragraph.bLineSpacingRule = 0;
-    paragraph.wBorders = 0x0F;
-    paragraph.wBorderWidth = 8;
-    paragraph.wBorderSpace = 2;
     SendMessageW(view.editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&paragraph));
   }
   SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
@@ -2745,8 +2980,8 @@ void Application::DrawTableGrid(const DocumentView& view) {
       0, SendMessageW(view.editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&first_point))));
   const auto last_view = static_cast<std::size_t>(std::max<LRESULT>(
       0, SendMessageW(view.editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&last_point))));
-  std::size_t visible_begin = view.editor_snapshot.ViewToSource(first_view);
-  std::size_t visible_end = view.editor_snapshot.ViewToSource(last_view);
+  std::size_t visible_begin = view.editor_snapshot.NativeToSource(first_view);
+  std::size_t visible_end = view.editor_snapshot.NativeToSource(last_view);
   visible_begin = visible_begin == 0 ? 0 : view.document.text().rfind(L'\n', visible_begin - 1) + 1;
   const auto next_line = view.document.text().find(L'\n', visible_end);
   visible_end = next_line == std::wstring::npos ? view.document.text().size() : next_line + 1;
@@ -2754,27 +2989,62 @@ void Application::DrawTableGrid(const DocumentView& view) {
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   HPEN pen = CreatePen(PS_SOLID, 1, dark ? RGB(105, 116, 128) : RGB(158, 169, 181));
   const HGDIOBJ previous_pen = SelectObject(dc, pen);
-  const HGDIOBJ previous_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+  const HFONT font = reinterpret_cast<HFONT>(SendMessageW(view.editor, WM_GETFONT, 0, 0));
+  const HGDIOBJ previous_font = font ? SelectObject(dc, font) : nullptr;
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  const int line_height = std::max(1, static_cast<int>(metrics.tmHeight));
   for (const auto& table : view.parse.tables) {
     const std::size_t draw_begin = std::max(table.begin, visible_begin);
     const std::size_t draw_end = std::min(table.end, visible_end);
     if (draw_begin >= draw_end) continue;
-    for (const auto& row : ParseTableVisualRows(view.document.text(), draw_begin, draw_end)) {
-      for (const auto& cell : row.cells) {
-        POINT begin{};
-        POINT end{};
-        const LONG view_begin = static_cast<LONG>(view.editor_snapshot.SourceToView(cell.begin));
-        const LONG view_end = static_cast<LONG>(view.editor_snapshot.SourceToView(cell.end));
-        SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&begin), view_begin);
-        SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&end), view_end);
-        if (begin.y >= client.bottom || begin.y + 22 < client.top) continue;
-        const int left = std::max(client.left, begin.x - 4);
-        const int right = std::min(client.right, std::max(begin.x + 12, end.x + 4));
-        Rectangle(dc, left, begin.y - 2, right, begin.y + 22);
+    const auto rows = ParseTableVisualRows(view.document.text(), draw_begin, draw_end);
+    for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
+      const auto& row = rows[row_index];
+      if (row.cells.empty()) continue;
+      std::vector<POINT> starts(row.cells.size());
+      std::vector<POINT> ends(row.cells.size());
+      for (std::size_t cell_index = 0; cell_index < row.cells.size(); ++cell_index) {
+        const auto& cell = row.cells[cell_index];
+        const LONG native_begin = static_cast<LONG>(view.editor_snapshot.SourceToNative(cell.begin));
+        const LONG native_end = static_cast<LONG>(view.editor_snapshot.SourceToNative(cell.end));
+        SendMessageW(view.editor, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&starts[cell_index]), native_begin);
+        SendMessageW(view.editor, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&ends[cell_index]), native_end);
       }
+      const int top = static_cast<int>(starts.front().y) - 3;
+      int bottom = top + line_height + 6;
+      if (row_index + 1 < rows.size()) {
+        POINT next_start{};
+        const auto next_source = rows[row_index + 1].begin;
+        SendMessageW(view.editor, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&next_start),
+                     static_cast<LONG>(view.editor_snapshot.SourceToNative(next_source)));
+        bottom = static_cast<int>(next_start.y) - 3;
+      }
+      if (bottom <= top) bottom = top + line_height + 1;
+      if (bottom < client.top || top >= client.bottom) continue;
+      const int left = std::max(static_cast<int>(client.left), static_cast<int>(starts.front().x) - 5);
+      const int right = std::min(static_cast<int>(client.right),
+                                 std::max(left + 8, static_cast<int>(ends.back().x) + 5));
+      MoveToEx(dc, left, top, nullptr);
+      LineTo(dc, right, top);
+      MoveToEx(dc, left, bottom, nullptr);
+      LineTo(dc, right, bottom);
+      MoveToEx(dc, left, top, nullptr);
+      LineTo(dc, left, bottom);
+      for (std::size_t cell_index = 0; cell_index + 1 < ends.size(); ++cell_index) {
+        const int boundary = std::clamp(static_cast<int>(ends[cell_index].x) + 4,
+                                        left + 1, right - 1);
+        MoveToEx(dc, boundary, top, nullptr);
+        LineTo(dc, boundary, bottom);
+      }
+      MoveToEx(dc, right, top, nullptr);
+      LineTo(dc, right, bottom);
     }
   }
-  SelectObject(dc, previous_brush);
+  if (previous_font) SelectObject(dc, previous_font);
   SelectObject(dc, previous_pen);
   DeleteObject(pen);
   ReleaseDC(view.editor, dc);
@@ -2800,13 +3070,13 @@ void Application::RebuildOutline(const DocumentView& view) {
 }
 
 std::wstring Application::EditorText(HWND editor, const EditorSnapshot& snapshot) const {
-  GETTEXTLENGTHEX length_request{GTL_NUMCHARS | GTL_PRECISE | GTL_USECRLF, 1200};
+  GETTEXTLENGTHEX length_request{GTL_NUMCHARS | GTL_PRECISE, 1200};
   const auto length = static_cast<std::size_t>(std::max<LRESULT>(
       0, SendMessageW(editor, EM_GETTEXTLENGTHEX,
                       reinterpret_cast<WPARAM>(&length_request), 0)));
   std::wstring text(length + 1, L'\0');
   GETTEXTEX text_request{static_cast<DWORD>(text.size() * sizeof(wchar_t)),
-                         GT_RAWTEXT | GT_USECRLF, 1200, nullptr, nullptr};
+                         GT_RAWTEXT, 1200, nullptr, nullptr};
   const auto copied = static_cast<std::size_t>(std::max<LRESULT>(
       0, SendMessageW(editor, EM_GETTEXTEX,
                       reinterpret_cast<WPARAM>(&text_request),
@@ -2943,14 +3213,14 @@ void Application::FindNext(bool restart_from_beginning) {
   }
   const std::size_t source_start = restart_from_beginning
       ? 0
-      : view.editor_snapshot.ViewToSource(static_cast<std::size_t>(selection.cpMax));
+      : view.editor_snapshot.NativeToSource(static_cast<std::size_t>(selection.cpMax));
   auto match = std::ranges::find_if(matches, [source_start](const auto& item) {
     return item.begin >= source_start;
   });
   if (match == matches.end()) match = matches.begin();
   const CHARRANGE target{
-      static_cast<LONG>(view.editor_snapshot.SourceToView(match->begin)),
-      static_cast<LONG>(view.editor_snapshot.SourceToView(match->end))};
+        static_cast<LONG>(view.editor_snapshot.SourceToNative(match->begin)),
+        static_cast<LONG>(view.editor_snapshot.SourceToNative(match->end))};
   SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&target));
   SendMessageW(editor, EM_SCROLLCARET, 0, 0);
   SetFocus(editor);
@@ -2989,8 +3259,8 @@ void Application::ReplaceCurrentDocument(bool all) {
 
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const std::size_t source_begin = view.editor_snapshot.ViewToSource(selection.cpMin);
-  const std::size_t source_end = view.editor_snapshot.ViewToSource(selection.cpMax);
+  const std::size_t source_begin = view.editor_snapshot.NativeToSource(selection.cpMin);
+  const std::size_t source_end = view.editor_snapshot.NativeToSource(selection.cpMax);
   const std::size_t start = source_begin == source_end ? source_end : source_begin;
   bool replaced{};
   if (!ReplaceDocumentMatch(view.document.text(), query, replacement, start, output,
@@ -3010,8 +3280,8 @@ void Application::ReplaceCurrentDocument(bool all) {
   }
   ApplySourceTextWithUndo(view, std::move(output));
   const CHARRANGE target{
-      static_cast<LONG>(view.editor_snapshot.SourceToView(replaced_begin)),
-      static_cast<LONG>(view.editor_snapshot.SourceToView(replaced_end))};
+        static_cast<LONG>(view.editor_snapshot.SourceToNative(replaced_begin)),
+        static_cast<LONG>(view.editor_snapshot.SourceToNative(replaced_end))};
   SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&target));
   SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
   SetFocus(view.editor);
@@ -3157,8 +3427,8 @@ void Application::OpenWorkspaceSearchResult(std::size_t index) {
   auto& view = *documents_[active_document_];
   SyncDocumentFromEditor(view);
   const CHARRANGE selection{
-      static_cast<LONG>(view.editor_snapshot.SourceToView(match.begin)),
-      static_cast<LONG>(view.editor_snapshot.SourceToView(match.end))};
+      static_cast<LONG>(view.editor_snapshot.SourceToNative(match.begin)),
+      static_cast<LONG>(view.editor_snapshot.SourceToNative(match.end))};
   SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
   SetFocus(view.editor);
@@ -3288,11 +3558,173 @@ void Application::UpdateCalendarTooltip(POINT point) {
   calendar_tooltip_text_ += L"\n" + std::wstring(JapaneseHolidayDataVersion()) + L" / " +
                             std::to_wstring(JapaneseHolidayFirstYear()) + L"–" +
                             std::to_wstring(JapaneseHolidayLastYear());
+  if (!holiday_update_status_.empty()) calendar_tooltip_text_ += L"\n" + holiday_update_status_;
   TTTOOLINFOW tool{sizeof(tool)};
   tool.hwnd = calendar_;
   tool.uId = 1;
   tool.lpszText = calendar_tooltip_text_.data();
   SendMessageW(calendar_tooltip_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+}
+
+void Application::ImportHolidayData() {
+  std::wstring path;
+  if (!PromptText(window_, instance_, L"祝日CSVのローカル取込み",
+                 L"内閣府の公開CSVをダウンロード済みの場合は、そのローカルpathを指定してください。\n"
+                 L"自動更新は既定でOFFで、ここでは通信しません。", path) || path.empty()) return;
+  JapaneseHolidayImportInfo info;
+  std::wstring error;
+  if (!ImportJapaneseHolidayCsvFile(path, info, error)) {
+    MessageBoxW(window_, error.c_str(), L"祝日データを取込めません", MB_ICONWARNING);
+    return;
+  }
+  bool cache_saved = true;
+  if (workspace_store_) {
+    const auto cache = workspace_store_->metadata_root() / L".cache" / L"holidays" / kHolidayCacheName;
+    std::error_code copy_error;
+    std::filesystem::create_directories(cache.parent_path(), copy_error);
+    auto temporary = cache; temporary += L".new";
+    if (!copy_error && CopyFileW(path.c_str(), temporary.c_str(), FALSE) &&
+        MoveFileExW(temporary.c_str(), cache.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      holiday_cache_loaded_ = true;
+    } else {
+      DeleteFileW(temporary.c_str());
+      cache_saved = false;
+    }
+  }
+  holiday_update_status_ = cache_saved
+      ? L"ローカルCSVを取込み済み（外部通信なし）"
+      : L"ローカルCSVはメモリへ取込みましたがcache保存に失敗しました。";
+  if (calendar_) InvalidateRect(calendar_, nullptr, TRUE);
+  const std::wstring message = L"祝日データを取込みました。\n件数: " +
+      std::to_wstring(info.records) + L"\n対象年: " + std::to_wstring(info.first_year) + L"–" +
+      std::to_wstring(info.last_year) + L"\n\n通常起動・月移動では外部通信しません。";
+  MessageBoxW(window_, message.c_str(), L"祝日データ", MB_ICONINFORMATION);
+}
+
+void Application::LoadHolidayCache() {
+  if (holiday_cache_loaded_ || !workspace_store_) return;
+  holiday_cache_loaded_ = true;
+  const auto cache = workspace_store_->metadata_root() / L".cache" / L"holidays" / kHolidayCacheName;
+  if (!std::filesystem::exists(cache)) return;
+  JapaneseHolidayImportInfo info;
+  std::wstring error;
+  if (ImportJapaneseHolidayCsvFile(cache, info, error)) {
+    holiday_update_status_ = L"cacheの祝日データを使用中（" + std::to_wstring(info.first_year) + L"–" +
+                             std::to_wstring(info.last_year) + L"）";
+  } else {
+    holiday_update_status_ = L"祝日cacheを検証できません。内蔵データを使用中。";
+  }
+}
+
+void Application::ScheduleHolidayUpdate() {
+  if (!workspace_store_ || !settings_.holiday_auto_update || TestAutomationSilent()) {
+    if (holiday_update_running_) {
+      ++holiday_update_generation_;
+      holiday_update_running_ = false;
+      if (holiday_update_worker_.joinable()) holiday_update_worker_.request_stop();
+    }
+    return;
+  }
+  HolidayUpdateState state;
+  const auto state_path = workspace_store_->metadata_root() / L".cache" / L"holidays" / kHolidayStateName;
+  if (!ReadHolidayState(state_path, state)) {
+    holiday_update_status_ = L"祝日更新状態を読めません。自動確認は保留します。";
+    return;
+  }
+  if (!HolidayUpdateDue(state, HolidayNowUnix())) return;
+  StartHolidayUpdate(false);
+}
+
+void Application::StartHolidayUpdate(bool manual) {
+  if (!workspace_store_) {
+    holiday_update_status_ = L"Workspaceを開いてから祝日更新を実行してください。";
+    return;
+  }
+  if (holiday_update_running_) {
+    holiday_update_status_ = L"祝日更新は既に実行中です。";
+    return;
+  }
+  if (!manual && (!settings_.holiday_auto_update || TestAutomationSilent())) return;
+  const auto holiday_root = workspace_store_->metadata_root() / L".cache" / L"holidays";
+  const auto cache_path = holiday_root / kHolidayCacheName;
+  const auto state_path = holiday_root / kHolidayStateName;
+  HolidayUpdateState state;
+  if (!ReadHolidayState(state_path, state)) state = {};
+  if (!manual && !HolidayUpdateDue(state, HolidayNowUnix())) return;
+  state.last_attempt_unix = HolidayNowUnix();
+  state.error.clear();
+  std::wstring state_error;
+  if (!WriteHolidayState(state_path, state, state_error)) {
+    holiday_update_status_ = state_error;
+    return;
+  }
+  if (holiday_update_worker_.joinable()) holiday_update_worker_.join();
+  holiday_update_running_ = true;
+  const auto generation = ++holiday_update_generation_;
+  const auto etag = state.etag;
+  const auto last_modified = state.last_modified;
+  const HWND owner = window_;
+  holiday_update_status_ = manual ? L"内閣府CSVを確認中…" : L"祝日更新を月次確認中…";
+  holiday_update_worker_ = std::jthread(
+      [owner, generation, cache_path, state_path, etag, last_modified](std::stop_token stop) {
+        JapaneseHolidayOnlineResult result;
+        FetchJapaneseHolidayCsv(stop, etag, last_modified, result);
+        auto* payload = new HolidayUpdateMessage{generation, cache_path, state_path, std::move(result)};
+        if (!PostMessageW(owner, kHolidayUpdateMessage, 0, reinterpret_cast<LPARAM>(payload))) delete payload;
+      });
+}
+
+void Application::CompleteHolidayUpdate(void* raw_payload) {
+  std::unique_ptr<HolidayUpdateMessage> payload(static_cast<HolidayUpdateMessage*>(raw_payload));
+  if (!payload || payload->generation != holiday_update_generation_) return;
+  holiday_update_running_ = false;
+  if (holiday_update_worker_.joinable()) holiday_update_worker_.join();
+  HolidayUpdateState state;
+  if (!ReadHolidayState(payload->state_path, state)) state = {};
+  state.last_attempt_unix = std::max(state.last_attempt_unix, HolidayNowUnix());
+  std::wstring error;
+  bool accepted = false;
+  JapaneseHolidayImportInfo info;
+  if (payload->result.not_modified) {
+    if (std::filesystem::exists(payload->cache_path) &&
+        ImportJapaneseHolidayCsvFile(payload->cache_path, info, error)) {
+      accepted = true;
+    } else {
+      error = L"304応答でしたが、検証済みの祝日cacheがありません。";
+    }
+  } else if (payload->result.status == 200 && !payload->result.csv.empty() &&
+             ValidateJapaneseHolidayCsv(payload->result.csv, info, error)) {
+    if (info.records < 10) {
+      error = L"内閣府CSVの件数が想定より少ないためcacheを置換しません。";
+    } else if (state.records > 0 && info.records * 2 < state.records) {
+      error = L"内閣府CSVの件数が既存cacheから大幅に減少したため置換しません。";
+    } else if (WriteHolidayCache(payload->cache_path, payload->result.csv, error) &&
+               ImportJapaneseHolidayCsv(payload->result.csv, info, error)) {
+      accepted = true;
+    }
+  } else if (error.empty()) {
+    error = payload->result.error.empty() ? L"内閣府CSVの取得に失敗しました。" : payload->result.error;
+  }
+  if (accepted) {
+    state.last_successful_check_unix = HolidayNowUnix();
+    state.records = info.records;
+    state.first_year = info.first_year;
+    state.last_year = info.last_year;
+    if (!payload->result.etag.empty()) state.etag = payload->result.etag;
+    if (!payload->result.last_modified.empty()) state.last_modified = payload->result.last_modified;
+    state.error.clear();
+    holiday_update_status_ = payload->result.not_modified
+        ? L"祝日cacheを再確認しました（変更なし）"
+        : L"内閣府の祝日データを更新しました";
+    if (calendar_) InvalidateRect(calendar_, nullptr, TRUE);
+  } else {
+    state.error = error;
+    holiday_update_status_ = L"祝日自動更新は失敗しました。既知データを継続利用します。";
+  }
+  std::wstring state_error;
+  if (!WriteHolidayState(payload->state_path, state, state_error) && !state_error.empty())
+    holiday_update_status_ += L"（状態保存失敗）";
+  if (status_) SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(holiday_update_status_.c_str()));
 }
 
 void Application::CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date) {
@@ -3368,7 +3800,7 @@ void Application::ApplyTableAction(TableAction action) {
   CHARRANGE selection{};
   SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   const std::wstring source = view.document.text();
-  const auto source_caret = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const auto source_caret = view.editor_snapshot.NativeToSource(selection.cpMin);
   TableEditResult edit;
   switch (action) {
     case TableAction::InsertRowBefore: edit = InsertTableRow(source, source_caret, false); break;
@@ -3384,7 +3816,7 @@ void Application::ApplyTableAction(TableAction action) {
     return;
   }
   ApplySourceTextWithUndo(view, edit.text);
-  const auto view_caret = view.editor_snapshot.SourceToView(edit.selection);
+  const auto view_caret = view.editor_snapshot.SourceToNative(edit.selection);
   SendMessageW(editor, EM_SETSEL, view_caret, view_caret);
 }
 
@@ -3399,7 +3831,7 @@ void Application::MoveOutlineSection(std::size_t source_begin, std::size_t targe
   if (!edit.changed) return;
 
   ApplySourceTextWithUndo(view, edit.text);
-  const auto view_caret = view.editor_snapshot.SourceToView(edit.selection);
+  const auto view_caret = view.editor_snapshot.SourceToNative(edit.selection);
   SendMessageW(view.editor, EM_SETSEL, view_caret, view_caret);
 }
 
@@ -3433,8 +3865,8 @@ void Application::SaveSession() {
     SendMessageW(view->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
     SessionDocument item;
     item.path = view->document.path();
-    item.selection_begin = view->editor_snapshot.ViewToSource(selection.cpMin);
-    item.selection_end = view->editor_snapshot.ViewToSource(selection.cpMax);
+    item.selection_begin = view->editor_snapshot.NativeToSource(selection.cpMin);
+    item.selection_end = view->editor_snapshot.NativeToSource(selection.cpMax);
     item.first_visible_line = static_cast<int>(SendMessageW(view->editor, EM_GETFIRSTVISIBLELINE, 0, 0));
     item.compact = view->compact_window != nullptr;
     if (item.compact) {
@@ -3852,7 +4284,10 @@ void Application::RunGitAction(int command) {
     case kGitUnstageAll: arguments.insert(arguments.end(), {L"restore", L"--staged", L"--", L"."}); action = L"Workspace内のステージ解除"; break;
     case kGitCommit:
       if (!PromptText(window_, instance_, L"Git commit", L"コミットメッセージ", value) || value.empty()) return;
-      arguments.insert(arguments.end(), {L"commit", L"-m", value, L"--", L"."}); action = L"Workspace内をコミット"; break;
+      // `git commit` without a pathspec consumes only the current index.  A
+      // pathspec such as `-- .` would also commit later unstaged changes and
+      // violates MDLite's explicit stage-then-commit boundary.
+      arguments.insert(arguments.end(), {L"commit", L"-m", value}); action = L"ステージ済み変更をコミット"; break;
     case kGitBranchCreate:
       if (!PromptText(window_, instance_, L"Git branch", L"作成するブランチ名", value) || value.empty()) return;
       arguments.insert(arguments.end(), {L"switch", L"-c", value}); action = L"ブランチ作成・切替"; save_first = true; break;
@@ -3981,7 +4416,7 @@ void Application::NavigateGitConflict(bool previous) {
   SyncDocumentFromEditor(view);
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const auto source_position = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const auto source_position = view.editor_snapshot.NativeToSource(selection.cpMin);
   const auto block_index = FindConflictBlock(view.document.text(), source_position, previous);
   const auto blocks = ParseConflictBlocks(view.document.text());
   if (!block_index || *block_index >= blocks.size()) {
@@ -3989,7 +4424,7 @@ void Application::NavigateGitConflict(bool previous) {
                 L"Git競合", MB_ICONWARNING);
     return;
   }
-  const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToView(blocks[*block_index].begin));
+  const LONG position = static_cast<LONG>(view.editor_snapshot.SourceToNative(blocks[*block_index].begin));
   SendMessageW(view.editor, EM_SETSEL, position, position);
   SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
   SetFocus(view.editor);
@@ -4009,7 +4444,7 @@ void Application::ResolveGitConflict(ConflictChoice choice) {
   SyncDocumentFromEditor(view);
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const auto source_position = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const auto source_position = view.editor_snapshot.NativeToSource(selection.cpMin);
   const auto block_index = FindConflictBlock(view.document.text(), source_position, false);
   if (!block_index) {
     MessageBoxW(window_, L"解決できるtext競合markerがありません。", L"Git競合", MB_ICONWARNING);
@@ -4018,7 +4453,7 @@ void Application::ResolveGitConflict(ConflictChoice choice) {
   const auto edit = ResolveConflictBlock(view.document.text(), *block_index, choice);
   if (!edit.changed) return;
   ApplySourceTextWithUndo(view, edit.text);
-  const auto conflict_caret = view.editor_snapshot.SourceToView(edit.selection);
+  const auto conflict_caret = view.editor_snapshot.SourceToNative(edit.selection);
   SendMessageW(view.editor, EM_SETSEL, static_cast<WPARAM>(conflict_caret),
                static_cast<LPARAM>(conflict_caret));
   const auto remaining = ParseConflictBlocks(view.document.text()).size();
@@ -4087,6 +4522,8 @@ void Application::LoadAndApplySettings() {
   }
   ApplySettings();
   RebuildAccelerators();
+  LoadHolidayCache();
+  ScheduleHolidayUpdate();
   const ULONGLONG now = GetTickCount64();
   for (auto& view : documents_) {
     if (view->document.dirty())
@@ -4118,6 +4555,9 @@ void Application::ApplySettings() {
                          find_word_, find_include_glob_, find_exclude_glob_, replace_one_,
                          replace_document_, find_results_, calendar_})
       if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), TRUE);
+    for (const auto& view : documents_)
+      if (view->editor) SendMessageW(view->editor, WM_SETFONT,
+                                     reinterpret_cast<WPARAM>(replacement), TRUE);
   }
   TreeView_SetBkColor(workspace_tree_, background);
   TreeView_SetTextColor(workspace_tree_, foreground);
@@ -4186,6 +4626,8 @@ void Application::OpenWorkspaceSettings() {
       L"theme: " + ThemeName(settings_.theme) + L" (" + settings_.origins[L"theme"] + L")\n" +
       L"font: " + settings_.font_face + L" " + std::to_wstring(settings_.font_size_pt) + L"pt (" +
       settings_.origins[L"font_face"] + L" / " + settings_.origins[L"font_size_pt"] + L")\n" +
+      L"祝日更新: " + std::wstring(settings_.holiday_auto_update ? L"月1回確認を許可" : L"OFF（同梱/取込みのみ）") +
+      L" (commonのみ / " + settings_.origins[L"holiday_auto_update"] + L")\n" +
       L"default memo Workspace: " +
       (settings_.default_memo_workspace.empty() ? std::wstring(L"未設定") : settings_.default_memo_workspace.wstring()) +
       L" (" + settings_.origins[L"default_memo_workspace"] + L")\n\n" +
@@ -4267,6 +4709,18 @@ void Application::OpenWorkspaceSettings() {
   else {
     try { layer.font_size_pt = static_cast<unsigned>(std::stoul(size)); }
     catch (const std::exception&) { MessageBoxW(window_, L"font sizeが数値ではありません。", L"設定", MB_ICONWARNING); return; }
+  }
+  if (scope == L"common") {
+    std::wstring holiday_update = layer.holiday_auto_update
+        ? (*layer.holiday_auto_update ? L"on" : L"off") : L"inherit";
+    if (!PromptText(window_, instance_, L"祝日更新",
+                    L"内閣府の公開CSVを月1回確認する許可。on / off / inherit\n"
+                    L"既定値はoff。Workspace設定では変更できません。", holiday_update)) return;
+    std::ranges::transform(holiday_update, holiday_update.begin(), towlower);
+    if (holiday_update == L"inherit") layer.holiday_auto_update.reset();
+    else if (holiday_update == L"on") layer.holiday_auto_update = true;
+    else if (holiday_update == L"off") layer.holiday_auto_update = false;
+    else { MessageBoxW(window_, L"祝日更新の値が不正です。", L"設定", MB_ICONWARNING); return; }
   }
   if (scope == L"common") {
     std::wstring memo_workspace = layer.default_memo_workspace
@@ -4507,6 +4961,8 @@ void Application::ShowCommandPalette() {
       Entry{L"編集: 検索", kEditFind, has_document, L"文書が開かれていません"},
       Entry{L"編集: Workspace検索", kEditFindWorkspace, has_workspace, L"Workspaceが未選択です"},
       Entry{L"表示: コンパクト表示", kViewCompact, has_document, L"文書が開かれていません"},
+      Entry{L"カレンダー: 祝日CSVをローカル取込み", kCalendarImportHolidays, true, L""},
+      Entry{L"カレンダー: 祝日を内閣府から今すぐ確認", kCalendarUpdateHolidays, true, L""},
       Entry{L"表示: Workspace設定", kViewSettings, has_workspace, L"Workspaceが未選択です"},
       Entry{L"Git: Status / Branches", kGitStatus, trusted, L"Workspaceの信頼が必要です"},
       Entry{L"Git: ブランチ切替", kGitBranchSwitch, trusted, L"Workspaceの信頼が必要です"},
@@ -4654,7 +5110,7 @@ void Application::ResizeImageAtCaret(unsigned width_dip) {
   SyncDocumentFromEditor(view);
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const auto source_position = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const auto source_position = view.editor_snapshot.NativeToSource(selection.cpMin);
   const auto parsed = ParseMarkdown(view.document.text());
   const auto image = std::ranges::find_if(parsed.images, [&](const auto& item) {
     return source_position >= item.begin && source_position <= item.end;
@@ -4665,8 +5121,8 @@ void Application::ResizeImageAtCaret(unsigned width_dip) {
     return;
   }
   const auto replacement = ImageHtml(image->alternate_text, image->target, width_dip);
-  const auto begin = static_cast<LONG>(view.editor_snapshot.SourceToView(image->begin));
-  const auto end = static_cast<LONG>(view.editor_snapshot.SourceToView(image->end));
+  const auto begin = static_cast<LONG>(view.editor_snapshot.SourceToNative(image->begin));
+  const auto end = static_cast<LONG>(view.editor_snapshot.SourceToNative(image->end));
   SendMessageW(view.editor, EM_SETSEL, begin, end);
   SendMessageW(view.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
 }
@@ -4683,7 +5139,7 @@ void Application::UploadImageAtCaret() {
   SyncDocumentFromEditor(view);
   CHARRANGE selection{};
   SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  const std::size_t source_position = view.editor_snapshot.ViewToSource(selection.cpMin);
+  const std::size_t source_position = view.editor_snapshot.NativeToSource(selection.cpMin);
   const auto parsed = ParseMarkdown(view.document.text());
   auto image = std::ranges::find_if(parsed.images, [&](const auto& item) {
     return source_position >= item.begin && source_position <= item.end;
@@ -4765,7 +5221,7 @@ void Application::OpenLinkAtSourcePosition(DocumentView& view, std::size_t sourc
     MessageBoxW(window_, (L"見出しanchorが見つかりません: #" + fragment).c_str(), L"リンク", MB_ICONINFORMATION);
     return;
   }
-  const LONG position = static_cast<LONG>(destination_view.editor_snapshot.SourceToView(heading->begin));
+  const LONG position = static_cast<LONG>(destination_view.editor_snapshot.SourceToNative(heading->begin));
   SendMessageW(destination_view.editor, EM_SETSEL, position, position);
   SendMessageW(destination_view.editor, EM_SCROLLCARET, 0, 0);
   SetFocus(destination_view.editor);

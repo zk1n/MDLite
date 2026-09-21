@@ -66,9 +66,7 @@
 `837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8`、`856a419e2890053a91c673e732e9113a4e39f103`、
 `40d88b73d556f994c9705f415685c0e0470b8477`、`da86373fbd780252345ee8583cf64bd4c8742e57`、`7abd422641888e402463ee01581a1d875674c3c6`、`8ee82cc16b3a0fcf7b40b97effac939fe032d76a`、`41303da2cc398f2f94efdfac595ac5f5ad5271ae` を origin (Forgejo) と github (GitHub) の
 `fix/visual-rebuild-localfirst` へ非force通常pushし、各push時の対象OIDが両remoteで同一であることを
-`ls-remote` read-backで確認した。responsive実装commit `41303da2cc398f2f94efdfac595ac5f5ad5271ae` の配送を両remoteで確認し、この参照更新を含むdocs commitもfeature branchへ配送する。main/tag/developは変更していない。
-であることを確認した。Human gate未実施のためdevelop統合は保留している。
-今回の設定/profile native form実装とGUI証拠更新は checkpoint `7d9f5e874e7096f41e50c9618faa23e1c20c6d47` に記録した。
+`ls-remote` read-backで確認した。設定/profile native form実装は checkpoint `7d9f5e874e7096f41e50c9618faa23e1c20c6d47`、fresh final12証拠・Review更新は docs commit `b98aa521cac2e998bec7ca562d4f623136634ee7`、fresh final13 table probe境界は docs commit `233d587485a56a3801ee967ad7d8cebd9f4f6c0c` に記録した。現在のfeature tip `233d587485a56a3801ee967ad7d8cebd9f4f6c0c` はlocal/両remoteで一致する。main/tag/developは変更していない。Human gate未実施のためdevelop統合は保留している。
 
 ## 残りの受入
 

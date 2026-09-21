@@ -203,11 +203,18 @@ function Wait-ListItemCount([IntPtr]$List, [int]$Minimum, [int]$TimeoutMs = 1000
     return $count
 }
 
+function Get-FileFingerprint([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'missing' }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ("mdlite-gui-acceptance-" + [guid]::NewGuid().ToString('N'))
 $workspace = Join-Path $runRoot 'workspace'
 [IO.Directory]::CreateDirectory($workspace) | Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $workspace '.mdlite')) | Out-Null
-[IO.File]::WriteAllText((Join-Path $workspace '.mdlite\settings.toml'),
+$settingsFile = Join-Path $workspace '.mdlite\settings.toml'
+$profilesFile = Join-Path $workspace '.mdlite\profiles.toml'
+[IO.File]::WriteAllText($settingsFile,
     "schema_version = 1`nauto_save = false`n", [Text.UTF8Encoding]::new($false))
 $first = Join-Path $workspace 'first.md'
 $second = Join-Path $workspace 'second.md'
@@ -284,12 +291,14 @@ try {
     # form-level Cancel and Apply paths. Profile Apply reaches the existing
     # silent-test confirmation boundary and is intentionally declined there;
     # this proves the form Apply/validation path without mutating the fixture.
+    $settingsBeforeCancel = Get-FileFingerprint $settingsFile
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1027, [IntPtr]::Zero)
     $settingsCancelForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
     $checks.settings_native_form = $settingsCancelForm -ne [IntPtr]::Zero
     $checks.settings_native_cancel = $settingsCancelForm -ne [IntPtr]::Zero
     [void][MDLiteNative]::SendMessage($settingsCancelForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+    $checks.settings_native_cancel_preserves = (Get-FileFingerprint $settingsFile) -eq $settingsBeforeCancel
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1027, [IntPtr]::Zero)
     $settingsApplyForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
@@ -297,18 +306,22 @@ try {
     [void][MDLiteNative]::SendMessage($settingsApplyForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
 
+    $profilesBeforeCancel = Get-FileFingerprint $profilesFile
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1029, [IntPtr]::Zero)
     $profilesCancelForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
     $checks.profiles_native_form = $profilesCancelForm -ne [IntPtr]::Zero
     $checks.profiles_native_cancel = $profilesCancelForm -ne [IntPtr]::Zero
     [void][MDLiteNative]::SendMessage($profilesCancelForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+    $checks.profiles_native_cancel_preserves = (Get-FileFingerprint $profilesFile) -eq $profilesBeforeCancel
 
+    $profilesBeforeApply = Get-FileFingerprint $profilesFile
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1029, [IntPtr]::Zero)
     $profilesApplyForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
     $checks.profiles_native_apply = $profilesApplyForm -ne [IntPtr]::Zero
     [void][MDLiteNative]::SendMessage($profilesApplyForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+    $checks.profiles_native_apply_declined_preserves = (Get-FileFingerprint $profilesFile) -eq $profilesBeforeApply
 
     [void][MDLiteNative]::SendMessage($findEdit, $WM_SETTEXT, [IntPtr]::Zero, 'PendingHit')
     $replaceEdit = Wait-Control $main 107 'Edit'

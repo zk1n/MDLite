@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,6 +94,22 @@ class Application {
     bool ime_composing{};
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;
+    bool painting_table_grid{};
+  };
+
+  struct TableGridRow {
+    std::size_t begin{};
+    std::size_t end{};
+    std::vector<TableVisualCell> cells;
+    int top{};
+    int bottom{};
+  };
+
+  struct TableGridGeometry {
+    int left{};
+    int right{};
+    std::vector<int> boundaries;
+    std::vector<TableGridRow> rows;
   };
 
   enum class SaveAllResult { AllSaved, RecoveryOnly, Discarded, Cancelled };
@@ -137,13 +154,18 @@ class Application {
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
-  void DrawTableGrid(const DocumentView& view);
+  void InvalidateTableGrid(DocumentView& view);
+  std::vector<TableGridGeometry> BuildTableGridGeometry(const DocumentView& view,
+                                                        const RECT& client,
+                                                        HDC metrics_dc = nullptr) const;
+  std::optional<std::size_t> HitTestTableCell(const DocumentView& view, POINT point) const;
+  void DrawTableGrid(const DocumentView& view, HDC paint_dc, const RECT& clip);
   void RefreshDerivedImages(DocumentView& view);
   void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);
   static bool ReadImageFileIdentity(const std::filesystem::path& path,
                                     DocumentView::ImageFileIdentity& identity);
   void RebuildOutline(const DocumentView& view);
-  std::wstring EditorText(HWND editor, const EditorSnapshot& snapshot) const;
+  bool EditorText(HWND editor, const EditorSnapshot& snapshot, std::wstring& text) const;
   void UpdateStatus();
   void ShowFindBar();
   SearchQuery SearchQueryFromFindBar() const;
@@ -193,6 +215,11 @@ class Application {
   bool PasteClipboardImage();
   void ResizeImageAtCaret(unsigned width_dip);
   void OpenLinkAtSourcePosition(DocumentView& view, std::size_t source_position, bool activate);
+  void ImportHolidayData();
+  void StartHolidayUpdate(bool manual);
+  void LoadHolidayCache();
+  void CompleteHolidayUpdate(void* payload);
+  void ScheduleHolidayUpdate();
   void UpdateCalendarTooltip(POINT point);
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
@@ -228,14 +255,20 @@ class Application {
   std::vector<SearchMatch> workspace_search_results_;
   std::size_t workspace_search_issue_count_{};
   std::jthread workspace_search_worker_;
+  std::jthread holiday_update_worker_;
   std::uint64_t workspace_search_generation_{};
+  std::uint64_t holiday_update_generation_{};
   ULONGLONG workspace_search_due_{};
   bool workspace_search_started_{};
+  bool holiday_cache_loaded_{};
+  bool holiday_update_running_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
   bool external_operation_active_{};
   bool outline_dragging_{};
   bool workspace_dragging_{};
+  bool workspace_pane_collapsed_{};
+  bool outline_pane_collapsed_{};
   std::size_t outline_drag_source_{};
   std::vector<std::filesystem::path> workspace_drag_sources_;
   std::shared_ptr<WorkspaceStore> workspace_store_;
@@ -243,10 +276,21 @@ class Application {
   HACCEL accelerator_table_{};
   HFONT editor_font_{};
   HBRUSH background_brush_{};
+  HBRUSH surface_brush_{};
+  HBRUSH input_brush_{};
+  HBRUSH editor_brush_{};
   COLORREF theme_background_{RGB(255, 255, 255)};
   COLORREF theme_foreground_{RGB(24, 24, 24)};
+  COLORREF theme_surface_{RGB(255, 255, 255)};
+  COLORREF theme_surface_alt_{RGB(243, 246, 250)};
+  COLORREF theme_editor_{RGB(252, 253, 255)};
+  COLORREF theme_input_{RGB(255, 255, 255)};
+  COLORREF theme_border_{RGB(210, 218, 228)};
+  COLORREF theme_muted_{RGB(92, 104, 120)};
+  COLORREF theme_accent_{RGB(56, 112, 194)};
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
+  std::wstring holiday_update_status_;
 };
 
 }  // namespace mdlite

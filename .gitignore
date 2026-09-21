@@ -22,6 +22,7 @@ CMakeFiles/
 /.codex-shared/
 /.local/
 /AGENTS.override.md
+/.codex-runtime/
 
 # User data / generated state; declarative .mdlite settings remain trackable
 **/.mdlite/.cache/

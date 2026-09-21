@@ -572,6 +572,35 @@ void TestEditorAdapter() {
         "compact mapping resumes immediately after a collapsed image range");
   const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
   Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
+  const auto native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\r\nc");
+  Check(native_lines.view == L"a\rb\rc", "native editor snapshot uses one CR per paragraph");
+  Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
+            native_lines.NativeToSource(1) == 1,
+        "native line-ending mapping remains compact and boundary-safe");
+  const std::wstring unicode_native_source = L"😀\r\n| A | B |";
+  const auto unicode_native = mdlite::BuildNativeTextEditorSnapshot(unicode_native_source);
+  Check(unicode_native.SourceToNative(2) == 2 && unicode_native.SourceToNative(3) == 2 &&
+            unicode_native.SourceToNative(4) == 3 && unicode_native.NativeToSource(2) == 2 &&
+            unicode_native.NativeToSource(3) == 4,
+        "native mapping keeps UTF-16 surrogate units distinct at a CRLF boundary");
+  const auto unicode_native_edit = mdlite::ApplyEditorText(
+      unicode_native, unicode_native_source, L"😀\r\n| AX | B |");
+  Check(unicode_native_edit.source == L"😀\r\n| AX | B |",
+        "native transaction preserves a CRLF boundary after a UTF-16 edit");
+  const auto lone_native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\nc");
+  Check(lone_native_lines.native_discontinuities.empty(),
+        "same-width lone LF boundaries do not allocate native discontinuity records");
+  Check(mdlite::CanonicalizeNativeText(L"a\r\nb\nc") == L"a\rb\rc",
+        "native text canonicalization collapses CRLF and lone LF to one paragraph boundary");
+  const auto native_raw_edit = mdlite::ApplyEditorText(
+      native_lines, L"a\nb\r\nc", L"a\r\nx\nb\r\nc");
+  Check(native_raw_edit.source == L"a\nx\nb\r\nc",
+        "native transaction canonicalizes alternate newline export before source mapping");
+  const auto native_image = mdlite::BuildNativeEditorSnapshot(L"a![x](p.png)\nb");
+  Check(native_image.view == L"a\uFFFC\rb", "native Markdown snapshot collapses images and normalizes LF");
+  Check(native_image.SourceToNative(1) == 1 && native_image.NativeToSource(1) == 1 &&
+            native_image.NativeToSource(2) == std::wstring_view(L"a![x](p.png)").size(),
+        "native image mapping anchors object boundaries without a dense map");
   const std::wstring adjacent_source = L"A![x](p.png)B";
   const auto adjacent_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_source);
   const auto adjacent_edit = mdlite::ApplyEditorText(adjacent_snapshot, adjacent_source, L"a\uFFFCb");
@@ -618,6 +647,12 @@ void TestEditorAdapter() {
       mixed_snapshot, image_then_table, target_snapshot.view);
   Check(mapped_transaction.source == table_edit.text,
         "table transaction after a derived image maps back to the exact Markdown source");
+  const auto mixed_native = mdlite::BuildNativeEditorSnapshot(image_then_table);
+  const auto target_native = mdlite::BuildNativeEditorSnapshot(table_edit.text);
+  const auto native_transaction = mdlite::ApplyEditorText(
+      mixed_native, image_then_table, target_native.view);
+  Check(native_transaction.source == table_edit.text,
+        "native transaction after a derived image maps back to the exact Markdown source");
 }
 
 void TestWorkspaceState(const std::filesystem::path& root) {
@@ -1071,6 +1106,20 @@ void TestTableEditing() {
   const auto inserted = mdlite::InsertTableColumn(table, table.find(L"1"), true);
   Check(inserted.changed && inserted.text.find(L"| --- | --- | --- |") != std::wstring::npos,
         "column insertion extends the delimiter row");
+  const std::wstring literal_table =
+      L"|  A  | B\\| raw | `C|D` |\r\n| :--- | ---: | :---: |\n| left  |  middle  | right |";
+  const auto literal_insert = mdlite::InsertTableColumn(
+      literal_table, literal_table.find(L"middle"), true);
+  Check(literal_insert.changed &&
+            literal_insert.text ==
+                L"|  A  | B\\| raw |  | `C|D` |\r\n| :--- | ---: | --- | :---: |\n| left  |  middle  |  | right |" &&
+            literal_insert.text[literal_insert.selection] == L'|',
+        "column insertion preserves literal cell text, escaped pipes, and mixed line endings");
+  const auto literal_delete = mdlite::DeleteTableColumn(literal_table, literal_table.find(L"middle"));
+  Check(literal_delete.changed &&
+            literal_delete.text == L"|  A  | `C|D` |\r\n| :--- | :---: |\n| left  | right |" &&
+            literal_delete.selection == literal_delete.text.find(L"left"),
+        "column deletion changes only the selected separator range and keeps caret in the row");
   const auto deleted = mdlite::DeleteTableRow(table, table.find(L"1"));
   Check(deleted.changed && deleted.text.find(L"| 1 | 2 |") == std::wstring::npos,
         "table row deletion removes only the selected row");
@@ -1111,8 +1160,97 @@ void TestTableEditing() {
 void TestJapaneseHolidays() {
   const auto name = mdlite::JapaneseHolidayName(2026, 9, 22);
   Check(name && *name == L"休日", "Cabinet Office holiday data includes 2026-09-22");
+  Check(mdlite::JapaneseHolidayName(2026, 5, 6) &&
+            *mdlite::JapaneseHolidayName(2026, 5, 6) == L"休日" &&
+            mdlite::JapaneseHolidayName(2027, 3, 22) &&
+            *mdlite::JapaneseHolidayName(2027, 3, 22) == L"休日",
+        "bundled holiday fixtures include 2026-05-06 and 2027-03-22");
   Check(mdlite::JapaneseHolidayYearSupported(2027), "last bundled holiday year is supported");
   Check(!mdlite::JapaneseHolidayYearSupported(2028), "out-of-range holiday year remains unknown");
+  mdlite::JapaneseHolidayImportInfo info;
+  std::wstring error;
+  Check(mdlite::ImportJapaneseHolidayCsv(L"date,name\n2028/01/01,元日\n2028/02/11,建国記念の日\n",
+                                         info, error) && info.records == 2 &&
+            mdlite::JapaneseHolidayName(2028, 1, 1) &&
+            *mdlite::JapaneseHolidayName(2028, 1, 1) == L"元日",
+        "local holiday CSV import atomically accepts a validated fixture");
+  Check(mdlite::JapaneseHolidayYearSupported(2028) && mdlite::JapaneseHolidayLastYear() >= 2028,
+        "imported holiday years become known without network access");
+  error.clear();
+  Check(!mdlite::ImportJapaneseHolidayCsv(L"date,name\n2028/01/01,元日\n2028/01/01,重複\n",
+                                          info, error) && !error.empty(),
+        "holiday CSV duplicate dates are rejected without replacing data");
+  error.clear();
+  Check(!mdlite::ValidateJapaneseHolidayCsv(L"<html><body>error</body></html>", info, error) &&
+            !error.empty(),
+        "HTML error pages are rejected as holiday data");
+  error.clear();
+  Check(mdlite::ValidateJapaneseHolidayCsv(L"date,name\n2028-05-01,祝日\n", info, error) &&
+            info.first_year == 2028 && info.last_year == 2028,
+        "online holiday validation accepts strict ISO-like date fixtures");
+  Check(mdlite::JapaneseHolidayUpdateDue(0, 0, 1),
+        "fake clock treats an empty holiday update state as due");
+  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 27 * 24 * 60 * 60),
+        "fake clock suppresses a holiday update before the 28-day interval");
+  Check(mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 28 * 24 * 60 * 60),
+        "fake clock schedules a holiday update at the 28-day interval");
+  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 900),
+        "clock rollback does not turn every startup into a network retry");
+  const std::wstring online_fixture =
+      L"date,name\n2028/01/01,元日\n2028/02/11,建国記念の日\n"
+      L"2028/02/23,天皇誕生日\n2028/03/20,春分の日\n2028/04/29,昭和の日\n"
+      L"2028/05/03,憲法記念日\n2028/05/04,みどりの日\n2028/05/05,こどもの日\n"
+      L"2028/07/17,海の日\n2028/08/11,山の日\n2028/09/18,敬老の日\n";
+  const auto accepted = mdlite::AssessJapaneseHolidayResponse(
+      200, false, false, 10, online_fixture);
+  Check(accepted.accepted && accepted.replace_cache && accepted.info.records == 11,
+        "mock HTTP 200 accepts a validated holiday payload for atomic cache replacement");
+  const auto unchanged = mdlite::AssessJapaneseHolidayResponse(304, true, true, 11, {});
+  Check(unchanged.accepted && !unchanged.replace_cache,
+        "mock HTTP 304 accepts only when a verified last-known-good cache exists");
+  const auto missing_cache = mdlite::AssessJapaneseHolidayResponse(304, true, false, 11, {});
+  Check(!missing_cache.accepted && !missing_cache.error.empty(),
+        "mock HTTP 304 without a verified cache fails closed");
+  const auto not_found = mdlite::AssessJapaneseHolidayResponse(404, false, false, 11, {});
+  Check(!not_found.accepted && not_found.error.find(L"404") != std::wstring::npos,
+        "mock HTTP 404 preserves the existing holiday data");
+  const auto server_error = mdlite::AssessJapaneseHolidayResponse(500, false, false, 11, {});
+  Check(!server_error.accepted && server_error.error.find(L"500") != std::wstring::npos,
+        "mock HTTP 500 preserves the existing holiday data");
+  const auto timeout = mdlite::AssessJapaneseHolidayResponse(0, false, false, 11, {});
+  Check(!timeout.accepted && !timeout.error.empty(),
+        "mock timeout/network failure keeps the last-known-good holiday data");
+  const auto empty_body = mdlite::AssessJapaneseHolidayResponse(200, false, false, 11, {});
+  Check(!empty_body.accepted && !empty_body.replace_cache && !empty_body.error.empty(),
+        "mock HTTP empty bodies cannot replace the holiday cache");
+  const auto html = mdlite::AssessJapaneseHolidayResponse(
+      200, false, false, 11, L"<html><body>error</body></html>");
+  Check(!html.accepted && !html.replace_cache,
+        "mock HTTP HTML error pages cannot replace the holiday cache");
+  const auto shrink = mdlite::AssessJapaneseHolidayResponse(200, false, false, 30,
+                                                             online_fixture);
+  Check(!shrink.accepted && shrink.error.find(L"減少") != std::wstring::npos,
+        "mock HTTP large record reductions are rejected");
+  wchar_t real_http[2]{};
+  if (GetEnvironmentVariableW(L"MDLITE_TEST_REAL_HOLIDAY_HTTP", real_http, 2) == 1 &&
+      real_http[0] == L'1') {
+    mdlite::JapaneseHolidayOnlineResult result;
+    const bool fetched = mdlite::FetchJapaneseHolidayCsv(std::stop_token{}, {}, {}, result);
+    if (!fetched) {
+      // Keep the diagnostic ASCII-safe even when the test process has the
+      // default "C" locale and cannot render the Japanese product text.
+      std::string error_ascii;
+      for (const wchar_t character : result.error) {
+        error_ascii += character < 0x80 ? static_cast<char>(character) : '?';
+      }
+      std::cerr << "real holiday HTTP status=" << result.status
+                << " error_length=" << result.error.size()
+                << " error_ascii=" << error_ascii << "\n";
+    }
+    Check(fetched && result.status == 200 && !result.csv.empty() && result.error.empty(),
+          "opt-in real WinHTTP holiday probe receives the official CSV");
+  }
+  mdlite::ClearImportedJapaneseHolidays();
 }
 
 void TestAssets(const std::filesystem::path& root) {
@@ -1355,6 +1493,7 @@ void TestSettings(const std::filesystem::path& root) {
   Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
   Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
             effective.font_size_pt == 14 && !effective.auto_save && effective.auto_save_delay_ms == 1500 &&
+            !effective.holiday_auto_update &&
             effective.colors[L"link"] == L"#80A0FF" &&
             effective.default_memo_workspace == *common.default_memo_workspace,
         "workspace overrides common while inherited values remain");

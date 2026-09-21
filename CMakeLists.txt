@@ -70,7 +70,7 @@ add_library(mdlite_core
 target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mdlite_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite webp webpdemux
+target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite winhttp webp webpdemux
   d2d1 d3d11 dxgi)
 
 add_executable(MDLite WIN32

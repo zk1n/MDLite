@@ -21,10 +21,10 @@ std::wstring NormalizeReplacement(std::wstring_view value, bool crlf) {
   std::wstring result;
   result.reserve(value.size());
   for (std::size_t index = 0; index < value.size(); ++index) {
-    if (value[index] == L'\r' && index + 1 < value.size() && value[index + 1] == L'\n') {
+    if (value[index] == L'\r') {
       if (crlf) result.push_back(L'\r');
       result.push_back(L'\n');
-      ++index;
+      if (index + 1 < value.size() && value[index + 1] == L'\n') ++index;
     } else {
       result.push_back(value[index]);
     }
@@ -179,6 +179,7 @@ std::wstring RestoreCollapsedRanges(const EditorSnapshot& before, std::wstring_v
 }  // namespace
 
 std::size_t EditorSnapshot::SourceToView(std::size_t position) const noexcept {
+  if (native_coordinates) return SourceToNative(position);
   position = std::min(position, source_size);
   const auto collapsed_range = std::ranges::upper_bound(
       collapsed, position, {}, &CollapsedRange::source_begin);
@@ -195,6 +196,7 @@ std::size_t EditorSnapshot::SourceToView(std::size_t position) const noexcept {
 }
 
 std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
+  if (native_coordinates) return NativeToSource(position);
   const auto collapsed_range = std::ranges::lower_bound(collapsed, position, {}, &CollapsedRange::view);
   if (collapsed_range != collapsed.end() && collapsed_range->view == position)
     return collapsed_range->source_begin;
@@ -208,12 +210,126 @@ std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
   return low;
 }
 
+std::size_t EditorSnapshot::SourceToNative(std::size_t position) const noexcept {
+  position = std::min(position, source_size);
+  std::ptrdiff_t delta{};
+  for (const auto& discontinuity : native_discontinuities) {
+    if (position < discontinuity.source_begin) break;
+    if (position < discontinuity.source_end) return discontinuity.native_begin;
+    const auto source_width = discontinuity.source_end - discontinuity.source_begin;
+    const auto native_width = discontinuity.native_end - discontinuity.native_begin;
+    delta += static_cast<std::ptrdiff_t>(native_width) -
+             static_cast<std::ptrdiff_t>(source_width);
+  }
+  const auto mapped = static_cast<std::ptrdiff_t>(position) + delta;
+  return mapped <= 0 ? 0 : static_cast<std::size_t>(mapped);
+}
+
+std::size_t EditorSnapshot::NativeToSource(std::size_t position) const noexcept {
+  std::ptrdiff_t delta{};
+  for (const auto& discontinuity : native_discontinuities) {
+    if (position < discontinuity.native_begin) {
+      const auto mapped = static_cast<std::ptrdiff_t>(position) - delta;
+      return mapped <= 0 ? 0 : std::min(source_size, static_cast<std::size_t>(mapped));
+    }
+    if (position < discontinuity.native_end) return discontinuity.source_begin;
+    const auto source_width = discontinuity.source_end - discontinuity.source_begin;
+    const auto native_width = discontinuity.native_end - discontinuity.native_begin;
+    delta += static_cast<std::ptrdiff_t>(source_width) -
+             static_cast<std::ptrdiff_t>(native_width);
+  }
+  const auto mapped = static_cast<std::ptrdiff_t>(position) + delta;
+  return mapped <= 0 ? 0 : std::min(source_size, static_cast<std::size_t>(mapped));
+}
+
 bool EditorSnapshot::HasCollapsedSourceRange(std::size_t begin,
                                              std::size_t end) const noexcept {
   const auto range = std::ranges::lower_bound(collapsed, begin, {},
                                                &CollapsedRange::source_begin);
   return range != collapsed.end() && range->source_begin == begin &&
          range->source_end == end;
+}
+
+std::vector<NativeDiscontinuity> BuildNativeDiscontinuities(
+    std::wstring_view source, const std::vector<CollapsedRange>& collapsed) {
+  std::vector<NativeDiscontinuity> result;
+  result.reserve(collapsed.size() + 8);
+  std::size_t native_position{};
+  std::size_t collapsed_index{};
+  for (std::size_t source_position{}; source_position < source.size();) {
+    if (collapsed_index < collapsed.size() &&
+        source_position == collapsed[collapsed_index].source_begin) {
+      const auto& range = collapsed[collapsed_index++];
+      result.push_back({range.source_begin, range.source_end, native_position,
+                        native_position + 1});
+      ++native_position;
+      source_position = range.source_end;
+      continue;
+    }
+    if (source[source_position] == L'\r' && source_position + 1 < source.size() &&
+        source[source_position + 1] == L'\n') {
+      result.push_back({source_position, source_position + 2, native_position,
+                        native_position + 1});
+      ++native_position;
+      source_position += 2;
+      continue;
+    }
+    // A lone LF is one source UTF-16 unit and one native CR unit. It changes
+    // the character value but not the coordinate, so retaining a record here
+    // only bloats large-file maps without adding an offset discontinuity.
+    if (source[source_position] == L'\n') {
+      ++native_position;
+      ++source_position;
+      continue;
+    }
+    ++native_position;
+    ++source_position;
+  }
+  return result;
+}
+
+std::wstring BuildNativeView(std::wstring_view source,
+                             const std::vector<CollapsedRange>& collapsed) {
+  std::wstring result;
+  result.reserve(source.size());
+  std::size_t collapsed_index{};
+  for (std::size_t source_position{}; source_position < source.size();) {
+    if (collapsed_index < collapsed.size() &&
+        source_position == collapsed[collapsed_index].source_begin) {
+      result.push_back(0xFFFC);
+      source_position = collapsed[collapsed_index++].source_end;
+      continue;
+    }
+    if (source[source_position] == L'\r' && source_position + 1 < source.size() &&
+        source[source_position + 1] == L'\n') {
+      result.push_back(L'\r');
+      source_position += 2;
+    } else if (source[source_position] == L'\n') {
+      result.push_back(L'\r');
+      ++source_position;
+    } else {
+      result.push_back(source[source_position++]);
+    }
+  }
+  return result;
+}
+
+std::wstring CanonicalizeNativeText(std::wstring_view native_text) {
+  std::wstring result;
+  result.reserve(native_text.size());
+  for (std::size_t index{}; index < native_text.size(); ++index) {
+    if (native_text[index] == L'\r') {
+      result.push_back(L'\r');
+      if (index + 1 < native_text.size() && native_text[index + 1] == L'\n') ++index;
+    } else if (native_text[index] == L'\n') {
+      // RichEdit's native paragraph boundary is CR. Treat a lone LF from an
+      // alternate text/export path as the same boundary.
+      result.push_back(L'\r');
+    } else {
+      result.push_back(native_text[index]);
+    }
+  }
+  return result;
 }
 
 EditorSnapshot BuildEditorSnapshot(std::wstring_view source) {
@@ -227,6 +343,7 @@ EditorSnapshot BuildEditorSnapshot(std::wstring_view source) {
     }
     result.view.push_back(source[index]);
   }
+  result.native_discontinuities = BuildNativeDiscontinuities(source, result.collapsed);
   return result;
 }
 
@@ -261,11 +378,35 @@ EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source) {
     result.view.push_back(source[index]);
     ++index;
   }
+  result.native_discontinuities = BuildNativeDiscontinuities(source, result.collapsed);
+  return result;
+}
+
+EditorSnapshot BuildNativeEditorSnapshot(std::wstring_view source) {
+  auto result = BuildMarkdownEditorSnapshot(source);
+  result.native_coordinates = true;
+  result.view = BuildNativeView(source, result.collapsed);
+  result.inserted_crs.clear();
+  for (auto& range : result.collapsed)
+    range.view = result.SourceToNative(range.source_begin);
+  return result;
+}
+
+EditorSnapshot BuildNativeTextEditorSnapshot(std::wstring_view source) {
+  auto result = BuildEditorSnapshot(source);
+  result.native_coordinates = true;
+  result.view = BuildNativeView(source, result.collapsed);
+  result.inserted_crs.clear();
   return result;
 }
 
 SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_view source,
                                   std::wstring_view new_view) {
+  std::wstring canonical_native;
+  if (before.native_coordinates) {
+    canonical_native = CanonicalizeNativeText(new_view);
+    new_view = canonical_native;
+  }
   SourceTransaction result;
   std::size_t prefix = 0;
   while (prefix < before.view.size() && prefix < new_view.size() &&

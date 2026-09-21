@@ -26,12 +26,12 @@
 | Release full performance | PASS / 制約記録 | `build/verification/performance-release-holiday-policy-full-final2.json`。P1 six-document 47,894,528 bytes、P4 42,967,040 bytes、P3 20/100MiB 247.2/1,242.2MB。P2 cancellation completed、P5 100/100 failures 0、compact 3/3、theme 100/100、入力p95最大6.4ms。今回のP1 sixは50MB目標内、100MiBは機能維持による高使用量 |
 | native座標・CRLF/LF・画像・表 transaction | PASS / 境界記録 | CoreTestsのnative snapshot/transaction回帰。表の描画・mouse hit-test・caret mappingは同じ可視行横断の共有列境界を使用。`build/verification/table-hit-test-native-responsive-final9.json` で隔離fixtureの4セルへ実native clickを送り、全4件が同一セル近傍のnative caretへ収束。最新 `build/verification/table-edit-native-final13.json` で行列操作、セル編集Undo/Redo、Tab、末尾行追加、矢印を実native経路で確認（10/11）。Shift+Tabはこの実行枠でSendInputが0/4、Win32 error 5 (Access Denied)となりBLOCKED、CoreTestsの逆移動ロジックはPASS |
 | responsive native layout | PASS (evidence only) | `build/verification/responsive-layout-native-final9.json` と `responsive-find-native-final9.json`。1266/800/520/420幅でeditor正幅・client内bounds、Workspace/Outlineの折畳み復元、Find/Replaceの狭幅再配置をnative child rectで確認。Human DPI/IME/主観受入とは分離 |
-| 設定・profile native form | PASS (automated native UI path) | `build/verification/gui-acceptance-settings-final12.json`。実native modal `MDLite.NativeFormWindow` を設定Applyとprofile Cancel経路で確認。連続Promptを通常編集経路から除去し、保存は既存のSettings/Profile validatorへ通す |
+| 設定・profile native form | PASS (automated native UI path) | 最新 `build/verification/gui-acceptance-settings-final14.json`。実native modal `MDLite.NativeFormWindow` の設定Apply/Cancelとprofile Apply/Cancel経路を確認。profile Applyはsilent試験の既存確認境界で保存確認を拒否し、fixtureを変更せずform Apply・validation経路を通した。連続Promptを通常編集経路から除去し、保存は既存のSettings/Profile validatorへ通す |
 | native screenshot | PASS (evidence only) | `build/verification/native-screenshot-responsive-final9.json` と `native-screenshot-responsive-final9.png`。隔離fixtureのRelease `MDLite.exe`（SHA-256 `495EBE4CEFFFE1C3E94F83065288D5D99CE291F088A7FBA62E70DCFD9FEBC7C9`）を1280x800でPrintWindow取得。Computer UseはMDLite window列挙後にWindowsロック画面で停止したため、操作・主観受入とは分離 |
 | native screenshot before/after | EVIDENCE | 修正前 `native-screenshot-final.json` / `.png`（Release hash `833C975470D9AA5A0B0439E6CAADA830E8883FCB9A9BC92379964197C45F583F`）と修正後 `native-screenshot-responsive-final9.json` / `.png`（Release hash `495EBE4CEFFFE1C3E94F83065288D5D99CE291F088A7FBA62E70DCFD9FEBC7C9`）を同じ隔離fixture・1280x800で取得。before/after画像は実native描画の比較証拠であり、Human視認性PASSではない |
 | 休日CSV import・重複拒否・既定OFF | PASS | CoreTests、local parser、fake clock 28日判定、mock HTTP 200/304/404/500/timeout/HTML/大幅減少 |
 | 無音回帰 | PASS（既存測定） | 100/100、失敗0。今回の表示変更で再現性を確認 |
-| GUI acceptance script | PASS | `build/verification/gui-acceptance-settings-final12.json`、pass=true。Release exe hash `132bc8628e50cc7cf2efb5be7bbc11cc3557de1bf7d9b83b476ee47977ce849c`。compact edit/Undo/Redo、Find/Replace、設定native form、profile native form、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
+| GUI acceptance script | PASS | 最新 `build/verification/gui-acceptance-settings-final14.json`、pass=true。Release exe hash `132bc8628e50cc7cf2efb5be7bbc11cc3557de1bf7d9b83b476ee47977ce849c`。compact edit/Undo/Redo、Find/Replace、設定native form Apply/Cancel、profile native form Apply/Cancel、画像object隣接編集、recovery、TCP観測を実native UI経路で確認 |
 | native screenshot / CUA操作 | PARTIAL / BLOCKED | PrintWindowによる現行Releaseの実native画面は取得済み（`native-screenshot-responsive-final9.json`）。Computer UseではMDLiteの実window列挙まではできたが、画面取得がWindowsロック画面となり前面化に失敗したため、クリック・ドラッグ・Humanの視認性は未確認 |
 | IME/ATOK、DPI複数monitor、table操作感、画像視認性 | NOT RUN | Human gate。自動click-routing evidenceをHuman PASSへ昇格しない |
 | HTTP月次休日自動更新 | IMPLEMENTED / mock PASS / real HTTP BLOCKED | commonで明示許可した場合だけ、固定の内閣府HTTPS URLを非同期確認。WinHTTPのTLS、timeout、2MiB上限、redirect拒否、304、件数大幅減少拒否、原子的cache置換を実装。opt-in実HTTPを実行したが、試験環境のWinHTTPが `12185 (ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY)` でTLS応答を受信できず、status=0となった。資格情報・TLS設定は変更していない |
@@ -46,10 +46,10 @@
 | QA-04 | table parser、可視行横断の共有column geometry、描画とmouse/caret hit-testの共通経路、`table-hit-test-native-responsive-final9.json` 4/4、最新 `table-edit-native-final13.json` の行列操作・Undo/Redo・Tab・矢印 10/11 | Shift+Tab実native入力（SendInput 0/4、Win32 error 5）と実DPIのcell hit-test/操作感は未実施 |
 | QA-05 | 5形式画像、隣接raw、full P4 compact 3/3 | 画像の主観的表示・animation視認性は未実施 |
 | QA-06 | PerMonitorV2 manifest、DIP layout、responsive child bounds at 1266/800/520/420, theme 100/100 | 100/125/150/200%・複数monitorは未実施 |
-| QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings、設定Applyとprofile Cancelのnative form | calendarのHuman操作とIME/視認性は未実施 |
+| QA-07 | GUI acceptanceの検索/置換/compact/recovery、Core calendar/settings、設定Apply/Cancelとprofile Apply/Cancelのnative form | calendarのHuman操作とIME/視認性は未実施 |
 | QA-08 | `git-local-first-final11.json`（`Invoke-GitLocalAcceptance.ps1`）でremoteなし隔離repoのlocal commit、staged/unstaged/untracked分離、Application.cppのindex-only commit形を確認。GUI TCP観測0、feature ref push/read-back | 実remote認証は今回のfeature配送で確認済み。実repoのcredential/hook操作とdevelop統合はHuman gate後 |
 | QA-09 | 同梱/local CSV、重複/HTML/encoding拒否、OFF既定、fake clock、mock HTTP 200/304/404/500/timeout/HTML/大幅減少、cache保全ポリシー | 実HTTPは `MDLITE_TEST_REAL_HOLIDAY_HTTP=1` で実行したが、WinHTTP 12185 によりBLOCKED。offline transport/timeoutの実WinHTTP matrixは未実施 |
-| QA-10 | 301 checks、Release CTest、silent P5 100/100、設定/profile native form、現行Release native screenshot evidence | ATOK・Human通知/視認性は未実施 |
+| QA-10 | 301 checks、Release CTest、silent P5 100/100、設定/profile native form Apply/Cancel、現行Release native screenshot evidence | ATOK・Human通知/視認性は未実施 |
 
 ## Git検証境界
 
@@ -66,7 +66,7 @@
 `837f24c6de9d1dcd6fe48ebaa09ec4d31bc57df8`、`856a419e2890053a91c673e732e9113a4e39f103`、
 `40d88b73d556f994c9705f415685c0e0470b8477`、`da86373fbd780252345ee8583cf64bd4c8742e57`、`7abd422641888e402463ee01581a1d875674c3c6`、`8ee82cc16b3a0fcf7b40b97effac939fe032d76a`、`41303da2cc398f2f94efdfac595ac5f5ad5271ae` を origin (Forgejo) と github (GitHub) の
 `fix/visual-rebuild-localfirst` へ非force通常pushし、各push時の対象OIDが両remoteで同一であることを
-`ls-remote` read-backで確認した。設定/profile native form実装は checkpoint `7d9f5e874e7096f41e50c9618faa23e1c20c6d47`、fresh final12証拠・Review更新は docs commit `b98aa521cac2e998bec7ca562d4f623136634ee7`、fresh final13 table probe境界は docs commit `233d587485a56a3801ee967ad7d8cebd9f4f6c0c`、最新checkpoint metadataは docs commit `374fd814c375a4ebac1778bd1466c9d2d555ddcb` に記録した。現在のfeature tip `374fd814c375a4ebac1778bd1466c9d2d555ddcb` はlocal/両remoteで一致する。main/tag/developは変更していない。Human gate未実施のためdevelop統合は保留している。
+`ls-remote` read-backで確認した。設定/profile native form実装は checkpoint `7d9f5e874e7096f41e50c9618faa23e1c20c6d47`、fresh final12証拠・Review更新は docs commit `b98aa521cac2e998bec7ca562d4f623136634ee7`、fresh final13 table probe境界は docs commit `233d587485a56a3801ee967ad7d8cebd9f4f6c0c`、最新checkpoint metadataは docs commit `374fd814c375a4ebac1778bd1466c9d2d555ddcb`、native form Apply/Cancel final14証拠は今回の次docs commitに記録する。現在のfeature tipはlocal/両remoteで一致する。main/tag/developは変更していない。Human gate未実施のためdevelop統合は保留している。
 
 ## 残りの受入
 

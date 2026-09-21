@@ -101,6 +101,32 @@ function Wait-ProcessClassWindow([Diagnostics.Process]$Process, [string]$ClassNa
     throw "Window was not created for process $($Process.Id): $ClassName"
 }
 
+function Get-ProcessClassWindow([Diagnostics.Process]$Process, [string]$ClassName) {
+    $script:foundWindow = [IntPtr]::Zero
+    $callback = [MDLiteNative+EnumWindowsProc]{
+        param([IntPtr]$window, [IntPtr]$parameter)
+        [uint32]$processId = 0
+        [void][MDLiteNative]::GetWindowThreadProcessId($window, [ref]$processId)
+        if ($processId -ne [uint32]$Process.Id) { return $true }
+        $name = New-Object Text.StringBuilder 128
+        [void][MDLiteNative]::GetClassName($window, $name, $name.Capacity)
+        if ($name.ToString() -ne $ClassName) { return $true }
+        $script:foundWindow = $window
+        return $false
+    }
+    [void][MDLiteNative]::EnumWindows($callback, [IntPtr]::Zero)
+    return $script:foundWindow
+}
+
+function Wait-ProcessClassWindowGone([Diagnostics.Process]$Process, [string]$ClassName, [int]$TimeoutMs = 10000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        if ((Get-ProcessClassWindow $Process $ClassName) -eq [IntPtr]::Zero) { return }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Window did not close for process $($Process.Id): $ClassName"
+}
+
 function Find-Control([IntPtr]$Parent, [int]$Id, [string]$ClassName = '') {
     $script:foundControl = [IntPtr]::Zero
     $callback = [MDLiteNative+EnumWindowsProc]{
@@ -254,19 +280,35 @@ try {
     $pendingCount = Wait-ListItemCount $results 1
     $checks.workspace_search_syncs_pending_input = $pendingCount -eq 1
 
-    # Settings and profile editing are native one-form dialogs.  Exercise the
-    # real modal window creation and Cancel/Apply paths instead of relying on
-    # source inspection of the old prompt sequence.
+    # Settings and profile editing are native one-form dialogs. Exercise both
+    # form-level Cancel and Apply paths. Profile Apply reaches the existing
+    # silent-test confirmation boundary and is intentionally declined there;
+    # this proves the form Apply/validation path without mutating the fixture.
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1027, [IntPtr]::Zero)
-    $settingsForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
-    $checks.settings_native_form = $settingsForm -ne [IntPtr]::Zero
-    [void][MDLiteNative]::SendMessage($settingsForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
+    $settingsCancelForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.settings_native_form = $settingsCancelForm -ne [IntPtr]::Zero
+    $checks.settings_native_cancel = $settingsCancelForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($settingsCancelForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1027, [IntPtr]::Zero)
+    $settingsApplyForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.settings_native_apply = $settingsApplyForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($settingsApplyForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1029, [IntPtr]::Zero)
-    $profilesForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
-    $checks.profiles_native_form = $profilesForm -ne [IntPtr]::Zero
-    [void][MDLiteNative]::SendMessage($profilesForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
+    $profilesCancelForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.profiles_native_form = $profilesCancelForm -ne [IntPtr]::Zero
+    $checks.profiles_native_cancel = $profilesCancelForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($profilesCancelForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
+
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1029, [IntPtr]::Zero)
+    $profilesApplyForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.profiles_native_apply = $profilesApplyForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($profilesApplyForm, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
 
     [void][MDLiteNative]::SendMessage($findEdit, $WM_SETTEXT, [IntPtr]::Zero, 'PendingHit')
     $replaceEdit = Wait-Control $main 107 'Edit'

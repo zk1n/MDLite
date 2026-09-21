@@ -666,6 +666,184 @@ bool PromptText(HWND owner, HINSTANCE instance, std::wstring_view title, std::ws
 
 std::wstring ControlText(HWND control);
 
+// Quick Open and the command palette use the same native picker surface.  A
+// filter edit and a real list box keep the candidate set visible while the
+// user narrows it, instead of hiding a second prompt behind the first one.
+struct NativePickerItem {
+  std::wstring label;
+};
+
+struct NativePickerContext {
+  std::vector<NativePickerItem>* items{};
+  std::wstring label;
+  HWND filter{};
+  HWND list{};
+  int width{720};
+  int height{520};
+  std::size_t selected{std::numeric_limits<std::size_t>::max()};
+  bool accepted{};
+  bool completed{};
+};
+
+constexpr int kNativePickerFilterId = 100;
+constexpr int kNativePickerListId = 101;
+
+std::wstring Lowercase(std::wstring value) {
+  std::ranges::transform(value, value.begin(), towlower);
+  return value;
+}
+
+void RefreshNativePickerList(NativePickerContext& context) {
+  if (!context.filter || !context.list || !context.items) return;
+  const auto query = Lowercase(ControlText(context.filter));
+  SendMessageW(context.list, LB_RESETCONTENT, 0, 0);
+  for (std::size_t index = 0; index < context.items->size(); ++index) {
+    const auto& item = (*context.items)[index];
+    if (!query.empty() && Lowercase(item.label).find(query) == std::wstring::npos) continue;
+    const auto row = static_cast<int>(SendMessageW(
+        context.list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.label.c_str())));
+    if (row == LB_ERR || row == LB_ERRSPACE) continue;
+    SendMessageW(context.list, LB_SETITEMDATA, static_cast<WPARAM>(row),
+                 static_cast<LPARAM>(index));
+  }
+  if (SendMessageW(context.list, LB_GETCOUNT, 0, 0) > 0)
+    SendMessageW(context.list, LB_SETCURSEL, 0, 0);
+}
+
+bool AcceptNativePickerSelection(NativePickerContext& context) {
+  if (!context.list || !context.items) return false;
+  const auto row = SendMessageW(context.list, LB_GETCURSEL, 0, 0);
+  if (row == LB_ERR) return false;
+  const auto item = SendMessageW(context.list, LB_GETITEMDATA, static_cast<WPARAM>(row), 0);
+  if (item == LB_ERR || static_cast<std::size_t>(item) >= context.items->size()) return false;
+  context.selected = static_cast<std::size_t>(item);
+  context.accepted = true;
+  context.completed = true;
+  return true;
+}
+
+LRESULT CALLBACK NativePickerWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto* context = reinterpret_cast<NativePickerContext*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+    context = static_cast<NativePickerContext*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
+  }
+  if (!context || !context->items) return DefWindowProcW(window, message, wparam, lparam);
+  if (message == WM_CREATE) {
+    const int margin = ScaleDip(window, 16);
+    const int label_height = ScaleDip(window, 38);
+    const int control_height = ScaleDip(window, 28);
+    const int content_width = context->width - margin * 2;
+    const HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HWND label = CreateWindowExW(0, L"STATIC", context->label.c_str(), WS_CHILD | WS_VISIBLE,
+                                 margin, margin, content_width, label_height, window, nullptr,
+                                 nullptr, nullptr);
+    if (label) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    context->filter = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        margin, margin + label_height, content_width, control_height, window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNativePickerFilterId)), nullptr, nullptr);
+    if (context->filter) SendMessageW(context->filter, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    context->list = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+        margin, margin + label_height + control_height + ScaleDip(window, 10), content_width,
+        context->height - margin * 2 - label_height - control_height - ScaleDip(window, 58), window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNativePickerListId)), nullptr, nullptr);
+    if (context->list) SendMessageW(context->list, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    const int button_y = context->height - margin - ScaleDip(window, 30);
+    HWND apply = CreateWindowExW(0, L"BUTTON", L"開く", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                 context->width - margin - ScaleDip(window, 190), button_y,
+                                 ScaleDip(window, 84), ScaleDip(window, 30), window,
+                                 reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                  context->width - margin - ScaleDip(window, 94), button_y,
+                                  ScaleDip(window, 84), ScaleDip(window, 30), window,
+                                  reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+    if (apply) SendMessageW(apply, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    if (cancel) SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    RefreshNativePickerList(*context);
+    if (context->filter) SetFocus(context->filter);
+    return 0;
+  }
+  if (message == WM_COMMAND) {
+    const int id = LOWORD(wparam);
+    const int code = HIWORD(wparam);
+    if (id == kNativePickerFilterId && code == EN_CHANGE) {
+      RefreshNativePickerList(*context);
+      return 0;
+    }
+    if (id == kNativePickerListId && code == LBN_DBLCLK && AcceptNativePickerSelection(*context)) {
+      DestroyWindow(window);
+      return 0;
+    }
+    if (id == IDOK) {
+      if (!AcceptNativePickerSelection(*context)) return 0;
+      DestroyWindow(window);
+      return 0;
+    }
+    if (id == IDCANCEL) {
+      context->completed = true;
+      DestroyWindow(window);
+      return 0;
+    }
+  }
+  if (message == WM_CLOSE) {
+    context->completed = true;
+    DestroyWindow(window);
+    return 0;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool RunNativePicker(HWND owner, HINSTANCE instance, std::wstring_view title,
+                     std::wstring_view label, std::vector<NativePickerItem>& items,
+                     std::size_t& selected) {
+  if (items.empty()) return false;
+  constexpr wchar_t picker_class[] = L"MDLite.NativePickerWindow";
+  WNDCLASSEXW existing{sizeof(existing)};
+  if (!GetClassInfoExW(instance, picker_class, &existing)) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.lpfnWndProc = NativePickerWindowProc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    window_class.lpszClassName = picker_class;
+    if (!RegisterClassExW(&window_class)) return false;
+  }
+  const int width = ScaleDip(owner, 720);
+  const int height = ScaleDip(owner, 520);
+  NativePickerContext context;
+  context.items = &items;
+  context.label = std::wstring(label);
+  context.width = width;
+  context.height = height;
+  RECT owner_rect{};
+  GetWindowRect(owner, &owner_rect);
+  const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
+  const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
+  HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, picker_class, std::wstring(title).c_str(),
+                                WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+                                x, y, width, height, owner, nullptr, instance, &context);
+  if (!dialog) return false;
+  EnableWindow(owner, FALSE);
+  MSG message{};
+  while (!context.completed) {
+    const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+    if (result <= 0) break;
+    if (!IsDialogMessageW(dialog, &message)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetForegroundWindow(owner);
+  if (!context.accepted) return false;
+  selected = context.selected;
+  return selected < items.size();
+}
+
 // Settings and profile editing use one native form instead of a chain of
 // prompt/message-box interactions.  The form deliberately stays small and
 // data-oriented: each field owns its control and the caller performs the
@@ -2097,47 +2275,25 @@ void Application::NewUntitledDocument() {
 
 void Application::QuickOpen() {
   if (workspace_.empty()) return;
-  const auto initial = FindQuickOpenCandidates(workspace_, L"", recent_documents_, 12);
-  std::wstring list;
+  // Keep a bounded, ranked candidate set in memory.  Filtering happens in the
+  // picker itself so typing never opens a second prompt or loses candidates
+  // that were outside the initial recent-file slice.
+  const auto initial = FindQuickOpenCandidates(workspace_, L"", recent_documents_, 200);
+  std::vector<std::filesystem::path> candidates;
+  std::vector<NativePickerItem> items;
   for (const auto& path : initial) {
     std::error_code error;
     const auto relative = std::filesystem::relative(path, workspace_, error);
-    if (!error) list += L"  " + relative.generic_wstring() + L"\n";
+    if (error) continue;
+    candidates.push_back(path);
+    items.push_back(NativePickerItem{relative.generic_wstring()});
   }
-  std::wstring query;
-  if (!PromptText(window_, instance_, L"Quick Open",
-                  L"ファイル名またはWorkspace相対pathで絞り込みます。\n"
-                  L"空欄なら最近使用した文書を先頭に表示します。\n\n" + list,
-                  query)) return;
-  auto matches = FindQuickOpenCandidates(workspace_, query, recent_documents_, 20);
-  if (matches.empty()) {
-    MessageBoxW(window_, L"一致する文書がありません。", L"Quick Open", MB_ICONINFORMATION);
-    return;
-  }
-  if (matches.size() == 1) {
-    OpenDocument(matches.front());
-    return;
-  }
-  std::wstring choices;
-  for (const auto& path : matches) {
-    std::error_code error;
-    const auto relative = std::filesystem::relative(path, workspace_, error);
-    if (!error) choices += relative.generic_wstring() + L"\n";
-  }
-  std::error_code relative_error;
-  std::wstring selected = std::filesystem::relative(matches.front(), workspace_, relative_error).generic_wstring();
-  if (!PromptText(window_, instance_, L"Quick Open — 候補",
-                  L"開く相対pathを指定してください。\n\n" + choices, selected)) return;
-  const auto match = std::ranges::find_if(matches, [&](const auto& path) {
-    std::error_code error;
-    const auto relative = std::filesystem::relative(path, workspace_, error).generic_wstring();
-    return !error && _wcsicmp(relative.c_str(), selected.c_str()) == 0;
-  });
-  if (match == matches.end()) {
-    MessageBoxW(window_, L"候補一覧にある相対pathを指定してください。", L"Quick Open", MB_ICONWARNING);
-    return;
-  }
-  OpenDocument(*match);
+  if (items.empty()) return;
+  std::size_t selected{};
+  if (!RunNativePicker(window_, instance_, L"Quick Open",
+                       L"ファイル名またはWorkspace相対pathで絞り込み、開く文書を選択してください。",
+                       items, selected)) return;
+  if (selected < candidates.size()) OpenDocument(candidates[selected]);
 }
 
 void Application::OpenWorkspace(const std::filesystem::path& path) {
@@ -5308,39 +5464,23 @@ void Application::ShowCommandPalette() {
       Entry{L"画像: 表示幅480 DIP", kImageWidth480, has_document, L"Markdown文書が必要です"},
       Entry{L"画像: Storageへupload", kImageUpload, trusted && has_document, L"信頼済みWorkspaceと文書が必要です"},
   };
-  std::wstring label = L"コマンド名の一部を入力してください。\n";
+  std::vector<NativePickerItem> items;
+  items.reserve(entries.size());
   for (const auto& entry : entries) {
-    label += L"・" + std::wstring(entry.name);
+    std::wstring label = entry.name;
     if (!entry.enabled) label += L"（実行不可: " + std::wstring(entry.reason) + L"）";
-    label += L"\n";
+    items.push_back(NativePickerItem{std::move(label)});
   }
-  std::wstring query;
-  if (!PromptText(window_, instance_, L"MDLite コマンドパレット", label, query) || query.empty()) return;
-  std::ranges::transform(query, query.begin(), towlower);
-  const Entry* match{};
-  std::wstring candidates;
-  for (const auto& entry : entries) {
-    std::wstring name(entry.name);
-    std::ranges::transform(name, name.begin(), towlower);
-    if (name.find(query) == std::wstring::npos) continue;
-    if (!match) match = &entry;
-    else candidates += L"\n";
-    candidates += entry.name;
-  }
-  if (!match) {
-    MessageBoxW(window_, L"一致するコマンドがありません。", L"コマンドパレット", MB_ICONINFORMATION);
+  std::size_t selected{};
+  if (!RunNativePicker(window_, instance_, L"MDLite コマンドパレット",
+                       L"コマンド名の一部を入力し、実行する項目を選択してください。",
+                       items, selected) || selected >= entries.size()) return;
+  const auto& match = entries[selected];
+  if (!match.enabled) {
+    MessageBoxW(window_, match.reason, L"このコマンドは実行できません", MB_ICONWARNING);
     return;
   }
-  if (candidates.find(L'\n') != std::wstring::npos) {
-    MessageBoxW(window_, (L"候補を一つに絞ってください。\n\n" + candidates).c_str(),
-                L"コマンドパレット", MB_ICONINFORMATION);
-    return;
-  }
-  if (!match->enabled) {
-    MessageBoxW(window_, match->reason, L"このコマンドは実行できません", MB_ICONWARNING);
-    return;
-  }
-  SendMessageW(window_, WM_COMMAND, MAKEWPARAM(match->command, 0), 0);
+  SendMessageW(window_, WM_COMMAND, MAKEWPARAM(match.command, 0), 0);
 }
 
 void Application::ToggleCompactWindow() {

@@ -92,6 +92,7 @@ $BM_SETCHECK = 0x00F1
 $BM_CLICK = 0x00F5
 $LVM_GETITEMCOUNT = 0x1004
 $TVM_GETCOUNT = 0x1105
+$LB_GETCOUNT = 0x018B
 $BST_UNCHECKED = 0
 $BST_CHECKED = 1
 $IDOK = 1
@@ -417,9 +418,9 @@ try {
     $checks.workspace_search_syncs_pending_input = $pendingCount -eq 1
 
     # Exercise the native workspace/outline/calendar presentation routes and
-    # the existing prompt-backed Quick Open/command-palette entry points. These
-    # are cancellation-only checks: they prove the normal command reaches the
-    # UI without mutating the fixture or using a prompt chain for settings.
+    # the searchable native Quick Open/command-palette pickers.  The picker
+    # checks select real candidates, then restore the original document before
+    # the remaining source/Undo/image assertions.
     $workspaceTree = Wait-Control $main 100 'SysTreeView32'
     $outlineTree = Wait-Control $main 103 'SysTreeView32'
     $checks.workspace_tree_items = [MDLiteNative]::SendMessage(
@@ -443,16 +444,53 @@ try {
     $checks.calendar_hidden = $calendar -eq [IntPtr]::Zero -or -not [MDLiteNative]::IsWindowVisible($calendar)
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
-    $quickOpenPrompt = Wait-ProcessClassWindow $process 'MDLite.PromptWindow'
-    $checks.quick_open_prompt = $quickOpenPrompt -ne [IntPtr]::Zero
-    [void][MDLiteNative]::SendMessage($quickOpenPrompt, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
-    Wait-ProcessClassWindowGone $process 'MDLite.PromptWindow'
+    $quickOpenPicker = Wait-ProcessClassWindow $process 'MDLite.NativePickerWindow'
+    $quickOpenFilter = Wait-Control $quickOpenPicker 100 'Edit'
+    $quickOpenList = Wait-Control $quickOpenPicker 101 'ListBox'
+    $checks.quick_open_picker = $quickOpenPicker -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($quickOpenFilter, $WM_SETTEXT, [IntPtr]::Zero, 'second.md')
+    Start-Sleep -Milliseconds 100
+    $quickOpenCount = [MDLiteNative]::SendMessage(
+        $quickOpenList, $LB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $checks.quick_open_filter_single = $quickOpenCount -eq 1
+    [void][MDLiteNative]::SendMessage($quickOpenPicker, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativePickerWindow'
+    Start-Sleep -Milliseconds 150
+    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W'
+    $checks.quick_open_editor_after_selection = ((Get-WindowText $editor) -replace "`r`n", "`n")
+    $checks.quick_open_candidate_selected = $checks.quick_open_editor_after_selection -eq 'second WorkspaceHit'
+
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
+    $quickOpenPicker = Wait-ProcessClassWindow $process 'MDLite.NativePickerWindow'
+    $quickOpenFilter = Wait-Control $quickOpenPicker 100 'Edit'
+    $quickOpenList = Wait-Control $quickOpenPicker 101 'ListBox'
+    [void][MDLiteNative]::SendMessage($quickOpenFilter, $WM_SETTEXT, [IntPtr]::Zero, 'first.md')
+    Start-Sleep -Milliseconds 100
+    $quickOpenCount = [MDLiteNative]::SendMessage(
+        $quickOpenList, $LB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $checks.quick_open_return_filter_single = $quickOpenCount -eq 1
+    [void][MDLiteNative]::SendMessage($quickOpenPicker, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativePickerWindow'
+    Start-Sleep -Milliseconds 150
+    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W'
+    $checks.quick_open_returned_to_first = ((Get-WindowText $editor) -replace "`r`n", "`n").StartsWith('CaseToken')
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1031, [IntPtr]::Zero)
-    $commandPalettePrompt = Wait-ProcessClassWindow $process 'MDLite.PromptWindow'
-    $checks.command_palette_prompt = $commandPalettePrompt -ne [IntPtr]::Zero
-    [void][MDLiteNative]::SendMessage($commandPalettePrompt, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
-    Wait-ProcessClassWindowGone $process 'MDLite.PromptWindow'
+    $commandPalettePicker = Wait-ProcessClassWindow $process 'MDLite.NativePickerWindow'
+    $commandPaletteFilter = Wait-Control $commandPalettePicker 100 'Edit'
+    $commandPaletteList = Wait-Control $commandPalettePicker 101 'ListBox'
+    $checks.command_palette_picker = $commandPalettePicker -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($commandPaletteFilter, $WM_SETTEXT, [IntPtr]::Zero, '表示: Workspace設定')
+    Start-Sleep -Milliseconds 100
+    $commandPaletteCount = [MDLiteNative]::SendMessage(
+        $commandPaletteList, $LB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $checks.command_palette_filter_single = $commandPaletteCount -eq 1
+    [void][MDLiteNative]::SendMessage($commandPalettePicker, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativePickerWindow'
+    $commandPaletteForm = Wait-ProcessClassWindow $process 'MDLite.NativeFormWindow'
+    $checks.command_palette_candidate_selected = $commandPaletteForm -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($commandPaletteForm, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.NativeFormWindow'
 
     # Settings and profile editing are native one-form dialogs. Exercise both
     # form-level Cancel and Apply paths. Profile Apply reaches the existing

@@ -91,6 +91,7 @@ $EM_REDO = 0x0454
 $BM_SETCHECK = 0x00F1
 $BM_CLICK = 0x00F5
 $LVM_GETITEMCOUNT = 0x1004
+$TVM_GETCOUNT = 0x1105
 $BST_UNCHECKED = 0
 $BST_CHECKED = 1
 $IDOK = 1
@@ -170,6 +171,22 @@ function Find-Control([IntPtr]$Parent, [int]$Id, [string]$ClassName = '') {
     }
     [void][MDLiteNative]::EnumChildWindows($Parent, $callback, [IntPtr]::Zero)
     return $script:foundControl
+}
+
+function Find-ChildClassWindow([IntPtr]$Parent, [string]$ClassName) {
+    $script:foundClassWindow = [IntPtr]::Zero
+    $callback = [MDLiteNative+EnumWindowsProc]{
+        param([IntPtr]$window, [IntPtr]$parameter)
+        $name = New-Object Text.StringBuilder 128
+        [void][MDLiteNative]::GetClassName($window, $name, $name.Capacity)
+        if ($name.ToString() -eq $ClassName) {
+            $script:foundClassWindow = $window
+            return $false
+        }
+        return $true
+    }
+    [void][MDLiteNative]::EnumChildWindows($Parent, $callback, [IntPtr]::Zero)
+    return $script:foundClassWindow
 }
 
 function Wait-Control([IntPtr]$Parent, [int]$Id, [string]$ClassName = '', [int]$TimeoutMs = 10000) {
@@ -329,7 +346,7 @@ $profilesFile = Join-Path $workspace '.mdlite\profiles.toml'
 $first = Join-Path $workspace 'first.md'
 $second = Join-Path $workspace 'second.md'
 $pixel = Join-Path $workspace 'pixel.png'
-$initial = 'CaseToken casetoken WorkspaceHit'
+$initial = "CaseToken casetoken WorkspaceHit`n# Outline Heading"
 [IO.File]::WriteAllText($first, $initial, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText($second, 'second WorkspaceHit', [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllBytes($pixel, [Convert]::FromBase64String(
@@ -344,7 +361,7 @@ try {
     $main = Wait-ProcessWindow $process
     $editor = Wait-Control $main 102 'RICHEDIT50W'
     $checks.main_window = $true
-    $checks.initial_view = (Get-WindowText $editor) -eq $initial
+    $checks.initial_view = ((Get-WindowText $editor) -replace "`r`n", "`n") -eq $initial
     $checks.runtime_environment = Get-NativeRuntimeSnapshot $process $main $editor $first $firstInitialHash $settingsFile
 
     # View -> compact. Focus selection must follow the editor, and EN_CHANGE must route to its new parent.
@@ -398,6 +415,44 @@ try {
     [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]108, [IntPtr]::Zero)
     $pendingCount = Wait-ListItemCount $results 1
     $checks.workspace_search_syncs_pending_input = $pendingCount -eq 1
+
+    # Exercise the native workspace/outline/calendar presentation routes and
+    # the existing prompt-backed Quick Open/command-palette entry points. These
+    # are cancellation-only checks: they prove the normal command reaches the
+    # UI without mutating the fixture or using a prompt chain for settings.
+    $workspaceTree = Wait-Control $main 100 'SysTreeView32'
+    $outlineTree = Wait-Control $main 103 'SysTreeView32'
+    $checks.workspace_tree_items = [MDLiteNative]::SendMessage(
+        $workspaceTree, $TVM_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -gt 0
+    $checks.outline_tree_items = [MDLiteNative]::SendMessage(
+        $outlineTree, $TVM_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -gt 0
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    $checks.outline_pane_collapsed = -not [MDLiteNative]::IsWindowVisible($outlineTree)
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    $checks.outline_pane_restored = [MDLiteNative]::IsWindowVisible($outlineTree)
+
+    $calendar = Find-ChildClassWindow $main 'SysMonthCal32'
+    $checks.calendar_control = $calendar -ne [IntPtr]::Zero
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    $checks.calendar_visible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    $checks.calendar_hidden = $calendar -eq [IntPtr]::Zero -or -not [MDLiteNative]::IsWindowVisible($calendar)
+
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
+    $quickOpenPrompt = Wait-ProcessClassWindow $process 'MDLite.PromptWindow'
+    $checks.quick_open_prompt = $quickOpenPrompt -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($quickOpenPrompt, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.PromptWindow'
+
+    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1031, [IntPtr]::Zero)
+    $commandPalettePrompt = Wait-ProcessClassWindow $process 'MDLite.PromptWindow'
+    $checks.command_palette_prompt = $commandPalettePrompt -ne [IntPtr]::Zero
+    [void][MDLiteNative]::SendMessage($commandPalettePrompt, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
+    Wait-ProcessClassWindowGone $process 'MDLite.PromptWindow'
 
     # Settings and profile editing are native one-form dialogs. Exercise both
     # form-level Cancel and Apply paths. Profile Apply reaches the existing
@@ -468,7 +523,7 @@ try {
     $imageUndoSource = [IO.File]::ReadAllText($first)
     $checks.image_undo_source_actual = $imageUndoSource
     $checks.image_presentation_undo_saved = $imageUndoSource -ne $imageSource -and
-        $imageUndoSource.StartsWith($beforeImage)
+        (($imageUndoSource -replace "`r`n", "`n").StartsWith(($beforeImage -replace "`r`n", "`n")))
     [void][MDLiteNative]::SendMessage($editor, $EM_REDO, [IntPtr]::Zero, [IntPtr]::Zero)
     [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]1005, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 150

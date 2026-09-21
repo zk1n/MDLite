@@ -15,14 +15,14 @@ Markdownの正本はソース。表示変更だけで本文を書き換えない
 
 作業開始時に実際のrepo root、branch、worktree、未コミット変更、実効model／reasoningを確認する。
 モデルを推測して記録しない。既存のユーザー共通設定・Skillを破壊せず利用する。
-ローカル運用に`../.codex-shared/runtime/routing-core.md`が存在し、Humanがその共通設定の利用を指示した場合、
-本ファイルからの相対パスとして読み、そこが指定する現行canonical policyを参照する。
+ローカル管理環境では作業開始時に`.codex/routing-entry.md`を実際に読み、
+そこが指定する現行canonical policyを参照する。
 親GitリポジトリのAGENTS.mdやconfigが自動継承されたとは仮定しない。
 
 共通設定の配布が必要なら、既存のREADME・同期／導入スクリプトを検査して最小限に適用する。
 他ProjectのAGENTS.md、.codex、認証、履歴、Git配信規則をディレクトリ単位でコピーしない。
 実効設定の再読込に再起動が必要なら隠さず扱う。未適用の設定を有効と報告しない。
-設定不足時は不明なchild routeを使わず、実効設定が明確なRootで可能な作業を継続する。
+設定不足時は依存するrouting laneをfail closedとし、Root単独継続で設定不足を隠さない。
 既存共通policyのRoot-only spawn等を尊重し、存在しないroleやfallbackを捏造しない。
 
 ## 実装
@@ -77,3 +77,22 @@ F5でビルド・デバッグ起動し、Release性能確認の入口を別に�
 実際に未使用のSkillや未実施テストを実施済みと報告しない。
 HANDOFFは対象repo自身のローカル領域に作成し、登録済みの既存受渡しツールで処理する。
 他Projectへのfallback、機密ログの公開、HANDOFFアップロード失敗を理由とした破壊的やり直しを禁止する。
+
+<!-- CodexAppRouting:start -->
+## Shared Codex Routing v2.1.0
+
+作業開始時に `.codex/routing-entry.md` を実際に読み、そこが指定する現行canonicalの
+`app-entry.md` と `routing-core.md` を読む。パスの記載だけを本文読込済みと扱わない。
+App通常選択の実効Root model/effortから既存policyを解決し、CLI profile選択の観測とは分ける。
+
+管理対象Rootでは、独立して切り出せる調査・実装・テスト・広いレビューを、既存基準に従い
+固定Luna Subagentへ明示的に委譲する。このAGENTSが委譲を要求しており、毎回の補助指示は不要。
+Root-only spawn、leaf/no-spawn、固定role/model/effort、`fork_turns="none"`、同時数、権限を守る。
+child/GuardianではRoot用Jev・Initial Gate・再帰spawnを実行しない。
+
+Luna Max/XHigh Rootは `jev-routing.md` の既存初回判定・再評価条件を適用し、同一eventで
+旧Sol Initial Gateを二重起動しない。maintainでも通常Worker分業を維持する。
+Sol/Astra Rootは `root-delegation.md` を読み、同系列child禁止を維持する。
+設定・実効値・routeが不明なら依存laneをfail closedとし、Root単独継続で隠さない。
+小さく密結合な作業の省略条件と、明示 `/goal` のみに適用するorchestrator-firstは維持する。
+<!-- CodexAppRouting:end -->

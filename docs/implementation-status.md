@@ -68,6 +68,6 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 - Microsoft IME／ATOKの実変換、候補確定、削除、選択、Undoの操作感。
 - 100/125/150% DPI、複数monitor、outline drag、table cell grid/hit-test、画像resizeの視認性。
 - PNG/JPEG/GIF/WebP/SVGの実表示とanimated GIF/WebPの主観的な見え方。WebP decoderはlibwebp 1.6.0を静的リンクし、Windows側の任意codecには依存しない。
-- Compact window配置、calendar tooltip、設定／profile formの連続操作感、実repositoryのGit credential/hook操作。修正前後の実native PrintWindow画像は保存済みだが、Computer UseはMDLite window列挙後にWindowsロック画面で停止したため、実クリック・ドラッグ・視認性は未実施。
+- Compact window配置、calendar tooltip、設定／profile formの連続操作感、実repositoryのGit credential/hook操作。修正前後と現行Releaseの実native PrintWindow画像（`native-screenshot-current-20260921.png`）は保存済みだが、Computer UseはMDLite window列挙後にWindowsロック画面で停止したため、実クリック・ドラッグ・視認性は未実施。
 
 これらはAI側の実装不足を隠すための待機ではなく、実機入力方式・主観評価・外部環境を必要とする最小Human gateである。

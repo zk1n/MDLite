@@ -83,6 +83,10 @@ HANDOFFは対象repo自身のローカル領域に作成し、登録済みの既
 
 作業開始時に `.codex/routing-entry.md` を実際に読み、そこが指定する現行canonicalの
 `app-entry.md` と `routing-core.md` を読む。パスの記載だけを本文読込済みと扱わない。
+続いてcurrent task CWDから `resolve_app_routing.py` を必ず実行し、通常Rootでは
+`VERIFIED_ROOT` と実効policyを確認する。small / read-only Root taskもこのresolverを省略しない。
+通常Rootはresolver成功前にWorker / specialist spawn、Initial Jev、substantive mutationを開始しない。
+`UNKNOWN` またはpolicy未解決ではdependent laneをfail closedとする。
 App通常選択の実効Root model/effortから既存policyを解決し、CLI profile選択の観測とは分ける。
 
 管理対象Rootでは、独立して切り出せる調査・実装・テスト・広いレビューを、既存基準に従い

@@ -36,3 +36,8 @@ CMakeFiles/
 *.key
 *.pem
 *.dmp
+
+# Generated local App routing and isolated acceptance fixtures
+/.codex/routing-entry.md
+/.codex/routing-manifest.json
+/.codex/routing-acceptance/

@@ -80,6 +80,14 @@ public static class MDLiteTableNative {
     }
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll")]
+    public static extern bool InvalidateRect(IntPtr window, IntPtr rectangle, bool erase);
+    [DllImport("user32.dll")]
+    public static extern bool UpdateWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern uint GetGuiResources(IntPtr process, uint flags);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
 }
 '@
 
@@ -97,11 +105,14 @@ $EM_GETSEL = 0x00B0
 $EM_REDO = 0x0454
 $VK_TAB = 0x09
 $VK_SHIFT = 0x10
+$VK_CONTROL = 0x11
+$VK_Z = 0x5A
 $VK_LEFT = 0x25
 $VK_RIGHT = 0x27
 $VK_UP = 0x26
 $VK_DOWN = 0x28
 $KEYEVENTF_KEYUP = 0x0002
+$KEYEVENTF_UNICODE = 0x0004
 $kEditor = 102
 $kFileSave = 1005
 $kTableRowBefore = 1057
@@ -201,6 +212,131 @@ function Send-Key([IntPtr]$Editor, [int]$Key) {
     [void][MDLiteTableNative]::SendMessage($Editor, $WM_KEYUP, [IntPtr]$Key, [IntPtr]::Zero)
 }
 
+function Get-ResourceSnapshot([Diagnostics.Process]$Process) {
+    try {
+        $Process.Refresh()
+        return [pscustomobject]@{
+            status = 'PASS'
+            gdi = [int][MDLiteTableNative]::GetGuiResources($Process.Handle, 0)
+            user = [int][MDLiteTableNative]::GetGuiResources($Process.Handle, 1)
+        }
+    }
+    catch {
+        return [pscustomobject]@{ status = 'BLOCKED'; reason = $_.Exception.Message }
+    }
+}
+
+function Invoke-PaintReentryProbe([IntPtr]$Editor, [Diagnostics.Process]$Process, [int]$Iterations = 96) {
+    try {
+        $before = Get-ResourceSnapshot $Process
+        if ($before.status -ne 'PASS') {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = $before.reason }
+        }
+        $samples = [Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt $Iterations; $index++) {
+            [void][MDLiteTableNative]::InvalidateRect($Editor, [IntPtr]::Zero, $false)
+            [void][MDLiteTableNative]::UpdateWindow($Editor)
+            if (($index + 1) % 16 -eq 0) {
+                $Process.Refresh()
+                if ($Process.HasExited) { break }
+                $samples.Add((Get-ResourceSnapshot $Process))
+            }
+        }
+        $after = Get-ResourceSnapshot $Process
+        $validSamples = @($samples | Where-Object { $_.status -eq 'PASS' })
+        if ($after.status -ne 'PASS' -or $validSamples.Count -eq 0) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; before = $before; after = $after; samples = @($samples) }
+        }
+        $maxGdi = (@($validSamples | ForEach-Object { $_.gdi }) | Measure-Object -Maximum).Maximum
+        $maxUser = (@($validSamples | ForEach-Object { $_.user }) | Measure-Object -Maximum).Maximum
+        $pass = -not $Process.HasExited -and $after.gdi -le ($before.gdi + 24) -and
+            $after.user -le ($before.user + 8) -and $maxGdi -le ($before.gdi + 24) -and
+            $maxUser -le ($before.user + 8)
+        return [pscustomobject]@{
+            pass = $pass
+            status = if ($pass) { 'PASS_OS_NATIVE_PAINT' } else { 'FAIL_RESOURCE_GROWTH_OR_EXIT' }
+            iterations = $Iterations
+            before = $before
+            after = $after
+            samples = @($samples)
+        }
+    }
+    catch {
+        return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = $_.Exception.Message }
+    }
+}
+
+function Send-UnicodeCharacters([IntPtr]$Editor, [string]$Text) {
+    $topLevel = $Editor
+    while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
+    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
+    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
+    [void][MDLiteTableNative]::SetFocus($Editor)
+    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = $Text.Length * 2; error = 5; status = 'BLOCKED' } }
+    $inputs = [MDLiteTableNative+INPUT[]]::new($Text.Length * 2)
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $down = $index * 2
+        $up = $down + 1
+        $inputs[$down].type = 1
+        $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new()
+        $inputs[$down].U.ki.wScan = [uint16][int]$Text[$index]
+        $inputs[$down].U.ki.dwFlags = $KEYEVENTF_UNICODE
+        $inputs[$up].type = 1
+        $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new()
+        $inputs[$up].U.ki.wScan = [uint16][int]$Text[$index]
+        $inputs[$up].U.ki.dwFlags = $KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP
+    }
+    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs,
+        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
+    return [pscustomobject]@{ sent = $sent; expected = $inputs.Length; error = if ($sent -eq $inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq $inputs.Length) { 'PASS' } else { 'BLOCKED' } }
+}
+
+function Send-ControlKey([IntPtr]$Editor, [int]$Key) {
+    $topLevel = $Editor
+    while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
+    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
+    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
+    [void][MDLiteTableNative]::SetFocus($Editor)
+    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = 4; error = 5; status = 'BLOCKED' } }
+    $inputs = [MDLiteTableNative+INPUT[]]::new(4)
+    for ($index = 0; $index -lt $inputs.Length; $index++) {
+        $inputs[$index].type = 1
+        $inputs[$index].U = [MDLiteTableNative+INPUT_UNION]::new()
+    }
+    $inputs[0].U.ki.wVk = [uint16]$VK_CONTROL
+    $inputs[1].U.ki.wVk = [uint16]$Key
+    $inputs[2].U.ki.wVk = [uint16]$Key
+    $inputs[2].U.ki.dwFlags = $KEYEVENTF_KEYUP
+    $inputs[3].U.ki.wVk = [uint16]$VK_CONTROL
+    $inputs[3].U.ki.dwFlags = $KEYEVENTF_KEYUP
+    $sent = [MDLiteTableNative]::SendInput(4, $inputs,
+        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
+    return [pscustomobject]@{ sent = $sent; expected = 4; error = if ($sent -eq 4) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq 4) { 'PASS' } else { 'BLOCKED' } }
+}
+
+function Send-KeyRepeat([IntPtr]$Editor, [int]$Key, [int]$Repeat) {
+    $topLevel = $Editor
+    while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
+    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
+    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
+    [void][MDLiteTableNative]::SetFocus($Editor)
+    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = $Repeat * 2; error = 5; status = 'BLOCKED' } }
+    $inputs = [MDLiteTableNative+INPUT[]]::new($Repeat * 2)
+    for ($index = 0; $index -lt $Repeat; $index++) {
+        $down = $index * 2
+        $up = $down + 1
+        $inputs[$down].type = 1
+        $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new()
+        $inputs[$down].U.ki.wVk = [uint16]$Key
+        $inputs[$up].type = 1
+        $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new()
+        $inputs[$up].U.ki.wVk = [uint16]$Key
+        $inputs[$up].U.ki.dwFlags = $KEYEVENTF_KEYUP
+    }
+    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs,
+        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
+    return [pscustomobject]@{ sent = $sent; expected = $inputs.Length; error = if ($sent -eq $inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq $inputs.Length) { 'PASS' } else { 'BLOCKED' } }
+}
 function Send-ShiftKey([IntPtr]$Editor, [int]$Key) {
     $topLevel = $Editor
     while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
@@ -259,7 +395,7 @@ function Invoke-TableCase([string]$Name, [scriptblock]$Action) {
         $main = Wait-ProcessWindow $process
         $editor = Wait-Control $main $kEditor 'RICHEDIT50W'
         Set-Selection $editor 0 0
-        $value = & $Action $main $editor $path
+        $value = & $Action $main $editor $path $process
         if ($null -eq $value) { throw "Case $Name returned no result" }
         $checks[$Name] = $value
     }
@@ -370,12 +506,74 @@ try {
         [pscustomobject]@{ pass = $selection.start -eq $two -and $selection.end -eq $two; actual_start = $selection.start; actual_end = $selection.end; expected = $two }
     }
     Invoke-TableCase 'arrow_down_column' {
-        param($main, $editor, $path)
+        param($main, $editor, $path, $process)
         $head = $source.IndexOf('Head A', [StringComparison]::Ordinal)
         Set-Selection $editor $head
         Send-Key $editor $VK_DOWN
         $selection = Get-Selection $editor
         [pscustomobject]@{ pass = $selection.start -eq $one -and $selection.end -eq $one; actual_start = $selection.start; actual_end = $selection.end; expected = $one }
+    }
+    Invoke-TableCase 'continuous_unicode_input_no_accumulation' {
+        param($main, $editor, $path, $process)
+        $payload = 'x' * 128
+        Set-Selection $editor $source.Length
+        $input = Send-UnicodeCharacters $editor $payload
+        if ($input.sent -ne $input.expected) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = "SendInput sent $($input.sent)/$($input.expected) (Win32 $($input.error))" }
+        }
+        Start-Sleep -Milliseconds 250
+        $saved = Save-Source $main $path
+        [pscustomobject]@{
+            pass = $saved -eq ($source + $payload)
+            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' } else { 'FAIL_INPUT_ACCUMULATION_OR_LOSS' }
+            expected_length = ($source + $payload).Length
+            actual_length = $saved.Length
+        }
+    }
+    Invoke-TableCase 'ctrl_z_single_transaction' {
+        param($main, $editor, $path, $process)
+        Set-Selection $editor $one
+        Invoke-Command $main $kTableRowBefore
+        $afterRow = Save-Source $main $path
+        Set-Selection $editor $one
+        Invoke-Command $main $kTableColumnAfter
+        $afterTwo = Save-Source $main $path
+        $firstInput = Send-ControlKey $editor $VK_Z
+        if ($firstInput.sent -ne $firstInput.expected) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = "Ctrl+Z SendInput sent $($firstInput.sent)/$($firstInput.expected) (Win32 $($firstInput.error))" }
+        }
+        $undoOne = Save-Source $main $path
+        Start-Sleep -Milliseconds 100
+        $secondInput = Send-ControlKey $editor $VK_Z
+        if ($secondInput.sent -ne $secondInput.expected) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = "second Ctrl+Z SendInput sent $($secondInput.sent)/$($secondInput.expected) (Win32 $($secondInput.error))" }
+        }
+        $undoTwo = Save-Source $main $path
+        [pscustomobject]@{
+            pass = $afterTwo -ne $afterRow -and $undoOne -eq $afterRow -and $undoTwo -eq $source
+            status = if ($undoOne -eq $afterRow -and $undoTwo -eq $source) { 'PASS_OS_INPUT_ONE_TRANSACTION' } else { 'FAIL_OVER_BROAD_OR_NOOP_CTRL_Z' }
+            after_row = $afterRow
+            after_two = $afterTwo
+            undo_one = $undoOne
+            undo_two = $undoTwo
+        }
+    }
+    Invoke-TableCase 'arrow_repeat_boundary' {
+        param($main, $editor, $path, $process)
+        $three = $source.IndexOf('three', [StringComparison]::Ordinal)
+        Set-Selection $editor ($one + 3)
+        $input = Send-KeyRepeat $editor $VK_RIGHT 8
+        if ($input.sent -ne $input.expected) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = "arrow SendInput sent $($input.sent)/$($input.expected) (Win32 $($input.error))" }
+        }
+        $selection = Get-Selection $editor
+        $saved = Save-Source $main $path
+        $pass = $saved -eq $source -and $selection.start -ge $two -and $selection.end -eq $selection.start -and $selection.start -lt $three
+        [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' } else { 'FAIL_ARROW_REPEAT_CROSSED_ROW_OR_MUTATED_SOURCE' }; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
+    }
+    Invoke-TableCase 'table_paint_reentry' {
+        param($main, $editor, $path, $process)
+        Invoke-PaintReentryProbe $editor $process 96
     }
 
     $failed = @($checks.GetEnumerator() | Where-Object { -not $_.Value.pass })

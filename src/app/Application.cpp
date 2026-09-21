@@ -1170,6 +1170,9 @@ Application::~Application() {
   if (accelerator_table_) DestroyAcceleratorTable(accelerator_table_);
   if (editor_font_) DeleteObject(editor_font_);
   if (background_brush_) DeleteObject(background_brush_);
+  if (surface_brush_) DeleteObject(surface_brush_);
+  if (input_brush_) DeleteObject(input_brush_);
+  if (editor_brush_) DeleteObject(editor_brush_);
 }
 
 bool Application::Initialize(int show_command) {
@@ -1313,6 +1316,16 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
                                                UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
   auto* view = app->FindDocumentView(window);
+  const bool source_navigation = message == WM_KILLFOCUS || message == WM_LBUTTONDOWN ||
+      (message == WM_KEYDOWN &&
+       (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN ||
+        wparam == VK_HOME || wparam == VK_END || wparam == VK_PRIOR || wparam == VK_NEXT));
+  if (view && !view->ime_composing && source_navigation &&
+      IsMarkdownFile(view->document.path())) {
+    // A caret/focus boundary terminates the pending native burst before the
+    // next command can create an unrelated source-history entry.
+    app->SyncDocumentFromEditor(*view);
+  }
   if (message == WM_SETFOCUS) app->SelectDocumentForEditor(window);
   if (message == WM_PASTE && app->PasteClipboardImage()) return 0;
   if (message == WM_IME_STARTCOMPOSITION && view) view->ime_composing = true;
@@ -1357,6 +1370,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       const auto direction = wparam == VK_LEFT ? TableCaretDirection::Left :
           wparam == VK_RIGHT ? TableCaretDirection::Right :
           wparam == VK_UP ? TableCaretDirection::Up : TableCaretDirection::Down;
+      const auto source_caret = view->editor_snapshot.NativeToSource(selection.cpMin);
       const auto destination = MoveTableCaretAtBoundary(
           view->document.text(), view->editor_snapshot.NativeToSource(selection.cpMin), direction);
       if (destination) {
@@ -1364,6 +1378,10 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
         SendMessageW(window, EM_SETSEL, view_caret, view_caret);
         return 0;
       }
+      const bool within_table = std::ranges::any_of(view->parse.tables, [&](const auto& table) {
+        return source_caret >= table.begin && source_caret <= table.end;
+      });
+      if (within_table) return 0;
     }
   }
   if (message == WM_LBUTTONDOWN && view && !view->ime_composing &&
@@ -1378,8 +1396,23 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     }
   }
   if (message == WM_NCDESTROY) RemoveWindowSubclass(window, EditorSubclass, 1);
+  RECT update_rect{};
+  const bool needs_table_paint = message == WM_PAINT && view &&
+                                 GetUpdateRect(window, &update_rect, FALSE) != FALSE;
   const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
-  if (message == WM_PAINT && view) app->DrawTableGrid(*view);
+  if (needs_table_paint && view && !view->painting_table_grid) {
+    HRGN update_region = CreateRectRgnIndirect(&update_rect);
+    HDC paint_dc = update_region
+        ? GetDCEx(window, update_region, DCX_INTERSECTRGN | DCX_CACHE | DCX_CLIPSIBLINGS)
+        : nullptr;
+    if (paint_dc) {
+      view->painting_table_grid = true;
+      app->DrawTableGrid(*view, paint_dc, update_rect);
+      view->painting_table_grid = false;
+      ReleaseDC(window, paint_dc);
+    }
+    if (update_region) DeleteObject(update_region);
+  }
   return result;
 }
 
@@ -1709,6 +1742,19 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_NOTIFY: {
       const auto* header = reinterpret_cast<NMHDR*>(lparam);
+      if (header && header->code == NM_CUSTOMDRAW &&
+          (header->hwndFrom == workspace_tree_ || header->hwndFrom == outline_ ||
+           header->hwndFrom == tabs_ || header->hwndFrom == find_results_ ||
+           header->hwndFrom == status_)) {
+        auto* draw = reinterpret_cast<NMCUSTOMDRAW*>(lparam);
+        if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
+          const bool selected = (draw->uItemState & CDIS_SELECTED) != 0;
+          SetTextColor(draw->hdc, selected ? RGB(255, 255, 255) : theme_foreground_);
+          SetBkColor(draw->hdc, selected ? theme_accent_ : theme_surface_);
+          return CDRF_DODEFAULT;
+        }
+      }
       if (header->hwndFrom == tabs_ && header->code == TCN_SELCHANGE) {
         const int index = TabCtrl_GetCurSel(tabs_);
         if (index >= 0) ActivateDocument(static_cast<std::size_t>(index));
@@ -1849,13 +1895,23 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                background_brush_ ? background_brush_ : GetSysColorBrush(COLOR_WINDOW));
       return 1;
     }
+    case WM_CTLCOLORBTN:
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORLISTBOX: {
       auto dc = reinterpret_cast<HDC>(wparam);
+      const HWND control = reinterpret_cast<HWND>(lparam);
+      const bool editor = std::ranges::any_of(documents_, [control](const auto& candidate) {
+        return candidate->editor == control;
+      });
+      const bool input = control == find_edit_ || control == replace_edit_ ||
+          control == find_include_glob_ || control == find_exclude_glob_;
+      const COLORREF background = editor ? theme_editor_ : input ? theme_input_ : theme_surface_;
+      HBRUSH brush = editor ? editor_brush_ : input ? input_brush_ : surface_brush_;
       SetTextColor(dc, theme_foreground_);
-      SetBkColor(dc, theme_background_);
-      return reinterpret_cast<LRESULT>(background_brush_ ? background_brush_ : GetSysColorBrush(COLOR_WINDOW));
+      SetBkColor(dc, background);
+      SetBkMode(dc, OPAQUE);
+      return reinterpret_cast<LRESULT>(brush ? brush : GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_DESTROY:
       if (workspace_mutex_) {
@@ -2797,6 +2853,7 @@ void Application::OnEditorChanged(HWND editor) {
     if (view->editor != editor) continue;
     if (view->ime_composing) return;
     const ULONGLONG now = GetTickCount64();
+    InvalidateTableGrid(*view);
     // RichEdit emits EN_CHANGE synchronously for each character. Coalesce the
     // expensive view-to-source snapshot into one transaction per input burst;
     // commands that need source immediately call SyncDocumentFromEditor first.
@@ -2831,6 +2888,7 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
   }
   const auto transaction = ApplyEditorText(native_snapshot, view.document.text(), current_view);
   if (!transaction.changed) return;
+  InvalidateTableGrid(view);
   view.source_undo.push_back({transaction.begin,
       view.document.text().substr(transaction.begin, transaction.old_end - transaction.begin),
       transaction.source.substr(transaction.begin, transaction.new_end - transaction.begin)});
@@ -2885,6 +2943,7 @@ void Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
   const std::size_t source_begin = view.editor_snapshot.NativeToSource(selection.cpMin);
   const std::size_t source_end = view.editor_snapshot.NativeToSource(selection.cpMax);
   const auto target_native = NativeSnapshotFor(view.document.path(), text);
+  InvalidateTableGrid(view);
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
     PresentationUndoGuard undo_guard(view.editor);
@@ -3290,6 +3349,7 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   const int active_line = static_cast<int>(SendMessageW(view.editor, EM_LINEFROMCHAR, selection.cpMin, 0));
   if (!force && view.active_line == active_line) return;
   view.active_line = active_line;
+  InvalidateTableGrid(view);
   view.parse = ParseMarkdown(view.document.text());
   RefreshDerivedImages(view);
 
@@ -3388,12 +3448,36 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
   InvalidateRect(view.editor, nullptr, TRUE);
 }
+void Application::InvalidateTableGrid(DocumentView& view) {
+  if (!view.editor) return;
+  RECT client{};
+  if (!GetClientRect(view.editor, &client) || client.right <= client.left ||
+      client.bottom <= client.top) return;
+  const auto geometry = BuildTableGridGeometry(view, client);
+  if (geometry.empty()) {
+    InvalidateRect(view.editor, nullptr, TRUE);
+    return;
+  }
+  for (const auto& table : geometry) {
+    if (table.rows.empty()) continue;
+    RECT dirty{table.left - 2, table.rows.front().top - 2,
+               table.right + 2, table.rows.front().bottom + 2};
+    for (const auto& row : table.rows) {
+      dirty.top = std::min<LONG>(dirty.top, static_cast<LONG>(row.top - 2));
+      dirty.bottom = std::max<LONG>(dirty.bottom, static_cast<LONG>(row.bottom + 2));
+    }
+    RECT clipped{};
+    if (IntersectRect(&clipped, &dirty, &client)) InvalidateRect(view.editor, &clipped, TRUE);
+  }
+}
 
 std::vector<Application::TableGridGeometry> Application::BuildTableGridGeometry(
-    const DocumentView& view, const RECT& client) const {
+    const DocumentView& view, const RECT& client, HDC metrics_dc) const {
   if (!IsMarkdownFile(view.document.path()) || view.parse.tables.empty() ||
       client.right <= client.left || client.bottom <= client.top) return {};
-  HDC dc = GetDC(view.editor);
+  HDC dc = metrics_dc;
+  const bool release_dc = dc == nullptr;
+  if (release_dc) dc = GetDC(view.editor);
   if (!dc) return {};
   POINTL first_point{client.left, client.top};
   POINTL last_point{std::max(client.left, client.right - 1),
@@ -3413,7 +3497,7 @@ std::vector<Application::TableGridGeometry> Application::BuildTableGridGeometry(
   GetTextMetricsW(dc, &metrics);
   const int line_height = std::max(1, static_cast<int>(metrics.tmHeight));
   if (previous_font) SelectObject(dc, previous_font);
-  ReleaseDC(view.editor, dc);
+  if (release_dc) ReleaseDC(view.editor, dc);
 
   std::vector<TableGridGeometry> result;
   for (const auto& table : view.parse.tables) {
@@ -3493,7 +3577,7 @@ std::vector<Application::TableGridGeometry> Application::BuildTableGridGeometry(
 }
 
 std::optional<std::size_t> Application::HitTestTableCell(const DocumentView& view, POINT point) const {
-  if (view.sync_due != 0 || !IsMarkdownFile(view.document.path())) return std::nullopt;
+  if (view.sync_due != 0 || view.presentation_due != 0 || !IsMarkdownFile(view.document.path())) return std::nullopt;
   RECT client{};
   GetClientRect(view.editor, &client);
   const auto geometry = BuildTableGridGeometry(view, client);
@@ -3514,39 +3598,42 @@ std::optional<std::size_t> Application::HitTestTableCell(const DocumentView& vie
   return std::nullopt;
 }
 
-void Application::DrawTableGrid(const DocumentView& view) {
-  if (!IsMarkdownFile(view.document.path()) || view.parse.tables.empty()) return;
-  HDC dc = GetDC(view.editor);
-  if (!dc) return;
+void Application::DrawTableGrid(const DocumentView& view, HDC paint_dc, const RECT& clip) {
+  if (!paint_dc || view.sync_due != 0 || view.presentation_due != 0 ||
+      !IsMarkdownFile(view.document.path()) || view.parse.tables.empty()) return;
   RECT client{};
   GetClientRect(view.editor, &client);
-  const auto geometry = BuildTableGridGeometry(view, client);
-  const bool dark = settings_.theme == ThemeMode::Dark ||
-                    (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
-  HPEN pen = CreatePen(PS_SOLID, 1, dark ? RGB(105, 116, 128) : RGB(158, 169, 181));
-  const HGDIOBJ previous_pen = SelectObject(dc, pen);
+  if (clip.right <= clip.left || clip.bottom <= clip.top) return;
+  const auto geometry = BuildTableGridGeometry(view, client, paint_dc);
+  HPEN pen = CreatePen(PS_SOLID, 1, theme_border_);
+  if (!pen) return;
+  IntersectClipRect(paint_dc, clip.left, clip.top, clip.right, clip.bottom);
+  const HGDIOBJ previous_pen = SelectObject(paint_dc, pen);
+  if (previous_pen == nullptr || previous_pen == HGDI_ERROR) {
+    DeleteObject(pen);
+    return;
+  }
   for (const auto& table : geometry) {
     for (const auto& row : table.rows) {
       if (row.bottom < client.top || row.top >= client.bottom) continue;
-      MoveToEx(dc, table.left, row.top, nullptr);
-      LineTo(dc, table.right, row.top);
-      MoveToEx(dc, table.left, row.bottom, nullptr);
-      LineTo(dc, table.right, row.bottom);
-      MoveToEx(dc, table.left, row.top, nullptr);
-      LineTo(dc, table.left, row.bottom);
+      MoveToEx(paint_dc, table.left, row.top, nullptr);
+      LineTo(paint_dc, table.right, row.top);
+      MoveToEx(paint_dc, table.left, row.bottom, nullptr);
+      LineTo(paint_dc, table.right, row.bottom);
+      MoveToEx(paint_dc, table.left, row.top, nullptr);
+      LineTo(paint_dc, table.left, row.bottom);
       for (std::size_t cell_index = 0;
            cell_index + 1 < row.cells.size() && cell_index < table.boundaries.size();
            ++cell_index) {
-        MoveToEx(dc, table.boundaries[cell_index], row.top, nullptr);
-        LineTo(dc, table.boundaries[cell_index], row.bottom);
+        MoveToEx(paint_dc, table.boundaries[cell_index], row.top, nullptr);
+        LineTo(paint_dc, table.boundaries[cell_index], row.bottom);
       }
-      MoveToEx(dc, table.right, row.top, nullptr);
-      LineTo(dc, table.right, row.bottom);
+      MoveToEx(paint_dc, table.right, row.top, nullptr);
+      LineTo(paint_dc, table.right, row.bottom);
     }
   }
-  SelectObject(dc, previous_pen);
+  SelectObject(paint_dc, previous_pen);
   DeleteObject(pen);
-  ReleaseDC(view.editor, dc);
 }
 
 void Application::RebuildOutline(const DocumentView& view) {
@@ -5051,11 +5138,27 @@ void Application::ApplySettings() {
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
   const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
+  theme_surface_ = ThemeColor(settings_, L"surface", dark ? RGB(42, 46, 54) : RGB(248, 250, 253));
+  theme_surface_alt_ = ThemeColor(settings_, L"surface_alt", dark ? RGB(50, 55, 64) : RGB(241, 245, 249));
+  theme_editor_ = ThemeColor(settings_, L"editor_background", dark ? RGB(28, 31, 36) : RGB(252, 253, 255));
+  theme_input_ = ThemeColor(settings_, L"input_background", dark ? RGB(36, 40, 47) : RGB(255, 255, 255));
+  theme_border_ = ThemeColor(settings_, L"border", dark ? RGB(83, 92, 105) : RGB(210, 218, 228));
+  theme_muted_ = ThemeColor(settings_, L"muted", dark ? RGB(170, 180, 194) : RGB(92, 104, 120));
+  theme_accent_ = ThemeColor(settings_, L"accent", dark ? RGB(108, 170, 255) : RGB(56, 112, 194));
   HBRUSH replacement_brush = CreateSolidBrush(background);
   if (replacement_brush) {
     if (background_brush_) DeleteObject(background_brush_);
     background_brush_ = replacement_brush;
   }
+  auto replace_brush = [](HBRUSH& target, COLORREF color) {
+    HBRUSH replacement = CreateSolidBrush(color);
+    if (!replacement) return;
+    if (target) DeleteObject(target);
+    target = replacement;
+  };
+  replace_brush(surface_brush_, theme_surface_);
+  replace_brush(input_brush_, theme_input_);
+  replace_brush(editor_brush_, theme_editor_);
   theme_background_ = background;
   theme_foreground_ = foreground;
   const int height = -MulDiv(static_cast<int>(settings_.font_size_pt),
@@ -5074,10 +5177,13 @@ void Application::ApplySettings() {
       if (view->editor) SendMessageW(view->editor, WM_SETFONT,
                                      reinterpret_cast<WPARAM>(replacement), TRUE);
   }
-  TreeView_SetBkColor(workspace_tree_, background);
+  TreeView_SetBkColor(workspace_tree_, theme_surface_);
   TreeView_SetTextColor(workspace_tree_, foreground);
-  TreeView_SetBkColor(outline_, background);
+  TreeView_SetBkColor(outline_, theme_surface_);
   TreeView_SetTextColor(outline_, foreground);
+  ListView_SetBkColor(find_results_, theme_surface_);
+  ListView_SetTextBkColor(find_results_, theme_surface_);
+  ListView_SetTextColor(find_results_, foreground);
   for (auto& view : documents_) {
     {
       ScopedEditorChangeSuppression suppression(suppress_editor_change_);
@@ -5085,7 +5191,7 @@ void Application::ApplySettings() {
       if (!guard) continue;
       CHARRANGE selection{};
       SendMessageW(view->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-      SendMessageW(view->editor, EM_SETBKGNDCOLOR, 0, background);
+      SendMessageW(view->editor, EM_SETBKGNDCOLOR, 0, theme_editor_);
       CHARFORMAT2W format{};
       format.cbSize = sizeof(format);
       format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;

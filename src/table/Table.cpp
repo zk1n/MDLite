@@ -19,6 +19,7 @@ struct TableBlock {
   std::size_t begin{};
   std::size_t end{};
   std::size_t current_row{};
+  std::vector<Row> row_ranges;
   std::vector<std::vector<std::wstring>> rows;
 };
 
@@ -125,13 +126,14 @@ std::optional<TableBlock> BlockAt(std::wstring_view source, std::size_t caret) {
     if (!ParseRow(source, previous_begin, previous_end)) break;
     block_begin = previous_begin;
   }
-  TableBlock block{block_begin, block_begin, 0, {}};
+  TableBlock block{block_begin, block_begin, 0, {}, {}};
   std::size_t line_begin = block_begin;
   while (line_begin <= source.size()) {
     const auto [begin, end] = LineRange(source, line_begin);
     const auto row = ParseRow(source, begin, end);
     if (!row) break;
     if (begin == current->begin) block.current_row = block.rows.size();
+    block.row_ranges.push_back(*row);
     block.rows.push_back(CellValues(source, *row));
     block.end = end;
     const std::size_t next = NextLineStart(source, end);
@@ -141,24 +143,66 @@ std::optional<TableBlock> BlockAt(std::wstring_view source, std::size_t caret) {
   return block.rows.size() >= 2 ? std::optional<TableBlock>(std::move(block)) : std::nullopt;
 }
 
-TableEditResult RenderBlock(std::wstring_view source, const TableBlock& block,
-                            std::size_t selected_column) {
-  std::wstring rendered;
-  const std::wstring line_break(PreferredLineBreak(source, block.begin));
-  std::size_t selection_in_block{};
-  for (std::size_t row_index = 0; row_index < block.rows.size(); ++row_index) {
-    if (row_index != 0) rendered += line_break;
-    const std::size_t row_begin = rendered.size();
-    const std::wstring row_text = RenderRow(block.rows[row_index]);
-    if (row_index == block.current_row) {
-      const auto row = ParseRow(row_text, 0, row_text.size());
-      if (row) selection_in_block = row_begin + row->cells[std::min(selected_column, row->cells.size() - 1)].first;
-    }
-    rendered += row_text;
-  }
+struct RowChange {
+  std::size_t begin{};
+  std::size_t end{};
+  std::wstring replacement;
+};
+
+// Column actions are source transactions over each row's separators; rebuilding the
+// whole block would rewrite untouched padding, escapes, and mixed line endings.
+std::wstring ApplyRowChanges(std::wstring_view source, std::vector<RowChange> changes) {
   std::wstring result(source);
-  result.replace(block.begin, block.end - block.begin, rendered);
-  return {std::move(result), block.begin + selection_in_block, true};
+  std::ranges::sort(changes, {}, &RowChange::begin);
+  for (auto change = changes.rbegin(); change != changes.rend(); ++change)
+    result.replace(change->begin, change->end - change->begin, change->replacement);
+  return result;
+}
+
+std::size_t RowCaretAfterChanges(std::wstring_view source, const TableBlock& block,
+                                 std::size_t selected_column,
+                                 const std::vector<RowChange>& changes) {
+  std::size_t current_begin = block.row_ranges[block.current_row].begin;
+  for (const auto& change : changes) {
+    if (change.begin < current_begin) {
+      current_begin += change.replacement.size();
+      current_begin -= change.end - change.begin;
+    }
+  }
+  const auto current = RowAt(source, current_begin);
+  if (!current || current->cells.empty()) return current_begin;
+  return current->cells[std::min(selected_column, current->cells.size() - 1)].first;
+}
+
+std::wstring InsertedColumnText(const std::wstring& value, bool before_existing_cell) {
+  return before_existing_cell ? value + L" | " : L" | " + value;
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> ColumnDeletionRange(
+    std::wstring_view source, const Row& row, std::size_t column) {
+  if (column >= row.cells.size()) return std::nullopt;
+  const auto line = source.substr(row.begin, row.end - row.begin);
+  std::size_t cursor = !line.empty() && line.front() == L'|' ? 1 : 0;
+  std::size_t previous_separator = std::wstring_view::npos;
+  for (std::size_t index{}; index <= column; ++index) {
+    const std::size_t separator = NextCellSeparator(line, cursor);
+    const std::size_t absolute_separator =
+        separator == std::wstring_view::npos ? row.end : row.begin + separator;
+    if (index == column) {
+      std::size_t begin = index == 0 ? row.begin : row.begin + previous_separator;
+      std::size_t end = absolute_separator;
+      if (index == 0 && (line.empty() || line.front() != L'|') &&
+          separator != std::wstring_view::npos) {
+        // Keep a non-leading-pipe row in its original form ("A | B" -> "B").
+        ++end;
+      }
+      return std::pair{begin, end};
+    }
+    if (separator == std::wstring_view::npos) return std::nullopt;
+    previous_separator = separator;
+    cursor = separator + 1;
+  }
+  return std::nullopt;
 }
 
 TableEditResult ReplaceLine(std::wstring_view source, const Row& row, std::wstring replacement,
@@ -311,12 +355,22 @@ TableEditResult InsertTableColumn(std::wstring_view source, std::size_t caret, b
   const std::size_t target = CellAt(*current, caret) + (after ? 1 : 0);
   auto block = BlockAt(source, caret);
   if (!block) return {std::wstring(source), caret, false};
-  for (auto& cells : block->rows) {
-    const bool delimiter = IsDelimiter(cells);
-    cells.insert(cells.begin() + static_cast<std::ptrdiff_t>(std::min(target, cells.size())),
-                 delimiter ? L"---" : L"");
+
+  std::vector<RowChange> changes;
+  changes.reserve(block->row_ranges.size());
+  for (std::size_t index{}; index < block->row_ranges.size(); ++index) {
+    const auto& row = block->row_ranges[index];
+    const auto& cells = block->rows[index];
+    const std::size_t insertion_cell = std::min(target, cells.size());
+    const bool before_existing_cell = insertion_cell < cells.size();
+    const std::size_t insertion = before_existing_cell
+                                       ? row.cells[insertion_cell].first
+                                       : row.cells.back().second;
+    const std::wstring value = IsDelimiter(cells) ? L"---" : L"";
+    changes.push_back({insertion, insertion, InsertedColumnText(value, before_existing_cell)});
   }
-  return RenderBlock(source, *block, target);
+  const std::wstring result = ApplyRowChanges(source, changes);
+  return {result, RowCaretAfterChanges(result, *block, target, changes), true};
 }
 
 TableEditResult DeleteTableColumn(std::wstring_view source, std::size_t caret) {
@@ -325,11 +379,19 @@ TableEditResult DeleteTableColumn(std::wstring_view source, std::size_t caret) {
   const std::size_t target = CellAt(*current, caret);
   auto block = BlockAt(source, caret);
   if (!block) return {std::wstring(source), caret, false};
-  for (auto& cells : block->rows) {
-    if (target >= cells.size() || cells.size() <= 1) return {std::wstring(source), caret, false};
-    cells.erase(cells.begin() + static_cast<std::ptrdiff_t>(target));
+
+  std::vector<RowChange> changes;
+  changes.reserve(block->row_ranges.size());
+  for (const auto& row : block->row_ranges) {
+    if (target >= row.cells.size() || row.cells.size() <= 1)
+      return {std::wstring(source), caret, false};
+    const auto deletion = ColumnDeletionRange(source, row, target);
+    if (!deletion) return {std::wstring(source), caret, false};
+    changes.push_back({deletion->first, deletion->second, L""});
   }
-  return RenderBlock(source, *block, target);
+  const std::wstring result = ApplyRowChanges(source, changes);
+  const std::size_t selected_column = target == 0 ? 0 : target - 1;
+  return {result, RowCaretAfterChanges(result, *block, selected_column, changes), true};
 }
 
 }  // namespace mdlite

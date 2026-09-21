@@ -73,6 +73,12 @@ public static class MDLiteNative {
     public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetObject(IntPtr handle, int size, out LOGFONTW font);
+    [DllImport("user32.dll")]
+    public static extern bool InvalidateRect(IntPtr window, IntPtr rectangle, bool erase);
+    [DllImport("user32.dll")]
+    public static extern bool UpdateWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern uint GetGuiResources(IntPtr process, uint flags);
 }
 '@
 
@@ -84,6 +90,7 @@ $WM_GETTEXTLENGTH = 0x000E
 $WM_GETFONT = 0x0031
 $WM_CHAR = 0x0102
 $WM_SETFOCUS = 0x0007
+$WM_SIZE = 0x0005
 $WM_UNDO = 0x0304
 $EM_SETSEL = 0x00B1
 $EM_GETSEL = 0x00B0
@@ -260,6 +267,76 @@ function Get-FileFingerprint([string]$Path) {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
+function Get-ResourceSnapshot([Diagnostics.Process]$Process) {
+    try {
+        $Process.Refresh()
+        return [pscustomobject]@{
+            status = 'PASS'
+            gdi = [int][MDLiteNative]::GetGuiResources($Process.Handle, 0)
+            user = [int][MDLiteNative]::GetGuiResources($Process.Handle, 1)
+        }
+    }
+    catch {
+        return [pscustomobject]@{ status = 'BLOCKED'; reason = $_.Exception.Message }
+    }
+}
+
+function Invoke-PaintLayoutReentryProbe(
+    [IntPtr]$Main,
+    [IntPtr]$Editor,
+    [Diagnostics.Process]$Process,
+    [int]$Iterations = 64) {
+    try {
+        $before = Get-ResourceSnapshot $Process
+        $beforeRect = New-Object MDLiteNative+RECT
+        if ($before.status -ne 'PASS' -or -not [MDLiteNative]::GetClientRect($Main, [ref]$beforeRect)) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = if ($before.status -ne 'PASS') { $before.reason } else { 'GetClientRect failed' } }
+        }
+        $width = [int]($beforeRect.right - $beforeRect.left)
+        $height = [int]($beforeRect.bottom - $beforeRect.top)
+        $sizeParam = [IntPtr](($height -band 0xFFFF) -shl 16 -bor ($width -band 0xFFFF))
+        $samples = [Collections.Generic.List[object]]::new()
+        for ($index = 0; $index -lt $Iterations; $index++) {
+            [void][MDLiteNative]::SendMessage($Main, $WM_SIZE, [IntPtr]1, $sizeParam)
+            [void][MDLiteNative]::InvalidateRect($Main, [IntPtr]::Zero, $false)
+            [void][MDLiteNative]::UpdateWindow($Main)
+            [void][MDLiteNative]::InvalidateRect($Editor, [IntPtr]::Zero, $false)
+            [void][MDLiteNative]::UpdateWindow($Editor)
+            if (($index + 1) % 16 -eq 0) {
+                $Process.Refresh()
+                if ($Process.HasExited) { break }
+                $samples.Add((Get-ResourceSnapshot $Process))
+            }
+        }
+        $after = Get-ResourceSnapshot $Process
+        $afterRect = New-Object MDLiteNative+RECT
+        $rectOk = [MDLiteNative]::GetClientRect($Main, [ref]$afterRect) -and
+            ($afterRect.right - $afterRect.left) -eq $width -and ($afterRect.bottom - $afterRect.top) -eq $height
+        $validSamples = @($samples | Where-Object { $_.status -eq 'PASS' })
+        if ($after.status -ne 'PASS' -or $validSamples.Count -eq 0) {
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; before = $before; after = $after; samples = @($samples); client_stable = $rectOk }
+        }
+        $maxGdi = (@($validSamples | ForEach-Object { $_.gdi }) | Measure-Object -Maximum).Maximum
+        $maxUser = (@($validSamples | ForEach-Object { $_.user }) | Measure-Object -Maximum).Maximum
+        $pass = -not $Process.HasExited -and $rectOk -and $after.gdi -le ($before.gdi + 24) -and
+            $after.user -le ($before.user + 8) -and $maxGdi -le ($before.gdi + 24) -and
+            $maxUser -le ($before.user + 8)
+        return [pscustomobject]@{
+            pass = $pass
+            status = if ($pass) { 'PASS_OS_NATIVE_PAINT_LAYOUT' } else { 'FAIL_REENTRY_RESOURCE_GROWTH_OR_LAYOUT_DRIFT' }
+            iterations = $Iterations
+            client_width = $width
+            client_height = $height
+            client_stable = $rectOk
+            before = $before
+            after = $after
+            samples = @($samples)
+        }
+    }
+    catch {
+        return [pscustomobject]@{ pass = $false; status = 'BLOCKED'; reason = $_.Exception.Message }
+    }
+}
 function Get-NativeRuntimeSnapshot(
     [Diagnostics.Process]$Process,
     [IntPtr]$Main,
@@ -364,6 +441,8 @@ try {
     $checks.main_window = $true
     $checks.initial_view = ((Get-WindowText $editor) -replace "`r`n", "`n") -eq $initial
     $checks.runtime_environment = Get-NativeRuntimeSnapshot $process $main $editor $first $firstInitialHash $settingsFile
+    # Re-enter native layout and paint synchronously; this is OS-native message evidence, not Human visual acceptance.
+    $checks.paint_layout_reentry = Invoke-PaintLayoutReentryProbe $main $editor $process 64
 
     # View -> compact. Focus selection must follow the editor, and EN_CHANGE must route to its new parent.
     [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]1030, [IntPtr]::Zero)

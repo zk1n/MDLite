@@ -94,6 +94,7 @@ class Application {
     bool ime_composing{};
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;
+    bool painting_table_grid{};
   };
 
   struct TableGridRow {
@@ -153,10 +154,12 @@ class Application {
   void OnEditorChanged(HWND editor);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
+  void InvalidateTableGrid(DocumentView& view);
   std::vector<TableGridGeometry> BuildTableGridGeometry(const DocumentView& view,
-                                                        const RECT& client) const;
+                                                        const RECT& client,
+                                                        HDC metrics_dc = nullptr) const;
   std::optional<std::size_t> HitTestTableCell(const DocumentView& view, POINT point) const;
-  void DrawTableGrid(const DocumentView& view);
+  void DrawTableGrid(const DocumentView& view, HDC paint_dc, const RECT& clip);
   void RefreshDerivedImages(DocumentView& view);
   void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);
   static bool ReadImageFileIdentity(const std::filesystem::path& path,
@@ -273,8 +276,18 @@ class Application {
   HACCEL accelerator_table_{};
   HFONT editor_font_{};
   HBRUSH background_brush_{};
+  HBRUSH surface_brush_{};
+  HBRUSH input_brush_{};
+  HBRUSH editor_brush_{};
   COLORREF theme_background_{RGB(255, 255, 255)};
   COLORREF theme_foreground_{RGB(24, 24, 24)};
+  COLORREF theme_surface_{RGB(255, 255, 255)};
+  COLORREF theme_surface_alt_{RGB(243, 246, 250)};
+  COLORREF theme_editor_{RGB(252, 253, 255)};
+  COLORREF theme_input_{RGB(255, 255, 255)};
+  COLORREF theme_border_{RGB(210, 218, 228)};
+  COLORREF theme_muted_{RGB(92, 104, 120)};
+  COLORREF theme_accent_{RGB(56, 112, 194)};
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
   std::wstring holiday_update_status_;

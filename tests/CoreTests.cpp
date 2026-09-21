@@ -577,6 +577,16 @@ void TestEditorAdapter() {
   Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
             native_lines.NativeToSource(1) == 1,
         "native line-ending mapping remains compact and boundary-safe");
+  const std::wstring unicode_native_source = L"😀\r\n| A | B |";
+  const auto unicode_native = mdlite::BuildNativeTextEditorSnapshot(unicode_native_source);
+  Check(unicode_native.SourceToNative(2) == 2 && unicode_native.SourceToNative(3) == 2 &&
+            unicode_native.SourceToNative(4) == 3 && unicode_native.NativeToSource(2) == 2 &&
+            unicode_native.NativeToSource(3) == 4,
+        "native mapping keeps UTF-16 surrogate units distinct at a CRLF boundary");
+  const auto unicode_native_edit = mdlite::ApplyEditorText(
+      unicode_native, unicode_native_source, L"😀\r\n| AX | B |");
+  Check(unicode_native_edit.source == L"😀\r\n| AX | B |",
+        "native transaction preserves a CRLF boundary after a UTF-16 edit");
   const auto lone_native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\nc");
   Check(lone_native_lines.native_discontinuities.empty(),
         "same-width lone LF boundaries do not allocate native discontinuity records");
@@ -1096,6 +1106,20 @@ void TestTableEditing() {
   const auto inserted = mdlite::InsertTableColumn(table, table.find(L"1"), true);
   Check(inserted.changed && inserted.text.find(L"| --- | --- | --- |") != std::wstring::npos,
         "column insertion extends the delimiter row");
+  const std::wstring literal_table =
+      L"|  A  | B\\| raw | `C|D` |\r\n| :--- | ---: | :---: |\n| left  |  middle  | right |";
+  const auto literal_insert = mdlite::InsertTableColumn(
+      literal_table, literal_table.find(L"middle"), true);
+  Check(literal_insert.changed &&
+            literal_insert.text ==
+                L"|  A  | B\\| raw |  | `C|D` |\r\n| :--- | ---: | --- | :---: |\n| left  |  middle  |  | right |" &&
+            literal_insert.text[literal_insert.selection] == L'|',
+        "column insertion preserves literal cell text, escaped pipes, and mixed line endings");
+  const auto literal_delete = mdlite::DeleteTableColumn(literal_table, literal_table.find(L"middle"));
+  Check(literal_delete.changed &&
+            literal_delete.text == L"|  A  | `C|D` |\r\n| :--- | :---: |\n| left  | right |" &&
+            literal_delete.selection == literal_delete.text.find(L"left"),
+        "column deletion changes only the selected separator range and keeps caret in the row");
   const auto deleted = mdlite::DeleteTableRow(table, table.find(L"1"));
   Check(deleted.changed && deleted.text.find(L"| 1 | 2 |") == std::wstring::npos,
         "table row deletion removes only the selected row");

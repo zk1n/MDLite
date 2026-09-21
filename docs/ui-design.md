@@ -25,6 +25,12 @@ Workspace／Outline pane は View メニューから個別に折り畳み・復�
 場合はnavigationを自動的に隠し、editorへ負幅・clippingを渡さない。Find/Replaceもclient幅に応じて
 advanced option、glob、Workspace actionを折り畳み、検索と置換の基本入力を残す。
 
+配色は `background`（window）、`surface`（pane/tab/list）、`surface_alt`（補助面）、
+`editor_background`（RichEdit）、`input_background`（検索入力）、`border`、`muted`、`accent` の
+tokenを `ThemeColor` から解決し、light/dark/system と DPI変更の再適用で同じ palette を native control、
+editor、表gridへ伝播する。表示用 table grid は WM_PAINT の update clip HDC のみへ描画し、保留中の
+source/presentation 世代では描画・hit-testを止めて古い geometry を混在させない。
+
 Markdown presentation は全体を通常書式へ戻してから必要な span だけを再適用する。underline、hidden、
 link、background、paragraph spacing/border を明示的に解除し、source変更や公開Undoを発生させない。
 

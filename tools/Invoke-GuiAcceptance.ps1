@@ -24,6 +24,25 @@ using System.Runtime.InteropServices;
 
 public static class MDLiteNative {
     public delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int left; public int top; public int right; public int bottom; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct LOGFONTW {
+        public int lfHeight;
+        public int lfWidth;
+        public int lfEscapement;
+        public int lfOrientation;
+        public int lfWeight;
+        public byte lfItalic;
+        public byte lfUnderline;
+        public byte lfStrikeOut;
+        public byte lfCharSet;
+        public byte lfOutPrecision;
+        public byte lfClipPrecision;
+        public byte lfQuality;
+        public byte lfPitchAndFamily;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string lfFaceName;
+    }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindow(string className, string windowName);
     [DllImport("user32.dll")]
@@ -46,6 +65,14 @@ public static class MDLiteNative {
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr window, out RECT rect);
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr window, out RECT rect);
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr window);
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetObject(IntPtr handle, int size, out LOGFONTW font);
 }
 '@
 
@@ -54,6 +81,7 @@ $WM_CLOSE = 0x0010
 $WM_SETTEXT = 0x000C
 $WM_GETTEXT = 0x000D
 $WM_GETTEXTLENGTH = 0x000E
+$WM_GETFONT = 0x0031
 $WM_CHAR = 0x0102
 $WM_SETFOCUS = 0x0007
 $WM_UNDO = 0x0304
@@ -203,9 +231,91 @@ function Wait-ListItemCount([IntPtr]$List, [int]$Minimum, [int]$TimeoutMs = 1000
     return $count
 }
 
+function Get-WindowClass([IntPtr]$Window) {
+    $name = New-Object Text.StringBuilder 128
+    [void][MDLiteNative]::GetClassName($Window, $name, $name.Capacity)
+    return $name.ToString()
+}
+
 function Get-FileFingerprint([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'missing' }
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Get-NativeRuntimeSnapshot(
+    [Diagnostics.Process]$Process,
+    [IntPtr]$Main,
+    [IntPtr]$Editor,
+    [string]$SourcePath,
+    [string]$InitialSourceHash,
+    [string]$SettingsPath) {
+    $windowRect = New-Object MDLiteNative+RECT
+    $clientRect = New-Object MDLiteNative+RECT
+    if (-not [MDLiteNative]::GetWindowRect($Main, [ref]$windowRect)) { throw 'GetWindowRect failed' }
+    if (-not [MDLiteNative]::GetClientRect($Main, [ref]$clientRect)) { throw 'GetClientRect failed' }
+    $dpi = [int][MDLiteNative]::GetDpiForWindow($Main)
+    $fontHandle = [MDLiteNative]::SendMessage($Editor, $WM_GETFONT, [IntPtr]::Zero, [IntPtr]::Zero)
+    $font = New-Object MDLiteNative+LOGFONTW
+    $fontBytes = if ($fontHandle -ne [IntPtr]::Zero) {
+        [MDLiteNative]::GetObject($fontHandle, [Runtime.InteropServices.Marshal]::SizeOf($font), [ref]$font)
+    } else { 0 }
+    $editorText = Get-WindowText $Editor
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $editorTextHash = ([BitConverter]::ToString(
+            $sha.ComputeHash([Text.Encoding]::Unicode.GetBytes($editorText))) -replace '-', '').ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    $richEditPath = Join-Path $env:WINDIR 'System32\Msftedit.dll'
+    $richEditVersion = if (Test-Path -LiteralPath $richEditPath -PathType Leaf) {
+        (Get-Item -LiteralPath $richEditPath).VersionInfo.FileVersion
+    } else { 'missing' }
+    $settingsText = if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
+        [IO.File]::ReadAllText($SettingsPath)
+    } else { '' }
+    $configuredFontFace = if ($settingsText -match '(?m)^font_face\s*=\s*"([^"]*)"') { $Matches[1] } else { 'Segoe UI' }
+    $configuredFontSize = if ($settingsText -match '(?m)^font_size_pt\s*=\s*([0-9]+)') {
+        [int]$Matches[1]
+    } else { 11 }
+    $loadedRichEdit = @()
+    $moduleError = $null
+    try {
+        $loadedRichEdit = @($Process.Modules | Where-Object {
+            $_.ModuleName -match '(?i)^(msftedit|riched20)\.dll$'
+        } | ForEach-Object {
+            [ordered]@{ name = $_.ModuleName; path = $_.FileName; file_version = $_.FileVersionInfo.FileVersion }
+        })
+    } catch { $moduleError = $_.Exception.Message }
+    $selectionPacked = [MDLiteNative]::SendMessage($Editor, $EM_GETSEL, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+    return [ordered]@{
+        process_id = $Process.Id
+        os_version = [Environment]::OSVersion.Version.ToString()
+        os_build = [Environment]::OSVersion.Version.Build
+        main_class = Get-WindowClass $Main
+        editor_class = Get-WindowClass $Editor
+        rich_edit_dll = $richEditPath
+        rich_edit_dll_file_version = $richEditVersion
+        loaded_rich_edit_modules = $loadedRichEdit
+        loaded_module_error = $moduleError
+        dpi = $dpi
+        window = [ordered]@{ left = $windowRect.left; top = $windowRect.top; right = $windowRect.right; bottom = $windowRect.bottom; width = $windowRect.right - $windowRect.left; height = $windowRect.bottom - $windowRect.top }
+        client = [ordered]@{ left = $clientRect.left; top = $clientRect.top; right = $clientRect.right; bottom = $clientRect.bottom; width = $clientRect.right - $clientRect.left; height = $clientRect.bottom - $clientRect.top }
+        font = [ordered]@{
+            source = 'RichEdit character format configured by effective settings'
+            configured_face = $configuredFontFace
+            configured_size_pt = $configuredFontSize
+            wm_getfont_handle = $fontHandle.ToInt64()
+            control_logfont_available = $fontBytes -gt 0
+            control_face = $font.lfFaceName
+            control_height = $font.lfHeight
+            control_weight = $font.lfWeight
+            control_point_size = if ($dpi -gt 0 -and $fontBytes -gt 0) { [Math]::Round(([Math]::Abs($font.lfHeight) * 72.0 / $dpi), 2) } else { $null }
+        }
+        caret_selection_packed = $selectionPacked
+        editor_text_utf16_sha256 = $editorTextHash
+        source_initial_sha256 = $InitialSourceHash
+        source_current_sha256 = Get-FileFingerprint $SourcePath
+        settings_sha256 = Get-FileFingerprint $SettingsPath
+    }
 }
 
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) ("mdlite-gui-acceptance-" + [guid]::NewGuid().ToString('N'))
@@ -227,6 +337,7 @@ $initial = 'CaseToken casetoken WorkspaceHit'
 $process = $null
 $checks = [ordered]@{}
 $typed = ' 日本語compact'
+$firstInitialHash = Get-FileFingerprint $first
 
 try {
     $process = Start-Process -FilePath $executable -ArgumentList @($first) -PassThru
@@ -234,6 +345,7 @@ try {
     $editor = Wait-Control $main 102 'RICHEDIT50W'
     $checks.main_window = $true
     $checks.initial_view = (Get-WindowText $editor) -eq $initial
+    $checks.runtime_environment = Get-NativeRuntimeSnapshot $process $main $editor $first $firstInitialHash $settingsFile
 
     # View -> compact. Focus selection must follow the editor, and EN_CHANGE must route to its new parent.
     [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]1030, [IntPtr]::Zero)

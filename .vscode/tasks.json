@@ -5,15 +5,36 @@
       "label": "MDLite: Debug build",
       "type": "shell",
       "command": "powershell",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "debug", "-Test"],
-      "group": {"kind": "build", "isDefault": true},
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\Invoke-Build.ps1",
+        "-Preset",
+        "debug",
+        "-Test"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
       "problemMatcher": "$msCompile"
     },
     {
       "label": "MDLite: Release build and test",
       "type": "shell",
       "command": "powershell",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "release", "-Test"],
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\Invoke-Build.ps1",
+        "-Preset",
+        "release",
+        "-Test"
+      ],
       "group": "build",
       "problemMatcher": "$msCompile"
     },
@@ -21,8 +42,39 @@
       "label": "MDLite: Release run",
       "type": "shell",
       "command": "powershell",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\tools\\Invoke-Build.ps1", "-Preset", "release", "-Run"],
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\Invoke-Build.ps1",
+        "-Preset",
+        "release",
+        "-Run"
+      ],
       "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "MDLite: Prepare F5 workspace",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\New-F5DemoWorkspace.ps1"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "MDLite: F5 build and prepare",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "MDLite: Prepare F5 workspace",
+        "MDLite: Debug build"
+      ],
+      "group": "build"
     }
   ]
 }

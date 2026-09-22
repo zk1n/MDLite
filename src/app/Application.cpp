@@ -10,6 +10,7 @@
 #include "workspace/Trust.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <commdlg.h>
 #include <richedit.h>
 #include <richole.h>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cwctype>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <thread>
 
@@ -55,6 +57,7 @@ constexpr UINT kHolidayUpdateMessage = WM_APP + 44;
 constexpr wchar_t kHolidayCacheName[] = L"japanese-holidays.csv";
 constexpr wchar_t kHolidayStateName[] = L"japanese-holidays.toml";
 constexpr wchar_t kHolidayProvider[] = L"内閣府 国民の祝日・休日CSV";
+constexpr ULONG_PTR kOwnerDrawSeparator = 1;
 
 int ScaleDip(HWND window, int value) {
   const UINT dpi = window == nullptr ? 96U : GetDpiForWindow(window);
@@ -1159,6 +1162,8 @@ void PlaceOnVisibleMonitor(HWND window, int x, int y, int width, int height) {
 Application::Application(HINSTANCE instance) : instance_(instance) {}
 
 Application::~Application() {
+  if (menu_ && IsMenu(menu_)) DestroyMenu(menu_);
+  menu_ = nullptr;
   if (workspace_search_worker_.joinable()) {
     workspace_search_worker_.request_stop();
     workspace_search_worker_.join();
@@ -1411,7 +1416,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       view->painting_table_grid = false;
       ReleaseDC(window, paint_dc);
     }
-    if (update_region) DeleteObject(update_region);
+    if (!paint_dc && update_region) DeleteObject(update_region);
   }
   return result;
 }
@@ -1740,6 +1745,25 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (HIWORD(wparam) == EN_CHANGE) OnEditorChanged(reinterpret_cast<HWND>(lparam));
       return 0;
     }
+    case WM_MEASUREITEM: {
+      auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+      if (!measure || measure->CtlType != ODT_MENU) return FALSE;
+      MeasureMenuItem(*measure);
+      return TRUE;
+    }
+    case WM_DRAWITEM: {
+      const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+      if (!draw) return FALSE;
+      if (draw->CtlType == ODT_MENU) {
+        DrawMenuItem(*draw);
+        return TRUE;
+      }
+      if (draw->hwndItem == status_) {
+        DrawStatusItem(*draw);
+        return TRUE;
+      }
+      return FALSE;
+    }
     case WM_NOTIFY: {
       const auto* header = reinterpret_cast<NMHDR*>(lparam);
       if (header && header->code == NM_CUSTOMDRAW &&
@@ -1914,6 +1938,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return reinterpret_cast<LRESULT>(brush ? brush : GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_DESTROY:
+      if (menu_ && IsMenu(menu_)) {
+        SetMenu(window_, nullptr);
+        DestroyMenu(menu_);
+        menu_ = nullptr;
+      }
       if (workspace_mutex_) {
         CloseHandle(workspace_mutex_);
         workspace_mutex_ = nullptr;
@@ -2019,7 +2048,37 @@ void Application::CreateMenuBar() {
   AppendMenuW(git, MF_STRING, kGitPull, L"Pull (fast-forward only)…");
   AppendMenuW(git, MF_STRING, kGitPush, L"Push…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(git), L"Git");
-  SetMenu(window_, menu);
+  menu_ = menu;
+  menu_labels_.clear();
+  menu_labels_.reserve(128);
+  std::function<void(HMENU)> prepare_menu = [&](HMENU current) {
+    if (!current) return;
+    const int count = GetMenuItemCount(current);
+    for (int index = 0; index < count; ++index) {
+      MENUITEMINFOW item{sizeof(item)};
+      item.fMask = MIIM_FTYPE | MIIM_SUBMENU;
+      if (!GetMenuItemInfoW(current, static_cast<UINT>(index), TRUE, &item)) continue;
+      if (item.hSubMenu) prepare_menu(item.hSubMenu);
+      const UINT length = GetMenuStringW(current, static_cast<UINT>(index), nullptr, 0,
+                                         MF_BYPOSITION);
+      std::wstring label(length, L'\0');
+      if (length != 0)
+        GetMenuStringW(current, static_cast<UINT>(index), label.data(), length + 1, MF_BYPOSITION);
+      MENUITEMINFOW owner{sizeof(owner)};
+      owner.fMask = MIIM_FTYPE | MIIM_DATA;
+      owner.fType = item.fType | MFT_OWNERDRAW;
+      if (item.fType & MFT_SEPARATOR) {
+        owner.dwItemData = kOwnerDrawSeparator;
+      } else {
+        auto stable_label = std::make_unique<std::wstring>(std::move(label));
+        owner.dwItemData = reinterpret_cast<ULONG_PTR>(stable_label.get());
+        menu_labels_.push_back(std::move(stable_label));
+      }
+      SetMenuItemInfoW(current, static_cast<UINT>(index), TRUE, &owner);
+    }
+  };
+  prepare_menu(menu_);
+  SetMenu(window_, menu_);
 }
 
 void Application::CreateControls() {
@@ -2036,8 +2095,10 @@ void Application::CreateControls() {
                                  TVS_LINESATROOT | TVS_SHOWSELALWAYS,
                                  0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kOutline), instance_, nullptr);
   SetWindowSubclass(outline_, TreeDragSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
-  status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE,
-                            0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
+                             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                             0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  SetStatusText(L"");
   find_bar_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr, WS_CHILD,
                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindBar), instance_, nullptr);
   find_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
@@ -2110,6 +2171,176 @@ void Application::CreateControls() {
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 }
 
+void Application::ApplyChromeTheme() {
+  if (!window_) return;
+
+  // Windows 11 owns the non-client frame; these documented DWM attributes keep
+  // the title bar and border on the same token palette as the client surfaces.
+  const BOOL use_dark_mode = dark_theme_ ? TRUE : FALSE;
+  constexpr DWORD kDwmUseImmersiveDarkMode = 20;
+  constexpr DWORD kDwmBorderColor = 34;
+  constexpr DWORD kDwmCaptionColor = 35;
+  constexpr DWORD kDwmTextColor = 36;
+  DwmSetWindowAttribute(window_, kDwmUseImmersiveDarkMode, &use_dark_mode,
+                        sizeof(use_dark_mode));
+  DwmSetWindowAttribute(window_, kDwmBorderColor, &theme_border_, sizeof(theme_border_));
+  DwmSetWindowAttribute(window_, kDwmCaptionColor, &theme_surface_, sizeof(theme_surface_));
+  DwmSetWindowAttribute(window_, kDwmTextColor, &theme_foreground_, sizeof(theme_foreground_));
+
+  if (menu_) {
+    MENUINFO menu_info{sizeof(menu_info)};
+    menu_info.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+    menu_info.hbrBack = surface_brush_;
+    SetMenuInfo(menu_, &menu_info);
+    DrawMenuBar(window_);
+  }
+  if (status_) InvalidateRect(status_, nullptr, TRUE);
+  InvalidateRect(window_, nullptr, TRUE);
+}
+
+void Application::SetStatusText(std::wstring_view text) {
+  status_text_.assign(text);
+  if (!status_) return;
+  // Owner-draw keeps the native status layout and accessibility identity while
+  // making its background/text/border use the same tokens as the other panes.
+  SendMessageW(status_, SB_SETTEXTW, SBT_OWNERDRAW,
+               reinterpret_cast<LPARAM>(status_text_.c_str()));
+  InvalidateRect(status_, nullptr, TRUE);
+}
+
+void Application::MeasureMenuItem(MEASUREITEMSTRUCT& measure) const {
+  if (measure.itemData == kOwnerDrawSeparator) {
+    measure.itemWidth = static_cast<UINT>(ScaleDip(window_, 16));
+    measure.itemHeight = static_cast<UINT>(std::max(1, ScaleDip(window_, 8)));
+    return;
+  }
+  const auto* label = reinterpret_cast<const std::wstring*>(measure.itemData);
+  if (!label) {
+    measure.itemWidth = static_cast<UINT>(ScaleDip(window_, 32));
+    measure.itemHeight = static_cast<UINT>(ScaleDip(window_, 28));
+    return;
+  }
+  HDC dc = GetDC(window_);
+  if (!dc) {
+    measure.itemWidth = static_cast<UINT>(ScaleDip(window_, 96));
+    measure.itemHeight = static_cast<UINT>(ScaleDip(window_, 28));
+    return;
+  }
+  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HGDIOBJ previous = SelectObject(dc, font);
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  const auto tab = label->find(L'\t');
+  const std::wstring_view full_text(*label);
+  const std::wstring_view main_text = full_text.substr(0, tab);
+  const std::wstring_view accelerator = tab == std::wstring::npos
+      ? std::wstring_view{} : std::wstring_view(*label).substr(tab + 1);
+  SIZE main_size{};
+  SIZE accelerator_size{};
+  GetTextExtentPoint32W(dc, main_text.data(), static_cast<int>(main_text.size()), &main_size);
+  if (!accelerator.empty())
+    GetTextExtentPoint32W(dc, accelerator.data(), static_cast<int>(accelerator.size()),
+                          &accelerator_size);
+  SelectObject(dc, previous);
+  ReleaseDC(window_, dc);
+  const int padding = ScaleDip(window_, 12);
+  const int gap = accelerator.empty() ? 0 : ScaleDip(window_, 28);
+  measure.itemWidth = static_cast<UINT>(std::max(ScaleDip(window_, 72),
+      static_cast<int>(main_size.cx + accelerator_size.cx) + padding * 2 + gap));
+  measure.itemHeight = static_cast<UINT>(std::max(ScaleDip(window_, 28),
+      static_cast<int>(metrics.tmHeight) + ScaleDip(window_, 8)));
+}
+
+void Application::DrawMenuItem(const DRAWITEMSTRUCT& draw) const {
+  if (!draw.hDC) return;
+  RECT item = draw.rcItem;
+  const bool separator = draw.itemData == kOwnerDrawSeparator;
+  const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+  const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
+  const COLORREF background = selected ? theme_accent_ : theme_surface_;
+  const COLORREF foreground = disabled ? theme_muted_ :
+      (selected ? RGB(255, 255, 255) : theme_foreground_);
+  HBRUSH background_brush = CreateSolidBrush(background);
+  if (background_brush) {
+    FillRect(draw.hDC, &item, background_brush);
+    DeleteObject(background_brush);
+  }
+  if (separator) {
+    const int y = item.top + (item.bottom - item.top) / 2;
+    HPEN pen = CreatePen(PS_SOLID, 1, theme_border_);
+    if (pen) {
+      HGDIOBJ previous = SelectObject(draw.hDC, pen);
+      MoveToEx(draw.hDC, item.left + ScaleDip(window_, 8), y, nullptr);
+      LineTo(draw.hDC, item.right - ScaleDip(window_, 8), y);
+      SelectObject(draw.hDC, previous);
+      DeleteObject(pen);
+    }
+    return;
+  }
+  const auto* label = reinterpret_cast<const std::wstring*>(draw.itemData);
+  if (!label) return;
+  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HGDIOBJ previous = SelectObject(draw.hDC, font);
+  SetBkMode(draw.hDC, TRANSPARENT);
+  SetTextColor(draw.hDC, foreground);
+  const int padding = ScaleDip(window_, 12);
+  RECT text_rect = item;
+  text_rect.left += padding;
+  text_rect.right -= padding;
+  const auto tab = label->find(L'\t');
+  const std::wstring_view full_text(*label);
+  const std::wstring_view main_text = full_text.substr(0, tab);
+  const std::wstring_view accelerator = tab == std::wstring::npos
+      ? std::wstring_view{} : std::wstring_view(*label).substr(tab + 1);
+  DrawTextW(draw.hDC, main_text.data(), static_cast<int>(main_text.size()), &text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+  if (!accelerator.empty()) {
+    RECT accelerator_rect = text_rect;
+    accelerator_rect.left = accelerator_rect.right - ScaleDip(window_, 150);
+    DrawTextW(draw.hDC, accelerator.data(), static_cast<int>(accelerator.size()), &accelerator_rect,
+              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_RIGHT);
+  }
+  if ((draw.itemState & ODS_FOCUS) != 0 && (draw.itemState & ODS_NOFOCUSRECT) == 0) {
+    HPEN pen = CreatePen(PS_DOT, 1, theme_accent_);
+    HBRUSH brush = static_cast<HBRUSH>(GetStockObject(HOLLOW_BRUSH));
+    if (pen && brush) {
+      HGDIOBJ old_pen = SelectObject(draw.hDC, pen);
+      HGDIOBJ old_brush = SelectObject(draw.hDC, brush);
+      Rectangle(draw.hDC, item.left + 1, item.top + 1, item.right - 1, item.bottom - 1);
+      SelectObject(draw.hDC, old_brush);
+      SelectObject(draw.hDC, old_pen);
+    }
+    if (pen) DeleteObject(pen);
+  }
+  SelectObject(draw.hDC, previous);
+}
+
+void Application::DrawStatusItem(const DRAWITEMSTRUCT& draw) const {
+  if (!draw.hDC) return;
+  RECT item = draw.rcItem;
+  HBRUSH brush = CreateSolidBrush(theme_surface_);
+  if (brush) {
+    FillRect(draw.hDC, &item, brush);
+    DeleteObject(brush);
+  }
+  HPEN pen = CreatePen(PS_SOLID, 1, theme_border_);
+  if (pen) {
+    HGDIOBJ previous = SelectObject(draw.hDC, pen);
+    MoveToEx(draw.hDC, item.left, item.top, nullptr);
+    LineTo(draw.hDC, item.right, item.top);
+    SelectObject(draw.hDC, previous);
+    DeleteObject(pen);
+  }
+  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HGDIOBJ previous = SelectObject(draw.hDC, font);
+  SetBkMode(draw.hDC, TRANSPARENT);
+  SetTextColor(draw.hDC, theme_foreground_);
+  item.left += ScaleDip(window_, 10);
+  item.right -= ScaleDip(window_, 10);
+  DrawTextW(draw.hDC, status_text_.c_str(), static_cast<int>(status_text_.size()), &item,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+  SelectObject(draw.hDC, previous);
+}
 void Application::LayoutControls() {
   RECT client{};
   GetClientRect(window_, &client);
@@ -3543,6 +3774,7 @@ std::vector<Application::TableGridGeometry> Application::BuildTableGridGeometry(
     if (row_geometry.empty()) continue;
     const int left = std::clamp(shared_left, static_cast<int>(client.left),
                                 static_cast<int>(client.right));
+    if (left >= client.right) continue;
     const int right = std::clamp(std::max(shared_right, left + 8),
                                  left + 1, static_cast<int>(client.right));
     std::vector<int> shared_boundaries(column_count > 0 ? column_count - 1 : 0, left + 1);
@@ -3760,7 +3992,7 @@ void Application::UpdateStatus() {
   } else {
     text = L"Workspaceまたはファイルを開いてください。";
   }
-  SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
+  SetStatusText(text);
 }
 
 void Application::ShowFindBar() {
@@ -3857,7 +4089,7 @@ void Application::ReplaceCurrentDocument(bool all) {
     }
     ApplySourceTextWithUndo(view, std::move(output));
     const std::wstring message = std::to_wstring(count) + L"箇所を1つのUndo操作として置換しました。";
-    SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(message.c_str()));
+    SetStatusText(message);
     return;
   }
 
@@ -3917,8 +4149,7 @@ void Application::SearchWorkspaceFromFindBar() {
   ListView_DeleteAllItems(find_results_);
   ShowWindow(find_results_, SW_SHOW);
   LayoutControls();
-  SendMessageW(status_, SB_SETTEXTW, 0,
-               reinterpret_cast<LPARAM>(L"Workspace検索中… 0件（逐次結果）"));
+  SetStatusText(L"Workspace検索中… 0件（逐次結果）");
   const auto root = workspace_;
   const HWND owner = window_;
   workspace_search_worker_ = std::jthread(
@@ -3954,8 +4185,7 @@ void Application::ScheduleWorkspaceSearch() {
   ListView_DeleteAllItems(find_results_);
   workspace_search_due_ = GetTickCount64() + 250;
   SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
-  SendMessageW(status_, SB_SETTEXTW, 0,
-               reinterpret_cast<LPARAM>(L"検索条件が変わりました。旧結果を破棄して再検索します…"));
+  SetStatusText(L"検索条件が変わりました。旧結果を破棄して再検索します…");
 }
 
 void Application::ApplyWorkspaceSearchBatch(void* raw_payload) {
@@ -3998,7 +4228,7 @@ void Application::ApplyWorkspaceSearchBatch(void* raw_payload) {
   const std::wstring status = L"Workspace検索中… " +
       std::to_wstring(workspace_search_results_.size()) + L"件 / 未処理 " +
       std::to_wstring(workspace_search_issue_count_) + L"件（逐次結果）";
-  SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(status.c_str()));
+  SetStatusText(status);
 }
 
 void Application::CompleteWorkspaceSearch(void* raw_payload) {
@@ -4010,14 +4240,14 @@ void Application::CompleteWorkspaceSearch(void* raw_payload) {
       MessageBoxW(window_, payload->error.c_str(), L"Workspace検索", MB_ICONWARNING);
     const std::wstring status = payload->error.empty() ? L"Workspace検索を中止しました。"
                                                        : payload->error;
-    SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(status.c_str()));
+    SetStatusText(status);
     return;
   }
   const std::wstring status = L"Workspace検索完了: " +
       std::to_wstring(workspace_search_results_.size()) +
       L"件 / 未処理 " + std::to_wstring(workspace_search_issue_count_) +
       L"件。結果一覧で詳細を確認できます。";
-  SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(status.c_str()));
+  SetStatusText(status);
 }
 
 void Application::OpenWorkspaceSearchResult(std::size_t index) {
@@ -4326,7 +4556,7 @@ void Application::CompleteHolidayUpdate(void* raw_payload) {
   std::wstring state_error;
   if (!WriteHolidayState(payload->state_path, state, state_error) && !state_error.empty())
     holiday_update_status_ += L"（状態保存失敗）";
-  if (status_) SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(holiday_update_status_.c_str()));
+  if (status_) SetStatusText(holiday_update_status_);
 }
 
 void Application::CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date) {
@@ -4443,7 +4673,7 @@ bool Application::SaveRecovery(DocumentView& view, bool interactive) {
   if (!view.document.dirty()) return false;
   std::wstring error;
   if (!view.workspace_store->WriteRecovery(view.document.path(), view.document.text(), error)) {
-    SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(error.c_str()));
+    SetStatusText(error);
     if (interactive) MessageBoxW(window_, error.c_str(), L"復旧保存できません", MB_ICONERROR);
     return false;
   }
@@ -5161,6 +5391,7 @@ void Application::ApplySettings() {
   replace_brush(editor_brush_, theme_editor_);
   theme_background_ = background;
   theme_foreground_ = foreground;
+  dark_theme_ = dark;
   const int height = -MulDiv(static_cast<int>(settings_.font_size_pt),
                              static_cast<int>(GetDpiForWindow(window_)), 72);
   HFONT replacement = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -5209,6 +5440,7 @@ void Application::ApplySettings() {
     editor_font_ = replacement;
     if (previous) DeleteObject(previous);
   }
+  ApplyChromeTheme();
   InvalidateRect(window_, nullptr, TRUE);
 }
 
@@ -5763,7 +5995,7 @@ void Application::OpenLinkAtSourcePosition(DocumentView& view, std::size_t sourc
   if (link == parsed.links.end()) return;
   if (!activate) {
     const std::wstring status = L"リンク: " + link->target;
-    SendMessageW(status_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(status.c_str()));
+    SetStatusText(status);
     return;
   }
   std::wstring target = link->target;

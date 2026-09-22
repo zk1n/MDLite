@@ -7,7 +7,7 @@
 repo rootのPowerShellから次を実行し、表示された一時pathを控えます。PNG/JPEG/GIF/WebPも同時に生成され、repo内は変更しません。
 
 ```powershell
-$acceptanceRoot = & .\samples\acceptance-workspace\New-AcceptanceWorkspace.ps1
+$acceptanceRoot = & .\tests\fixtures\acceptance-workspace\New-AcceptanceWorkspace.ps1
 $acceptanceRoot
 ```
 
@@ -74,4 +74,4 @@ F5でDebug版をビルド・起動し、表示された一時pathをWorkspaceと
 | H-03 | case/regex/whole-word、2件目、未保存置換、Cancel、Undo成立 | 未実施 | NOT RUN |  |
 | H-04 | IME、DPI、5画像形式、resize、animation成立 | 未実施 | NOT RUN |  |
 
-確認後、一時Workspaceは通常の一時データとして削除できます。repo内の `samples/acceptance-workspace` は入力kitなので編集不要です。
+確認後、一時Workspaceは通常の一時データとして削除できます。repo内の `tests/fixtures/acceptance-workspace` は入力kitなので編集不要です。

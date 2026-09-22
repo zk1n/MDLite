@@ -11,6 +11,10 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# MDLite does not use C++ modules. Keep ordinary MSVC header dependency
+# tracking enabled; the module scanner can emit an empty dependency set for
+# headers and leave a launcher object with an obsolete Application layout.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 if(MSVC)
   # Local/F5 and unsigned verification builds must run on a clean Windows 11
   # machine without requiring an administrator-installed VC redistributable.
@@ -79,9 +83,13 @@ add_executable(MDLite WIN32
   src/app/Application.cpp
   src/app/Application.h
 )
+# Application is constructed by value in wWinMain; its stack layout must be
+# rebuilt whenever the class or EffectiveSettings layout changes.
+set_source_files_properties(src/main.cpp PROPERTIES
+  OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/app/Application.h;${CMAKE_CURRENT_SOURCE_DIR}/src/settings/Settings.h")
 target_compile_definitions(MDLite PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(MDLite PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs wer)
+target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs dwmapi wer)
 
 include(CTest)
 if(BUILD_TESTING)

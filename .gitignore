@@ -42,3 +42,6 @@ CMakeFiles/
 /.codex/routing-entry.md
 /.codex/routing-manifest.json
 /.codex/routing-acceptance/
+
+# F5-generated disposable workspaces (never product source or fixtures)
+/samples/

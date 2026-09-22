@@ -7,8 +7,10 @@
       "request": "launch",
       "program": "${workspaceFolder}\\build\\debug\\MDLite.exe",
       "cwd": "${workspaceFolder}",
-      "preLaunchTask": "MDLite: Debug build",
-      "args": ["${workspaceFolder}\\samples\\demo-workspace"]
+      "preLaunchTask": "MDLite: F5 build and prepare",
+      "args": [
+        "${workspaceFolder}\\samples\\demo-workspace"
+      ]
     }
   ]
 }

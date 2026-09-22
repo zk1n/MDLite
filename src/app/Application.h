@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -130,6 +131,11 @@ class Application {
   void CreateControls();
   void LayoutControls();
   void CreateMenuBar();
+  void ApplyChromeTheme();
+  void SetStatusText(std::wstring_view text);
+  void MeasureMenuItem(MEASUREITEMSTRUCT& measure) const;
+  void DrawMenuItem(const DRAWITEMSTRUCT& draw) const;
+  void DrawStatusItem(const DRAWITEMSTRUCT& draw) const;
   void OpenWorkspaceDialog();
   void OpenFileDialog();
   void NewUntitledDocument();
@@ -227,6 +233,7 @@ class Application {
 
   HINSTANCE instance_{};
   HWND window_{};
+  HMENU menu_{};
   HWND workspace_tree_{};
   HWND tabs_{};
   HWND outline_{};
@@ -288,6 +295,9 @@ class Application {
   COLORREF theme_border_{RGB(210, 218, 228)};
   COLORREF theme_muted_{RGB(92, 104, 120)};
   COLORREF theme_accent_{RGB(56, 112, 194)};
+  bool dark_theme_{};
+  std::vector<std::unique_ptr<std::wstring>> menu_labels_;
+  std::wstring status_text_;
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
   std::wstring holiday_update_status_;

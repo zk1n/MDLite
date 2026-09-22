@@ -40,18 +40,24 @@ FetchContent_Declare(libwebp
 FetchContent_MakeAvailable(libwebp)
 
 add_library(mdlite_core
+  src/app/PanelLayout.cpp
+  src/app/PanelLayout.h
   src/assets/Assets.cpp
   src/assets/Assets.h
   src/assets/StorageAdapter.cpp
   src/assets/StorageAdapter.h
   src/calendar/JapaneseHolidays.cpp
   src/calendar/JapaneseHolidays.h
+  src/calendar/CalendarDayIndex.cpp
+  src/calendar/CalendarDayIndex.h
   src/core/Document.cpp
   src/core/Document.h
   src/editor/EditorAdapter.cpp
   src/editor/EditorAdapter.h
   src/git/Conflict.cpp
   src/git/Conflict.h
+  src/git/GitPanel.cpp
+  src/git/GitPanel.h
   src/markdown/Markdown.cpp
   src/markdown/Markdown.h
   src/profiles/Profiles.cpp
@@ -98,6 +104,26 @@ if(BUILD_TESTING)
   target_compile_options(mdlite_core_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   target_link_libraries(mdlite_core_tests PRIVATE mdlite_core libwebpmux shlwapi)
   add_test(NAME mdlite_core_tests COMMAND mdlite_core_tests)
+  add_executable(mdlite_panel_layout_tests tests/PanelLayoutTests.cpp)
+  target_compile_definitions(mdlite_panel_layout_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_panel_layout_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_panel_layout_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_panel_layout_tests COMMAND mdlite_panel_layout_tests)
+  add_executable(mdlite_table_interaction_tests tests/TableInteractionTests.cpp)
+  target_compile_definitions(mdlite_table_interaction_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_table_interaction_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_table_interaction_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_table_interaction_tests COMMAND mdlite_table_interaction_tests)
+  add_executable(mdlite_git_panel_tests tests/GitPanelModelTests.cpp)
+  target_compile_definitions(mdlite_git_panel_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_git_panel_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_git_panel_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_git_panel_tests COMMAND mdlite_git_panel_tests)
+  add_executable(mdlite_calendar_day_index_tests tests/CalendarDayIndexTests.cpp)
+  target_compile_definitions(mdlite_calendar_day_index_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_calendar_day_index_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_calendar_day_index_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_calendar_day_index_tests COMMAND mdlite_calendar_day_index_tests)
 endif()
 
 install(TARGETS MDLite RUNTIME DESTINATION .)

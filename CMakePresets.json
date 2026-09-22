@@ -43,12 +43,12 @@
     {
       "name": "debug",
       "configurePreset": "debug",
-      "targets": ["MDLite", "mdlite_core_tests"]
+      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests"]
     },
     {
       "name": "release",
       "configurePreset": "release",
-      "targets": ["MDLite", "mdlite_core_tests"]
+      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests"]
     }
   ],
   "testPresets": [

@@ -1,4 +1,5 @@
 #pragma once
+#include "app/PanelLayout.h"
 
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
@@ -13,6 +14,7 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -93,6 +95,8 @@ class Application {
     std::vector<RenderedImage> rendered_images;
     ULONGLONG image_asset_check_due{};
     bool ime_composing{};
+    bool native_edit_in_flight{};
+    bool native_edit_pending{};
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;
     bool painting_table_grid{};
@@ -114,6 +118,8 @@ class Application {
   };
 
   enum class SaveAllResult { AllSaved, RecoveryOnly, Discarded, Cancelled };
+  enum class SaveIntent { UserRequested, BackgroundAutosave };
+  enum class SaveResult { Saved, RecoverySaved, NoChange, Cancelled, Failed };
 
   enum class TableAction { InsertRowBefore, InsertRowAfter, DeleteRow, InsertColumnBefore,
                            InsertColumnAfter, DeleteColumn };
@@ -130,6 +136,12 @@ class Application {
 
   void CreateControls();
   void LayoutControls();
+  void LoadPanelLayout();
+  void SavePanelLayout();
+  void MovePanelToSlot(PanelId id, PanelSlot slot);
+  void MoveFocusedPanelToSlot(PanelSlot slot);
+  void ResizeFocusedPanel(double delta);
+  void UpdatePanelHeaders();
   void CreateMenuBar();
   void ApplyChromeTheme();
   void SetStatusText(std::wstring_view text);
@@ -147,8 +159,8 @@ class Application {
   void OpenDocumentView(Document document, std::wstring tab_name);
   void OpenRecoverySnapshot(const std::filesystem::path& path);
   void ActivateDocument(std::size_t index);
-  bool SaveDocument(DocumentView& view, bool interactive);
-  bool SaveDocumentAs(DocumentView& view);
+  SaveResult SaveDocument(DocumentView& view, SaveIntent intent);
+  SaveResult SaveDocumentAs(DocumentView& view);
   void ReloadDocumentFromDisk();
   void CompareDocumentWithDisk();
   SaveAllResult SaveAllForExit(bool interactive);
@@ -158,6 +170,8 @@ class Application {
   void ApplySourceTextWithUndo(DocumentView& view, std::wstring text, bool record_history = true);
   bool ApplySourceHistory(DocumentView& view, bool redo);
   void OnEditorChanged(HWND editor);
+  void CommitPendingNativeEdit(DocumentView& view);
+  void SchedulePresentation(DocumentView& view);
   void SyncDocumentFromEditor(DocumentView& view);
   void ApplyMarkdownPresentation(DocumentView& view, bool force);
   void InvalidateTableGrid(DocumentView& view);
@@ -254,6 +268,9 @@ class Application {
   HWND find_results_{};
   HWND calendar_{};
   HWND calendar_tooltip_{};
+  HWND git_panel_{};
+  HWND calendar_details_{};
+  std::array<HWND, 4> panel_headers_{};
   std::filesystem::path workspace_;
   std::vector<std::filesystem::path> copied_files_;
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
@@ -269,6 +286,7 @@ class Application {
   bool workspace_search_started_{};
   bool holiday_cache_loaded_{};
   bool holiday_update_running_{};
+  bool save_dialog_active_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
   bool external_operation_active_{};
@@ -298,6 +316,8 @@ class Application {
   bool dark_theme_{};
   std::vector<std::unique_ptr<std::wstring>> menu_labels_;
   std::wstring status_text_;
+  PanelLayout panel_layout_ = PanelLayout::Default();
+  PanelId focused_panel_{PanelId::Explorer};
   EffectiveSettings settings_;
   std::wstring calendar_tooltip_text_;
   std::wstring holiday_update_status_;

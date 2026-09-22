@@ -515,12 +515,20 @@ try {
 
     $calendar = Find-ChildClassWindow $main 'SysMonthCal32'
     $checks.calendar_control = $calendar -ne [IntPtr]::Zero
+    $calendarInitialVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 100
-    $checks.calendar_visible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
+    $calendarFirstVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
+    $checks.calendar_visible = $calendarFirstVisible -ne $calendarInitialVisible
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 100
-    $checks.calendar_hidden = $calendar -eq [IntPtr]::Zero -or -not [MDLiteNative]::IsWindowVisible($calendar)
+    $calendarSecondVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
+    $checks.calendar_hidden = $calendarSecondVisible -eq $calendarInitialVisible
+    $checks.calendar_toggle_trace = [ordered]@{
+        initial_visible = $calendarInitialVisible
+        after_first_command = $calendarFirstVisible
+        after_second_command = $calendarSecondVisible
+    }
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
     $quickOpenPicker = Wait-ProcessClassWindow $process 'MDLite.NativePickerWindow'
@@ -747,6 +755,22 @@ try {
     $checks['executable_sha256'] = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
     $checks['preset'] = $Preset
     $checks['timestamp_utc'] = [DateTime]::UtcNow.ToString('o')
+    $checks['evidence'] = [ordered]@{
+        E01_source_round_trip = @('compact_edit_saved','current_replace_one_saved','image_markup_source_saved')
+        E02_dirty_save_boundary = @('compact_edit_saved','settings_native_cancel_preserves','profiles_native_cancel_preserves')
+        E03_undo_redo_invariant = @('compact_undo_saved','compact_redo_saved','current_replace_one_undo','current_replace_one_redo','image_presentation_undo_saved','image_presentation_redo_saved')
+        E04_table_geometry_navigation = 'NOT OBSERVED BY GUI HARNESS'
+        E05_arrow_repeat_fallback = 'NOT OBSERVED BY GUI HARNESS'
+        E06_native_paint_invalidation = @('paint_layout_reentry')
+        E07_continuous_input = @('compact_edit_saved')
+        E08_transaction_rollback = @('compact_undo_saved','current_replace_one_undo')
+        E09_ime_atok = 'UNKNOWN: synthetic SendInput/messages are not IME/ATOK acceptance'
+        E10_physical_long_press = 'UNKNOWN: no physical long-press input'
+        E11_dpi_visual = 'UNKNOWN: native geometry snapshot only; Human visual/DPI remains open'
+        E12_dialog_timer = @('settings_native_form','profiles_native_form','recovery_snapshot_created','crash_recovery_restored')
+        E13_presentation = @('workspace_tree_items','outline_tree_items','calendar_visible','quick_open_picker','command_palette_picker')
+    }
+    $checks['evidence_boundary'] = 'Automated native observation only; UNKNOWN and NOT_OBSERVED remain open.'
     $failedChecks = @($checks.GetEnumerator() | Where-Object {
         $_.Value -is [bool] -and -not $_.Value
     })

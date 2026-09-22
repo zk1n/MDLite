@@ -655,6 +655,75 @@ void TestEditorAdapter() {
         "native transaction after a derived image maps back to the exact Markdown source");
 }
 
+void TestEditorTransactionBoundaries() {
+  const std::wstring initial = L"ab";
+  const auto first_snapshot = mdlite::BuildEditorSnapshot(initial);
+  const auto first = mdlite::ApplyEditorText(first_snapshot, initial, L"aXb");
+  Check(first.changed && first.source == L"aXb" && first.begin == 1 && first.old_end == 1 &&
+            first.new_end == 2,
+        "first ASCII character edit is one source transaction with exact insertion bounds");
+
+  const auto second_snapshot = mdlite::BuildEditorSnapshot(first.source);
+  const auto second = mdlite::ApplyEditorText(second_snapshot, first.source, L"aXYb");
+  Check(second.changed && second.source == L"aXYb" && second.begin == 2 && second.old_end == 2 &&
+            second.new_end == 3,
+        "second ASCII character edit starts a separate transaction after the first commit");
+
+  const auto replacement_snapshot = mdlite::BuildEditorSnapshot(second.source);
+  const auto replacement = mdlite::ApplyEditorText(
+      replacement_snapshot, second.source, L"aPASTEb");
+  Check(replacement.changed && replacement.source == L"aPASTEb" && replacement.begin == 1 &&
+            replacement.old_end == 3 && replacement.new_end == 6,
+        "replacement or paste-like input remains one exact source transaction");
+
+  const std::wstring unicode_source = L"😀\r\nA\nB";
+  const auto unicode_snapshot = mdlite::BuildEditorSnapshot(unicode_source);
+  const auto unicode_edit = mdlite::ApplyEditorText(
+      unicode_snapshot, unicode_source, L"😀\r\nAX\r\nB");
+  Check(unicode_edit.changed && unicode_edit.source == L"😀\r\nAX\nB" &&
+            unicode_edit.begin == 5 && unicode_edit.old_end == 5 && unicode_edit.new_end == 6,
+        "a UTF-16 edit beside a surrogate and mixed LF/CRLF preserves source line endings");
+
+  const auto undo = mdlite::ApplyEditorText(
+      mdlite::BuildEditorSnapshot(unicode_edit.source), unicode_edit.source, unicode_snapshot.view);
+  Check(undo.changed && undo.source == unicode_source && undo.begin == 5 && undo.old_end == 6 &&
+            undo.new_end == 5,
+        "undo-like reverse transaction restores the exact original surrogate and line endings");
+  const auto redo = mdlite::ApplyEditorText(
+      mdlite::BuildEditorSnapshot(undo.source), undo.source, L"😀\r\nAX\r\nB");
+  Check(redo.changed && redo.source == unicode_edit.source && redo.begin == 5 && redo.old_end == 5 &&
+            redo.new_end == 6,
+        "redo-like forward transaction restores the exact edited source");
+
+  const std::wstring literal_table =
+      L"|  A  | B\\| raw | `C|D` |\r\n| :--- | ---: | :---: |\r\n| left  |  middle  | right |";
+  const auto table_edit = mdlite::InsertTableColumn(
+      literal_table, literal_table.find(L"middle"), true);
+  const auto table_before = mdlite::BuildEditorSnapshot(literal_table);
+  const auto table_after = mdlite::BuildEditorSnapshot(table_edit.text);
+  const auto table_transaction = mdlite::ApplyEditorText(
+      table_before, literal_table, table_after.view);
+  Check(table_edit.changed && table_transaction.changed &&
+            table_transaction.source == table_edit.text &&
+            table_transaction.source.find(L"B\\| raw") != std::wstring::npos &&
+            table_transaction.source.find(L"`C|D`") != std::wstring::npos,
+        "table edit transaction preserves escaped and code-span pipe literals exactly");
+  const auto table_undo = mdlite::ApplyEditorText(
+      mdlite::BuildEditorSnapshot(table_transaction.source), table_transaction.source,
+      table_before.view);
+  Check(table_undo.changed && table_undo.source == literal_table,
+        "table undo-like transaction restores literal source without presentation rewriting");
+  const auto table_redo = mdlite::ApplyEditorText(
+      mdlite::BuildEditorSnapshot(table_undo.source), table_undo.source, table_after.view);
+  Check(table_redo.changed && table_redo.source == table_edit.text,
+        "table redo-like transaction restores the exact helper result");
+
+  const auto no_op = mdlite::ApplyEditorText(
+      mdlite::BuildEditorSnapshot(table_redo.source), table_redo.source, table_after.view);
+  Check(!no_op.changed && no_op.source == table_redo.source,
+        "reapplying the committed presentation is a source-preserving no-op");
+}
+
 void TestWorkspaceState(const std::filesystem::path& root) {
   const auto workspace = root / L"workspace";
   std::filesystem::create_directories(workspace);
@@ -1578,6 +1647,7 @@ int wmain() {
   TestEditorLineEndingBoundary(root);
   TestMarkdown();
   TestEditorAdapter();
+  TestEditorTransactionBoundaries();
   TestWorkspaceState(root);
   TestTrustAndProcess(root);
   TestProfiles(root);

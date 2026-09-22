@@ -1,5 +1,7 @@
 #pragma once
 
+#include "app/PanelLayout.h"
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -57,10 +59,13 @@ class WorkspaceStore {
                    std::wstring& error) const;
   bool WriteSessionState(const SessionState& session, std::wstring& error) const;
   bool ReadSessionState(SessionState& session, std::wstring& error) const;
+  bool WritePanelLayout(const PanelLayout& layout, std::wstring& error) const;
+  bool ReadPanelLayout(PanelLayout& layout, std::wstring& error) const;
 
   [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
   [[nodiscard]] std::filesystem::path metadata_root() const { return root_ / L".mdlite"; }
   [[nodiscard]] std::filesystem::path state_root() const { return metadata_root() / L".state"; }
+  [[nodiscard]] std::filesystem::path panel_layout_path() const { return state_root() / L"panel-layout.toml"; }
 
  private:
   std::filesystem::path RecoveryPath(const std::filesystem::path& document_path) const;

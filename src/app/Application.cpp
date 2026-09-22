@@ -462,8 +462,58 @@ enum ControlId : int {
   // existing numeric IDs directly.
   kViewWorkspacePane,
   kViewOutlinePane,
+  kViewResetPanels,
+  kViewMoveFocusedLeftTop,
+  kViewMoveFocusedLeftBottom,
+  kViewMoveFocusedRightTop,
+  kViewMoveFocusedRightBottom,
+  kPanelHeaderExplorer,
+  kPanelHeaderCalendar,
+  kPanelHeaderOutline,
+  kPanelHeaderGit,
+  kViewMoveExplorerLeftTop,
+  kViewMoveExplorerLeftBottom,
+  kViewMoveExplorerRightTop,
+  kViewMoveExplorerRightBottom,
+  kViewMoveCalendarLeftTop,
+  kViewMoveCalendarLeftBottom,
+  kViewMoveCalendarRightTop,
+  kViewMoveCalendarRightBottom,
+  kViewMoveOutlineLeftTop,
+  kViewMoveOutlineLeftBottom,
+  kViewMoveOutlineRightTop,
+  kViewMoveOutlineRightBottom,
+  kViewMoveGitLeftTop,
+  kViewMoveGitLeftBottom,
+  kViewMoveGitRightTop,
+  kViewMoveGitRightBottom,
+  kViewResizeFocusedNarrow,
+  kViewResizeFocusedWide,
 };
 
+int PanelIndex(PanelId id) {
+  return static_cast<int>(id);
+}
+
+const wchar_t* PanelName(PanelId id) {
+  switch (id) {
+    case PanelId::Explorer: return L"Explorer";
+    case PanelId::Calendar: return L"Calendar";
+    case PanelId::Outline: return L"Outline";
+    case PanelId::Git: return L"Git";
+  }
+  return L"Panel";
+}
+
+const wchar_t* PanelSlotName(PanelSlot slot) {
+  switch (slot) {
+    case PanelSlot::LeftTop: return L"左上";
+    case PanelSlot::LeftBottom: return L"左下";
+    case PanelSlot::RightTop: return L"右上";
+    case PanelSlot::RightBottom: return L"右下";
+  }
+  return L"?";
+}
 bool IsTextFile(const std::filesystem::path& path) {
   std::wstring extension = path.extension().wstring();
   std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
@@ -1293,7 +1343,8 @@ LRESULT CALLBACK Application::CompactWindowProc(HWND window, UINT message, WPARA
   if (message == WM_NOTIFY && view != app->documents_.end()) {
     const auto* header = reinterpret_cast<const NMHDR*>(lparam);
     if (header && header->hwndFrom == (*view)->editor && header->code == EN_SELCHANGE &&
-        !app->suppress_editor_change_) {
+        !app->suppress_editor_change_ && !(*view)->native_edit_in_flight &&
+        !(*view)->ime_composing && (*view)->sync_due == 0) {
       app->ApplyMarkdownPresentation(*(*view), false);
       return 0;
     }
@@ -1334,10 +1385,12 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
   if (message == WM_SETFOCUS) app->SelectDocumentForEditor(window);
   if (message == WM_PASTE && app->PasteClipboardImage()) return 0;
   if (message == WM_IME_STARTCOMPOSITION && view) view->ime_composing = true;
-  if (message == WM_IME_ENDCOMPOSITION) {
-    if (view) view->ime_composing = false;
-    app->OnEditorChanged(window);
-  }
+  const bool native_mutation = view != nullptr &&
+      (message == WM_CHAR || message == WM_CUT || message == WM_CLEAR ||
+       message == WM_PASTE || message == WM_IME_COMPOSITION ||
+       message == WM_IME_ENDCOMPOSITION ||
+       (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE)));
+  if (native_mutation) view->native_edit_in_flight = true;
   const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
   const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
   if (view && !view->ime_composing &&
@@ -1375,7 +1428,6 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       const auto direction = wparam == VK_LEFT ? TableCaretDirection::Left :
           wparam == VK_RIGHT ? TableCaretDirection::Right :
           wparam == VK_UP ? TableCaretDirection::Up : TableCaretDirection::Down;
-      const auto source_caret = view->editor_snapshot.NativeToSource(selection.cpMin);
       const auto destination = MoveTableCaretAtBoundary(
           view->document.text(), view->editor_snapshot.NativeToSource(selection.cpMin), direction);
       if (destination) {
@@ -1383,10 +1435,16 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
         SendMessageW(window, EM_SETSEL, view_caret, view_caret);
         return 0;
       }
-      const bool within_table = std::ranges::any_of(view->parse.tables, [&](const auto& table) {
-        return source_caret >= table.begin && source_caret <= table.end;
-      });
-      if (within_table) return 0;
+      const LONG native_length = GetWindowTextLengthW(window);
+      const LONG line = static_cast<LONG>(SendMessageW(
+          window, EM_EXLINEFROMCHAR, 0, static_cast<LPARAM>(selection.cpMin)));
+      const LONG line_count = static_cast<LONG>(SendMessageW(window, EM_GETLINECOUNT, 0, 0));
+      const bool at_document_boundary =
+          (direction == TableCaretDirection::Left && selection.cpMin == 0) ||
+          (direction == TableCaretDirection::Right && selection.cpMax >= native_length) ||
+          (direction == TableCaretDirection::Up && line <= 0) ||
+          (direction == TableCaretDirection::Down && line_count > 0 && line >= line_count - 1);
+      if (at_document_boundary) return 0;
     }
   }
   if (message == WM_LBUTTONDOWN && view && !view->ime_composing &&
@@ -1405,6 +1463,18 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
   const bool needs_table_paint = message == WM_PAINT && view &&
                                  GetUpdateRect(window, &update_rect, FALSE) != FALSE;
   const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+  if (view && view->native_edit_in_flight) {
+    const bool ime_result = message == WM_IME_COMPOSITION &&
+                            (lparam & GCS_RESULTSTR) != 0;
+    const bool ordinary_edit = !view->ime_composing &&
+        (message == WM_CHAR || message == WM_CUT || message == WM_CLEAR ||
+         message == WM_PASTE ||
+         (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE)));
+    if (message == WM_IME_ENDCOMPOSITION) view->ime_composing = false;
+    if (ime_result || message == WM_IME_ENDCOMPOSITION || ordinary_edit)
+      app->CommitPendingNativeEdit(*view);
+    view->native_edit_in_flight = false;
+  }
   if (needs_table_paint && view && !view->painting_table_grid) {
     HRGN update_region = CreateRectRgnIndirect(&update_rect);
     HDC paint_dc = update_region
@@ -1492,7 +1562,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             if (!view->ime_composing && now >= view->sync_due) {
               SyncDocumentFromEditor(*view);
               if (IsMarkdownFile(view->document.path()))
-                view->presentation_due = now + kPresentationDelayMs;
+                SchedulePresentation(*view);
             }
           }
           if (view->presentation_due != 0) {
@@ -1523,14 +1593,19 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
           pending = true;
           fast_poll = true;
           if (view->ime_composing) continue;
+          if (save_dialog_active_) continue;
           if (view->recovery_due != 0 && now >= view->recovery_due) {
             SaveRecovery(*view);
             view->recovery_due = now + kRecoveryDelayMs;
           }
           if (settings_.auto_save && view->autosave_due != 0 && now >= view->autosave_due) {
-            if (SaveDocument(*view, false)) {
+            const auto save_result = SaveDocument(*view, SaveIntent::BackgroundAutosave);
+            if (save_result == SaveResult::Saved || save_result == SaveResult::NoChange) {
               view->autosave_due = 0;
               view->recovery_due = 0;
+            } else if (save_result == SaveResult::RecoverySaved) {
+              view->autosave_due = now + settings_.auto_save_delay_ms;
+              view->recovery_due = now + kRecoveryDelayMs;
             } else {
               view->autosave_due = now + kRecoveryDelayMs;
             }
@@ -1664,13 +1739,35 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_COMMAND: {
       const int command = LOWORD(wparam);
+      if (command == kPanelHeaderExplorer || command == kPanelHeaderCalendar ||
+          command == kPanelHeaderOutline || command == kPanelHeaderGit) {
+        focused_panel_ = command == kPanelHeaderExplorer ? PanelId::Explorer :
+            command == kPanelHeaderCalendar ? PanelId::Calendar :
+            command == kPanelHeaderOutline ? PanelId::Outline : PanelId::Git;
+        SetFocus(panel_headers_[PanelIndex(focused_panel_)]);
+        UpdatePanelHeaders();
+      }
+      else if (command == kViewMoveFocusedLeftTop) MoveFocusedPanelToSlot(PanelSlot::LeftTop);
+      else if (command == kViewMoveFocusedLeftBottom) MoveFocusedPanelToSlot(PanelSlot::LeftBottom);
+      else if (command == kViewResizeFocusedNarrow) ResizeFocusedPanel(-24.0);
+      else if (command == kViewResizeFocusedWide) ResizeFocusedPanel(24.0);
+      else if (command == kViewMoveFocusedRightTop) MoveFocusedPanelToSlot(PanelSlot::RightTop);
+      else if (command == kViewMoveFocusedRightBottom) MoveFocusedPanelToSlot(PanelSlot::RightBottom);
+      else if (command >= kViewMoveExplorerLeftTop && command <= kViewMoveExplorerRightBottom)
+        MovePanelToSlot(PanelId::Explorer, static_cast<PanelSlot>(command - kViewMoveExplorerLeftTop));
+      else if (command >= kViewMoveCalendarLeftTop && command <= kViewMoveCalendarRightBottom)
+        MovePanelToSlot(PanelId::Calendar, static_cast<PanelSlot>(command - kViewMoveCalendarLeftTop));
+      else if (command >= kViewMoveOutlineLeftTop && command <= kViewMoveOutlineRightBottom)
+        MovePanelToSlot(PanelId::Outline, static_cast<PanelSlot>(command - kViewMoveOutlineLeftTop));
+      else if (command >= kViewMoveGitLeftTop && command <= kViewMoveGitRightBottom)
+        MovePanelToSlot(PanelId::Git, static_cast<PanelSlot>(command - kViewMoveGitLeftTop));
       if (command == kFileOpenWorkspace) OpenWorkspaceDialog();
       else if (command == kFileNew) NewUntitledDocument();
       else if (command == kFileOpen) OpenFileDialog();
       else if (command == kFileQuickOpen) QuickOpen();
       else if (command == kFileClose && active_document_ < documents_.size()) CloseDocument(active_document_);
       else if (command == kFileSave && active_document_ < documents_.size())
-        SaveDocument(*documents_[active_document_], true);
+        SaveDocument(*documents_[active_document_], SaveIntent::UserRequested);
       else if (command == kFileSaveAs && active_document_ < documents_.size())
         SaveDocumentAs(*documents_[active_document_]);
       else if (command == kFileReload) ReloadDocumentFromDisk();
@@ -1712,7 +1809,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         ReplaceWorkspaceFromFindBar();
       else if (command == kFindWorkspace) SearchWorkspaceFromFindBar();
       else if (command == kViewCalendar) {
-        ShowWindow(calendar_, IsWindowVisible(calendar_) ? SW_HIDE : SW_SHOW);
+        if (auto* panel = panel_layout_.Find(PanelId::Calendar))
+          panel->hidden = !panel->hidden;
+        ShowWindow(calendar_, panel_layout_.Find(PanelId::Calendar)->hidden ? SW_HIDE : SW_SHOW);
+        SavePanelLayout();
         LayoutControls();
       }
       else if (command == kCalendarImportHolidays) ImportHolidayData();
@@ -1723,10 +1823,23 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kViewCompact) ToggleCompactWindow();
       else if (command == kViewWorkspacePane) {
         workspace_pane_collapsed_ = !workspace_pane_collapsed_;
+        if (auto* panel = panel_layout_.Find(PanelId::Explorer))
+          panel->collapsed = workspace_pane_collapsed_;
+        SavePanelLayout();
         LayoutControls();
       }
       else if (command == kViewOutlinePane) {
         outline_pane_collapsed_ = !outline_pane_collapsed_;
+        if (auto* panel = panel_layout_.Find(PanelId::Outline))
+          panel->collapsed = outline_pane_collapsed_;
+        SavePanelLayout();
+        LayoutControls();
+      }
+      else if (command == kViewResetPanels) {
+        panel_layout_.Reset();
+        workspace_pane_collapsed_ = false;
+        outline_pane_collapsed_ = false;
+        SavePanelLayout();
         LayoutControls();
       }
       else if (command == kViewCommandPalette) ShowCommandPalette();
@@ -1855,14 +1968,20 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       } else if (header->hwndFrom == calendar_ && header->code == MCN_SELECT) {
         const auto* selection = reinterpret_cast<NMSELCHANGE*>(lparam);
         CreateProfileForDate(BuiltInProfile::Daily, selection->stSelStart);
-        ShowWindow(calendar_, SW_HIDE);
+        wchar_t selected_date[64]{};
+        swprintf_s(selected_date, L"選択日: %04u-%02u-%02u", selection->stSelStart.wYear,
+                   selection->stSelStart.wMonth, selection->stSelStart.wDay);
+        if (calendar_details_) SetWindowTextW(calendar_details_, selected_date);
       } else if (header->hwndFrom == find_results_ &&
                  (header->code == NM_DBLCLK || header->code == LVN_ITEMACTIVATE)) {
         const int index = ListView_GetNextItem(find_results_, -1, LVNI_SELECTED);
         if (index >= 0) OpenWorkspaceSearchResult(static_cast<std::size_t>(index));
       } else if (!suppress_editor_change_ && active_document_ < documents_.size() &&
                  header->hwndFrom == documents_[active_document_]->editor &&
-                 header->code == EN_SELCHANGE) {
+                 header->code == EN_SELCHANGE &&
+                 !documents_[active_document_]->native_edit_in_flight &&
+                 !documents_[active_document_]->ime_composing &&
+                 documents_[active_document_]->sync_due == 0) {
         ApplyMarkdownPresentation(*documents_[active_document_], false);
       } else if (active_document_ < documents_.size() &&
                  header->hwndFrom == documents_[active_document_]->editor &&
@@ -2005,6 +2124,27 @@ void Application::CreateMenuBar() {
   AppendMenuW(view, MF_STRING, kViewCompact, L"現在の文書をコンパクト表示");
   AppendMenuW(view, MF_STRING, kViewWorkspacePane, L"Workspace paneを折り畳む／表示");
   AppendMenuW(view, MF_STRING, kViewOutlinePane, L"Outline paneを折り畳む／表示");
+  AppendMenuW(view, MF_STRING, kViewResetPanels, L"パネル配置を初期化");
+  HMENU panel_layout = CreatePopupMenu();
+  AppendMenuW(panel_layout, MF_STRING, kViewResizeFocusedNarrow, L"フォーカス中を狭くする");
+  AppendMenuW(panel_layout, MF_STRING, kViewResizeFocusedWide, L"フォーカス中を広くする");
+  AppendMenuW(panel_layout, MF_STRING, kViewMoveFocusedLeftTop, L"フォーカス中を左上へ\tCtrl+Alt+1");
+  AppendMenuW(panel_layout, MF_STRING, kViewMoveFocusedLeftBottom, L"フォーカス中を左下へ\tCtrl+Alt+2");
+  AppendMenuW(panel_layout, MF_STRING, kViewMoveFocusedRightTop, L"フォーカス中を右上へ\tCtrl+Alt+3");
+  AppendMenuW(panel_layout, MF_STRING, kViewMoveFocusedRightBottom, L"フォーカス中を右下へ\tCtrl+Alt+4");
+  auto add_panel_layout_menu = [&](const wchar_t* label, int first_command) {
+    HMENU destinations = CreatePopupMenu();
+    AppendMenuW(destinations, MF_STRING, first_command + 0, L"左上");
+    AppendMenuW(destinations, MF_STRING, first_command + 1, L"左下");
+    AppendMenuW(destinations, MF_STRING, first_command + 2, L"右上");
+    AppendMenuW(destinations, MF_STRING, first_command + 3, L"右下");
+    AppendMenuW(panel_layout, MF_POPUP, reinterpret_cast<UINT_PTR>(destinations), label);
+  };
+  add_panel_layout_menu(L"Explorerを移動", kViewMoveExplorerLeftTop);
+  add_panel_layout_menu(L"Calendarを移動", kViewMoveCalendarLeftTop);
+  add_panel_layout_menu(L"Outlineを移動", kViewMoveOutlineLeftTop);
+  add_panel_layout_menu(L"Gitを移動", kViewMoveGitLeftTop);
+  AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(panel_layout), L"パネル配置");
   AppendMenuW(view, MF_STRING, kViewCommandPalette, L"コマンドパレット…\tCtrl+Shift+P");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"表示");
   HMENU table = CreatePopupMenu();
@@ -2148,6 +2288,26 @@ void Application::CreateControls() {
   calendar_ = CreateWindowExW(WS_EX_CLIENTEDGE, MONTHCAL_CLASSW, nullptr,
                               WS_CHILD | MCS_DAYSTATE | MCS_WEEKNUMBERS,
                               0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  git_panel_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC",
+                              L"Git\r\n状態を更新するにはGit: Statusを実行してください。",
+                              WS_CHILD | SS_LEFT | SS_NOPREFIX,
+                              0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  calendar_details_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC",
+                                      L"選択日: （カレンダーから選択）",
+                                      WS_CHILD | SS_LEFT | SS_NOPREFIX,
+                                      0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  panel_headers_[PanelIndex(PanelId::Explorer)] = CreateWindowExW(
+      0, L"BUTTON", L"Explorer", WS_CHILD | BS_PUSHBUTTON | BS_FLAT | WS_TABSTOP,
+      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kPanelHeaderExplorer), instance_, nullptr);
+  panel_headers_[PanelIndex(PanelId::Calendar)] = CreateWindowExW(
+      0, L"BUTTON", L"Calendar", WS_CHILD | BS_PUSHBUTTON | BS_FLAT | WS_TABSTOP,
+      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kPanelHeaderCalendar), instance_, nullptr);
+  panel_headers_[PanelIndex(PanelId::Outline)] = CreateWindowExW(
+      0, L"BUTTON", L"Outline", WS_CHILD | BS_PUSHBUTTON | BS_FLAT | WS_TABSTOP,
+      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kPanelHeaderOutline), instance_, nullptr);
+  panel_headers_[PanelIndex(PanelId::Git)] = CreateWindowExW(
+      0, L"BUTTON", L"Git", WS_CHILD | BS_PUSHBUTTON | BS_FLAT | WS_TABSTOP,
+      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kPanelHeaderGit), instance_, nullptr);
   SendMessageW(calendar_, MCM_SETFIRSTDAYOFWEEK, 0, 6);
   SetWindowSubclass(calendar_, CalendarSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   calendar_tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
@@ -2167,7 +2327,8 @@ void Application::CreateControls() {
   for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_, replace_edit_,
                        find_workspace_, replace_workspace_, find_case_, find_regex_, find_word_,
                        find_include_glob_, find_exclude_glob_, replace_one_, replace_document_,
-                       find_results_})
+                       find_results_, git_panel_, calendar_details_, panel_headers_[0], panel_headers_[1],
+                        panel_headers_[2], panel_headers_[3]})
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 }
 
@@ -2341,6 +2502,58 @@ void Application::DrawStatusItem(const DRAWITEMSTRUCT& draw) const {
             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
   SelectObject(draw.hDC, previous);
 }
+void Application::LoadPanelLayout() {
+  panel_layout_ = PanelLayout::Default();
+  if (workspace_store_) {
+    std::wstring error;
+    if (!workspace_store_->ReadPanelLayout(panel_layout_, error)) {
+      panel_layout_.Reset();
+      SetStatusText(L"パネル配置を読み込めないため既定配置を使用します。" );
+    }
+  }
+  if (const auto* explorer = panel_layout_.Find(PanelId::Explorer))
+    workspace_pane_collapsed_ = explorer->collapsed;
+  if (const auto* outline = panel_layout_.Find(PanelId::Outline))
+    outline_pane_collapsed_ = outline->collapsed;
+  LayoutControls();
+}
+
+void Application::SavePanelLayout() {
+  if (!workspace_store_) return;
+  std::wstring error;
+  if (!workspace_store_->WritePanelLayout(panel_layout_, error))
+    SetStatusText(L"パネル配置を保存できません。" );
+}
+void Application::MovePanelToSlot(PanelId id, PanelSlot slot) {
+  std::wstring error;
+  if (!panel_layout_.Move(id, slot, error)) {
+    SetStatusText(error.empty() ? L"パネル配置を変更できません。" : error);
+    return;
+  }
+  focused_panel_ = id;
+  SavePanelLayout();
+  LayoutControls();
+  SetStatusText(std::wstring(PanelName(id)) + L"を" + PanelSlotName(slot) + L"へ移動しました。");
+}
+
+void Application::MoveFocusedPanelToSlot(PanelSlot slot) {
+  MovePanelToSlot(focused_panel_, slot);
+}
+
+void Application::UpdatePanelHeaders() {
+  for (const auto id : {PanelId::Explorer, PanelId::Calendar, PanelId::Outline, PanelId::Git}) {
+    const auto* panel = panel_layout_.Find(id);
+    const HWND header = panel_headers_[PanelIndex(id)];
+    if (!panel || !header) continue;
+    std::wstring text = PanelName(id);
+    text += L"  [";
+    text += PanelSlotName(panel->slot);
+    text += L"]";
+    if (focused_panel_ == id) text += L"  •";
+    SetWindowTextW(header, text.c_str());
+    if (editor_font_) SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(editor_font_), TRUE);
+  }
+}
 void Application::LayoutControls() {
   RECT client{};
   GetClientRect(window_, &client);
@@ -2351,15 +2564,51 @@ void Application::LayoutControls() {
   const int content_height = std::max(0L, client.bottom - status_height);
   const bool find_visible = IsWindowVisible(find_bar_) != FALSE;
   const bool results_visible = IsWindowVisible(find_results_) != FALSE;
-  const int desired_tree_width = ScaleDip(window_, kTreeWidth);
-  const int desired_outline_width = ScaleDip(window_, kOutlineWidth);
+  const auto state_for_slot = [&](PanelSlot slot) -> const PanelState* {
+    for (const auto& panel : panel_layout_.panels())
+      if (panel.slot == slot) return &panel;
+    return nullptr;
+  };
+  const auto is_visible = [&](const PanelState* panel) {
+    if (!panel || panel->hidden || panel->collapsed) return false;
+    if (panel->id == PanelId::Explorer && workspace_pane_collapsed_) return false;
+    if (panel->id == PanelId::Outline && outline_pane_collapsed_) return false;
+    return true;
+  };
+  const auto control_for = [&](PanelId id) {
+    switch (id) {
+      case PanelId::Explorer: return workspace_tree_;
+      case PanelId::Calendar: return calendar_;
+      case PanelId::Outline: return outline_;
+      case PanelId::Git: return git_panel_;
+    }
+    return static_cast<HWND>(nullptr);
+  };
+  const auto header_for = [&](PanelId id) {
+    return panel_headers_[PanelIndex(id)];
+  };
+  const auto left_top = state_for_slot(PanelSlot::LeftTop);
+  const auto left_bottom = state_for_slot(PanelSlot::LeftBottom);
+  const auto right_top = state_for_slot(PanelSlot::RightTop);
+  const auto right_bottom = state_for_slot(PanelSlot::RightBottom);
+  const bool show_left_top = is_visible(left_top);
+  const bool show_left_bottom = is_visible(left_bottom);
+  const bool show_right_top = is_visible(right_top);
+  const bool show_right_bottom = is_visible(right_bottom);
+  const auto preferred_width = [&](const PanelState* top, const PanelState* bottom, int fallback) {
+    if (is_visible(top)) return ScaleDip(window_, static_cast<int>(top->width));
+    if (is_visible(bottom)) return ScaleDip(window_, static_cast<int>(bottom->width));
+    return ScaleDip(window_, fallback);
+  };
+  const int desired_tree_width = preferred_width(left_top, left_bottom, kTreeWidth);
+  const int desired_outline_width = preferred_width(right_top, right_bottom, kOutlineWidth);
   const int minimum_editor_width = ScaleDip(window_, kMinimumEditorWidth);
   const int minimum_pane_width = ScaleDip(window_, kMinimumPaneWidth);
   const int pane_budget = std::max(0L, client.right - minimum_editor_width);
   int tree_width = 0;
   int outline_width = 0;
-  const bool want_tree = !workspace_pane_collapsed_;
-  const bool want_outline = !outline_pane_collapsed_;
+  const bool want_tree = show_left_top || show_left_bottom;
+  const bool want_outline = show_right_top || show_right_bottom;
   if (want_tree && want_outline && pane_budget >= minimum_pane_width * 2) {
     const int desired_total = desired_tree_width + desired_outline_width;
     if (pane_budget >= desired_total) {
@@ -2367,7 +2616,7 @@ void Application::LayoutControls() {
       outline_width = desired_outline_width;
     } else {
       tree_width = std::max(minimum_pane_width,
-                            MulDiv(pane_budget, desired_tree_width, desired_total));
+                            MulDiv(pane_budget, desired_tree_width, std::max(1, desired_total)));
       outline_width = pane_budget - tree_width;
       if (outline_width < minimum_pane_width) {
         outline_width = minimum_pane_width;
@@ -2379,14 +2628,53 @@ void Application::LayoutControls() {
   } else if (want_outline && pane_budget >= minimum_pane_width) {
     outline_width = std::min(desired_outline_width, pane_budget);
   }
-  // At very narrow widths keep one useful navigation pane only when there is
-  // enough room for its hit targets; otherwise the editor owns the full row.
   if (tree_width == 0 && outline_width == 0 && pane_budget >= minimum_pane_width) {
     if (want_tree) tree_width = std::min(desired_tree_width, pane_budget);
     else if (want_outline) outline_width = std::min(desired_outline_width, pane_budget);
   }
-  ShowWindow(workspace_tree_, tree_width > 0 ? SW_SHOW : SW_HIDE);
-  ShowWindow(outline_, outline_width > 0 ? SW_SHOW : SW_HIDE);
+  for (const auto& panel : panel_layout_.panels()) {
+    ShowWindow(control_for(panel.id), SW_HIDE);
+    ShowWindow(header_for(panel.id), SW_HIDE);
+  }
+  ShowWindow(calendar_details_, SW_HIDE);
+  const int header_height = ScaleDip(window_, 26);
+  const auto side_height = [&](const PanelState* top, const PanelState* bottom, bool top_visible,
+                               bool bottom_visible) {
+    if (!top_visible) return 0;
+    if (!bottom_visible) return content_height;
+    if (content_height <= header_height * 2 + 2) return content_height / 2;
+    const int top_weight = std::max(1, static_cast<int>(top->height));
+    const int bottom_weight = std::max(1, static_cast<int>(bottom->height));
+    return std::clamp(MulDiv(content_height, top_weight, top_weight + bottom_weight),
+                      header_height + 1, content_height - header_height - 1);
+  };
+  const int left_top_height = side_height(left_top, left_bottom, show_left_top, show_left_bottom);
+  const int right_top_height = side_height(right_top, right_bottom, show_right_top, show_right_bottom);
+  const auto place_panel = [&](const PanelState* panel, int x, int y, int width, int height) {
+    if (!panel || !is_visible(panel) || width <= 0 || height <= 0) return;
+    const HWND header = header_for(panel->id);
+    const HWND control = control_for(panel->id);
+    MoveWindow(header, x, y, width, std::min(header_height, height), TRUE);
+    ShowWindow(header, SW_SHOW);
+    const int content_top = y + std::min(header_height, height);
+    const int panel_content_height = std::max(0, height - std::min(header_height, height));
+    MoveWindow(control, x, content_top, width, panel_content_height, TRUE);
+    ShowWindow(control, panel_content_height > 0 ? SW_SHOW : SW_HIDE);
+    if (panel->id == PanelId::Calendar) {
+      const int calendar_height = std::max(0, panel_content_height * 2 / 3);
+      MoveWindow(calendar_, x, content_top, width, calendar_height, TRUE);
+      MoveWindow(calendar_details_, x, content_top + calendar_height, width,
+                 std::max(0, panel_content_height - calendar_height), TRUE);
+      ShowWindow(calendar_, calendar_height > 0 ? SW_SHOW : SW_HIDE);
+      ShowWindow(calendar_details_, calendar_height > 0 ? SW_SHOW : SW_HIDE);
+    }
+  };
+  place_panel(left_top, 0, 0, tree_width, left_top_height);
+  place_panel(left_bottom, 0, left_top_height, tree_width,
+              std::max(0, content_height - left_top_height));
+  place_panel(right_top, client.right - outline_width, 0, outline_width, right_top_height);
+  place_panel(right_bottom, client.right - outline_width, right_top_height, outline_width,
+              std::max(0, content_height - right_top_height));
   const int tab_height = ScaleDip(window_, kTabHeight);
   const int center_left = tree_width;
   const int center_width = std::max(0L, client.right - tree_width - outline_width);
@@ -2408,17 +2696,14 @@ void Application::LayoutControls() {
     MoveWindow(control, x, y, std::max(0, width), std::max(0, height), TRUE);
     ShowWindow(control, visible && width > 0 && height > 0 ? SW_SHOW : SW_HIDE);
   };
-  MoveWindow(workspace_tree_, 0, 0, tree_width, content_height, TRUE);
-  MoveWindow(outline_, client.right - outline_width, 0, outline_width, content_height, TRUE);
-  MoveWindow(tabs_, center_left, 0, center_width, tab_height, TRUE);
-  MoveWindow(find_bar_, center_left, tab_height, center_width, find_visible ? find_height : 0, TRUE);
-  const int option_cluster = show_advanced_find ?
-      ScaleDip(window_, 72 + 62 + 58 + 8) : 0;
+  const int option_cluster = show_advanced_find ? ScaleDip(window_, 72 + 62 + 58 + 8) : 0;
   const int first_row_available = std::max(0, center_width - padding * 2);
   const int button_width = std::min(base_button_width,
                                     std::max(0, first_row_available - minimum_input_width -
                                                    option_cluster - gap * 2));
   const int input_width = std::max(0, first_row_available - button_width - option_cluster - gap * 2);
+  MoveWindow(tabs_, center_left, 0, center_width, tab_height, TRUE);
+  MoveWindow(find_bar_, center_left, tab_height, center_width, find_visible ? find_height : 0, TRUE);
   place(find_edit_, center_left + padding, tab_height + ScaleDip(window_, 4), input_width,
         input_height, find_visible);
   const int find_next_x = center_left + padding + input_width + gap;
@@ -2433,7 +2718,6 @@ void Application::LayoutControls() {
   option_x += ScaleDip(window_, 62) + gap;
   place(find_word_, option_x, tab_height + ScaleDip(window_, 5), ScaleDip(window_, 58),
         ScaleDip(window_, 22), show_advanced_find);
-
   const int replacement_cluster = show_workspace_actions ?
       ScaleDip(window_, 82 + 92 + 118 + 12) : ScaleDip(window_, 82);
   const int replacement_width = std::max(0, first_row_available - replacement_cluster - gap);
@@ -2448,7 +2732,6 @@ void Application::LayoutControls() {
   replace_x += ScaleDip(window_, 92) + gap;
   place(replace_workspace_, replace_x, tab_height + ScaleDip(window_, 35), ScaleDip(window_, 118),
         button_height, show_workspace_actions);
-
   const int glob_button_width = show_workspace_actions ? base_button_width : 0;
   const int glob_width = show_globs ? std::max(0, (center_width - padding * 2 - glob_button_width - gap * 2) / 2) : 0;
   place(find_include_glob_, center_left + padding, tab_height + ScaleDip(window_, 66), glob_width,
@@ -2467,25 +2750,15 @@ void Application::LayoutControls() {
       MoveWindow(view->editor, center_left, editor_top, center_width,
                  std::max(0, content_height - editor_top), TRUE);
   }
-  if (calendar_) {
-    RECT required{};
-    MonthCal_GetMinReqRect(calendar_, &required);
-    const int width = required.right - required.left;
-    const int height = required.bottom - required.top;
-    MoveWindow(calendar_, std::max(center_left, static_cast<int>(client.right) - outline_width - width - ScaleDip(window_, 8)),
-               editor_top + ScaleDip(window_, 8), width, height, TRUE);
-    if (calendar_tooltip_) {
-      TTTOOLINFOW tool{sizeof(tool)};
-      tool.hwnd = calendar_;
-      tool.uId = 1;
-      GetClientRect(calendar_, &tool.rect);
-      SendMessageW(calendar_tooltip_, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
-    }
-    if (IsWindowVisible(calendar_)) SetWindowPos(calendar_, HWND_TOP, 0, 0, 0, 0,
-                                                 SWP_NOMOVE | SWP_NOSIZE);
+  if (calendar_ && calendar_tooltip_) {
+    TTTOOLINFOW tool{sizeof(tool)};
+    tool.hwnd = calendar_;
+    tool.uId = 1;
+    GetClientRect(calendar_, &tool.rect);
+    SendMessageW(calendar_tooltip_, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
   }
+  UpdatePanelHeaders();
 }
-
 void Application::OpenWorkspaceDialog() {
   IFileDialog* dialog = nullptr;
   if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
@@ -2675,6 +2948,7 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
     }
   }
   LoadAndApplySettings();
+  LoadPanelLayout();
   SetWindowTextW(window_, (L"MDLite — " + workspace_.filename().wstring()).c_str());
   PopulateWorkspaceTree();
   UpdateStatus();
@@ -2767,7 +3041,7 @@ void Application::OpenDocumentView(Document document, std::wstring tab_name) {
   const bool dark = settings_.theme == ThemeMode::Dark ||
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   SendMessageW(view->editor, EM_SETBKGNDCOLOR, 0,
-               ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255)));
+               ThemeColor(settings_, L"editor_background", dark ? RGB(28, 31, 36) : RGB(252, 253, 255)));
   SetWindowSubclass(view->editor, EditorSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
@@ -2870,7 +3144,10 @@ bool Application::CloseDocument(std::size_t index) {
         (L"変更を保存してタブを閉じますか？\n" + view.document.path().wstring()).c_str(),
         L"タブを閉じる", MB_ICONQUESTION | MB_YESNOCANCEL | MB_DEFBUTTON1);
     if (answer == IDCANCEL) return false;
-    if (answer == IDYES && !SaveDocument(view, true)) return false;
+    if (answer == IDYES) {
+      const auto save_result = SaveDocument(view, SaveIntent::UserRequested);
+      if (save_result != SaveResult::Saved && save_result != SaveResult::NoChange) return false;
+    }
     if (answer == IDNO && view.workspace_store) {
       std::wstring ignored;
       view.workspace_store->RemoveRecovery(view.document.path(), ignored);
@@ -2895,32 +3172,39 @@ bool Application::CloseDocument(std::size_t index) {
   return true;
 }
 
-bool Application::SaveDocument(DocumentView& view, bool interactive) {
-  if (view.ime_composing) return false;
+Application::SaveResult Application::SaveDocument(DocumentView& view, SaveIntent intent) {
+  if (view.ime_composing) return SaveResult::Failed;
   SyncDocumentFromEditor(view);
-  if (!view.document.dirty()) return true;
-  if (view.document.untitled()) return SaveDocumentAs(view);
+  if (!view.document.dirty()) return SaveResult::NoChange;
+  if (view.document.untitled()) {
+    if (intent == SaveIntent::BackgroundAutosave) {
+      const bool recovered = SaveRecovery(view, false);
+      UpdateStatus();
+      return recovered ? SaveResult::RecoverySaved : SaveResult::Failed;
+    }
+    return SaveDocumentAs(view);
+  }
   std::wstring error;
   if (!view.document.Save(error)) {
     const bool recovered = SaveRecovery(view, false);
     UpdateStatus();
-    if (interactive) {
+    if (intent == SaveIntent::UserRequested) {
       if (recovered) error += L"\n最新の編集内容はWorkspaceの復旧領域へ保存しました。";
       else error += L"\n復旧領域への保存にも失敗しました。別名保存するか編集を続けてください。";
       MessageBoxW(window_, error.c_str(), L"保存できません", MB_ICONWARNING);
     }
-    return false;
+    return recovered ? SaveResult::RecoverySaved : SaveResult::Failed;
   }
   if (view.workspace_store) {
     std::wstring recovery_error;
     view.workspace_store->RemoveRecovery(view.document.path(), recovery_error);
   }
   UpdateStatus();
-  return true;
+  return SaveResult::Saved;
 }
 
-bool Application::SaveDocumentAs(DocumentView& view) {
-  if (view.ime_composing) return false;
+Application::SaveResult Application::SaveDocumentAs(DocumentView& view) {
+  if (view.ime_composing || save_dialog_active_) return SaveResult::Cancelled;
   SyncDocumentFromEditor(view);
   wchar_t path[32768]{};
   std::wstring suggested = view.document.untitled()
@@ -2936,12 +3220,15 @@ bool Application::SaveDocumentAs(DocumentView& view) {
       ? workspace_.wstring() : view.document.path().parent_path().wstring();
   dialog.lpstrInitialDir = initial_directory.c_str();
   dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-  if (!GetSaveFileNameW(&dialog)) return false;
+  save_dialog_active_ = true;
+  const BOOL selected = GetSaveFileNameW(&dialog);
+  save_dialog_active_ = false;
+  if (!selected) return SaveResult::Cancelled;
   const auto old_path = view.document.path();
   std::wstring error;
   if (!view.document.SaveAs(path, error)) {
     MessageBoxW(window_, error.c_str(), L"別名保存できません", MB_ICONWARNING);
-    return false;
+    return SaveResult::Failed;
   }
   if (view.workspace_store) {
     std::wstring ignored;
@@ -2958,7 +3245,7 @@ bool Application::SaveDocumentAs(DocumentView& view) {
   view.autosave_due = 0;
   view.recovery_due = 0;
   UpdateStatus();
-  return true;
+  return SaveResult::Saved;
 }
 
 void Application::ReloadDocumentFromDisk() {
@@ -3041,7 +3328,9 @@ void Application::CompareDocumentWithDisk() {
 bool Application::SaveAllRequired(bool interactive) {
   bool all_saved = true;
   for (auto& view : documents_) {
-    if (!SaveDocument(*view, interactive)) all_saved = false;
+    const auto save_result = SaveDocument(*view,
+        interactive ? SaveIntent::UserRequested : SaveIntent::BackgroundAutosave);
+    if (save_result != SaveResult::Saved && save_result != SaveResult::NoChange) all_saved = false;
   }
   return all_saved;
 }
@@ -3050,9 +3339,12 @@ Application::SaveAllResult Application::SaveAllForExit(bool interactive) {
   bool result = true;
   bool all_recovered = true;
   for (auto& view : documents_) {
-    if (!SaveDocument(*view, interactive)) {
+    const auto save_result = SaveDocument(*view,
+        interactive ? SaveIntent::UserRequested : SaveIntent::BackgroundAutosave);
+    if (save_result != SaveResult::Saved && save_result != SaveResult::NoChange) {
       result = false;
-      all_recovered = SaveRecovery(*view, false) && all_recovered;
+      all_recovered = (save_result == SaveResult::RecoverySaved ||
+                       SaveRecovery(*view, false)) && all_recovered;
     }
   }
   if (!result && interactive) {
@@ -3071,7 +3363,8 @@ Application::SaveAllResult Application::SaveAllForExit(bool interactive) {
     if (choice == IDCANCEL) return SaveAllResult::Cancelled;
     if (choice == IDNO) return SaveAllResult::Discarded;
     for (auto& view : documents_) {
-      if (view->document.dirty() && !SaveDocumentAs(*view)) return SaveAllResult::Cancelled;
+      if (view->document.dirty() && SaveDocumentAs(*view) != SaveResult::Saved)
+        return SaveAllResult::Cancelled;
     }
     return SaveAllResult::AllSaved;
   }
@@ -3082,12 +3375,16 @@ void Application::OnEditorChanged(HWND editor) {
   if (suppress_editor_change_) return;
   for (auto& view : documents_) {
     if (view->editor != editor) continue;
-    if (view->ime_composing) return;
     const ULONGLONG now = GetTickCount64();
+    view->native_edit_pending = true;
     InvalidateTableGrid(*view);
-    // RichEdit emits EN_CHANGE synchronously for each character. Coalesce the
-    // expensive view-to-source snapshot into one transaction per input burst;
-    // commands that need source immediately call SyncDocumentFromEditor first.
+    if (view->ime_composing) {
+      UpdateStatus();
+      return;
+    }
+    // EN_CHANGE records a pending native edit. Normal WM_CHAR/command dispatch
+    // commits it immediately; the timer remains a safe fallback for messages
+    // whose mutation boundary is not classified.
     view->sync_due = now + kEditorSyncDelayMs;
     view->presentation_due = 0;
     view->autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
@@ -3098,11 +3395,30 @@ void Application::OnEditorChanged(HWND editor) {
   }
 }
 
+void Application::CommitPendingNativeEdit(DocumentView& view) {
+  if (!view.native_edit_pending && view.sync_due == 0) return;
+  if (view.sync_due == 0) {
+    const ULONGLONG now = GetTickCount64();
+    view.sync_due = now;
+    view.autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
+    if (view.recovery_due == 0) view.recovery_due = now + kRecoveryDelayMs;
+    SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
+  }
+  SyncDocumentFromEditor(view);
+  SchedulePresentation(view);
+}
+
+void Application::SchedulePresentation(DocumentView& view) {
+  if (view.ime_composing || !IsMarkdownFile(view.document.path())) return;
+  view.presentation_due = GetTickCount64() + kPresentationDelayMs;
+  SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
+}
+
 void Application::SyncDocumentFromEditor(DocumentView& view) {
   // EN_CHANGE is the authority for pending native-editor input. Presentation
   // updates are performed with notifications suppressed and must never be read
   // back as Markdown source (RichEdit may expose an image object as a space).
-  if (view.sync_due == 0) return;
+  if (view.sync_due == 0 && !view.native_edit_pending) return;
   view.sync_due = 0;
   const auto native_snapshot = NativeSnapshotFor(view.document);
   CHARRANGE selection{};
@@ -3114,11 +3430,15 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
     // Never infer a source edit from a truncated/misaligned native readback.
     // Keep the pending input alive for a later timer pass without showing a
     // dialog or turning a presentation-only failure into data loss.
+    view.native_edit_pending = true;
     view.sync_due = GetTickCount64() + kEditorSyncDelayMs;
     return;
   }
   const auto transaction = ApplyEditorText(native_snapshot, view.document.text(), current_view);
-  if (!transaction.changed) return;
+  if (!transaction.changed) {
+    view.native_edit_pending = false;
+    return;
+  }
   InvalidateTableGrid(view);
   view.source_undo.push_back({transaction.begin,
       view.document.text().substr(transaction.begin, transaction.old_end - transaction.begin),
@@ -3127,6 +3447,7 @@ void Application::SyncDocumentFromEditor(DocumentView& view) {
   view.source_redo.clear();
   view.document.MarkEdited(transaction.source);
   view.editor_snapshot = SnapshotFor(view.document);
+  view.native_edit_pending = false;
   const auto target_native = NativeSnapshotFor(view.document);
   {
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
@@ -3230,7 +3551,7 @@ void Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
 }
 
 bool Application::ApplySourceHistory(DocumentView& view, bool redo) {
-  if (view.sync_due != 0) SyncDocumentFromEditor(view);
+  if (view.sync_due != 0 || view.native_edit_pending) SyncDocumentFromEditor(view);
   auto& source = redo ? view.source_redo : view.source_undo;
   auto& destination = redo ? view.source_undo : view.source_redo;
   if (source.empty()) return false;
@@ -3593,7 +3914,7 @@ void Application::ApplyMarkdownPresentation(DocumentView& view, bool force) {
   const bool dark = settings_.theme == ThemeMode::Dark ||
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
-  const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
+  const COLORREF background = theme_editor_;
   CHARFORMAT2W normal{sizeof(normal)};
   normal.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_STRIKEOUT |
                   CFM_UNDERLINE | CFM_EFFECTS | CFM_HIDDEN | CFM_BACKCOLOR | CFM_LINK;
@@ -4393,6 +4714,7 @@ void Application::UpdateCalendarTooltip(POINT point) {
                             std::to_wstring(JapaneseHolidayFirstYear()) + L"–" +
                             std::to_wstring(JapaneseHolidayLastYear());
   if (!holiday_update_status_.empty()) calendar_tooltip_text_ += L"\n" + holiday_update_status_;
+  if (calendar_details_) SetWindowTextW(calendar_details_, calendar_tooltip_text_.c_str());
   TTTOOLINFOW tool{sizeof(tool)};
   tool.hwnd = calendar_;
   tool.uId = 1;
@@ -5091,6 +5413,7 @@ void Application::RunGitStatus() {
   RunProcess(git_path, {L"-C", workspace_.wstring(), L"branch", L"--format=%(HEAD) %(refname:short)"},
              workspace_, 64 * 1024, 30000, branches, error);
   std::wstring output = L"status\n" + status.output + L"\nbranches\n" + branches.output;
+  if (git_panel_) SetWindowTextW(git_panel_, output.c_str());
   if (status.truncated || branches.truncated) output += L"\n(出力上限で省略しました)";
   MessageBoxW(window_, output.c_str(), L"Git Status / Branches", status.exit_code == 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
@@ -5309,7 +5632,8 @@ void Application::MarkGitConflictResolved() {
   if (marker_count != 0 && MessageBoxW(window_,
       (L"競合markerが " + std::to_wstring(marker_count) + L" 件残っています。それでも解決済みとしてstageしますか？").c_str(),
       L"Git競合", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
-  if (!SaveDocument(view, true)) return;
+  const auto save_result = SaveDocument(view, SaveIntent::UserRequested);
+  if (save_result != SaveResult::Saved && save_result != SaveResult::NoChange) return;
   if (MessageBoxW(window_, (L"次の文書だけをGit indexへ追加し、解決済みにしますか？\n\n" +
                             std::filesystem::relative(view.document.path(), workspace_).generic_wstring()).c_str(),
                   L"Git競合", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
@@ -5402,7 +5726,8 @@ void Application::ApplySettings() {
     for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_,
                          replace_edit_, find_workspace_, replace_workspace_, find_case_, find_regex_,
                          find_word_, find_include_glob_, find_exclude_glob_, replace_one_,
-                         replace_document_, find_results_, calendar_})
+                         replace_document_, find_results_, calendar_, git_panel_, calendar_details_, panel_headers_[0], panel_headers_[1],
+                         panel_headers_[2], panel_headers_[3]})
       if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), TRUE);
     for (const auto& view : documents_)
       if (view->editor) SendMessageW(view->editor, WM_SETFONT,
@@ -5456,6 +5781,16 @@ void Application::RebuildAccelerators() {
       std::pair{std::wstring_view(L"view.commandPalette"), static_cast<WORD>(kViewCommandPalette)},
   };
   std::vector<ACCEL> accelerators;
+  // Panel placement remains available even when the workspace keybinding file
+  // is absent or intentionally minimal. The active header selects the panel.
+  accelerators.push_back(ACCEL{static_cast<BYTE>(FCONTROL | FALT), static_cast<WORD>('1'),
+                               static_cast<WORD>(kViewMoveFocusedLeftTop)});
+  accelerators.push_back(ACCEL{static_cast<BYTE>(FCONTROL | FALT), static_cast<WORD>('2'),
+                               static_cast<WORD>(kViewMoveFocusedLeftBottom)});
+  accelerators.push_back(ACCEL{static_cast<BYTE>(FCONTROL | FALT), static_cast<WORD>('3'),
+                               static_cast<WORD>(kViewMoveFocusedRightTop)});
+  accelerators.push_back(ACCEL{static_cast<BYTE>(FCONTROL | FALT), static_cast<WORD>('4'),
+                               static_cast<WORD>(kViewMoveFocusedRightBottom)});
   for (const auto& [name, command] : commands) {
     const auto value = settings_.keybindings.find(std::wstring(name));
     if (value == settings_.keybindings.end()) continue;
@@ -6075,4 +6410,18 @@ std::vector<std::filesystem::path> Application::SelectedTreePaths() const {
   return paths;
 }
 
+void Application::ResizeFocusedPanel(double delta) {
+  auto* panel = panel_layout_.Find(focused_panel_);
+  if (!panel || !std::isfinite(delta)) return;
+  const double width = panel->width + delta;
+  const double height = panel->height + delta;
+  std::wstring error;
+  if (!panel_layout_.Resize(focused_panel_, width, height, error)) {
+    SetStatusText(error.empty() ? L"パネル寸法を変更できません。" : error);
+    return;
+  }
+  SavePanelLayout();
+  LayoutControls();
+  SetStatusText(std::wstring(PanelName(focused_panel_)) + L"の寸法を変更しました。");
+}
 }  // namespace mdlite

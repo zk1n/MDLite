@@ -2,8 +2,8 @@
 
 #include <windows.h>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -83,12 +83,7 @@ bool IsWithin(const std::filesystem::path& root, const std::filesystem::path& ca
   return true;
 }
 
-bool AtomicWriteUtf8(const std::filesystem::path& path, std::wstring_view text, std::wstring& error) {
-  std::string bytes;
-  if (!EncodeUtf8(text, bytes)) {
-    error = L"UTF-8へ変換できない文字があります。";
-    return false;
-  }
+bool AtomicWriteBytes(const std::filesystem::path& path, std::string_view bytes, std::wstring& error) {
   std::filesystem::path temporary = path;
   temporary += L".new";
   HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -108,6 +103,15 @@ bool AtomicWriteUtf8(const std::filesystem::path& path, std::wstring_view text, 
     return false;
   }
   return true;
+}
+
+bool AtomicWriteUtf8(const std::filesystem::path& path, std::wstring_view text, std::wstring& error) {
+  std::string bytes;
+  if (!EncodeUtf8(text, bytes)) {
+    error = L"UTF-8へ変換できない文字があります。";
+    return false;
+  }
+  return AtomicWriteBytes(path, bytes, error);
 }
 
 std::uint64_t HashPath(const std::filesystem::path& path) {
@@ -429,4 +433,36 @@ bool WorkspaceStore::ReadSessionState(SessionState& state, std::wstring& error) 
   return true;
 }
 
+bool WorkspaceStore::WritePanelLayout(const PanelLayout& layout, std::wstring& error) const {
+  error.clear();
+  if (!layout.Validate(error)) return false;
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(state_root(), filesystem_error);
+  if (filesystem_error) {
+    error = L"Workspace状態フォルダーを作成できません: " + state_root().wstring();
+    return false;
+  }
+  return AtomicWriteBytes(panel_layout_path(), layout.Serialize(), error);
+}
+
+bool WorkspaceStore::ReadPanelLayout(PanelLayout& layout, std::wstring& error) const {
+  error.clear();
+  const auto path = panel_layout_path();
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    std::error_code filesystem_error;
+    if (!std::filesystem::exists(path, filesystem_error)) {
+      layout = PanelLayout::Default();
+      return true;
+    }
+    error = L"パネル状態ファイルを開けません。";
+    return false;
+  }
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  input.close();
+  PanelLayout candidate;
+  if (!PanelLayout::Deserialize(bytes, candidate, error)) return false;
+  layout = candidate;
+  return true;
+}
 }  // namespace mdlite

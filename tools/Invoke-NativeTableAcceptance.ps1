@@ -266,76 +266,44 @@ function Invoke-PaintReentryProbe([IntPtr]$Editor, [Diagnostics.Process]$Process
     }
 }
 
-function Send-UnicodeCharacters([IntPtr]$Editor, [string]$Text) {
+function Enter-InputTarget([IntPtr]$Editor) {
     $topLevel = $Editor
     while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
-    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
-    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
-    [void][MDLiteTableNative]::SetFocus($Editor)
-    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = $Text.Length * 2; error = 5; status = 'BLOCKED' } }
+    [uint32]$targetThread = 0; [void][MDLiteTableNative]::GetWindowThreadProcessId($topLevel, [ref]$targetThread)
+    $currentThread = [MDLiteTableNative]::GetCurrentThreadId(); $attached = $false
+    if ($targetThread -ne 0 -and $targetThread -ne $currentThread) { $attached = [MDLiteTableNative]::AttachThreadInput($currentThread, $targetThread, $true) }
+    [void][MDLiteTableNative]::BringWindowToTop($topLevel); [void][MDLiteTableNative]::SetForegroundWindow($topLevel); [void][MDLiteTableNative]::SetFocus($Editor)
+    $foreground = [MDLiteTableNative]::GetForegroundWindow()
+    if ($foreground -ne $topLevel) { if ($attached) { [void][MDLiteTableNative]::AttachThreadInput($currentThread, $targetThread, $false) }; return $null }
+    [pscustomobject]@{ targetThread=$targetThread; currentThread=$currentThread; attached=$attached }
+}
+function Exit-InputTarget($Target) { if ($Target -and $Target.attached) { [void][MDLiteTableNative]::AttachThreadInput($Target.currentThread, $Target.targetThread, $false) } }
+
+function Send-UnicodeCharacters([IntPtr]$Editor, [string]$Text) {
+    $target = Enter-InputTarget $Editor
+    if (-not $target) { return [pscustomobject]@{ sent = 0; expected = $Text.Length * 2; error = 5; status = 'BLOCKED'; reason = 'foreground/thread delivery not proven' } }
     $inputs = [MDLiteTableNative+INPUT[]]::new($Text.Length * 2)
     for ($index = 0; $index -lt $Text.Length; $index++) {
-        $down = $index * 2
-        $up = $down + 1
-        $inputs[$down].type = 1
-        $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new()
-        $inputs[$down].U.ki.wScan = [uint16][int]$Text[$index]
-        $inputs[$down].U.ki.dwFlags = $KEYEVENTF_UNICODE
-        $inputs[$up].type = 1
-        $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new()
-        $inputs[$up].U.ki.wScan = [uint16][int]$Text[$index]
-        $inputs[$up].U.ki.dwFlags = $KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP
+        $down = $index * 2; $up = $down + 1; $inputs[$down].type = 1; $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new(); $inputs[$down].U.ki.wScan = [uint16][int]$Text[$index]; $inputs[$down].U.ki.dwFlags = $KEYEVENTF_UNICODE
+        $inputs[$up].type = 1; $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new(); $inputs[$up].U.ki.wScan = [uint16][int]$Text[$index]; $inputs[$up].U.ki.dwFlags = $KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP
     }
-    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs,
-        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
-    return [pscustomobject]@{ sent = $sent; expected = $inputs.Length; error = if ($sent -eq $inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq $inputs.Length) { 'PASS' } else { 'BLOCKED' } }
+    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs, [Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); Exit-InputTarget $target
+    [pscustomobject]@{ sent=$sent; expected=$inputs.Length; error=if($sent -eq $inputs.Length){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}; status=if($sent -eq $inputs.Length){'PASS'}else{'BLOCKED'} }
 }
 
 function Send-ControlKey([IntPtr]$Editor, [int]$Key) {
-    $topLevel = $Editor
-    while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
-    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
-    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
-    [void][MDLiteTableNative]::SetFocus($Editor)
-    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = 4; error = 5; status = 'BLOCKED' } }
-    $inputs = [MDLiteTableNative+INPUT[]]::new(4)
-    for ($index = 0; $index -lt $inputs.Length; $index++) {
-        $inputs[$index].type = 1
-        $inputs[$index].U = [MDLiteTableNative+INPUT_UNION]::new()
-    }
-    $inputs[0].U.ki.wVk = [uint16]$VK_CONTROL
-    $inputs[1].U.ki.wVk = [uint16]$Key
-    $inputs[2].U.ki.wVk = [uint16]$Key
-    $inputs[2].U.ki.dwFlags = $KEYEVENTF_KEYUP
-    $inputs[3].U.ki.wVk = [uint16]$VK_CONTROL
-    $inputs[3].U.ki.dwFlags = $KEYEVENTF_KEYUP
-    $sent = [MDLiteTableNative]::SendInput(4, $inputs,
-        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
-    return [pscustomobject]@{ sent = $sent; expected = 4; error = if ($sent -eq 4) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq 4) { 'PASS' } else { 'BLOCKED' } }
+    $target = Enter-InputTarget $Editor; if (-not $target) { return [pscustomobject]@{ sent=0; expected=4; error=5; status='BLOCKED'; reason='foreground/thread delivery not proven' } }
+    $inputs = [MDLiteTableNative+INPUT[]]::new(4); for ($index=0; $index -lt 4; $index++) { $inputs[$index].type=1; $inputs[$index].U=[MDLiteTableNative+INPUT_UNION]::new() }
+    $inputs[0].U.ki.wVk=[uint16]$VK_CONTROL; $inputs[1].U.ki.wVk=[uint16]$Key; $inputs[2].U.ki.wVk=[uint16]$Key; $inputs[2].U.ki.dwFlags=$KEYEVENTF_KEYUP; $inputs[3].U.ki.wVk=[uint16]$VK_CONTROL; $inputs[3].U.ki.dwFlags=$KEYEVENTF_KEYUP
+    $sent=[MDLiteTableNative]::SendInput(4,$inputs,[Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); Exit-InputTarget $target
+    [pscustomobject]@{ sent=$sent; expected=4; error=if($sent -eq 4){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}; status=if($sent -eq 4){'PASS'}else{'BLOCKED'} }
 }
 
 function Send-KeyRepeat([IntPtr]$Editor, [int]$Key, [int]$Repeat) {
-    $topLevel = $Editor
-    while (($parent = [MDLiteTableNative]::GetParent($topLevel)) -ne [IntPtr]::Zero) { $topLevel = $parent }
-    [void][MDLiteTableNative]::BringWindowToTop($topLevel)
-    [void][MDLiteTableNative]::SetForegroundWindow($topLevel)
-    [void][MDLiteTableNative]::SetFocus($Editor)
-    if ([MDLiteTableNative]::GetForegroundWindow() -ne $topLevel) { return [pscustomobject]@{ sent = 0; expected = $Repeat * 2; error = 5; status = 'BLOCKED' } }
-    $inputs = [MDLiteTableNative+INPUT[]]::new($Repeat * 2)
-    for ($index = 0; $index -lt $Repeat; $index++) {
-        $down = $index * 2
-        $up = $down + 1
-        $inputs[$down].type = 1
-        $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new()
-        $inputs[$down].U.ki.wVk = [uint16]$Key
-        $inputs[$up].type = 1
-        $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new()
-        $inputs[$up].U.ki.wVk = [uint16]$Key
-        $inputs[$up].U.ki.dwFlags = $KEYEVENTF_KEYUP
-    }
-    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs,
-        [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
-    return [pscustomobject]@{ sent = $sent; expected = $inputs.Length; error = if ($sent -eq $inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; status = if ($sent -eq $inputs.Length) { 'PASS' } else { 'BLOCKED' } }
+    $target = Enter-InputTarget $Editor; if (-not $target) { return [pscustomobject]@{ sent=0; expected=$Repeat*2; error=5; status='BLOCKED'; reason='foreground/thread delivery not proven' } }
+    $inputs=[MDLiteTableNative+INPUT[]]::new($Repeat*2); for($index=0;$index -lt $Repeat;$index++){ $down=$index*2; $up=$down+1; $inputs[$down].type=1; $inputs[$down].U=[MDLiteTableNative+INPUT_UNION]::new(); $inputs[$down].U.ki.wVk=[uint16]$Key; $inputs[$up].type=1; $inputs[$up].U=[MDLiteTableNative+INPUT_UNION]::new(); $inputs[$up].U.ki.wVk=[uint16]$Key; $inputs[$up].U.ki.dwFlags=$KEYEVENTF_KEYUP }
+    $sent=[MDLiteTableNative]::SendInput($inputs.Length,$inputs,[Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); Exit-InputTarget $target
+    [pscustomobject]@{ sent=$sent; expected=$inputs.Length; error=if($sent -eq $inputs.Length){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}; status=if($sent -eq $inputs.Length){'PASS'}else{'BLOCKED'} }
 }
 function Send-ShiftKey([IntPtr]$Editor, [int]$Key) {
     $topLevel = $Editor
@@ -525,7 +493,7 @@ try {
         $saved = Save-Source $main $path
         [pscustomobject]@{
             pass = $saved -eq ($source + $payload)
-            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' } else { 'FAIL_INPUT_ACCUMULATION_OR_LOSS' }
+            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
             expected_length = ($source + $payload).Length
             actual_length = $saved.Length
         }
@@ -551,7 +519,7 @@ try {
         $undoTwo = Save-Source $main $path
         [pscustomobject]@{
             pass = $afterTwo -ne $afterRow -and $undoOne -eq $afterRow -and $undoTwo -eq $source
-            status = if ($undoOne -eq $afterRow -and $undoTwo -eq $source) { 'PASS_OS_INPUT_ONE_TRANSACTION' } else { 'FAIL_OVER_BROAD_OR_NOOP_CTRL_Z' }
+            status = if ($undoOne -eq $afterRow -and $undoTwo -eq $source) { 'PASS_OS_INPUT_ONE_TRANSACTION' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
             after_row = $afterRow
             after_two = $afterTwo
             undo_one = $undoOne
@@ -569,7 +537,7 @@ try {
         $selection = Get-Selection $editor
         $saved = Save-Source $main $path
         $pass = $saved -eq $source -and $selection.start -ge $two -and $selection.end -eq $selection.start -and $selection.start -lt $three
-        [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' } else { 'FAIL_ARROW_REPEAT_CROSSED_ROW_OR_MUTATED_SOURCE' }; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
+        [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
     }
     Invoke-TableCase 'table_paint_reentry' {
         param($main, $editor, $path, $process)
@@ -582,6 +550,22 @@ try {
         executable_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
         source = $source
         checks = $checks
+        evidence = [ordered]@{
+            E01_source_round_trip = @('row_before','row_after','row_delete','column_before','column_after','column_delete')
+            E02_dirty_save_boundary = @('cell_edit_undo_redo','tab_next_cell','tab_appends_row')
+            E03_undo_redo_invariant = @('cell_edit_undo_redo','ctrl_z_single_transaction')
+            E04_table_geometry_navigation = @('tab_next_cell','arrow_right_boundary','arrow_down_column')
+            E05_arrow_repeat_fallback = @('arrow_repeat_boundary')
+            E06_native_paint_invalidation = @('table_paint_reentry')
+            E07_continuous_input = @('continuous_unicode_input_no_accumulation')
+            E08_transaction_rollback = @('ctrl_z_single_transaction')
+            E09_ime_atok = 'UNKNOWN: synthetic SendInput is not IME/ATOK acceptance'
+            E10_physical_long_press = 'UNKNOWN: no physical long-press input'
+            E11_dpi_visual = 'UNKNOWN: no Human visual/DPI acceptance'
+            E12_dialog_timer = 'NOT OBSERVED BY TABLE HARNESS'
+            E13_presentation = 'NOT OBSERVED BY TABLE HARNESS'
+        }
+        evidence_boundary = 'Automated native Win32/RichEdit only; UNKNOWN and NOT_OBSERVED remain open.'
         all_cases_pass = $failed.Count -eq 0
         caveat = 'Automated native Win32/RichEdit path; not Human IME/DPI/subjective acceptance.'
         timestamp_utc = [DateTime]::UtcNow.ToString('o')

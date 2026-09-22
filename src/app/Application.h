@@ -200,6 +200,8 @@ class Application {
   bool CloseDocument(std::size_t index);
   void CreateProfile(BuiltInProfile profile);
   void CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date);
+  void OpenSelectedCalendarDate();
+  void UpdateCalendarDetails(const SYSTEMTIME& date);
   void CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date);
   void ApplyTableAction(TableAction action);
   void MoveOutlineSection(std::size_t source_begin, std::size_t target_begin);

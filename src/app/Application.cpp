@@ -3,8 +3,10 @@
 #include "assets/Assets.h"
 #include "assets/StorageAdapter.h"
 #include "calendar/JapaneseHolidays.h"
+#include "calendar/CalendarDayIndex.h"
 #include "git/Conflict.h"
 #include "search/Search.h"
+#include "git/GitPanel.h"
 #include "search/Replace.h"
 #include "process/ProcessRunner.h"
 #include "workspace/Trust.h"
@@ -23,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <ctime>
 #include <array>
 #include <chrono>
 #include <cwctype>
@@ -489,6 +492,7 @@ enum ControlId : int {
   kViewMoveGitRightBottom,
   kViewResizeFocusedNarrow,
   kViewResizeFocusedWide,
+  kCalendarOpenSelected,
 };
 
 int PanelIndex(PanelId id) {
@@ -1815,6 +1819,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         SavePanelLayout();
         LayoutControls();
       }
+      else if (command == kCalendarOpenSelected) OpenSelectedCalendarDate();
       else if (command == kCalendarImportHolidays) ImportHolidayData();
       else if (command == kCalendarUpdateHolidays) StartHolidayUpdate(true);
       else if (command == kViewSettings) OpenWorkspaceSettings();
@@ -1965,13 +1970,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
             ++month.wYear;
           }
         }
+      } else if (header->hwndFrom == calendar_ && header->code == NM_DBLCLK) {
+        OpenSelectedCalendarDate();
       } else if (header->hwndFrom == calendar_ && header->code == MCN_SELECT) {
         const auto* selection = reinterpret_cast<NMSELCHANGE*>(lparam);
-        CreateProfileForDate(BuiltInProfile::Daily, selection->stSelStart);
-        wchar_t selected_date[64]{};
-        swprintf_s(selected_date, L"選択日: %04u-%02u-%02u", selection->stSelStart.wYear,
-                   selection->stSelStart.wMonth, selection->stSelStart.wDay);
-        if (calendar_details_) SetWindowTextW(calendar_details_, selected_date);
+        UpdateCalendarDetails(selection->stSelStart);
       } else if (header->hwndFrom == find_results_ &&
                  (header->code == NM_DBLCLK || header->code == LVN_ITEMACTIVATE)) {
         const int index = ListView_GetNextItem(find_results_, -1, LVNI_SELECTED);
@@ -2115,6 +2118,7 @@ void Application::CreateMenuBar() {
   AppendMenuW(edit, MF_STRING, kEditReplaceWorkspace, L"Workspaceを置換…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), L"編集");
   HMENU view = CreatePopupMenu();
+  AppendMenuW(view, MF_STRING, kCalendarOpenSelected, L"選択日のDailyを開く");
   AppendMenuW(view, MF_STRING, kViewCalendar, L"カレンダー");
   AppendMenuW(view, MF_STRING, kCalendarImportHolidays, L"祝日CSVをローカル取込み…");
   AppendMenuW(view, MF_STRING, kCalendarUpdateHolidays, L"祝日を内閣府から今すぐ確認");
@@ -5402,20 +5406,33 @@ void Application::RunGitStatus() {
                 L"Git", MB_ICONWARNING);
     return;
   }
-  ProcessResult status;
-  std::wstring error;
-  if (!RunProcess(git_path, {L"-C", workspace_.wstring(), L"status", L"--short", L"--branch"},
-                  workspace_, 64 * 1024, 30000, status, error)) {
-    MessageBoxW(window_, error.c_str(), L"Git", MB_ICONERROR);
-    return;
+  GitPanelModel model(git_path, workspace_);
+  const auto snapshot = model.Refresh();
+  auto state_name = [](GitPanelState state) {
+    switch (state) {
+      case GitPanelState::NoGit: return L"Git未導入";
+      case GitPanelState::NoRepository: return L"repositoryなし";
+      case GitPanelState::Ready: return L"準備完了";
+      case GitPanelState::NoRemote: return L"remoteなし";
+      case GitPanelState::OperationInProgress: return L"操作中";
+      case GitPanelState::Error: return L"エラー";
+    }
+    return L"不明";
+  };
+  std::wstring output = L"Git\n状態: " + std::wstring(state_name(snapshot.state));
+  if (!snapshot.branch.empty()) output += L"\nbranch: " + snapshot.branch;
+  if (!snapshot.repository_root.empty()) output += L"\nrepository: " + snapshot.repository_root.wstring();
+  output += L"\n変更: staged=" + std::to_wstring(snapshot.has_staged_changes ? 1 : 0) +
+            L" / unstaged=" + std::to_wstring(snapshot.has_unstaged_changes ? 1 : 0) +
+            L" / untracked=" + std::to_wstring(snapshot.has_untracked_files ? 1 : 0);
+  for (const auto& file : snapshot.files) {
+    const wchar_t marker = file.conflicted ? L'!' : file.untracked ? L'?' :
+        file.staged && file.unstaged ? L'±' : file.staged ? L'+' : L'~';
+    output += L"\n" + std::wstring(1, marker) + L" " + file.path.generic_wstring();
   }
-  ProcessResult branches;
-  RunProcess(git_path, {L"-C", workspace_.wstring(), L"branch", L"--format=%(HEAD) %(refname:short)"},
-             workspace_, 64 * 1024, 30000, branches, error);
-  std::wstring output = L"status\n" + status.output + L"\nbranches\n" + branches.output;
+  if (!snapshot.error.empty()) output += L"\n" + snapshot.error;
   if (git_panel_) SetWindowTextW(git_panel_, output.c_str());
-  if (status.truncated || branches.truncated) output += L"\n(出力上限で省略しました)";
-  MessageBoxW(window_, output.c_str(), L"Git Status / Branches", status.exit_code == 0 ? MB_ICONINFORMATION : MB_ICONWARNING);
+  SetStatusText(snapshot.error.empty() ? L"Git statusを更新しました。" : snapshot.error);
 }
 
 void Application::RunGitAction(int command) {
@@ -6423,5 +6440,82 @@ void Application::ResizeFocusedPanel(double delta) {
   SavePanelLayout();
   LayoutControls();
   SetStatusText(std::wstring(PanelName(focused_panel_)) + L"の寸法を変更しました。");
+}
+void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
+  if (!calendar_details_) return;
+  const CalendarDate selected{static_cast<int>(date.wYear), static_cast<int>(date.wMonth),
+                              static_cast<int>(date.wDay)};
+  std::wstring output = L"選択日: " + std::to_wstring(selected.year) + L"-" +
+      (selected.month < 10 ? L"0" : L"") + std::to_wstring(selected.month) + L"-" +
+      (selected.day < 10 ? L"0" : L"") + std::to_wstring(selected.day);
+  if (const auto holiday = JapaneseHolidayName(selected.year, selected.month, selected.day))
+    output += L"\n祝日: " + std::wstring(*holiday);
+  else if (!JapaneseHolidayYearSupported(selected.year))
+    output += L"\n祝日: データ収録範囲外（不明）";
+  if (workspace_.empty() || !workspace_store_) {
+    output += L"\nテキスト一覧: Workspace未選択";
+    SetWindowTextW(calendar_details_, output.c_str());
+    return;
+  }
+
+  std::vector<ProfileDefinition> profiles;
+  std::wstring profile_error;
+  ProfileDefinition daily;
+  const bool profiles_ok = ResolveProfiles(
+      CommonProfilesPath(), workspace_store_->metadata_root() / L"profiles.toml",
+      profiles, profile_error);
+  if (profiles_ok) {
+    const auto found = std::ranges::find_if(profiles, [](const auto& item) {
+      return item.id == L"daily";
+    });
+    if (found != profiles.end()) daily = *found;
+  }
+  if (!profiles_ok || daily.id.empty()) {
+    output += L"\nDaily profile: 不明";
+    output += L"\nテキスト一覧: 取得できません";
+    SetWindowTextW(calendar_details_, output.c_str());
+    return;
+  }
+
+  const auto details = BuildCalendarDayDetails(workspace_, selected, daily);
+  switch (details.index.state) {
+    case CalendarIndexState::Zero: output += L"\n作成ファイル: 0件"; break;
+    case CalendarIndexState::Reading: output += L"\n作成ファイル: 取得中"; break;
+    case CalendarIndexState::Error: output += L"\n作成ファイル: 読み取りエラー"; break;
+    case CalendarIndexState::Ready:
+      output += L"\n作成ファイル: " + std::to_wstring(details.index.files.size()) + L"件";
+      break;
+  }
+  for (const auto& file : details.index.files) {
+    output += L"\n・" + file.name + L" [" + std::wstring(CalendarFileTypeName(file.type)) + L"] " +
+              file.relative_path.generic_wstring();
+    if (file.creation_time_utc) {
+      const auto seconds = std::chrono::system_clock::to_time_t(*file.creation_time_utc);
+      tm local{};
+      if (localtime_s(&local, &seconds) == 0) {
+        wchar_t stamp[32]{};
+        wcsftime(stamp, std::size(stamp), L"%Y-%m-%d %H:%M", &local);
+        output += L" (作成 " + std::wstring(stamp) + L")";
+      }
+    } else {
+      output += L" (作成日時不明)";
+    }
+  }
+  if (details.configured_daily_path) {
+    std::error_code path_error;
+    const auto relative = std::filesystem::relative(*details.configured_daily_path,
+                                                    workspace_, path_error);
+    if (!path_error) output += L"\nDaily path: " + relative.generic_wstring();
+  }
+  if (!details.workspace_index.error.empty()) output += L"\n" + details.workspace_index.error;
+  SetWindowTextW(calendar_details_, output.c_str());
+}
+
+void Application::OpenSelectedCalendarDate() {
+  if (!calendar_) return;
+  SYSTEMTIME selected{};
+  if (!SendMessageW(calendar_, MCM_GETCURSEL, 0, reinterpret_cast<LPARAM>(&selected))) return;
+  CreateProfileForDate(BuiltInProfile::Daily, selected);
+  UpdateCalendarDetails(selected);
 }
 }  // namespace mdlite

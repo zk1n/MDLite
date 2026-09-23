@@ -94,9 +94,12 @@ App通常選択の実効Root model/effortから既存policyを解決し、CLI pr
 Root-only spawn、leaf/no-spawn、固定role/model/effort、`fork_turns="none"`、同時数、権限を守る。
 child/GuardianではRoot用Jev・Initial Gate・再帰spawnを実行しない。
 
-Luna Max/XHigh Rootは `jev-routing.md` の既存初回判定・再評価条件を適用し、同一eventで
-旧Sol Initial Gateを二重起動しない。maintainでも通常Worker分業を維持する。
-Sol/Astra Rootは `root-delegation.md` を読み、同系列child禁止を維持する。
+Luna 5.6/6 Max/XHigh Rootは `jev-routing.md` のInitial／Difficulty／Review条件を適用し、同一event・gate kindで
+旧Sol Initial Gateを二重起動しない。maintainでも通常GPT-6 Luna Worker分業を維持する。
+Sol 6 High RootはDifficulty／Reviewだけを利用でき、Jev-selectedのread-only `sol_expert_xhigh`
+1つを除いて同系列child禁止を維持する。Astra RootはAstra child禁止を維持する。
+Jev persistent permissionはprotected policy／exact request bytes／one-use ledger／managed hookが全て一致する場合だけ有効で、
+`on-request + auto_review`、sandbox、他のdeny、Git／Drive／Notion権限を上書きしない。
 設定・実効値・routeが不明なら依存laneをfail closedとし、Root単独継続で隠さない。
 小さく密結合な作業の省略条件と、明示 `/goal` のみに適用するorchestrator-firstは維持する。
 <!-- CodexAppRouting:end -->

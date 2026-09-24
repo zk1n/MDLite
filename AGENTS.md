@@ -80,13 +80,5 @@ HANDOFFは対象repo自身のローカル領域に作成し、登録済みの既
 <!-- CodexAppRouting:start -->
 ## Shared Codex routing
 
-作業開始時に `.codex/routing-entry.md` と指定先の `app-entry.md` / `routing-core.md` を実際に読む。small・read-onlyを含む管理対象Rootはcurrent CWDで `resolve_app_routing.py` を実行し、`VERIFIED_ROOT` と実効policyを確認してからdependent delegation、Jev、substantive mutationへ進む。CLI profile名はruntime model/effortの証拠ではない。未解決laneだけ停止し、独立read-only作業は続ける。
-
-Rootは独立して切り出せるまとまった作業を固定Luna leafへ明示的に委譲する。Rootだけがspawnし、child/GuardianはRoot用Jev・Initial Gate・再帰spawnを行わない。固定role/model/effort、`fork_turns="none"`、権限とhostのglobal thread safety limitを守り、旧Sol High spawned cap=2を適用しない。
-
-Rootは作業分解、統合、競合解消、通常verification、難所判断、Reviewer指摘の反映、最終完了判定を担う。test/build/lint/typecheck/diff/acceptance照合は独立reviewではない。Workerごとの独立reviewやRoot自身を独立Reviewerとする扱いはしない。Task終盤に別Agentのread-only Sol XHighで通常technical reviewを原則1回行い、高影響・不可逆・重大なarchitecture/design tradeoffにはAstra XHighを選べる。Reviewer待ちにも安全な独立作業を続ける。
-
-LunaはJev Initial、Luna/Solは必要なDifficultyだけを使い、旧Jev Review Gateを現行routingに用いない。Jevは固定選択肢・最大3 semantic round・Luna昇格・Sol相談を維持し、final reviewer選定だけの呼出しをしない。通常Jevにtask consent、protected ledger、prepare/live token、managed hookを要求しない。
-
-まとまった実装後、実装Workerと実質的に実装したRootは既存`ponytail-review` Skillを1回自己チェックとして使い、最終verificationへ進む。testごとに反復せず、単純merge・機械的編集・自明な設定変更には強制しない。Ponytail Pluginやlifecycle hookは導入しない。`on-request + auto_review`、sandbox、危険操作の承認境界、明示`/goal`だけのorchestrator-firstは維持する。
+At task start, read `.codex/routing-entry.md` and follow the shared `app-entry.md` and `routing-core.md` it references.
 <!-- CodexAppRouting:end -->

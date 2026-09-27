@@ -507,10 +507,39 @@ void TestMarkdown() {
   Check(parsed.headings[0].level == 1 && parsed.headings[0].text == L"Parent", "H1 is parsed");
   Check(parsed.headings[1].level == 2 && parsed.headings[1].text == L"Child", "H2 is parsed");
   Check(!parsed.spans.empty(), "presentation spans are produced");
-  const auto visual = mdlite::ParseMarkdown(L"![代替](assets/a.png)\n| A | B |\n|---|---|\n| 1 | 2 |\n");
+  const auto visual = mdlite::ParseMarkdown(
+      L"![代替](assets/a.png)\n| A | B |\n| :--- | ---: |\n| 1 | 2 |\n");
   Check(visual.images.size() == 1 && visual.images.front().target == L"assets/a.png",
         "image references retain source ranges and targets");
-  Check(visual.tables.size() == 1, "GFM table blocks are identified for native presentation");
+  Check(visual.tables.size() == 1 && visual.tables[0].rows.size() == 3 &&
+            visual.tables[0].alignments.size() == 2 &&
+            visual.tables[0].alignments[0] == mdlite::TableAlignment::Left &&
+            visual.tables[0].alignments[1] == mdlite::TableAlignment::Right,
+        "Markdown presentation consumes the shared GFM parser with cell ranges and alignment");
+  Check(mdlite::ParseMarkdown(L"h | v\n: | ---\na | b").tables.empty(),
+        "Markdown presentation rejects malformed GFM delimiter rows");
+  const std::wstring separated_tables =
+      L"lead\n| A | B |\n| :--- | ---: |\n| left | right |\nmiddle\n"
+      L"| C | D |\n| --- | :---: |\n| x | y |\n"
+      L"```md\n| F | G |\n| --- | --- |\n| fenced | content |\n```\n";
+  const auto multiple_tables = mdlite::ParseMarkdown(separated_tables);
+  const auto first_table_begin = separated_tables.find(L"| A | B |");
+  const auto first_table_row_end = separated_tables.find(L"| left | right |") +
+                                  std::wstring_view(L"| left | right |").size();
+  const auto second_table_begin = separated_tables.find(L"| C | D |");
+  const auto second_table_row_end = separated_tables.find(L"| x | y |") +
+                                   std::wstring_view(L"| x | y |").size();
+  Check(multiple_tables.tables.size() == 2 &&
+            multiple_tables.tables[0].begin == first_table_begin &&
+            multiple_tables.tables[0].end == first_table_row_end &&
+            multiple_tables.tables[0].rows.size() == 3 &&
+            multiple_tables.tables[0].alignments[0] == mdlite::TableAlignment::Left &&
+            multiple_tables.tables[0].alignments[1] == mdlite::TableAlignment::Right &&
+            multiple_tables.tables[1].begin == second_table_begin &&
+            multiple_tables.tables[1].end == second_table_row_end &&
+            multiple_tables.tables[1].rows.size() == 3 &&
+            multiple_tables.tables[1].alignments[1] == mdlite::TableAlignment::Center,
+        "Markdown parses separated GFM tables at forward offsets and excludes fenced table-shaped text");
   const auto links = mdlite::ParseMarkdown(L"[local](notes/a.md#heading) ![image](a.png) <https://example.test/>\n");
   Check(links.links.size() == 2 && links.links[0].target == L"notes/a.md#heading" &&
             links.links[1].target == L"https://example.test/",
@@ -520,6 +549,463 @@ void TestMarkdown() {
   Check(resized.images.size() == 1 && resized.images.front().target == L"assets/a.png" &&
             resized.images.front().width_dip == 480,
         "safe generated img markup retains target and display width");
+  const auto escaped_html_image = mdlite::ParseMarkdown(
+      L"<img src=\"assets/a&amp;b.png\" alt=\"&quot;A &lt;B&gt;\" width=\"320\">");
+  Check(escaped_html_image.images.size() == 1 &&
+            escaped_html_image.images.front().target == L"assets/a&b.png" &&
+            escaped_html_image.images.front().alternate_text == L"\"A <B>" &&
+            mdlite::ImageHtml(escaped_html_image.images.front().alternate_text,
+                              escaped_html_image.images.front().target, 640) ==
+                L"<img src=\"assets/a&amp;b.png\" alt=\"&quot;A &lt;B&gt;\" width=\"640\">",
+        "decoded HTML image fields are escaped once when Markdown images become HTML");
+  const std::wstring html_image_with_attributes =
+      L"<img TITLE=\"2 > 1\" DATA-SRC=\"fallback.png\" SRC=\"assets/a&#38;b.png\" "
+      L"ALT=\"&#65; &#x1F600;\" WIDTH=\"320\">";
+  const auto html_image_attributes = mdlite::ParseMarkdown(html_image_with_attributes);
+  const auto resized_html_image = mdlite::ResizeHtmlImageWidth(html_image_with_attributes, 640);
+  Check(html_image_attributes.images.size() == 1 &&
+            html_image_attributes.images.front().target == L"assets/a&b.png" &&
+            html_image_attributes.images.front().alternate_text == L"A \U0001F600" &&
+            html_image_attributes.images.front().end == html_image_with_attributes.size() &&
+            resized_html_image && *resized_html_image ==
+                L"<img TITLE=\"2 > 1\" DATA-SRC=\"fallback.png\" SRC=\"assets/a&#38;b.png\" "
+                L"ALT=\"&#65; &#x1F600;\" WIDTH=\"640\">",
+        "HTML attributes use exact names, quoted greater-than boundaries, numeric references, and source-preserving width resize");
+  const std::wstring duplicate_markdown_target = L"![a.png](a.png)";
+  const auto duplicate_markdown_parse = mdlite::ParseMarkdown(duplicate_markdown_target);
+  std::optional<std::wstring> rewritten_markdown_target;
+  if (!duplicate_markdown_parse.images.empty())
+    rewritten_markdown_target = mdlite::ReplaceImageReferenceTarget(
+        duplicate_markdown_target, duplicate_markdown_parse.images.front(),
+        L"https://cdn.example/a.png");
+  Check(rewritten_markdown_target &&
+            *rewritten_markdown_target == L"![a.png](https://cdn.example/a.png)",
+        "image destination replacement leaves matching Markdown alt text unchanged");
+  const std::wstring balanced_markdown_destinations =
+      L"![nested](https://cdn.example/a(b(c)).png) "
+      L"![escaped](https://cdn.example/a\\(b\\).png)";
+  const auto balanced_markdown_parse = mdlite::ParseMarkdown(balanced_markdown_destinations);
+  const auto balanced_markdown_images = mdlite::ParseMarkdownImages(balanced_markdown_destinations);
+  const std::wstring nested_target = L"https://cdn.example/a(b(c)).png";
+  const std::wstring escaped_target = L"https://cdn.example/a\\(b\\).png";
+  const auto nested_target_begin = balanced_markdown_destinations.find(nested_target);
+  const auto escaped_target_begin = balanced_markdown_destinations.find(escaped_target);
+  Check(balanced_markdown_parse.images.size() == 2 && balanced_markdown_images.size() == 2 &&
+            balanced_markdown_parse.images[0].target == nested_target &&
+            balanced_markdown_parse.images[0].target_begin == nested_target_begin &&
+            balanced_markdown_parse.images[0].target_end == nested_target_begin + nested_target.size() &&
+            balanced_markdown_destinations.substr(
+                balanced_markdown_parse.images[0].target_begin,
+                balanced_markdown_parse.images[0].target_end -
+                    balanced_markdown_parse.images[0].target_begin) == nested_target &&
+            balanced_markdown_images[0].target == nested_target &&
+            balanced_markdown_images[0].target_begin == nested_target_begin &&
+            balanced_markdown_images[0].target_end == nested_target_begin + nested_target.size() &&
+            balanced_markdown_parse.images[1].target == escaped_target &&
+            balanced_markdown_images[1].target == escaped_target &&
+            balanced_markdown_parse.images[1].target_begin == escaped_target_begin &&
+            balanced_markdown_parse.images[1].target_end == escaped_target_begin + escaped_target.size() &&
+            balanced_markdown_images[1].target_begin == escaped_target_begin &&
+            balanced_markdown_images[1].target_end == escaped_target_begin + escaped_target.size(),
+        "Markdown scanners preserve exact target spans for nested and escaped parentheses");
+  std::optional<std::wstring> rewritten_balanced_target;
+  if (!balanced_markdown_parse.images.empty())
+    rewritten_balanced_target = mdlite::ReplaceImageReferenceTarget(
+        balanced_markdown_destinations, balanced_markdown_parse.images.front(),
+        L"https://cdn.example/new(v2).png");
+  Check(rewritten_balanced_target &&
+            rewritten_balanced_target->starts_with(L"![nested](https://cdn.example/new(v2).png) ") &&
+            rewritten_balanced_target->ends_with(L"![escaped](https://cdn.example/a\\(b\\).png)"),
+        "Markdown replacement preserves balanced parentheses and escaped neighboring targets");
+  const std::wstring angle_markdown_destination =
+      L"![angle](<https://cdn.example/a(b).png>)";
+  const auto angle_markdown_parse = mdlite::ParseMarkdown(angle_markdown_destination);
+  const auto angle_markdown_images = mdlite::ParseMarkdownImages(angle_markdown_destination);
+  const std::wstring angle_target = L"https://cdn.example/a(b).png";
+  const auto angle_target_begin = angle_markdown_destination.find(angle_target);
+  std::optional<std::wstring> rewritten_angle_target;
+  if (!angle_markdown_parse.images.empty())
+    rewritten_angle_target = mdlite::ReplaceImageReferenceTarget(
+        angle_markdown_destination, angle_markdown_parse.images.front(),
+        L"https://cdn.example/new(v2).png");
+  Check(angle_markdown_parse.images.size() == 1 && angle_markdown_images.size() == 1 &&
+            angle_markdown_parse.images.front().target == angle_target &&
+            angle_markdown_parse.images.front().target_begin == angle_target_begin &&
+            angle_markdown_parse.images.front().target_end == angle_target_begin + angle_target.size() &&
+            angle_markdown_images.front().target == angle_target &&
+            angle_markdown_images.front().target_begin == angle_target_begin &&
+            angle_markdown_images.front().target_end == angle_target_begin + angle_target.size() &&
+            rewritten_angle_target &&
+            *rewritten_angle_target == L"![angle](<https://cdn.example/new(v2).png>)",
+        "angle-bracket destinations expose only their content span and preserve their delimiters on replacement");
+  const std::wstring angle_unmatched_paren_source = L"![angle](<old>)";
+  const auto angle_unmatched_paren_parse = mdlite::ParseMarkdown(angle_unmatched_paren_source);
+  const auto* angle_unmatched_paren_image = angle_unmatched_paren_parse.images.empty()
+      ? nullptr
+      : &angle_unmatched_paren_parse.images.front();
+  std::optional<std::wstring> angle_unmatched_paren_replacement;
+  if (angle_unmatched_paren_image)
+    angle_unmatched_paren_replacement = mdlite::ReplaceImageReferenceTarget(
+        angle_unmatched_paren_source, *angle_unmatched_paren_image,
+        L"https://cdn.example/x).png");
+  std::optional<std::wstring> angle_space_replacement;
+  if (angle_unmatched_paren_image)
+    angle_space_replacement = mdlite::ReplaceImageReferenceTarget(
+        angle_unmatched_paren_source, *angle_unmatched_paren_image,
+        L"https://cdn.example/a b).png");
+  Check(angle_unmatched_paren_image && angle_unmatched_paren_replacement &&
+            *angle_unmatched_paren_replacement ==
+                L"![angle](<https://cdn.example/x).png>)",
+        "angle-bracket replacement preserves the wrapper around otherwise-unmatched URL parentheses");
+  Check(angle_space_replacement &&
+            *angle_space_replacement == L"![angle](<https://cdn.example/a b).png>)" &&
+            !mdlite::ReplaceImageReferenceTarget(
+                angle_unmatched_paren_source, *angle_unmatched_paren_image,
+                L"https://cdn.example/<x).png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                angle_unmatched_paren_source, *angle_unmatched_paren_image,
+                L"https://cdn.example/x>.png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                angle_unmatched_paren_source, *angle_unmatched_paren_image,
+                L"https://cdn.example/x\t.png"),
+        "angle destinations allow spaces but reject controls and raw angle delimiters in replacement content");
+  const std::wstring nested_image_description =
+      L"![outer [inner](inner.png)](outer.png)";
+  const auto nested_description_parse = mdlite::ParseMarkdown(nested_image_description);
+  const auto nested_description_images = mdlite::ParseMarkdownImages(nested_image_description);
+  const std::wstring escaped_bracket_description =
+      L"![escaped\\](inner.png)](outer.png)";
+  const auto escaped_bracket_parse = mdlite::ParseMarkdown(escaped_bracket_description);
+  const auto escaped_bracket_images = mdlite::ParseMarkdownImages(escaped_bracket_description);
+  Check(nested_description_parse.images.size() == 1 && nested_description_images.size() == 1 &&
+            nested_description_parse.images.front().alternate_text == L"outer [inner](inner.png)" &&
+            nested_description_parse.images.front().target == L"outer.png" &&
+            nested_description_images.front().target == L"outer.png" &&
+            escaped_bracket_parse.images.size() == 1 && escaped_bracket_images.size() == 1 &&
+            escaped_bracket_parse.images.front().alternate_text == L"escaped\\](inner.png)" &&
+            escaped_bracket_parse.images.front().target == L"outer.png" &&
+            escaped_bracket_images.front().target == L"outer.png",
+        "image destinations follow the outer label bracket across nested links and escaped brackets");
+  const std::wstring code_span_brackets_in_image_label =
+      L"![outer `](inner.png)` tail](outer.png)";
+  const auto code_span_label_parse = mdlite::ParseMarkdown(code_span_brackets_in_image_label);
+  const auto code_span_label_images =
+      mdlite::ParseMarkdownImages(code_span_brackets_in_image_label);
+  const auto outer_target_begin = code_span_brackets_in_image_label.find(L"outer.png");
+  Check(code_span_label_parse.images.size() == 1 && code_span_label_images.size() == 1 &&
+            code_span_label_parse.images.front().target == L"outer.png" &&
+            code_span_label_parse.images.front().target_begin == outer_target_begin &&
+            code_span_label_parse.images.front().target_end == outer_target_begin + 9 &&
+            code_span_label_parse.images.front().end == code_span_brackets_in_image_label.size() &&
+            code_span_label_images.front().target == L"outer.png" &&
+            code_span_label_images.front().target_begin == outer_target_begin &&
+            code_span_label_images.front().target_end == outer_target_begin + 9,
+        "code-span brackets in an image label do not close the label or become its destination");
+  const std::wstring bare_title_destination =
+      L"![title](https://cdn.example/a(b).png \"image title\")";
+  const auto bare_title_parse = mdlite::ParseMarkdown(bare_title_destination);
+  const auto bare_title_images = mdlite::ParseMarkdownImages(bare_title_destination);
+  const std::wstring bare_title_target = L"https://cdn.example/a(b).png";
+  const auto bare_title_target_begin = bare_title_destination.find(bare_title_target);
+  Check(bare_title_parse.images.size() == 1 && bare_title_images.size() == 1 &&
+            bare_title_parse.images.front().target == bare_title_target &&
+            bare_title_parse.images.front().target_begin == bare_title_target_begin &&
+            bare_title_parse.images.front().target_end ==
+                bare_title_target_begin + bare_title_target.size() &&
+            bare_title_images.front().target == bare_title_target &&
+            bare_title_images.front().target_begin == bare_title_target_begin &&
+            bare_title_images.front().target_end == bare_title_target_begin + bare_title_target.size() &&
+            bare_title_parse.images.front().end == bare_title_destination.size(),
+        "bare image destinations stop before quoted titles while the source span includes the closing syntax");
+  std::optional<std::wstring> rewritten_bare_title;
+  if (!bare_title_parse.images.empty())
+    rewritten_bare_title = mdlite::ReplaceImageReferenceTarget(
+        bare_title_destination, bare_title_parse.images.front(),
+        L"https://cdn.example/replacement(v2).png");
+  Check(rewritten_bare_title &&
+            *rewritten_bare_title ==
+                L"![title](https://cdn.example/replacement(v2).png \"image title\")",
+        "Markdown target replacement preserves the quoted title");
+  const std::wstring angle_space_title_destination =
+      L"![title](<https://cdn.example/a b.png> 'image title')";
+  const auto angle_space_title_parse = mdlite::ParseMarkdown(angle_space_title_destination);
+  const auto angle_space_title_images = mdlite::ParseMarkdownImages(angle_space_title_destination);
+  const std::wstring angle_space_target = L"https://cdn.example/a b.png";
+  const auto angle_space_target_begin = angle_space_title_destination.find(angle_space_target);
+  std::optional<std::wstring> rewritten_angle_space_title;
+  if (!angle_space_title_parse.images.empty())
+    rewritten_angle_space_title = mdlite::ReplaceImageReferenceTarget(
+        angle_space_title_destination, angle_space_title_parse.images.front(),
+        L"https://cdn.example/replacement(v2).png");
+  Check(angle_space_title_parse.images.size() == 1 && angle_space_title_images.size() == 1 &&
+            angle_space_title_parse.images.front().target == angle_space_target &&
+            angle_space_title_parse.images.front().target_begin == angle_space_target_begin &&
+            angle_space_title_parse.images.front().target_end ==
+                angle_space_target_begin + angle_space_target.size() &&
+            angle_space_title_images.front().target == angle_space_target &&
+            angle_space_title_images.front().target_begin == angle_space_target_begin &&
+            angle_space_title_images.front().target_end ==
+                angle_space_target_begin + angle_space_target.size() &&
+            rewritten_angle_space_title &&
+            *rewritten_angle_space_title ==
+                L"![title](<https://cdn.example/replacement(v2).png> 'image title')",
+        "angle image destinations retain internal spaces and titles outside the replaceable target span");
+  const std::wstring parenthesized_title_destination =
+      L"![title](https://cdn.example/a.png (outer (nested) title))";
+  const auto parenthesized_title_parse = mdlite::ParseMarkdown(parenthesized_title_destination);
+  Check(parenthesized_title_parse.images.size() == 1 &&
+            parenthesized_title_parse.images.front().target == L"https://cdn.example/a.png" &&
+            parenthesized_title_parse.images.front().end == parenthesized_title_destination.size(),
+        "parenthesized CommonMark titles allow nested parentheses and retain the closing source span");
+  const std::wstring unterminated_title_destination =
+      L"![bad](<https://cdn.example/a b.png> \"unterminated)";
+  const std::wstring missing_title_wrapper =
+      L"![bad](<https://cdn.example/a b.png> \"title\"";
+  Check(mdlite::ParseMarkdown(unterminated_title_destination).images.empty() &&
+            mdlite::ParseMarkdownImages(unterminated_title_destination).empty() &&
+            mdlite::ParseMarkdown(missing_title_wrapper).images.empty() &&
+            mdlite::ParseMarkdownImages(missing_title_wrapper).empty(),
+        "angle destinations require both a closed title and the enclosing destination delimiter");
+  const auto markdown_without_parentheses = mdlite::ParseMarkdown(L"![a.png](a.png)");
+  const auto* plain_markdown_image = markdown_without_parentheses.images.empty()
+      ? nullptr
+      : &markdown_without_parentheses.images.front();
+  const std::wstring markdown_destination_control =
+      L"https://cdn.example/bad" + std::wstring(1, L'\x01') + L"path.png";
+  Check(plain_markdown_image &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/bad).png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/bad(a.png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/bad path.png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/bad\tpath.png") &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, markdown_destination_control) &&
+            !mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/dangling\\") &&
+            mdlite::ReplaceImageReferenceTarget(
+                L"![a.png](a.png)", *plain_markdown_image, L"https://cdn.example/escaped\\).png") ==
+                std::optional<std::wstring>(L"![a.png](https://cdn.example/escaped\\).png)"),
+        "Markdown replacements reject unrepresentable whitespace or parentheses and accept escaped parentheses");
+  const std::wstring duplicate_html_target =
+      L"<img alt=\"a&amp;b.png\" src=\"a&amp;b.png\">";
+  const auto duplicate_html_parse = mdlite::ParseMarkdown(duplicate_html_target);
+  std::optional<std::wstring> rewritten_html_target;
+  if (!duplicate_html_parse.images.empty())
+    rewritten_html_target = mdlite::ReplaceImageReferenceTarget(
+        duplicate_html_target, duplicate_html_parse.images.front(),
+        L"https://cdn.example/a.png?x=1&y=2");
+  Check(rewritten_html_target &&
+            *rewritten_html_target ==
+                L"<img alt=\"a&amp;b.png\" src=\"https://cdn.example/a.png?x=1&amp;y=2\">",
+        "HTML image upload changes only the parsed src attribute and escapes its new URL");
+  const auto unquoted_html_width = mdlite::ResizeHtmlImageWidth(L"<img src=assets/a.png />", 320);
+  Check(unquoted_html_width && *unquoted_html_width == L"<img src=assets/a.png width=\"320\" />",
+        "unquoted image attributes accept a new width without changing their source");
+  const std::wstring duplicate_html_source =
+      L"<img src=\"a.png\" src=\"b.png\" alt=\"![nested](x.png)\" width=\"120\">";
+  const auto duplicate_html_image = mdlite::ParseMarkdown(duplicate_html_source);
+  Check(duplicate_html_image.images.empty() &&
+            mdlite::ParseMarkdownImages(duplicate_html_source).empty() &&
+            !mdlite::ResizeHtmlImageWidth(duplicate_html_source, 320) &&
+            !mdlite::ResizeHtmlImageWidth(L"<img src=\"unterminated.png\"", 320),
+        "ambiguous or malformed HTML images are rejected instead of rewritten");
+  const auto mixed_image_order = mdlite::ParseMarkdown(
+      L"<img src=\"html.png\" alt=\"html\">![markdown](markdown.png)");
+  Check(mixed_image_order.images.size() == 2 &&
+            mixed_image_order.images[0].begin < mixed_image_order.images[1].begin &&
+            mixed_image_order.images[0].target == L"html.png" &&
+            mixed_image_order.images[1].target == L"markdown.png",
+        "mixed HTML and Markdown image references remain in source order");
+  const std::wstring markdown_in_html_attribute =
+      L"<img src=\"https://example.invalid/a.png\" alt=\"![guide](hint.png)\">"
+      L"![next](next.png)";
+  const auto html_attribute_overlap = mdlite::ParseMarkdown(markdown_in_html_attribute);
+  const auto html_attribute_images = mdlite::ParseMarkdownImages(markdown_in_html_attribute);
+  const auto nested_markdown_begin = markdown_in_html_attribute.find(L"![guide]");
+  Check(html_attribute_overlap.images.size() == 2 && html_attribute_images.size() == 2 &&
+            html_attribute_overlap.images[0].target == L"https://example.invalid/a.png" &&
+            html_attribute_overlap.images[1].target == L"next.png" &&
+            html_attribute_overlap.images[0].end <= html_attribute_overlap.images[1].begin &&
+            mdlite::FindImageAtSourcePosition(html_attribute_overlap, nested_markdown_begin) ==
+                &html_attribute_overlap.images[0],
+        "Markdown-looking alt text remains inside its HTML image range while the touching Markdown image stays selectable");
+  const std::wstring markdown_alt_html_tag =
+      L"![outer <img src=\"inner.png\">](outer.png)";
+  const auto markdown_alt_html_image = mdlite::ParseMarkdown(markdown_alt_html_tag);
+  const auto markdown_alt_html_images = mdlite::ParseMarkdownImages(markdown_alt_html_tag);
+  const auto inner_html_begin = markdown_alt_html_tag.find(L"<img");
+  Check(markdown_alt_html_image.images.size() == 1 && markdown_alt_html_images.size() == 1 &&
+            markdown_alt_html_image.images.front().target == L"outer.png" &&
+            markdown_alt_html_image.images.front().begin == 0 &&
+            markdown_alt_html_image.images.front().end == markdown_alt_html_tag.size() &&
+            mdlite::FindImageAtSourcePosition(markdown_alt_html_image, inner_html_begin) ==
+                &markdown_alt_html_image.images.front(),
+        "HTML-looking alt text remains owned by its enclosing Markdown image in both image scanners");
+  const std::wstring escaped_markdown_image = L"\\![literal](literal.png)";
+  const auto escaped_markdown_parse = mdlite::ParseMarkdown(escaped_markdown_image);
+  const auto escaped_markdown_images = mdlite::ParseMarkdownImages(escaped_markdown_image);
+  const auto escaped_markdown_snapshot = mdlite::BuildNativeEditorSnapshot(escaped_markdown_image);
+  Check(escaped_markdown_parse.images.empty() && escaped_markdown_images.empty() &&
+            escaped_markdown_snapshot.collapsed.empty() &&
+            escaped_markdown_snapshot.view == escaped_markdown_image,
+        "an escaped Markdown image opener remains literal in both parsers and the native editor");
+  const std::wstring even_backslashes_before_image = L"\\\\![real](real.png)";
+  const auto even_backslashes_image_parse = mdlite::ParseMarkdown(even_backslashes_before_image);
+  const auto even_backslashes_image_snapshot =
+      mdlite::BuildNativeEditorSnapshot(even_backslashes_before_image);
+  Check(even_backslashes_image_parse.images.size() == 1 &&
+            even_backslashes_image_parse.images.front().target == L"real.png" &&
+            mdlite::ParseMarkdownImages(even_backslashes_before_image).size() == 1 &&
+            even_backslashes_image_snapshot.collapsed.size() == 1,
+        "an even backslash run leaves a following Markdown image opener active");
+  const std::wstring inline_code_image_syntax =
+      L"`![single](single.png)` and ``![code](code.png) <img src=\"code-html.png\">`` and "
+      L"![real](real.png)";
+  const auto inline_code_image_parse = mdlite::ParseMarkdown(inline_code_image_syntax);
+  const auto inline_code_image_only = mdlite::ParseMarkdownImages(inline_code_image_syntax);
+  Check(inline_code_image_parse.images.size() == 1 && inline_code_image_only.size() == 1 &&
+            inline_code_image_parse.images.front().target == L"real.png" &&
+            inline_code_image_parse.images.front().begin ==
+                inline_code_image_syntax.find(L"![real]"),
+        "Markdown and HTML image syntax inside inline code stays literal in both image scanners");
+  const std::wstring mixed_backtick_runs =
+      L"`open ``![inside](nested.png)` close`` done`` ![real](real.png)";
+  const auto mixed_backtick_parse = mdlite::ParseMarkdown(mixed_backtick_runs);
+  Check(mixed_backtick_parse.images.size() == 1 &&
+            mixed_backtick_parse.images.front().target == L"real.png" &&
+            mdlite::ParseMarkdownImages(mixed_backtick_runs).size() == 1,
+        "backtick run indexing pairs nearest equal delimiters and skips nested runs without rescanning suffixes");
+  const std::wstring escaped_inline_code_image =
+      std::wstring(1, L'\\') + L'\x60' + L"![escaped](escaped.png)" +
+      std::wstring(1, L'\\') + L'\x60';
+  const auto escaped_inline_code_parse = mdlite::ParseMarkdown(escaped_inline_code_image);
+  const auto escaped_inline_code_images = mdlite::ParseMarkdownImages(escaped_inline_code_image);
+  Check(escaped_inline_code_parse.images.size() == 1 &&
+            escaped_inline_code_parse.images.front().target == L"escaped.png" &&
+            escaped_inline_code_images.size() == 1 &&
+            escaped_inline_code_images.front().target == L"escaped.png",
+        "backslash-escaped code punctuation does not hide a Markdown image");
+  const std::wstring escaped_prefix_code_span =
+      std::wstring(1, L'\\') + L'\x60' + L'\x60' + L"![hidden](hidden.png)" +
+      L'\x60' + L" ![visible](visible.png)";
+  const auto escaped_prefix_parse = mdlite::ParseMarkdown(escaped_prefix_code_span);
+  const auto escaped_prefix_images = mdlite::ParseMarkdownImages(escaped_prefix_code_span);
+  Check(escaped_prefix_parse.images.size() == 1 &&
+            escaped_prefix_parse.images.front().target == L"visible.png" &&
+            escaped_prefix_images.size() == 1 &&
+            escaped_prefix_images.front().target == L"visible.png",
+        "an escaped first tick leaves a valid suffix run as the code opener");
+  const std::wstring even_backslashes_before_code =
+      std::wstring(2, L'\\') + L'\x60' + L"![hidden](hidden.png)" + L'\x60';
+  Check(mdlite::ParseMarkdown(even_backslashes_before_code).images.empty() &&
+            mdlite::ParseMarkdownImages(even_backslashes_before_code).empty(),
+        "even backslash parity leaves the following code opener active");
+  const std::wstring escaped_backslash_inside_code =
+      std::wstring(1, L'\x60') + L"inside \\" + L'\x60' + L" ![after](after.png)";
+  const auto escaped_backslash_inside_parse = mdlite::ParseMarkdown(escaped_backslash_inside_code);
+  const auto escaped_backslash_inside_images =
+      mdlite::ParseMarkdownImages(escaped_backslash_inside_code);
+  Check(escaped_backslash_inside_parse.images.size() == 1 &&
+            escaped_backslash_inside_parse.images.front().target == L"after.png" &&
+            escaped_backslash_inside_images.size() == 1 &&
+            escaped_backslash_inside_images.front().target == L"after.png",
+        "backslash is literal when an inline code span is already open");
+  std::wstring many_inline_codes_and_images;
+  many_inline_codes_and_images.reserve(2000 * 40);
+  for (int index = 0; index < 2000; ++index) {
+    many_inline_codes_and_images += std::wstring(1, L'\x60') + L"code" + L'\x60' +
+        L" ![image](image.png) ";
+  }
+  const auto many_inline_code_parse = mdlite::ParseMarkdown(many_inline_codes_and_images);
+  const auto many_inline_code_images = mdlite::ParseMarkdownImages(many_inline_codes_and_images);
+  Check(many_inline_code_parse.images.size() == 2000 &&
+            many_inline_code_images.size() == 2000,
+        "many ordered code spans and image candidates retain linear source-order exclusion");
+  const std::wstring html_attribute_backtick_opener =
+      L"<img src=\"html.png\" alt=\"title`\">![markdown](markdown.png)`";
+  const auto html_attribute_backtick_parse = mdlite::ParseMarkdown(html_attribute_backtick_opener);
+  const auto html_attribute_backtick_images = mdlite::ParseMarkdownImages(html_attribute_backtick_opener);
+  Check(html_attribute_backtick_parse.images.size() == 2 &&
+            html_attribute_backtick_parse.images[0].target == L"html.png" &&
+            html_attribute_backtick_parse.images[1].target == L"markdown.png" &&
+            html_attribute_backtick_images.size() == 2 &&
+            html_attribute_backtick_images[0].target == L"html.png" &&
+            html_attribute_backtick_images[1].target == L"markdown.png",
+        "a tag-first attribute backtick does not pair with an outside closer or hide the following Markdown image");
+  const std::wstring html_attribute_paired_backticks =
+      L"<img src=\"html.png\" alt=\"`title`\"> `![hidden](hidden.png)` ![markdown](markdown.png)";
+  const auto html_attribute_paired_parse = mdlite::ParseMarkdown(html_attribute_paired_backticks);
+  const auto html_attribute_paired_images = mdlite::ParseMarkdownImages(html_attribute_paired_backticks);
+  Check(html_attribute_paired_parse.images.size() == 2 &&
+            html_attribute_paired_parse.images[0].target == L"html.png" &&
+            html_attribute_paired_parse.images[1].target == L"markdown.png" &&
+            html_attribute_paired_images.size() == 2 &&
+            html_attribute_paired_images[0].target == L"html.png" &&
+            html_attribute_paired_images[1].target == L"markdown.png",
+        "paired attribute backticks leave a separate following code span and Markdown image intact");
+  const std::wstring code_open_before_html_attribute =
+      L"`code <img src=\"html.png\" alt=\"title`\">![markdown](markdown.png)";
+  const auto code_open_before_html_parse = mdlite::ParseMarkdown(code_open_before_html_attribute);
+  const auto code_open_before_html_images = mdlite::ParseMarkdownImages(code_open_before_html_attribute);
+  const auto attribute_delimiter = code_open_before_html_attribute.find(L'`', 1);
+  bool earlier_code_closed_at_attribute{};
+  for (const auto& span : code_open_before_html_parse.spans) {
+    if (span.kind == mdlite::SpanKind::Code && span.begin == 1 &&
+        span.end == attribute_delimiter) {
+      earlier_code_closed_at_attribute = true;
+      break;
+    }
+  }
+  Check(code_open_before_html_parse.images.size() == 1 &&
+            code_open_before_html_parse.images.front().target == L"markdown.png" &&
+            code_open_before_html_images.size() == 1 &&
+            code_open_before_html_images.front().target == L"markdown.png" &&
+            earlier_code_closed_at_attribute,
+        "an earlier code opener can still close on an equal-length backtick inside a later HTML tag");
+  const std::wstring multiline_code_image_syntax =
+      L"`open\n![inside](code.png)\n<img src=\"code-html.png\">\nclose` ![real](real.png)";
+  const auto multiline_code_image_parse = mdlite::ParseMarkdown(multiline_code_image_syntax);
+  const auto multiline_code_image_only = mdlite::ParseMarkdownImages(multiline_code_image_syntax);
+  Check(multiline_code_image_parse.images.size() == 1 &&
+            multiline_code_image_only.size() == 1 &&
+            multiline_code_image_parse.images.front().target == L"real.png" &&
+            multiline_code_image_parse.images.front().begin ==
+                multiline_code_image_syntax.find(L"![real]"),
+        "matched multiline code spans keep Markdown and HTML image syntax literal until their closing delimiter");
+  const std::wstring unmatched_inline_code = L"`unmatched\n\n![after](after.png)";
+  const auto unmatched_inline_code_parse = mdlite::ParseMarkdown(unmatched_inline_code);
+  const std::wstring fenced_inline_code_boundary =
+      L"`unmatched\n```\n![fenced](fenced.png)\n```\n![after](after.png)";
+  const auto fenced_inline_code_parse = mdlite::ParseMarkdown(fenced_inline_code_boundary);
+  Check(unmatched_inline_code_parse.images.size() == 1 &&
+            unmatched_inline_code_parse.images.front().target == L"after.png" &&
+            mdlite::ParseMarkdownImages(unmatched_inline_code).size() == 1 &&
+            fenced_inline_code_parse.images.size() == 1 &&
+            fenced_inline_code_parse.images.front().target == L"after.png" &&
+            mdlite::ParseMarkdownImages(fenced_inline_code_boundary).size() == 1,
+        "unmatched inline-code openers reset at blank and fenced block boundaries");
+  const std::wstring list_continuation_code =
+      L"- `open\n  ![inside](list-code.png)\n  close` and ![real](list-real.png)";
+  const auto list_continuation_parse = mdlite::ParseMarkdown(list_continuation_code);
+  const auto list_continuation_images = mdlite::ParseMarkdownImages(list_continuation_code);
+  const std::wstring list_item_boundary = L"- `open\n- ![new](new-item.png) `close";
+  const auto list_item_boundary_parse = mdlite::ParseMarkdown(list_item_boundary);
+  Check(list_continuation_parse.images.size() == 1 && list_continuation_images.size() == 1 &&
+            list_continuation_parse.images.front().target == L"list-real.png" &&
+            list_item_boundary_parse.images.size() == 1 &&
+            list_item_boundary_parse.images.front().target == L"new-item.png" &&
+            mdlite::ParseMarkdownImages(list_item_boundary).size() == 1,
+        "inline-code spans carry through supported list continuations but reset at a new item");
+  const auto adjacent_images = mdlite::ParseMarkdown(L"![first](a.png)![second](b.png)");
+  Check(adjacent_images.images.size() == 2 &&
+            mdlite::FindImageAtSourcePosition(adjacent_images, adjacent_images.images[0].end) ==
+                &adjacent_images.images[1] &&
+            mdlite::FindImageAtSourcePosition(adjacent_images, adjacent_images.images.back().end) ==
+                &adjacent_images.images.back(),
+        "caret at an adjacent image boundary selects the image starting there and final-end fallback remains available");
   const auto oversized = mdlite::ParseMarkdown(
       L"<img src=\"assets/a.png\" alt=\"sample\" width=\"4294967295\">\n");
   Check(oversized.images.size() == 1 && oversized.images.front().width_dip == 8192,
@@ -542,6 +1028,74 @@ void TestMarkdown() {
   Check(std::ranges::any_of(blocks.spans, [](const auto& span) {
           return span.kind == mdlite::SpanKind::Emphasis;
         }), "single emphasis is recognized separately from strong emphasis");
+  const std::wstring indented_code_with_delimiter = L"    a | b\n|---|---|\n";
+  const auto indented_code_parse = mdlite::ParseMarkdown(indented_code_with_delimiter);
+  const auto indented_code_snapshot =
+      mdlite::BuildNativeEditorSnapshot(indented_code_with_delimiter);
+  Check(indented_code_parse.tables.empty() && indented_code_snapshot.tables.empty(),
+        "an indented-code pipe row cannot become a native GFM table after a delimiter");
+  Check(indented_code_snapshot.view ==
+            mdlite::CanonicalizeNativeText(indented_code_with_delimiter),
+        "indented-code source text remains intact in the native projection");
+  const std::wstring indented_code_context =
+      L"    ```\n"
+      L"    # literal [link](hidden.md) **text**\n"
+      L"![visible](visible.png)\n"
+      L"# real heading\n";
+  const auto indented_code_context_parse = mdlite::ParseMarkdown(indented_code_context);
+  const auto indented_code_context_images =
+      mdlite::ParseMarkdownImages(indented_code_context);
+  const auto indented_heading_move = mdlite::MoveHeadingSection(
+      indented_code_context, indented_code_context.find(L"# literal"),
+      indented_code_context.size());
+  Check(indented_code_context_parse.images.size() == 1 &&
+            indented_code_context_parse.images.front().target == L"visible.png" &&
+            indented_code_context_images.size() == 1 &&
+            indented_code_context_images.front().target == L"visible.png" &&
+            indented_code_context_parse.links.empty() &&
+            indented_code_context_parse.headings.size() == 1 &&
+            indented_code_context_parse.headings.front().text == L"real heading" &&
+            !indented_heading_move.changed &&
+            indented_heading_move.text == indented_code_context &&
+            std::ranges::none_of(indented_code_context_parse.spans, [](const auto& span) {
+              return span.kind == mdlite::SpanKind::Strong;
+            }),
+        "four-space backticks do not open a fence or parse code contents as Markdown");
+
+  const std::wstring list_source = L"  - nested\n1. basic\n12) numbered\n- [x] checked\n"
+                                   L"```\n- fenced\n```\n-plain\nordinary - text\n";
+  const auto lists = mdlite::ParseMarkdown(list_source);
+  std::vector<mdlite::StyleSpan> list_markers;
+  std::vector<mdlite::StyleSpan> ordered_markers;
+  for (const auto& span : lists.spans) {
+    if (span.kind == mdlite::SpanKind::ListMarker) list_markers.push_back(span);
+    if (span.kind == mdlite::SpanKind::OrderedListMarker) ordered_markers.push_back(span);
+  }
+  const std::vector<std::wstring> expected_markers{L"- ", L"- "};
+  const std::vector<std::wstring> expected_ordered_markers{L"1. ", L"12) "};
+  Check(list_markers.size() == expected_markers.size() &&
+            ordered_markers.size() == expected_ordered_markers.size(),
+        "bullet/task and ordered prefixes have distinct presentation spans");
+  bool marker_offsets_match = list_markers.size() == expected_markers.size();
+  for (std::size_t index = 0; marker_offsets_match && index < expected_markers.size(); ++index) {
+    const auto& span = list_markers[index];
+    marker_offsets_match = span.end - span.begin == expected_markers[index].size() &&
+                           list_source.substr(span.begin, span.end - span.begin) == expected_markers[index];
+  }
+  bool ordered_offsets_match = ordered_markers.size() == expected_ordered_markers.size();
+  for (std::size_t index = 0; ordered_offsets_match && index < expected_ordered_markers.size(); ++index) {
+    const auto& span = ordered_markers[index];
+    ordered_offsets_match = span.end - span.begin == expected_ordered_markers[index].size() &&
+                            list_source.substr(span.begin, span.end - span.begin) == expected_ordered_markers[index];
+  }
+  Check(marker_offsets_match && ordered_offsets_match,
+        "list spans point to exact source prefixes, including nested indentation offsets");
+  const auto task_marker = std::ranges::find_if(list_markers, [&](const auto& span) {
+    return span.begin == list_source.find(L"- [x] checked");
+  });
+  Check(task_marker != list_markers.end() &&
+            list_source.substr(task_marker->end, 3) == L"[x]",
+        "task checkbox remains outside the hidden list marker span");
 
   const std::wstring outline = L"# First\nintro\n## Child\nchild\n# Second\nend\n# Third\nlast\n";
   const auto outline_parse = mdlite::ParseMarkdown(outline);
@@ -561,6 +1115,23 @@ void TestEditorAdapter() {
   Check(snapshot.SourceToView(2) == 3, "source-to-view mapping accounts for expanded LF");
   Check(snapshot.ViewToSource(2) == 1, "inserted CR maps to the source LF boundary");
 
+  const std::wstring selection_source = L"before\r\nafter😀";
+  const auto selection_snapshot = mdlite::BuildNativeTextEditorSnapshot(selection_source);
+  const std::size_t selection_begin = selection_source.find(L"after");
+  const std::size_t selection_end = selection_source.size();
+  const std::size_t native_begin = selection_snapshot.SourceToNative(selection_begin);
+  const std::size_t native_end = selection_snapshot.SourceToNative(selection_end);
+  const auto forward_selection = mdlite::NativeSelectionToSource(
+      selection_snapshot, native_begin, native_end, false);
+  const auto reverse_selection = mdlite::NativeSelectionToSource(
+      selection_snapshot, native_end, native_begin, true);
+  Check(forward_selection == mdlite::SourceSelection{selection_begin, selection_end} &&
+            reverse_selection == mdlite::SourceSelection{selection_end, selection_begin},
+        "selection mapping preserves anchor, active endpoint, and reversed direction");
+  const auto native_reverse = mdlite::SourceSelectionToNative(selection_snapshot, reverse_selection);
+  Check(native_reverse == mdlite::SourceSelection{native_end, native_begin},
+        "source selection restores native endpoint direction after line-break mapping");
+
   const auto edited = mdlite::ApplyEditorText(snapshot, L"a\nb😀\r\nc", L"a\r\nnew\r\nb😀\r\nc");
   Check(edited.changed && edited.source == L"a\nnew\nb😀\r\nc",
         "range transaction preserves LF and existing CRLF without whole-document normalization");
@@ -570,8 +1141,14 @@ void TestEditorAdapter() {
   Check(image.view == L"before \uFFFC after", "derived editor view represents an image without changing source");
   Check(image.SourceToView(22) == 8 && image.ViewToSource(8) == 22,
         "compact mapping resumes immediately after a collapsed image range");
-  const auto image_deleted = mdlite::ApplyEditorText(image, L"before ![alt](img.png) after", L"before  after");
-  Check(image_deleted.source == L"before  after", "deleting the derived image removes its complete source range");
+  const auto image_deleted = mdlite::ApplyEditorText(
+      image, L"before ![alt](img.png) after", L"before  after",
+      mdlite::EditorEditHint{
+          mdlite::SourceSelection{image.collapsed.front().source_begin,
+                                 image.collapsed.front().source_end},
+          mdlite::EditorEditKind::Delete});
+  Check(!image_deleted.identity_ambiguous && image_deleted.source == L"before  after",
+        "a verified deletion removes the derived image's complete source range");
   const auto native_lines = mdlite::BuildNativeTextEditorSnapshot(L"a\nb\r\nc");
   Check(native_lines.view == L"a\rb\rc", "native editor snapshot uses one CR per paragraph");
   Check(native_lines.SourceToNative(2) == 2 && native_lines.NativeToSource(2) == 2 &&
@@ -601,17 +1178,62 @@ void TestEditorAdapter() {
   Check(native_image.SourceToNative(1) == 1 && native_image.NativeToSource(1) == 1 &&
             native_image.NativeToSource(2) == std::wstring_view(L"a![x](p.png)").size(),
         "native image mapping anchors object boundaries without a dense map");
+  Check(mdlite::BuildNativeEditorSnapshot(L"![remote](https://example.test/a.png)").view ==
+            L"![remote](https://example.test/a.png)" &&
+            mdlite::BuildNativeEditorSnapshot(L"![1](1.png)![2](2.png)").view ==
+                L"![1](1.png)![2](2.png)",
+        "native table projection retains the existing remote and ambiguous image rules");
   const std::wstring adjacent_source = L"A![x](p.png)B";
   const auto adjacent_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_source);
-  const auto adjacent_edit = mdlite::ApplyEditorText(adjacent_snapshot, adjacent_source, L"a\uFFFCb");
-  Check(adjacent_edit.source == L"a![x](p.png)b",
-        "one coalesced edit on both sides preserves the unchanged image Markdown source");
+  const auto before_image_edit = mdlite::ApplyEditorText(
+      adjacent_snapshot, adjacent_source, L"a\uFFFCB",
+      mdlite::EditorEditHint{mdlite::SourceSelection{0, 1},
+                            mdlite::EditorEditKind::Replace});
+  const std::wstring after_before_image_edit = L"a![x](p.png)B";
+  const auto after_before_image_snapshot =
+      mdlite::BuildMarkdownEditorSnapshot(after_before_image_edit);
+  const std::size_t trailing_text_begin = after_before_image_edit.find(L'B');
+  const auto after_image_edit = mdlite::ApplyEditorText(
+      after_before_image_snapshot, after_before_image_edit, L"a\uFFFCb",
+      mdlite::EditorEditHint{mdlite::SourceSelection{trailing_text_begin,
+                                                    trailing_text_begin + 1},
+                            mdlite::EditorEditKind::Replace});
+  Check(!before_image_edit.identity_ambiguous && !after_image_edit.identity_ambiguous &&
+            after_image_edit.source == L"a![x](p.png)b",
+        "separate verified edits around an image preserve its Markdown source");
   const std::wstring two_images = L"A![1](1.png)X![2](2.png)B";
   const auto two_image_snapshot = mdlite::BuildMarkdownEditorSnapshot(two_images);
   const auto first_image_deleted = mdlite::ApplyEditorText(
       two_image_snapshot, two_images, L"aX\uFFFCb");
-  Check(first_image_deleted.source == L"aX![2](2.png)b",
-        "deleting the first of two derived images preserves the surviving image identity");
+  Check(first_image_deleted.identity_ambiguous && !first_image_deleted.changed &&
+            first_image_deleted.source == two_images,
+        "coalesced multi-image edits without a verified selection retain the original source");
+  const std::wstring ambiguous_image_pair = L"![1](1.png)X![2](2.png)";
+  const auto ambiguous_image_snapshot = mdlite::BuildMarkdownEditorSnapshot(ambiguous_image_pair);
+  const std::wstring one_native_image(1, static_cast<wchar_t>(0xFFFC));
+  const std::size_t image_separator = ambiguous_image_pair.find(L'X');
+  const std::size_t second_image_begin = ambiguous_image_pair.find(L"![2]");
+  const auto first_image_and_anchor_deleted = mdlite::ApplyEditorText(
+      ambiguous_image_snapshot, ambiguous_image_pair, one_native_image,
+      mdlite::EditorEditHint{mdlite::SourceSelection{0, second_image_begin},
+                            mdlite::EditorEditKind::Delete});
+  Check(!first_image_and_anchor_deleted.identity_ambiguous &&
+            first_image_and_anchor_deleted.changed &&
+            first_image_and_anchor_deleted.source == L"![2](2.png)",
+        "a verified selection deleting the first image and its only anchor preserves the second image source");
+  const auto anchor_and_second_image_deleted = mdlite::ApplyEditorText(
+      ambiguous_image_snapshot, ambiguous_image_pair, one_native_image,
+      mdlite::EditorEditHint{mdlite::SourceSelection{image_separator, ambiguous_image_pair.size()},
+                            mdlite::EditorEditKind::Delete});
+  Check(!anchor_and_second_image_deleted.identity_ambiguous &&
+            anchor_and_second_image_deleted.changed &&
+            anchor_and_second_image_deleted.source == L"![1](1.png)",
+        "a verified selection deleting the second image and its only anchor preserves the first image source");
+  const auto unresolved_image_identity = mdlite::ApplyEditorText(
+      ambiguous_image_snapshot, ambiguous_image_pair, one_native_image);
+  Check(unresolved_image_identity.identity_ambiguous && !unresolved_image_identity.changed &&
+            unresolved_image_identity.source == ambiguous_image_pair,
+        "image source restoration fails closed when the native edit has no identity hint");
   const std::wstring adjacent_images = L"![1](1.png)![2](2.png)";
   const auto adjacent_images_snapshot = mdlite::BuildMarkdownEditorSnapshot(adjacent_images);
   Check(adjacent_images_snapshot.collapsed.empty() && adjacent_images_snapshot.view == adjacent_images,
@@ -648,11 +1270,129 @@ void TestEditorAdapter() {
   Check(mapped_transaction.source == table_edit.text,
         "table transaction after a derived image maps back to the exact Markdown source");
   const auto mixed_native = mdlite::BuildNativeEditorSnapshot(image_then_table);
-  const auto target_native = mdlite::BuildNativeEditorSnapshot(table_edit.text);
+  auto edited_mixed_native_view = mixed_native.view;
+  const std::size_t native_value_view = edited_mixed_native_view.find(L"1");
+  edited_mixed_native_view.replace(native_value_view, 1, L"2");
   const auto native_transaction = mdlite::ApplyEditorText(
-      mixed_native, image_then_table, target_native.view);
-  Check(native_transaction.source == table_edit.text,
-        "native transaction after a derived image maps back to the exact Markdown source");
+      mixed_native, image_then_table, edited_mixed_native_view);
+  std::wstring expected_native_transaction = image_then_table;
+  const std::size_t native_value_source = expected_native_transaction.find(L"1");
+  expected_native_transaction.replace(native_value_source, 1, L"2");
+  Check(native_transaction.source == expected_native_transaction,
+        "native cell edit after a derived image preserves the exact Markdown table syntax");
+
+  const std::wstring image_in_table_source =
+      L"| Name | Preview |\n| --- | --- |\n| sample | ![pixel](pixel.png) |\n";
+  const auto image_in_table = mdlite::BuildNativeEditorSnapshot(image_in_table_source);
+  const std::size_t image_marker = image_in_table.view.find(static_cast<wchar_t>(0xFFFC));
+  const std::size_t image_source = image_in_table_source.find(L"![pixel]");
+  auto edited_image_table_view = image_in_table.view;
+  edited_image_table_view.replace(edited_image_table_view.find(L"sample"), 6, L"example");
+  const auto image_table_transaction = mdlite::ApplyEditorText(
+      image_in_table, image_in_table_source, edited_image_table_view);
+  std::wstring expected_image_table_source = image_in_table_source;
+  expected_image_table_source.replace(expected_image_table_source.find(L"sample"), 6, L"example");
+  Check(image_marker != std::wstring::npos,
+        "a local image inside a projected cell uses one native object marker");
+  Check(image_marker == std::wstring::npos ||
+            image_in_table.NativeToSource(image_marker) == image_source,
+        "a projected cell image marker maps back to its original Markdown start");
+  Check(image_marker == std::wstring::npos ||
+            image_in_table.SourceToNative(image_source) == image_marker,
+        "the image Markdown start maps to its projected cell object");
+  Check(image_table_transaction.source == expected_image_table_source,
+        "editing adjacent projected cell text preserves table image Markdown");
+
+  const std::wstring table_then_image_source =
+      L"| Name | Preview |\n| --- | --- |\n| sample | ![inside](inside.png) |\n\n"
+      L"![after](after.png) tail";
+  const auto table_then_image = mdlite::BuildNativeEditorSnapshot(table_then_image_source);
+  const auto table_image_marker = table_then_image.view.find(static_cast<wchar_t>(0xFFFC));
+  const auto following_image_marker = table_image_marker == std::wstring::npos
+      ? std::wstring::npos
+      : table_then_image.view.find(static_cast<wchar_t>(0xFFFC), table_image_marker + 1);
+  const auto table_image_source = table_then_image_source.find(L"![inside]");
+  const auto following_image_source = table_then_image_source.find(L"![after]");
+  const auto following_tail_source = table_then_image_source.find(L"tail");
+  Check(table_image_marker != std::wstring::npos &&
+            following_image_marker != std::wstring::npos &&
+            table_then_image.NativeToSource(table_image_marker) == table_image_source &&
+            table_then_image.NativeToSource(following_image_marker) == following_image_source &&
+            table_then_image.SourceToNative(table_image_source) == table_image_marker &&
+            table_then_image.SourceToNative(following_image_source) == following_image_marker &&
+            table_then_image.NativeToSource(
+                table_then_image.SourceToNative(following_tail_source)) == following_tail_source,
+        "an image consumed inside a projected table leaves following image and text mappings aligned");
+
+  const std::wstring native_table_source =
+      L"before\r\n| A | B |\r\n| --- | --- |\r\n| alpha\\|beta | `x|y` |\r\nmiddle\n"
+      L"| left | right |\n| --- | --- |\n| a || c |\n| x | y |\nafter";
+  const auto native_table = mdlite::BuildNativeEditorSnapshot(native_table_source);
+  const std::wstring expected_table_view =
+      L"before\r A \t B \r alpha\\|beta \t `x|y` \rmiddle\r left \t right \t"
+      L"\r a \t\t c \r x \t y \t\rafter";
+  Check(native_table.tables.size() == 2 && native_table.view == expected_table_view,
+        "native GFM projection keeps adjacent text and emits visible cells with tab and CR separators");
+  Check(native_table.tables[0].cells.size() == 4 && native_table.tables[1].cells.size() == 7 &&
+            native_table.tables[1].gaps.size() > native_table.tables[0].gaps.size(),
+        "native table mappings cover multiple tables, escaped/code-span pipes, empty and ragged cells");
+  const std::size_t escaped_source = native_table_source.find(L"alpha\\|beta");
+  const std::size_t escaped_view = native_table.view.find(L"alpha\\|beta");
+  const std::size_t middle_source = native_table_source.find(L"middle");
+  const std::size_t middle_view = native_table.view.find(L"middle");
+  Check(native_table.SourceToView(escaped_source + 3) == escaped_view + 3 &&
+            native_table.ViewToSource(escaped_view + 3) == escaped_source + 3 &&
+            native_table.SourceToNative(middle_source) == middle_view &&
+            native_table.NativeToSource(middle_view) == middle_source,
+        "table cell and adjacent-text source/view/native coordinates round-trip across mixed line endings");
+  auto edited_table_view = native_table.view;
+  edited_table_view.replace(escaped_view, std::wstring_view(L"alpha\\|beta").size(), L"updated");
+  const auto edited_table = mdlite::ApplyEditorText(
+      native_table, native_table_source, edited_table_view);
+  std::wstring expected_table_source = native_table_source;
+  expected_table_source.replace(escaped_source, std::wstring_view(L"alpha\\|beta").size(), L"updated");
+  Check(edited_table.changed && edited_table.source == expected_table_source &&
+            edited_table.begin == escaped_source &&
+            edited_table.old_end == escaped_source + std::wstring_view(L"alpha\\|beta").size(),
+        "editing one projected cell changes only its source text and preserves Markdown syntax and CRLFs");
+  const std::wstring final_cell_source =
+      L"|H|B|\r\n|---|---|\r\n|a|b|\r\ntail";
+  const auto final_cell_snapshot = mdlite::BuildNativeEditorSnapshot(final_cell_source);
+  auto final_cell_view = final_cell_snapshot.view;
+  const std::size_t final_cell_view_begin = final_cell_view.find(L"b");
+  final_cell_view.replace(final_cell_view_begin, 1, L"z");
+  const auto final_cell_edit = mdlite::ApplyEditorText(
+      final_cell_snapshot, final_cell_source, final_cell_view);
+  std::wstring expected_final_cell_source = final_cell_source;
+  expected_final_cell_source.replace(final_cell_source.find(L"b"), 1, L"z");
+  Check(final_cell_edit.source == expected_final_cell_source,
+        "editing the last unpadded cell preserves its trailing pipe and following CRLF");
+
+  auto native_table_coordinates = native_table;
+  mdlite::NativeTableCoordinates first_table_coordinates;
+  first_table_coordinates.begin = native_table.tables[0].view_begin;
+  std::size_t native_cell_position = first_table_coordinates.begin + 2;
+  for (const auto& cell : native_table.tables[0].cells) {
+    const auto width = cell.source_end - cell.source_begin;
+    first_table_coordinates.cells.push_back({native_cell_position, native_cell_position + width});
+    native_cell_position += width + 2;
+  }
+  first_table_coordinates.end = native_cell_position + 3;
+  const auto second_table_view_cell = native_table.tables[1].cells.front().view_begin;
+  const auto expected_second_table_native =
+      second_table_view_cell + first_table_coordinates.end - native_table.tables[0].view_end;
+  Check(mdlite::ReplaceNativeTableCoordinates(native_table_coordinates, 0,
+                                               first_table_coordinates) &&
+            native_table_coordinates.SourceToNative(escaped_source) ==
+                first_table_coordinates.cells[2].begin +
+                    (escaped_source - native_table.tables[0].cells[2].source_begin) &&
+            native_table_coordinates.NativeToSource(
+                first_table_coordinates.cells[2].begin +
+                (escaped_source - native_table.tables[0].cells[2].source_begin) + 3) ==
+                escaped_source + 3 &&
+            native_table_coordinates.SourceToNative(
+                native_table.tables[1].cells.front().source_begin) == expected_second_table_native,
+        "replacing TOM table/cell coordinates rebuilds native mappings for following tables");
 }
 
 void TestEditorTransactionBoundaries() {
@@ -763,15 +1503,64 @@ void TestWorkspaceState(const std::filesystem::path& root) {
   session.main_height = 700;
   session.recent_documents = {workspace / L"nested/project-note.txt", workspace / L"Alpha.md"};
   session.documents.push_back({document, 1, 2, 3, true, 100, 120, 640, 480});
+  session.documents.back().first_visible_source_offset = 2;
+  session.documents.back().horizontal_left_edge_source_offset = 3;
   Check(store.WriteSessionState(session, error), "detailed session state writes");
   mdlite::SessionState detailed;
   Check(store.ReadSessionState(detailed, error), "detailed session state reads");
   Check(detailed.documents.size() == 1 && detailed.documents[0].selection_begin == 1 &&
             detailed.documents[0].selection_end == 2 && detailed.documents[0].first_visible_line == 3 &&
+            detailed.documents[0].first_visible_source_offset == 2 &&
+            detailed.documents[0].horizontal_left_edge_source_offset == 3 &&
             detailed.documents[0].compact && detailed.documents[0].width == 640 &&
             detailed.main_width == 1100 && detailed.recent_documents.size() == 2 &&
             detailed.recent_documents[0].filename() == L"project-note.txt",
-        "session preserves selection, scroll, compact placement, and main placement");
+        "session preserves selection, source scroll anchor, legacy scroll, compact placement, and main placement");
+  const auto dot_draft = workspace / L"..draft.md";
+  WriteBytes(dot_draft, {'d'});
+  mdlite::SessionState dot_draft_session;
+  dot_draft_session.documents.push_back({dot_draft});
+  dot_draft_session.recent_documents.push_back(dot_draft);
+  Check(store.WriteSessionState(dot_draft_session, error),
+        "session writes a root document whose name begins with two dots");
+  mdlite::SessionState restored_dot_draft;
+  Check(store.ReadSessionState(restored_dot_draft, error) &&
+            restored_dot_draft.documents.size() == 1 &&
+            restored_dot_draft.documents[0].path == dot_draft &&
+            restored_dot_draft.recent_documents.size() == 1 &&
+            restored_dot_draft.recent_documents[0] == dot_draft,
+        "session restores ..draft.md as both an open and recent document");
+
+  const auto outside = root / L"outside.md";
+  WriteBytes(outside, {'o'});
+  mdlite::SessionState outside_session;
+  outside_session.documents.push_back({outside});
+  outside_session.recent_documents.push_back(outside);
+  Check(store.WriteSessionState(outside_session, error),
+        "session write skips documents outside the workspace");
+  mdlite::SessionState written_outside;
+  Check(store.ReadSessionState(written_outside, error) && written_outside.documents.empty() &&
+            written_outside.recent_documents.empty(),
+        "session serialization omits a real ../outside.md path");
+  const std::string outside_session_text =
+      "recent = \"../outside.md\"\n\n[[document]]\npath = \"../outside.md\"\n";
+  WriteBytes(store.state_root() / L"session.toml",
+             std::vector<unsigned char>(outside_session_text.begin(), outside_session_text.end()));
+  mdlite::SessionState restored_outside;
+  Check(store.ReadSessionState(restored_outside, error) && restored_outside.documents.empty() &&
+            restored_outside.recent_documents.empty(),
+        "session rejects a real ../outside.md path for open and recent documents");
+  const std::string legacy_session =
+      "schema_version = 2\nactive_index = 0\n\n[[document]]\npath = \"note.md\"\n"
+      "selection_begin = 1\nselection_end = 2\nfirst_visible_line = 7\ncompact = false\n";
+  WriteBytes(store.state_root() / L"session.toml",
+             std::vector<unsigned char>(legacy_session.begin(), legacy_session.end()));
+  mdlite::SessionState legacy;
+  Check(store.ReadSessionState(legacy, error) && legacy.documents.size() == 1 &&
+            legacy.documents[0].first_visible_line == 7 &&
+            !legacy.documents[0].first_visible_source_offset.has_value() &&
+            !legacy.documents[0].horizontal_left_edge_source_offset.has_value(),
+        "legacy session without source scroll anchor keeps its line and leaves the optional anchor unset");
   Check(store.DiscardRecoverySnapshot(recovery.recovery_path, error),
         "recovery can be explicitly discarded by its validated state path");
   Check(store.RecoveryFiles().empty(), "recovery removal is visible");
@@ -1204,8 +1993,8 @@ void TestTableEditing() {
         "Down skips the GFM delimiter row and keeps the table column");
   const auto backwards_from_eof_row = mdlite::MoveToAdjacentTableCell(table, table.find(L"1"), true);
   Check(!backwards_from_eof_row.changed &&
-            backwards_from_eof_row.selection == table.rfind(L"---"),
-        "Shift+Tab from the first cell of an EOF row reaches the previous row");
+            backwards_from_eof_row.selection == table.find(L"B"),
+        "Shift+Tab from the first body cell skips the delimiter and reaches the header");
   const std::wstring crlf_table = L"| A | B |\r\n| --- | --- |\r\n| 1 | 2 |";
   const auto crlf_insert = mdlite::InsertTableRow(crlf_table, crlf_table.find(L"1"), false);
   Check(crlf_insert.changed && crlf_insert.text.find(L"|  |  |\r\n| 1 | 2 |") != std::wstring::npos,
@@ -1256,69 +2045,7 @@ void TestJapaneseHolidays() {
   error.clear();
   Check(mdlite::ValidateJapaneseHolidayCsv(L"date,name\n2028-05-01,祝日\n", info, error) &&
             info.first_year == 2028 && info.last_year == 2028,
-        "online holiday validation accepts strict ISO-like date fixtures");
-  Check(mdlite::JapaneseHolidayUpdateDue(0, 0, 1),
-        "fake clock treats an empty holiday update state as due");
-  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 27 * 24 * 60 * 60),
-        "fake clock suppresses a holiday update before the 28-day interval");
-  Check(mdlite::JapaneseHolidayUpdateDue(1'000, 0, 1'000 + 28 * 24 * 60 * 60),
-        "fake clock schedules a holiday update at the 28-day interval");
-  Check(!mdlite::JapaneseHolidayUpdateDue(1'000, 0, 900),
-        "clock rollback does not turn every startup into a network retry");
-  const std::wstring online_fixture =
-      L"date,name\n2028/01/01,元日\n2028/02/11,建国記念の日\n"
-      L"2028/02/23,天皇誕生日\n2028/03/20,春分の日\n2028/04/29,昭和の日\n"
-      L"2028/05/03,憲法記念日\n2028/05/04,みどりの日\n2028/05/05,こどもの日\n"
-      L"2028/07/17,海の日\n2028/08/11,山の日\n2028/09/18,敬老の日\n";
-  const auto accepted = mdlite::AssessJapaneseHolidayResponse(
-      200, false, false, 10, online_fixture);
-  Check(accepted.accepted && accepted.replace_cache && accepted.info.records == 11,
-        "mock HTTP 200 accepts a validated holiday payload for atomic cache replacement");
-  const auto unchanged = mdlite::AssessJapaneseHolidayResponse(304, true, true, 11, {});
-  Check(unchanged.accepted && !unchanged.replace_cache,
-        "mock HTTP 304 accepts only when a verified last-known-good cache exists");
-  const auto missing_cache = mdlite::AssessJapaneseHolidayResponse(304, true, false, 11, {});
-  Check(!missing_cache.accepted && !missing_cache.error.empty(),
-        "mock HTTP 304 without a verified cache fails closed");
-  const auto not_found = mdlite::AssessJapaneseHolidayResponse(404, false, false, 11, {});
-  Check(!not_found.accepted && not_found.error.find(L"404") != std::wstring::npos,
-        "mock HTTP 404 preserves the existing holiday data");
-  const auto server_error = mdlite::AssessJapaneseHolidayResponse(500, false, false, 11, {});
-  Check(!server_error.accepted && server_error.error.find(L"500") != std::wstring::npos,
-        "mock HTTP 500 preserves the existing holiday data");
-  const auto timeout = mdlite::AssessJapaneseHolidayResponse(0, false, false, 11, {});
-  Check(!timeout.accepted && !timeout.error.empty(),
-        "mock timeout/network failure keeps the last-known-good holiday data");
-  const auto empty_body = mdlite::AssessJapaneseHolidayResponse(200, false, false, 11, {});
-  Check(!empty_body.accepted && !empty_body.replace_cache && !empty_body.error.empty(),
-        "mock HTTP empty bodies cannot replace the holiday cache");
-  const auto html = mdlite::AssessJapaneseHolidayResponse(
-      200, false, false, 11, L"<html><body>error</body></html>");
-  Check(!html.accepted && !html.replace_cache,
-        "mock HTTP HTML error pages cannot replace the holiday cache");
-  const auto shrink = mdlite::AssessJapaneseHolidayResponse(200, false, false, 30,
-                                                             online_fixture);
-  Check(!shrink.accepted && shrink.error.find(L"減少") != std::wstring::npos,
-        "mock HTTP large record reductions are rejected");
-  wchar_t real_http[2]{};
-  if (GetEnvironmentVariableW(L"MDLITE_TEST_REAL_HOLIDAY_HTTP", real_http, 2) == 1 &&
-      real_http[0] == L'1') {
-    mdlite::JapaneseHolidayOnlineResult result;
-    const bool fetched = mdlite::FetchJapaneseHolidayCsv(std::stop_token{}, {}, {}, result);
-    if (!fetched) {
-      // Keep the diagnostic ASCII-safe even when the test process has the
-      // default "C" locale and cannot render the Japanese product text.
-      std::string error_ascii;
-      for (const wchar_t character : result.error) {
-        error_ascii += character < 0x80 ? static_cast<char>(character) : '?';
-      }
-      std::cerr << "real holiday HTTP status=" << result.status
-                << " error_length=" << result.error.size()
-                << " error_ascii=" << error_ascii << "\n";
-    }
-    Check(fetched && result.status == 200 && !result.csv.empty() && result.error.empty(),
-          "opt-in real WinHTTP holiday probe receives the official CSV");
-  }
+        "holiday validation accepts strict ISO-like local CSV date fixtures");
   mdlite::ClearImportedJapaneseHolidays();
 }
 
@@ -1438,12 +2165,19 @@ void TestAssets(const std::filesystem::path& root) {
   mdlite::AssetImportResult first{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", first, error),
         "supported image copies into workspace assets");
-  Check(first.relative_reference == L"assets/image.png", "image reference is document-relative");
+  Check(first.relative_reference == L"assets/image.png" && first.created_new_asset,
+        "image reference is document-relative and reports its newly copied asset");
+  mdlite::AssetImportResult existing_asset{};
+  Check(mdlite::ImportImageAsset(first.stored_path, workspace, workspace / L"note.md",
+                                 existing_asset, error) && !existing_asset.created_new_asset &&
+            existing_asset.stored_path == first.stored_path,
+        "reusing an existing workspace asset does not claim ownership of or replace it");
   Check(WriteValidPng(png), "replacement PNG fixture is valid");
   mdlite::AssetImportResult second{};
   Check(mdlite::ImportImageAsset(png, workspace, workspace / L"note.md", second, error),
         "second image import succeeds without overwrite");
-  Check(second.stored_path.filename() == L"image_1.png", "asset collision gets a new name");
+  Check(second.stored_path.filename() == L"image_1.png" && second.created_new_asset,
+        "asset collision gets a new name and reports the newly copied asset");
   const auto corrupt = source_directory / L"corrupt.png";
   WriteBytes(corrupt, {0x89, 'P', 'N', 'G'});
   mdlite::AssetImportResult corrupt_result{};
@@ -1530,6 +2264,56 @@ void TestStorageAdapter(const std::filesystem::path& root) {
         "mock storage adapter success is supported");
   Check(result.reference == L"https://example.invalid/asset" && ReadBytes(asset) == std::vector<unsigned char>({'P','N','G'}),
         "storage adapter keeps local asset and returns a reference");
+  auto reference_adapter = adapter;
+  reference_adapter.arguments.back() = L"https://example.invalid/a b.png";
+  mdlite::StorageUploadResult spaced_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          spaced_reference, error) && !error.empty(),
+        "storage adapter rejects whitespace in an HTTPS URI before it can enter Markdown");
+  reference_adapter.arguments.back() = L"https:///missing-host.png";
+  mdlite::StorageUploadResult missing_authority_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          missing_authority_reference, error) && !error.empty(),
+        "storage adapter rejects HTTPS references without an authority");
+  reference_adapter.arguments.back() = L"https://example.invalid/a%2G.png";
+  mdlite::StorageUploadResult malformed_escape_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          malformed_escape_reference, error) && !error.empty(),
+        "storage adapter rejects malformed percent escapes in an HTTPS URI");
+  reference_adapter.arguments.back() = L"https://example.invalid:abc/asset.png";
+  mdlite::StorageUploadResult malformed_port_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          malformed_port_reference, error) && !error.empty(),
+        "storage adapter rejects nonnumeric HTTPS authority ports");
+  reference_adapter.arguments.back() = L"https://[garbage]/asset.png";
+  mdlite::StorageUploadResult malformed_ip_literal_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          malformed_ip_literal_reference, error) && !error.empty(),
+        "storage adapter rejects malformed HTTPS IP literals");
+  reference_adapter.arguments.back() = L"https://host[name/asset.png";
+  mdlite::StorageUploadResult malformed_reg_name_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          malformed_reg_name_reference, error) && !error.empty(),
+        "storage adapter rejects URI-reserved characters in an unbracketed host");
+  reference_adapter.arguments.back() = L"https://example.invalid/a{b}.png";
+  mdlite::StorageUploadResult malformed_uri_character_reference;
+  error.clear();
+  Check(!mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                          malformed_uri_character_reference, error) && !error.empty(),
+        "storage adapter rejects characters outside the RFC 3986 URI character set");
+  reference_adapter.arguments.back() = L"https://[2001:db8::1]:443/a%20b.png?x=1";
+  mdlite::StorageUploadResult encoded_reference;
+  error.clear();
+  Check(mdlite::UploadWithStorageAdapter(reference_adapter, asset, L"revision-1", nullptr,
+                                         encoded_reference, error) &&
+            encoded_reference.reference == reference_adapter.arguments.back(),
+        "storage adapter accepts a properly encoded URL destination");
 
   const auto invalid_config = directory / L"storage-invalid.toml";
   WriteBytes(invalid_config, std::vector<unsigned char>{
@@ -1541,6 +2325,9 @@ void TestStorageAdapter(const std::filesystem::path& root) {
 }
 
 void TestSettings(const std::filesystem::path& root) {
+  const auto defaults = mdlite::DefaultSettingsLayer();
+  Check(defaults.theme == mdlite::ThemeMode::Dark,
+        "new settings default to the approved dark theme");
   const auto directory = root / L"settings";
   const auto common_path = directory / L"common.toml";
   const auto workspace_path = directory / L"workspace.toml";
@@ -1562,7 +2349,6 @@ void TestSettings(const std::filesystem::path& root) {
   Check(mdlite::ResolveSettings(common_path, workspace_path, effective, error), "settings hierarchy resolves");
   Check(effective.theme == mdlite::ThemeMode::Light && effective.font_face == L"Yu Gothic UI" &&
             effective.font_size_pt == 14 && !effective.auto_save && effective.auto_save_delay_ms == 1500 &&
-            !effective.holiday_auto_update &&
             effective.colors[L"link"] == L"#80A0FF" &&
             effective.default_memo_workspace == *common.default_memo_workspace,
         "workspace overrides common while inherited values remain");
@@ -1606,6 +2392,18 @@ void TestSettings(const std::filesystem::path& root) {
   const std::string preserved_text(preserved.begin(), preserved.end());
   Check(preserved_text.find("new_option = \"keep-me\"") != std::string::npos,
         "settings save preserves fields unknown to this build");
+  const std::string legacy_holiday = "schema_version = 1\nholiday_auto_update = true\n";
+  const auto legacy_path = directory / L"legacy-holiday-update.toml";
+  WriteBytes(legacy_path, std::vector<unsigned char>(legacy_holiday.begin(), legacy_holiday.end()));
+  mdlite::SettingsLayer legacy_layer;
+  Check(mdlite::LoadSettingsLayer(legacy_path, legacy_layer, error) && legacy_layer.preserved_lines.empty(),
+        "removed holiday network setting is consumed instead of preserved");
+  Check(mdlite::SaveSettingsLayer(legacy_path, legacy_layer, error),
+        "legacy holiday network setting can be saved away");
+  const auto legacy_saved = ReadBytes(legacy_path);
+  const std::string legacy_saved_text(legacy_saved.begin(), legacy_saved.end());
+  Check(legacy_saved_text.find("holiday_auto_update") == std::string::npos,
+        "settings save does not restore the removed holiday network setting");
 }
 
 void TestGitConflicts() {

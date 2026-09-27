@@ -1,7 +1,6 @@
 #include "calendar/JapaneseHolidays.h"
 
 #include <windows.h>
-#include <winhttp.h>
 
 #include <algorithm>
 #include <array>
@@ -172,19 +171,6 @@ bool ParseCsvRecords(std::wstring_view csv, std::vector<ImportedHoliday>& parsed
   return true;
 }
 
-bool QueryResponseHeader(HINTERNET request, DWORD query, std::wstring& value) {
-  DWORD size{};
-  if (WinHttpQueryHeaders(request, query, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &size,
-                           WINHTTP_NO_HEADER_INDEX) != FALSE || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-    return false;
-  std::wstring buffer(size / sizeof(wchar_t), L'\0');
-  if (!WinHttpQueryHeaders(request, query, WINHTTP_HEADER_NAME_BY_INDEX, buffer.data(), &size,
-                            WINHTTP_NO_HEADER_INDEX)) return false;
-  if (size >= sizeof(wchar_t) && buffer.back() == L'\0') buffer.pop_back();
-  value = std::move(buffer);
-  return true;
-}
-
 }  // namespace
 
 std::optional<std::wstring_view> JapaneseHolidayName(int year, int month, int day) {
@@ -226,52 +212,6 @@ bool ValidateJapaneseHolidayCsv(std::wstring_view csv, JapaneseHolidayImportInfo
   return ParseCsvRecords(csv, parsed, info, error);
 }
 
-bool JapaneseHolidayUpdateDue(std::int64_t last_attempt_unix,
-                              std::int64_t last_successful_check_unix,
-                              std::int64_t now_unix) noexcept {
-  constexpr std::int64_t kCheckInterval = 28 * 24 * 60 * 60;
-  const auto last = std::max(last_attempt_unix, last_successful_check_unix);
-  // A wall-clock rollback must not turn every startup into a network retry.
-  // Wait until the clock catches up with the last recorded attempt/success.
-  return last <= 0 || (now_unix >= last && now_unix - last >= kCheckInterval);
-}
-
-JapaneseHolidayUpdateAssessment AssessJapaneseHolidayResponse(
-    std::uint32_t status, bool not_modified, bool verified_cache_available,
-    std::size_t existing_records, std::wstring_view csv) {
-  JapaneseHolidayUpdateAssessment assessment;
-  if (not_modified || status == 304) {
-    if (verified_cache_available) {
-      assessment.accepted = true;
-      return assessment;
-    }
-    assessment.error = L"304応答でしたが、検証済みの祝日cacheがありません。";
-    return assessment;
-  }
-  if (status != 200) {
-    assessment.error = status == 0
-        ? L"内閣府CSVの取得に失敗しました。"
-        : L"内閣府CSVがHTTP " + std::to_wstring(status) + L"を返しました。";
-    return assessment;
-  }
-  if (csv.empty()) {
-    assessment.error = L"内閣府CSVの本文が空です。";
-    return assessment;
-  }
-  if (!ValidateJapaneseHolidayCsv(csv, assessment.info, assessment.error)) return assessment;
-  if (assessment.info.records < 10) {
-    assessment.error = L"内閣府CSVの件数が想定より少ないためcacheを置換しません。";
-    return assessment;
-  }
-  if (existing_records > 0 && assessment.info.records * 2 < existing_records) {
-    assessment.error = L"内閣府CSVの件数が既存cacheから大幅に減少したため置換しません。";
-    return assessment;
-  }
-  assessment.accepted = true;
-  assessment.replace_cache = true;
-  return assessment;
-}
-
 bool ImportJapaneseHolidayCsv(std::wstring_view csv, JapaneseHolidayImportInfo& info,
                               std::wstring& error) {
   std::vector<ImportedHoliday> parsed;
@@ -296,129 +236,6 @@ bool ImportJapaneseHolidayCsvFile(const std::filesystem::path& path,
 void ClearImportedJapaneseHolidays() noexcept {
   std::scoped_lock lock(imported_mutex);
   imported_holidays.clear();
-}
-
-bool FetchJapaneseHolidayCsv(std::stop_token stop, std::wstring_view etag,
-                             std::wstring_view last_modified,
-                             JapaneseHolidayOnlineResult& result) {
-  result = {};
-  const auto winhttp_error = [](DWORD code, std::wstring_view message) {
-    return L"WinHTTP " + std::to_wstring(code) + L": " + std::wstring(message);
-  };
-  constexpr wchar_t kHost[] = L"www8.cao.go.jp";
-  constexpr wchar_t kPath[] = L"/chosei/shukujitsu/syukujitsu.csv";
-  HINTERNET session = WinHttpOpen(L"MDLite/0.1 holiday-data", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) {
-    result.error = winhttp_error(GetLastError(), L"内閣府CSVの通信セッションを作成できません。");
-    return false;
-  }
-  auto close = [&] {
-    if (session) WinHttpCloseHandle(session);
-    session = nullptr;
-  };
-  WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
-  if (stop.stop_requested()) { close(); result.error = L"祝日データ更新を中止しました。"; return false; }
-  HINTERNET connection = WinHttpConnect(session, kHost, INTERNET_DEFAULT_HTTPS_PORT, 0);
-  if (!connection) {
-    const DWORD win_error = GetLastError();
-    close();
-    result.error = winhttp_error(win_error, L"内閣府CSVへ接続できません。");
-    return false;
-  }
-  HINTERNET request = WinHttpOpenRequest(connection, L"GET", kPath, nullptr,
-                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         WINHTTP_FLAG_SECURE);
-  if (!request) {
-    const DWORD win_error = GetLastError();
-    WinHttpCloseHandle(connection); close();
-    result.error = winhttp_error(win_error, L"内閣府CSV要求を作成できません。");
-    return false;
-  }
-  const DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-  WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
-                   const_cast<DWORD*>(&redirect_policy), sizeof(redirect_policy));
-  std::wstring headers = L"Accept: text/csv, text/plain;q=0.8\r\n";
-  if (!etag.empty()) headers += L"If-None-Match: " + std::wstring(etag) + L"\r\n";
-  if (!last_modified.empty()) headers += L"If-Modified-Since: " + std::wstring(last_modified) + L"\r\n";
-  bool ok = !stop.stop_requested() &&
-            WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
-                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-            WinHttpReceiveResponse(request, nullptr);
-  if (!ok) {
-    const DWORD win_error = GetLastError();
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    result.error = stop.stop_requested()
-                       ? L"祝日データ更新を中止しました。"
-                       : winhttp_error(win_error, L"内閣府CSVの応答を受信できません。");
-    return false;
-  }
-  DWORD status = 0, status_size = sizeof(status);
-  if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                            WINHTTP_NO_HEADER_INDEX)) {
-    const DWORD win_error = GetLastError();
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    result.error = winhttp_error(win_error, L"内閣府CSVのHTTP statusを確認できません。");
-    return false;
-  }
-  result.status = status;
-  QueryResponseHeader(request, WINHTTP_QUERY_ETAG, result.etag);
-  QueryResponseHeader(request, WINHTTP_QUERY_LAST_MODIFIED, result.last_modified);
-  if (status == 304) {
-    result.not_modified = true;
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    return true;
-  }
-  if (status != 200) {
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    result.error = L"内閣府CSVがHTTP " + std::to_wstring(status) + L"を返しました。"; return false;
-  }
-  constexpr std::size_t kMaxBytes = 2 * 1024 * 1024;
-  std::string bytes;
-  for (;;) {
-    if (stop.stop_requested()) {
-      WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-      result.error = L"祝日データ更新を中止しました。"; return false;
-    }
-    DWORD available = 0;
-    if (!WinHttpQueryDataAvailable(request, &available)) {
-      const DWORD win_error = GetLastError();
-      WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-      result.error = winhttp_error(win_error, L"内閣府CSVの本文サイズを取得できません。");
-      return false;
-    }
-    if (available == 0) break;
-    if (bytes.size() + available > kMaxBytes) {
-      WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-      result.error = L"内閣府CSVがサイズ上限を超えています。"; return false;
-    }
-    const std::size_t offset = bytes.size();
-    bytes.resize(offset + available);
-    DWORD read = 0;
-    if (!WinHttpReadData(request, bytes.data() + offset, available, &read) || read == 0) {
-      const DWORD win_error = GetLastError();
-      WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-      result.error = winhttp_error(win_error, L"内閣府CSVの本文を読み取れません。");
-      return false;
-    }
-    bytes.resize(offset + read);
-  }
-  std::wstring decoded;
-  if (!DecodeCsv(bytes, decoded)) {
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    result.error = L"内閣府CSVの文字コードを厳密に判定できません。"; return false;
-  }
-  JapaneseHolidayImportInfo info;
-  if (!ValidateJapaneseHolidayCsv(decoded, info, result.error)) {
-    WinHttpCloseHandle(request); WinHttpCloseHandle(connection); close();
-    return false;
-  }
-  result.csv = std::move(decoded);
-  WinHttpCloseHandle(request);
-  WinHttpCloseHandle(connection);
-  close();
-  return true;
 }
 
 }  // namespace mdlite

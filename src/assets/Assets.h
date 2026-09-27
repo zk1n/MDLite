@@ -12,6 +12,7 @@ struct AssetImportResult {
   std::wstring relative_reference;
   bool safe_to_render{true};
   std::wstring safety_message;
+  bool created_new_asset{};
 };
 
 struct RasterImageInfo {

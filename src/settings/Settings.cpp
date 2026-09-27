@@ -46,10 +46,6 @@ void Overlay(const SettingsLayer& layer, std::wstring_view origin, EffectiveSett
   if (layer.font_size_pt) { target.font_size_pt = *layer.font_size_pt; target.origins[L"font_size_pt"] = origin; }
   // Network permission is a user-wide choice.  A Workspace file may not
   // silently elevate it when opened or shared.
-  if (layer.holiday_auto_update && origin != L"Workspace上書き") {
-    target.holiday_auto_update = *layer.holiday_auto_update;
-    target.origins[L"holiday_auto_update"] = origin;
-  }
   if (layer.default_memo_workspace) {
     target.default_memo_workspace = *layer.default_memo_workspace;
     target.origins[L"default_memo_workspace"] = origin;
@@ -121,15 +117,14 @@ SettingsLayer DefaultSettingsLayer() {
   SettingsLayer layer;
   layer.auto_save = true;
   layer.auto_save_delay_ms = 750;
-  layer.theme = ThemeMode::System;
+  layer.theme = ThemeMode::Dark;
   layer.font_face = L"Segoe UI";
   layer.font_size_pt = 11;
-  layer.holiday_auto_update = false;
   layer.default_memo_workspace = std::filesystem::path{};
   layer.keybindings = {{L"file.new", L"Ctrl+N"}, {L"file.open", L"Ctrl+O"},
                        {L"file.save", L"Ctrl+S"}, {L"file.quickOpen", L"Ctrl+P"},
                        {L"file.close", L"Ctrl+W"}, {L"edit.find", L"Ctrl+F"}, {L"edit.findNext", L"F3"},
-                       {L"view.commandPalette", L"Ctrl+Shift+P"}};
+                       {L"view.commandPalette", L"Ctrl+K"}};
   return layer;
 }
 
@@ -254,9 +249,8 @@ bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, 
       }
       catch (const std::exception&) { error = L"font_size_ptが数値ではありません。"; return false; }
     } else if (key == L"holiday_auto_update") {
-      if (raw == L"true") layer.holiday_auto_update = true;
-      else if (raw == L"false") layer.holiday_auto_update = false;
-      else { error = L"holiday_auto_updateはtrueまたはfalseで指定してください。"; return false; }
+      // Drop the legacy opt-in network updater key instead of preserving it
+      // as an unknown setting that could be restored by a future build.
     } else if (key.starts_with(L"bind.")) {
       const auto quoted = Unquote(raw);
       if (!quoted) { error = L"キー割当ては引用符で囲んでください。"; return false; }
@@ -281,8 +275,6 @@ bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& l
   if (layer.theme) text += L"theme = \"" + ThemeName(*layer.theme) + L"\"\n";
   if (layer.font_face) text += L"font_face = \"" + *layer.font_face + L"\"\n";
   if (layer.font_size_pt) text += L"font_size_pt = " + std::to_wstring(*layer.font_size_pt) + L"\n";
-  if (layer.holiday_auto_update)
-    text += L"holiday_auto_update = " + std::wstring(*layer.holiday_auto_update ? L"true" : L"false") + L"\n";
   if (layer.default_memo_workspace)
     text += L"default_memo_workspace = \"" + layer.default_memo_workspace->generic_wstring() + L"\"\n";
   for (const auto& [command, shortcut] : layer.keybindings) text += L"bind." + command + L" = \"" + shortcut + L"\"\n";

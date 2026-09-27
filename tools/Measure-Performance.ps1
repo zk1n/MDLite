@@ -19,6 +19,7 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class MDLitePerfNative {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
     public delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr parameter);
@@ -27,7 +28,9 @@ public static class MDLitePerfNative {
     [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool GetClientRect(IntPtr window, out RECT rectangle);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, ref RECT lparam, uint flags, uint timeoutMs, out IntPtr result);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeoutMs, out IntPtr result);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, string lparam, uint flags, uint timeoutMs, out IntPtr result);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
@@ -54,7 +57,14 @@ $LVM_GETITEMCOUNT = 0x1004
 $BM_CLICK = 0x00F5
 $WM_LBUTTONDOWN = 0x0201
 $WM_LBUTTONUP = 0x0202
+$WM_KEYDOWN = 0x0100
+$WM_KEYUP = 0x0101
+$VK_HOME = 0x24
+$VK_RIGHT = 0x27
+$TCM_GETITEMCOUNT = 0x1304 # TCM_FIRST + 4; scalar tab count
+$TCM_GETCURSEL = 0x130B # TCM_FIRST + 11; scalar selected-index query
 $WM_TEST_THEME_CHANGE = 0x802B # WM_APP + 43; enabled only under MDLITE_TEST_SILENT
+$WM_TEST_TAB_ITEM_CENTER = 0x803A # WM_APP + 58; in-process tab rectangle query
 $SMTO_FAIL_FAST = 0x0023 # BLOCK | ABORTIFHUNG | ERRORONEXIT
 # Full fixtures intentionally exercise 10,000-file and 100 MiB paths.  Keep the
 # quick-run watchdog strict, but allow a single synchronous GUI query enough time
@@ -99,7 +109,9 @@ function Send-NativeMessage([Diagnostics.Process]$Process, [IntPtr]$Window, [uin
     if ($sent -eq [IntPtr]::Zero) {
         Assert-ProcessRunning $Process $Context
         $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw "$Context`: SendMessageTimeout failed or exceeded ${TimeoutMs}ms (Win32=$nativeError)."
+        $Process.Refresh()
+        $hung = [MDLitePerfNative]::IsHungAppWindow($Window)
+        throw "$Context`: SendMessageTimeout failed or exceeded ${TimeoutMs}ms (Win32=$nativeError, pid=$($Process.Id), hung=$hung, cpu_ms=$([Math]::Round($Process.TotalProcessorTime.TotalMilliseconds, 3)), working_set=$($Process.WorkingSet64), private_bytes=$($Process.PrivateMemorySize64))."
     }
     Assert-ProcessRunning $Process $Context
     Write-Verbose "END GUI message: $Context"
@@ -262,12 +274,61 @@ function Invoke-SearchCancellation([Diagnostics.Process]$Process, [IntPtr]$Main)
 function Open-CompactWindows([Diagnostics.Process]$Process, [IntPtr]$Main, [int]$Count) {
     $tabs = Find-Control $Process $Main $ControlTabs
     if ($tabs -eq [IntPtr]::Zero) { return 0 }
-    for ($index = 0; $index -lt $Count; $index++) {
-        # Exercise the native tab control so MDLite receives the real TCN_SELCHANGE.
-        $x = 24 + (120 * $index)
-        $lparam = [IntPtr](($x -band 0xFFFF) -bor (12 -shl 16))
+    # The native tab control may scroll the active item into view, leaving
+    # earlier tabs clipped when the P4 fixture names exceed the available width.
+    # Open in reverse visual order so selecting each earlier tab also scrolls
+    # it into the visible client area before its item-center click.
+    for ($index = $Count - 1; $index -ge 0; $index--) {
+        # Ask the owning window to query the RECT in-process. TCM_GETITEMRECT
+        # carries a RECT*; passing the caller's address directly across process
+        # boundaries can crash the target control instead of returning geometry.
+        $packed = (Send-NativeMessage $Process $Main $WM_TEST_TAB_ITEM_CENTER `
+            ([IntPtr]$index) ([IntPtr]::Zero) "Get tab $index rectangle center").ToInt64()
+        if ($packed -eq -1) { throw "Get tab $index rectangle center`: tab item is unavailable." }
+        $packed = $packed -band 0xffffffffL
+        $x = [int]($packed -band 0xffff)
+        $y = [int](($packed -shr 16) -band 0xffff)
+        if ($x -ge 0x8000) { $x -= 0x10000 }
+        if ($y -ge 0x8000) { $y -= 0x10000 }
+        $clientRect = [MDLitePerfNative+RECT]::new()
+        if (-not [MDLitePerfNative]::GetClientRect($tabs, [ref]$clientRect)) {
+            throw "GetClientRect failed for tab control $index."
+        }
+        if ($x -lt $clientRect.Left -or $x -ge $clientRect.Right -or
+            $y -lt $clientRect.Top -or $y -ge $clientRect.Bottom) {
+            # An open document can leave the tab row scrolled away from the
+            # requested item. Use the control's normal keyboard navigation to
+            # bring it into view, then click the freshly measured item center.
+            [void](Send-NativeMessage $Process $tabs $WM_KEYDOWN ([IntPtr]$VK_HOME) ([IntPtr]1) "Scroll tabs to first item")
+            [void](Send-NativeMessage $Process $tabs $WM_KEYUP ([IntPtr]$VK_HOME) ([IntPtr]0xC0000001) "Release Home key")
+            for ($step = 0; $step -lt $index; $step++) {
+                [void](Send-NativeMessage $Process $tabs $WM_KEYDOWN ([IntPtr]$VK_RIGHT) ([IntPtr]1) "Navigate to tab $index")
+                [void](Send-NativeMessage $Process $tabs $WM_KEYUP ([IntPtr]$VK_RIGHT) ([IntPtr]0xC0000001) "Release Right key")
+            }
+            $packed = (Send-NativeMessage $Process $Main $WM_TEST_TAB_ITEM_CENTER `
+                ([IntPtr]$index) ([IntPtr]::Zero) "Re-measure visible tab $index center").ToInt64()
+            if ($packed -eq -1) { throw "Tab $index center is unavailable after keyboard navigation." }
+            $packed = $packed -band 0xffffffffL
+            $x = [int]($packed -band 0xffff)
+            $y = [int](($packed -shr 16) -band 0xffff)
+            if ($x -ge 0x8000) { $x -= 0x10000 }
+            if ($y -ge 0x8000) { $y -= 0x10000 }
+            if (-not [MDLitePerfNative]::GetClientRect($tabs, [ref]$clientRect)) {
+                throw "GetClientRect failed for tab control $index after keyboard navigation."
+            }
+            if ($x -lt $clientRect.Left -or $x -ge $clientRect.Right -or
+                $y -lt $clientRect.Top -or $y -ge $clientRect.Bottom) {
+                throw "Tab $index remains outside tab client after keyboard navigation: center=($x,$y), client=($($clientRect.Left),$($clientRect.Top),$($clientRect.Right),$($clientRect.Bottom))."
+            }
+        }
+        $lparam = [IntPtr](($x -band 0xFFFF) -bor (($y -band 0xFFFF) -shl 16))
         [void](Send-NativeMessage $Process $tabs $WM_LBUTTONDOWN ([IntPtr]1) $lparam "Select tab $index down")
         [void](Send-NativeMessage $Process $tabs $WM_LBUTTONUP ([IntPtr]::Zero) $lparam "Select tab $index up")
+        $selected = (Send-NativeMessage $Process $tabs $TCM_GETCURSEL `
+            ([IntPtr]::Zero) ([IntPtr]::Zero) "Read selected tab $index").ToInt64()
+        if ($selected -ne $index) {
+            throw "Select tab $index at ($x,$y) did not update selection; TCM_GETCURSEL returned $selected; tab client=($($clientRect.Left),$($clientRect.Top),$($clientRect.Right),$($clientRect.Bottom))."
+        }
         [void](Send-NativeMessage $Process $Main $WM_COMMAND ([IntPtr]1030) ([IntPtr]::Zero) "Open compact window $index")
         Start-Sleep -Milliseconds 50
     }
@@ -290,6 +351,112 @@ function Find-Control([Diagnostics.Process]$Process, [IntPtr]$Parent, [int]$Id) 
     Assert-ProcessRunning $Process "Find control $Id"
     Write-Verbose "END control enumeration: $Id handle=$script:perfControl"
     return $script:perfControl
+}
+
+function Count-EditorWindows([Diagnostics.Process]$Process, [IntPtr]$Parent) {
+    Assert-WindowOwnedByProcess $Process $Parent 'Count RichEdit windows'
+    $script:perfEditorCount = 0
+    $callback = [MDLitePerfNative+EnumWindowsProc]{
+        param([IntPtr]$window, [IntPtr]$parameter)
+        $className = New-Object Text.StringBuilder 64
+        [void][MDLitePerfNative]::GetClassName($window, $className, $className.Capacity)
+        if ($className.ToString() -eq 'RICHEDIT50W') { $script:perfEditorCount++ }
+        return $true
+    }
+    [void][MDLitePerfNative]::EnumChildWindows($Parent, $callback, [IntPtr]::Zero)
+    Assert-ProcessRunning $Process 'Count RichEdit windows'
+    return $script:perfEditorCount
+}
+
+function ConvertTo-HexString([byte[]]$Bytes, [int]$Offset, [int]$Count) {
+    if ($null -eq $Bytes -or $Count -le 0) { return '' }
+    return [BitConverter]::ToString($Bytes, $Offset, $Count).Replace('-', '')
+}
+
+function Test-InputSourceRoundTrip([string]$Path, [string]$Suffix) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        # Fixtures put Japanese text in their short header, followed by ASCII blocks.
+        $probe = New-Object byte[] ([int][Math]::Min(256, $stream.Length))
+        $probeCount = $stream.Read($probe, 0, $probe.Length)
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        try {
+            [void]$utf8.GetString($probe, 0, $probeCount)
+            $encoding = $utf8
+            $encodingName = 'UTF-8'
+        } catch [Text.DecoderFallbackException] {
+            $encoding = [Text.Encoding]::GetEncoding(932)
+            $encodingName = 'Windows-932'
+        }
+        $expected = $encoding.GetBytes($Suffix)
+        if ($stream.Length -lt $expected.Length) {
+            return [pscustomobject]@{
+                pass = $false
+                encoding = $encodingName
+                expected_suffix_bytes = $expected.Length
+                actual_suffix_bytes = 0
+                tail_probe_bytes = $probeCount
+                suffix_position = 'file-shorter-than-input'
+                actual_tail_hex = ConvertTo-HexString $probe 0 $probeCount
+            }
+        }
+
+        # RichEdit keeps a terminal paragraph break. Saving text entered at the
+        # end of the visible document can therefore emit one final CRLF/LF/CR
+        # after the input. Require the exact input suffix at EOF or immediately
+        # before that single document terminator; do not accept arbitrary
+        # substring matches or extra content after the measured edit.
+        $tailLength = [int][Math]::Min([long]($expected.Length + 2), $stream.Length)
+        $tail = New-Object byte[] $tailLength
+        [void]$stream.Seek(-$tailLength, [IO.SeekOrigin]::End)
+        $tailCount = $stream.Read($tail, 0, $tail.Length)
+        $suffixPosition = 'missing'
+        $matches = $false
+        $exactOffset = $tailCount - $expected.Length
+        if ($exactOffset -ge 0) {
+            $matches = $true
+            for ($index = 0; $matches -and $index -lt $expected.Length; $index++) {
+                if ($tail[$exactOffset + $index] -ne $expected[$index]) { $matches = $false }
+            }
+            if ($matches) { $suffixPosition = 'end-of-file' }
+        }
+        if (-not $matches) {
+            foreach ($terminator in @(
+                [byte[]]@(0x0D, 0x0A),
+                [byte[]]@(0x0A),
+                [byte[]]@(0x0D)
+            )) {
+                $offset = $tailCount - $expected.Length - $terminator.Length
+                if ($offset -lt 0) { continue }
+                $candidateMatches = $true
+                for ($index = 0; $candidateMatches -and $index -lt $expected.Length; $index++) {
+                    if ($tail[$offset + $index] -ne $expected[$index]) { $candidateMatches = $false }
+                }
+                for ($index = 0; $candidateMatches -and $index -lt $terminator.Length; $index++) {
+                    if ($tail[$offset + $expected.Length + $index] -ne $terminator[$index]) { $candidateMatches = $false }
+                }
+                if ($candidateMatches) {
+                    $matches = $true
+                    $suffixPosition = switch ($terminator.Length) {
+                        2 { 'before-terminal-crlf'; break }
+                        1 { if ($terminator[0] -eq 0x0A) { 'before-terminal-lf' } else { 'before-terminal-cr' }; break }
+                    }
+                    break
+                }
+            }
+        }
+        return [pscustomobject]@{
+            pass = $matches
+            encoding = $encodingName
+            expected_suffix_bytes = $expected.Length
+            actual_suffix_bytes = if ($matches) { $expected.Length } else { 0 }
+            tail_probe_bytes = $tailCount
+            suffix_position = $suffixPosition
+            actual_tail_hex = ConvertTo-HexString $tail 0 $tailCount
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Wait-MainWindow([Diagnostics.Process]$Process, [int]$TimeoutMs = 120000) {
@@ -334,6 +501,7 @@ function Get-ResourceSample([Diagnostics.Process]$Process, [Diagnostics.Stopwatc
         handles = $Process.HandleCount
         gdi_objects = [MDLitePerfNative]::GetGuiResources($Process.Handle, 0)
         user_objects = [MDLitePerfNative]::GetGuiResources($Process.Handle, 1)
+        main_pane_editor_windows = Count-EditorWindows $Process $Window
         responding = -not [MDLitePerfNative]::IsHungAppWindow($Window)
     }
 }
@@ -378,20 +546,58 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
     $openedDocumentBytes = [long](($Targets | ForEach-Object {
         (Get-Item -LiteralPath $_).Length
     } | Measure-Object -Sum).Sum)
-    $process = Start-Process -FilePath $executable -ArgumentList $Targets -PassThru
+    if ($Targets.Count -gt 0 -and $Name -match '^P[123]-') {
+        $targetWorkspace = [IO.Path]::GetFullPath((Split-Path -Parent $Targets[0]))
+        $performanceRoot = [IO.Path]::GetFullPath($runRoot) + [IO.Path]::DirectorySeparatorChar
+        if (-not $targetWorkspace.StartsWith($performanceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to reset session outside the generated performance fixture: $targetWorkspace"
+        }
+        $previousSession = Join-Path $targetWorkspace '.mdlite\.state\session.toml'
+        if (Test-Path -LiteralPath $previousSession -PathType Leaf) {
+            # Each P1/P2/P3 scenario is an independent workload. The app's
+            # normal clean exit persists its last session, so remove only that
+            # generated fixture state before the next isolated measurement.
+            Remove-Item -LiteralPath $previousSession -Force
+        }
+    }
+    if ($null -eq $Targets -or $Targets.Count -eq 0) {
+        $process = Start-Process -FilePath $executable -PassThru
+    } else {
+        $process = Start-Process -FilePath $executable -ArgumentList $Targets -PassThru
+    }
     $main = [IntPtr]::Zero
     $samples = New-Object Collections.Generic.List[object]
     try {
         $ready = Wait-MainWindow $process
         $main = $ready.handle
         $documentReadyMs = $null
+        $documentReadyTabCount = $null
         if ($Targets.Count -gt 0) {
             $documentTimeoutSeconds = if ($Profile -eq 'full') { 300 } else { 60 }
             $documentDeadline = [DateTime]::UtcNow.AddSeconds($documentTimeoutSeconds)
+            $initialTabs = Find-Control $process $main $ControlTabs
+            $initialEditor = [IntPtr]::Zero
+            $initialLength = 0L
             do {
                 Assert-ProcessRunning $process "$Name document load"
                 if ([MDLitePerfNative]::IsHungAppWindow($main)) {
                     Start-Sleep -Milliseconds 25
+                    continue
+                }
+                if ($initialTabs -eq [IntPtr]::Zero) {
+                    $initialTabs = Find-Control $process $main $ControlTabs
+                }
+                if ($initialTabs -eq [IntPtr]::Zero) {
+                    Start-Sleep -Milliseconds 10
+                    continue
+                }
+                $documentReadyTabCount = (Send-NativeMessage $process $initialTabs $TCM_GETITEMCOUNT `
+                    ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name startup tab count").ToInt32()
+                # Opening multiple command-line paths creates each tab in sequence,
+                # suspending the previous editor as it goes. Wait for the final tab
+                # notification before retaining an editor HWND for text probing.
+                if ($documentReadyTabCount -ne $Targets.Count) {
+                    Start-Sleep -Milliseconds 10
                     continue
                 }
                 $initialEditor = Find-Control $process $main $ControlEditor
@@ -403,7 +609,7 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
                 Start-Sleep -Milliseconds 10
             } while ([DateTime]::UtcNow -lt $documentDeadline)
             if ($initialEditor -eq [IntPtr]::Zero -or $initialLength -eq 0) {
-                throw "The initial document did not finish loading within $documentTimeoutSeconds seconds."
+                throw "The initial document did not finish loading $($Targets.Count) tabs within $documentTimeoutSeconds seconds (observed tabs=$documentReadyTabCount)."
             }
             $documentReadyMs = [Math]::Round($watch.Elapsed.TotalMilliseconds, 3)
         }
@@ -417,12 +623,26 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
         $settledInputMs = $null
         $settledInputCpuMs = $null
         $saveMs = $null
+        $inputSourceRoundTrip = $null
+        $inputEditorLengthBefore = $null
+        $inputEditorLengthAfter = $null
+        $inputEditorLengthAfterSave = $null
+        $inputExpectedCharacters = $null
         if ($MeasureInput -and $editor -ne [IntPtr]::Zero) {
-            [void](Send-NativeMessage $process $editor $EM_SETSEL ([IntPtr](-1)) ([IntPtr](-1)) "$Name select input position")
+            $inputEditorLengthBefore = (Send-NativeMessage $process $editor $WM_GETTEXTLENGTH `
+                ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name input text length before").ToInt64()
+            [void](Send-NativeMessage $process $editor $EM_SETSEL `
+                ([IntPtr]$inputEditorLengthBefore) ([IntPtr]$inputEditorLengthBefore) "$Name select input position")
             $process.Refresh()
             $settledCpuStartMs = $process.TotalProcessorTime.TotalMilliseconds
             $settledWatch = [Diagnostics.Stopwatch]::StartNew()
-            foreach ($character in ('input-latency-日本語-0123456789-abcdefghijklmnopqrstuvwxyz'.ToCharArray())) {
+            # Cross-process WM_CHAR is not a faithful Unicode/IME injector for
+            # RichEdit on these Japanese Windows fixtures; send ASCII here and
+            # keep Japanese composition evidence in the separate GUI/native
+            # acceptance routes.
+            $inputText = 'input-latency-0123456789-abcdefghijklmnopqrstuvwxyz'
+            $inputExpectedCharacters = $inputText.Length
+            foreach ($character in $inputText.ToCharArray()) {
                 $inputWatch = [Diagnostics.Stopwatch]::StartNew()
                 [void](Send-NativeMessage $process $editor $WM_CHAR ([IntPtr][int]$character) ([IntPtr]::Zero) "$Name input character")
                 $inputWatch.Stop()
@@ -434,12 +654,35 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
                 $settledInputCpuMs = $settled.process_cpu_ms
                 $samples.Add((Get-ResourceSample $process $watch $main))
             }
+            $inputEditorLengthAfter = (Send-NativeMessage $process $editor $WM_GETTEXTLENGTH `
+                ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name input text length after").ToInt64()
             $saveWatch = [Diagnostics.Stopwatch]::StartNew()
             [void](Send-NativeMessage $process $main $WM_COMMAND ([IntPtr]1005) ([IntPtr]::Zero) "$Name save")
             $saveWatch.Stop()
             $saveMs = [Math]::Round($saveWatch.Elapsed.TotalMilliseconds, 3)
+            $inputEditorLengthAfterSave = (Send-NativeMessage $process $editor $WM_GETTEXTLENGTH `
+                ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name input text length after save").ToInt64()
             Start-Sleep -Milliseconds 250
             $samples.Add((Get-ResourceSample $process $watch $main))
+            $tabs = Find-Control $process $main $ControlTabs
+            if ($tabs -eq [IntPtr]::Zero) { throw "$Name input source round-trip: tab control is unavailable." }
+            $activeTabIndex = (Send-NativeMessage $process $tabs $TCM_GETCURSEL `
+                ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name active input tab index").ToInt32()
+            if ($activeTabIndex -lt 0 -or $activeTabIndex -ge $Targets.Count) {
+                throw "$Name input source round-trip: active tab index $activeTabIndex is outside $($Targets.Count) targets."
+            }
+            $inputSourceRoundTrip = Test-InputSourceRoundTrip $Targets[$activeTabIndex] $inputText
+            $inputSourceRoundTrip | Add-Member -NotePropertyName target_tab_index -NotePropertyValue $activeTabIndex
+            $inputSourceRoundTrip | Add-Member -NotePropertyName editor_length_before -NotePropertyValue $inputEditorLengthBefore
+            $inputSourceRoundTrip | Add-Member -NotePropertyName editor_length_after -NotePropertyValue $inputEditorLengthAfter
+            $inputSourceRoundTrip | Add-Member -NotePropertyName editor_length_after_save -NotePropertyValue $inputEditorLengthAfterSave
+            $inputSourceRoundTrip | Add-Member -NotePropertyName expected_input_characters -NotePropertyValue $inputExpectedCharacters
+            if (-not $inputSourceRoundTrip.pass) {
+                throw "$Name input source round-trip failed for active tab $activeTabIndex ($($inputSourceRoundTrip.encoding)): emitted input suffix is absent at the saved document boundary (position=$($inputSourceRoundTrip.suffix_position), editor_length=$inputEditorLengthBefore->$inputEditorLengthAfter->$inputEditorLengthAfterSave, expected_input_characters=$inputExpectedCharacters, tail_hex=$($inputSourceRoundTrip.actual_tail_hex))."
+            }
+            if ($Name.StartsWith('P5-') -and ($inputEditorLengthAfter - $inputEditorLengthBefore) -ne $inputExpectedCharacters) {
+                throw "$Name editor input length delta was $($inputEditorLengthAfter - $inputEditorLengthBefore); expected $inputExpectedCharacters characters."
+            }
         }
         $cancelResult = [pscustomobject]@{ first_batch_seen=$false; stale_results_cleared=$false; completed=$false; elapsed_ms=$null }
         if ($MeasureSearchCancel) {
@@ -509,12 +752,32 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
             throw "GUI theme change to '$ThemeChange' did not persist."
         }
         $last = $samples[$samples.Count - 1]
+        $tabs = Find-Control $process $main $ControlTabs
+        $mainTabCount = if ($tabs -ne [IntPtr]::Zero) {
+            (Send-NativeMessage $process $tabs $TCM_GETITEMCOUNT `
+                ([IntPtr]::Zero) ([IntPtr]::Zero) "$Name tab count").ToInt32()
+        } else { $null }
+        $mainEditorCount = Count-EditorWindows $process $main
+        $expectedMainTabCount = if ($Name -eq 'P1-one-document') { 1 } `
+            elseif ($Name -eq 'P1-six-documents') { 6 } else { $null }
+        $expectedMainEditorCount = if ($null -ne $expectedMainTabCount) { 1 } else { $null }
+        if ($null -ne $expectedMainTabCount -and
+            ($mainTabCount -ne $expectedMainTabCount -or
+             $mainEditorCount -ne $expectedMainEditorCount)) {
+            throw "$Name`: expected $expectedMainTabCount main tabs and $expectedMainEditorCount main-pane RichEdit window, observed tabs=$mainTabCount, editors=$mainEditorCount."
+        }
         return [pscustomobject]@{
             scenario = $Name
+            status = 'PASS'
             opened_document_count = $Targets.Count
+            main_tab_count = $mainTabCount
+            main_pane_editor_windows = $mainEditorCount
+            expected_main_tab_count = $expectedMainTabCount
+            expected_main_pane_editor_count = $expectedMainEditorCount
             opened_document_bytes = $openedDocumentBytes
             ready_ms = [Math]::Round([double]$ready.elapsed_ms, 3)
             document_ready_ms = $documentReadyMs
+            document_ready_tab_count = $documentReadyTabCount
             input_definition = if ($MeasureInput) { 'wall time until cross-process synchronous WM_CHAR returns after RichEdit processing and synchronous EN_CHANGE; excludes deferred source synchronization and presentation' } else { $null }
             input_count = $latencies.Count
             input_p50_ms = Get-Percentile $latencies.ToArray() 0.50
@@ -524,6 +787,11 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
             input_settled_ms = $settledInputMs
             input_settled_cpu_ms = $settledInputCpuMs
             save_command_ms = $saveMs
+            input_editor_length_before = $inputEditorLengthBefore
+            input_editor_length_after = $inputEditorLengthAfter
+            input_editor_length_after_save = $inputEditorLengthAfterSave
+            input_expected_characters = $inputExpectedCharacters
+            input_source_round_trip = $inputSourceRoundTrip
             save_definition = if ($MeasureInput) { 'wall time until synchronous Save command returns, including immediate editor-to-source synchronization and disk write' } else { $null }
             search_publication_mode = if ($MeasureSearch) { 'progressive batches; first transition observed directly, settled is a 750ms no-count-change heuristic' } else { $null }
             search_first_result_ms = $searchFirstResultMs
@@ -563,8 +831,37 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
     }
 }
 
-$runRoot = Join-Path ([IO.Path]::GetTempPath()) ("mdlite-performance-" + [guid]::NewGuid().ToString('N'))
+function Add-ScenarioResult([string]$Name, [scriptblock]$Measurement) {
+    $script:activePerformanceScenario = $Name
+    $startedUtc = [DateTime]::UtcNow
+    try {
+        $script:scenarios.Add((& $Measurement)) | Out-Null
+    } catch {
+        $script:scenarios.Add([pscustomobject]@{
+            scenario = $Name
+            status = 'FAILED'
+            elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $startedUtc).TotalSeconds, 3)
+            error = $_.Exception.Message
+        }) | Out-Null
+    } finally {
+        $script:activePerformanceScenario = $null
+    }
+}
+
+$tempRootPath = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$tempRootPrefix = $tempRootPath.TrimEnd([char[]]@(
+    [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) +
+    [IO.Path]::DirectorySeparatorChar
+$runRoot = [IO.Path]::GetFullPath((Join-Path $tempRootPrefix `
+    ("mdlite-performance-" + [guid]::NewGuid().ToString('N'))))
+if (-not $runRoot.StartsWith($tempRootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+    (Split-Path -Leaf $runRoot) -notmatch '^mdlite-performance-[0-9a-f]{32}$') {
+    throw "Generated performance fixture escaped its temp root: $runRoot"
+}
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
+$scenarios = New-Object Collections.Generic.List[object]
+$p5Rows = New-Object Collections.Generic.List[object]
+$p5Failures = 0
 try {
     $full = $Profile -eq 'full'
     $p1 = New-Workspace $runRoot 'P1'
@@ -574,6 +871,9 @@ try {
     $p1SixSizes = @([long]($p1OpenBytes / 6)) * 6
     $p1SixSizes[0] += $p1OpenBytes - [long](($p1SixSizes | Measure-Object -Sum).Sum)
     $p1Targets = New-DistributedFixture $p1 $p1Count $p1Bytes $true (@($p1OpenBytes) + $p1SixSizes)
+    # Keep one CP932 note last so the active six-document edit/save round-trip
+    # exercises both fixture encodings across P1/P2 single- and multi-tab cases.
+    $p1SixTargets = @($p1Targets[2..6]) + @($p1Targets[1])
 
     $p2 = New-Workspace $runRoot 'P2'
     $p2Bytes = if ($full) { 200MB } else { 10MB }
@@ -582,12 +882,13 @@ try {
     $p2SixSizes = @([long]($p2OpenBytes / 6)) * 6
     $p2SixSizes[0] += $p2OpenBytes - [long](($p2SixSizes | Measure-Object -Sum).Sum)
     $p2Targets = New-DistributedFixture $p2 $p2Count $p2Bytes $true (@($p2OpenBytes) + $p2SixSizes)
+    $p2SixTargets = @($p2Targets[2..6]) + @($p2Targets[1])
     $p1OneFixtureBytes = (Get-Item -LiteralPath $p1Targets[0]).Length
-    $p1SixFixtureBytes = [long](($p1Targets[1..6] | ForEach-Object {
+    $p1SixFixtureBytes = [long](($p1SixTargets | ForEach-Object {
         (Get-Item -LiteralPath $_).Length
     } | Measure-Object -Sum).Sum)
     $p2OneFixtureBytes = (Get-Item -LiteralPath $p2Targets[0]).Length
-    $p2SixFixtureBytes = [long](($p2Targets[1..6] | ForEach-Object {
+    $p2SixFixtureBytes = [long](($p2SixTargets | ForEach-Object {
         (Get-Item -LiteralPath $_).Length
     } | Measure-Object -Sum).Sum)
 
@@ -638,29 +939,36 @@ try {
 
     $p5 = New-Workspace $runRoot 'P5'
     $p5Doc = Join-Path $p5 'cycle.md'
-    [IO.File]::WriteAllText($p5Doc, "# Cycle`r`nperformance token`r`n", [Text.UTF8Encoding]::new($false))
+    $p5Seed = "# Cycle`r`nperformance token`r`n"
+    $p5ExpectedInputCharacters = 'input-latency-0123456789-abcdefghijklmnopqrstuvwxyz'.Length
+    [IO.File]::WriteAllText($p5Doc, $p5Seed, [Text.UTF8Encoding]::new($false))
 
-    $scenarios = New-Object Collections.Generic.List[object]
-    $scenarios.Add((Measure-Scenario 'P0-first-run-approximation' @() $false $false 1500))
-    $scenarios.Add((Measure-Scenario 'P0-warm' @() $false $false 1500))
-    $scenarios.Add((Measure-Scenario -Name 'P1-one-document' -Targets @($p1Targets[0]) -MeasureInput $true -MeasureSearch $true -StableMs 1500 -MeasureSettledInput $true))
-    $scenarios.Add((Measure-Scenario -Name 'P1-six-documents' -Targets @($p1Targets[1..6]) -MeasureInput $true -MeasureSearch $false -StableMs 1500 -MeasureSettledInput $true))
-    $scenarios.Add((Measure-Scenario 'P2-one-document-search' @($p2Targets[0]) $true $true 1000 $full))
-    $scenarios.Add((Measure-Scenario 'P2-six-documents-search' @($p2Targets[1..6]) $true $true 1000 $false))
+    Add-ScenarioResult 'P0-first-run-approximation' { Measure-Scenario 'P0-first-run-approximation' @() $false $false 1500 }
+    Add-ScenarioResult 'P0-warm' { Measure-Scenario 'P0-warm' @() $false $false 1500 }
+    # P1 isolates document editing memory; workspace search has dedicated P2 scenarios.
+    Add-ScenarioResult 'P1-one-document' { Measure-Scenario -Name 'P1-one-document' -Targets @($p1Targets[0]) -MeasureInput $true -MeasureSearch $false -StableMs 1500 -MeasureSettledInput $true }
+    Add-ScenarioResult 'P1-six-documents' { Measure-Scenario -Name 'P1-six-documents' -Targets $p1SixTargets -MeasureInput $true -MeasureSearch $false -StableMs 1500 -MeasureSettledInput $true }
+    Add-ScenarioResult 'P2-one-document-search' { Measure-Scenario 'P2-one-document-search' @($p2Targets[0]) $true $true 1000 $full }
+    Add-ScenarioResult 'P2-six-documents-search' { Measure-Scenario 'P2-six-documents-search' $p2SixTargets $true $true 1000 $false }
     foreach ($target in $p3Targets) {
         $size = [int]((Get-Item -LiteralPath $target).Length / 1MB)
-        $scenarios.Add((Measure-Scenario "P3-${size}MiB" @($target) $true $true 1000))
+        Add-ScenarioResult "P3-${size}MiB" { Measure-Scenario "P3-${size}MiB" @($target) $true $true 1000 }
     }
-    $scenarios.Add((Measure-Scenario -Name 'P4-images-and-compacts' -Targets $p4Docs -MeasureInput $true -MeasureSearch $false -StableMs 2500 -CompactCount 3 -MeasureSettledInput $true))
+    Add-ScenarioResult 'P4-images-and-compacts' { Measure-Scenario -Name 'P4-images-and-compacts' -Targets $p4Docs -MeasureInput $true -MeasureSearch $false -StableMs 2500 -CompactCount 3 -MeasureSettledInput $true }
 
-    $p5Rows = New-Object Collections.Generic.List[object]
-    $p5Failures = 0
     for ($iteration = 1; $iteration -le $P5Iterations; $iteration++) {
         try {
+            [IO.File]::WriteAllText($p5Doc, $p5Seed, [Text.UTF8Encoding]::new($false))
             $theme = if ($iteration % 2 -eq 0) { 'light' } else { 'dark' }
             $row = Measure-Scenario ("P5-{0:D3}" -f $iteration) @($p5Doc) $true $true 0 $false 0 $theme
             $p5Rows.Add([pscustomobject]@{
                 iteration=$iteration
+                input_editor_length_before=$row.input_editor_length_before
+                input_editor_length_after=$row.input_editor_length_after
+                input_editor_length_after_save=$row.input_editor_length_after_save
+                input_editor_length_delta=($row.input_editor_length_after - $row.input_editor_length_before)
+                input_expected_characters=$row.input_expected_characters
+                input_source_round_trip_pass=$row.input_source_round_trip.pass
                 ready_ms=$row.ready_ms
                 input_p95_ms=$row.input_p95_ms
                 search_first_result_ms=$row.search_first_result_ms
@@ -676,6 +984,12 @@ try {
             $p5Failures++
             $p5Rows.Add([pscustomobject]@{
                 iteration=$iteration
+                input_editor_length_before=$null
+                input_editor_length_after=$null
+                input_editor_length_after_save=$null
+                input_editor_length_delta=$null
+                input_expected_characters=$p5ExpectedInputCharacters
+                input_source_round_trip_pass=$false
                 ready_ms=$null
                 input_p95_ms=$null
                 search_first_result_ms=$null
@@ -739,9 +1053,11 @@ try {
             $ramBytes = [long]([Microsoft.VisualBasic.Devices.ComputerInfo]::new().TotalPhysicalMemory)
         } catch {}
     }
+    $scenarioFailureCount = @($scenarios | Where-Object { $_.status -eq 'FAILED' }).Count
     $result = [pscustomobject]@{
         schema = 'mdlite-performance-v3'
         timestamp_utc = [DateTime]::UtcNow.ToString('o')
+        measurement_status = if ($scenarioFailureCount -eq 0 -and $p5Failures -eq 0) { 'PASS' } else { 'FAILED_OR_INCOMPLETE' }
         profile = $Profile
         preset = $Preset
         executable_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
@@ -777,6 +1093,7 @@ try {
             encoding = 'P1/P2 alternate UTF-8 no BOM and Windows-932'
         }
         scenarios = $scenarios.ToArray()
+        scenario_failures = $scenarioFailureCount
         p5 = [pscustomobject]@{
             iterations = $P5Iterations
             failures = $p5Failures
@@ -791,6 +1108,7 @@ try {
             $(if ($full) { 'P2 cancellation changes the live query after the first progressive batch, exercising generation cancellation/stale-result discard and recording return to a responsive window.' } else { 'Quick profile skips the P2 GUI cancellation injection; full profile is required for that evidence.' }),
             'P4 opens three image documents and requests three compact windows with PNG/JPEG/static and animated WebP/two GIF periods/SVG. Viewport-offscreen decode suppression and subjective animation quality remain separately unmeasured.',
             'P3 records load, visible input dispatch, forced source-sync/save, and search completion. Resources after process exit cannot be sampled from the exited process; P5 compares repeated final in-process samples instead.',
+            'Performance input uses ASCII WM_CHAR messages; cross-process WM_CHAR does not model Unicode IME composition. Japanese input and composition remain separate GUI/native acceptance evidence.',
             'P5 performs launch, input/save, workspace search, persisted theme application, and clean exit in every iteration. The theme step uses a test-only silent window message that calls the same workspace settings save/reload/application path without opening prompt or result dialogs.'
         )
     }
@@ -798,10 +1116,19 @@ try {
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding utf8
     $result | ConvertTo-Json -Depth 5
-    if ($p5Failures -ne 0) { exit 1 }
+    if ($scenarioFailureCount -ne 0 -or $p5Failures -ne 0) { exit 1 }
 }
 finally {
-    if (Test-Path -LiteralPath $runRoot) { Remove-Item -LiteralPath $runRoot -Recurse -Force }
+    if (Test-Path -LiteralPath $runRoot) {
+        $resolvedRunRoot = [IO.Path]::GetFullPath($runRoot)
+        $runRootLeaf = Split-Path -Leaf $resolvedRunRoot
+        if ($resolvedRunRoot.StartsWith($tempRootPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+            $runRootLeaf -match '^mdlite-performance-[0-9a-f]{32}$') {
+            Remove-Item -LiteralPath $resolvedRunRoot -Recurse -Force
+        } else {
+            Write-Warning "Refusing to remove an unexpected performance fixture path: $resolvedRunRoot"
+        }
+    }
     if ($null -eq $previousCrashUiSetting) {
         Remove-Item Env:MDLITE_TEST_NO_CRASH_UI -ErrorAction SilentlyContinue
     } else {

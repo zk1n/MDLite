@@ -46,8 +46,13 @@ void TestDefaultAndMutation() {
         "Outline defaults to right top");
   Check(layout.Find(mdlite::PanelId::Git)->slot == mdlite::PanelSlot::RightBottom,
         "Git defaults to right bottom");
-  Check(layout.Find(mdlite::PanelId::Calendar)->hidden,
-        "Calendar starts hidden in the compact default layout");
+  Check(layout.Find(mdlite::PanelId::Explorer)->width == 308.0 &&
+            layout.Find(mdlite::PanelId::Calendar)->width == 308.0 &&
+            layout.Find(mdlite::PanelId::Outline)->width == 368.0 &&
+            layout.Find(mdlite::PanelId::Git)->width == 368.0,
+        "default panel widths match the approved editor proportions");
+  Check(!layout.Find(mdlite::PanelId::Calendar)->hidden,
+        "Calendar is visible in the default left bottom slot");
 
   Check(layout.Move(mdlite::PanelId::Explorer, mdlite::PanelSlot::RightTop, error),
         "moving onto a panel swaps slots");

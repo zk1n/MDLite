@@ -149,6 +149,17 @@ bool ParseGitStatusPorcelain(std::wstring_view output, GitPanelStatus& status,
   return true;
 }
 
+bool IsGitResultCurrent(
+    std::uint64_t result_generation,
+    const std::filesystem::path& result_workspace,
+    std::uint64_t current_generation,
+    const std::filesystem::path& active_workspace,
+    const std::filesystem::path& requested_workspace) {
+  return result_generation == current_generation &&
+         result_workspace == active_workspace &&
+         result_workspace == requested_workspace;
+}
+
 std::optional<GitCommand> BuildGitCommand(const GitActionRequest& request,
                                            std::wstring& error) {
   error.clear();
@@ -159,20 +170,12 @@ std::optional<GitCommand> BuildGitCommand(const GitActionRequest& request,
   GitCommand command;
   switch (request.operation) {
     case GitOperation::Stage:
-      command.arguments = {L"add", L"--"};
+      command.arguments = {L"--literal-pathspecs", L"add", L"--"};
       command.description = L"Git stage";
       break;
     case GitOperation::Unstage:
-      command.arguments = {L"restore", L"--staged", L"--"};
+      command.arguments = {L"--literal-pathspecs", L"restore", L"--staged", L"--"};
       command.description = L"Git unstage";
-      break;
-    case GitOperation::Commit:
-      if (Trim(request.commit_message).empty()) {
-        error = L"Git commitには空でないメッセージが必要です。";
-        return std::nullopt;
-      }
-      command.arguments = {L"commit", L"-m", request.commit_message, L"--"};
-      command.description = L"Git commit";
       break;
   }
   for (const auto& path : request.paths) {
@@ -212,11 +215,12 @@ GitPanelStatus GitPanelModel::Refresh(void* cancellation_event) const {
                root_result.output.empty() ? L"Git repositoryを確認できません。" : root_result.output);
     return status;
   }
-  status.repository_root = std::filesystem::path(Trim(root_result.output));
+  const auto repository_root = std::filesystem::path(Trim(root_result.output));
 
   ProcessResult status_result;
   if (!RunGit(git_executable_, workspace_,
-              {L"-C", workspace_.wstring(), L"status", L"--porcelain=v1", L"--branch", L"-z"},
+              {L"-C", workspace_.wstring(), L"status", L"--porcelain=v1", L"--branch", L"-z",
+               L"--untracked-files=all"},
               cancellation_event, status_result, error)) {
     SetFailure(status, GitPanelState::Error, error);
     return status;
@@ -227,10 +231,17 @@ GitPanelStatus GitPanelModel::Refresh(void* cancellation_event) const {
                status_result.output.empty() ? L"Git statusを取得できません。" : status_result.output);
     return status;
   }
+  if (status_result.truncated || status_result.output.empty() ||
+      status_result.output.back() != L'\0') {
+    SetFailure(status, GitPanelState::Error,
+               L"Git statusの出力が上限を超えたか不完全なため、一覧を更新できません。範囲を絞って再試行してください。");
+    return status;
+  }
   if (!ParseGitStatusPorcelain(status_result.output, status, error)) {
     SetFailure(status, GitPanelState::Error, error);
     return status;
   }
+  status.repository_root = repository_root;
 
   ProcessResult remote_result;
   if (!RunGit(git_executable_, workspace_, {L"-C", workspace_.wstring(), L"remote"},
@@ -261,17 +272,127 @@ GitOperationResult GitPanelModel::Execute(const GitActionRequest& request,
     result.error = L"git.exeが見つかりません。";
     return result;
   }
+  ProcessResult root_result;
   std::wstring process_error;
+  if (!RunGit(git_executable_, workspace_,
+              {L"-C", workspace_.wstring(), L"rev-parse", L"--show-toplevel"},
+              cancellation_event, root_result, process_error)) {
+    result.state = GitPanelState::Error;
+    result.error = std::move(process_error);
+    return result;
+  }
+  if (root_result.exit_code != 0) {
+    result.state = IsNoRepositoryMessage(root_result.output) ? GitPanelState::NoRepository
+                                                             : GitPanelState::Error;
+    result.error = root_result.output.empty() ? L"Git repositoryを確認できません。"
+                                              : std::move(root_result.output);
+    return result;
+  }
+  const auto repository_root = std::filesystem::path(Trim(root_result.output));
   result.state = GitPanelState::OperationInProgress;
-  std::vector<std::wstring> arguments{L"-C", workspace_.wstring()};
-  arguments.insert(arguments.end(), command->arguments.begin(), command->arguments.end());
-  const bool started = RunGit(git_executable_, workspace_, arguments, cancellation_event,
+  std::vector<std::wstring> operation_arguments = command->arguments;
+  if (request.operation == GitOperation::Unstage) {
+    ProcessResult head;
+    const bool checked_head = RunGit(
+        git_executable_, repository_root,
+        {L"-C", repository_root.wstring(), L"rev-parse", L"--verify", L"HEAD"},
+        cancellation_event, head, process_error);
+    if (!checked_head) {
+      result.state = GitPanelState::Error;
+      result.error = std::move(process_error);
+      return result;
+    }
+    if (head.exit_code != 0) {
+      if (head.output.find(L"Needed a single revision") == std::wstring::npos) {
+        result.state = GitPanelState::Error;
+        result.error = head.output.empty() ? L"Git HEADを確認できません。" : head.output;
+        return result;
+      }
+      operation_arguments = {L"--literal-pathspecs", L"rm", L"--cached", L"--quiet", L"--"};
+      for (const auto& path : request.paths) operation_arguments.push_back(GitPathArgument(path));
+    }
+  }
+  std::vector<std::wstring> arguments{L"-C", repository_root.wstring()};
+  arguments.insert(arguments.end(), operation_arguments.begin(), operation_arguments.end());
+  const bool started = RunGit(git_executable_, repository_root, arguments, cancellation_event,
                               result.process, process_error);
   result.state = started && result.process.exit_code == 0 ? GitPanelState::Ready
                                                            : GitPanelState::Error;
   if (!started) result.error = process_error;
   else if (!result.process.output.empty()) result.error = result.process.output;
   else if (result.state == GitPanelState::Error) result.error = L"Git操作に失敗しました。";
+  return result;
+}
+
+GitFileDiffResult GitPanelModel::DiffFile(const std::filesystem::path& path,
+                                          void* cancellation_event) const {
+  GitFileDiffResult result;
+  const std::wstring value = GitPathArgument(path);
+  if (!IsPathSafe(value)) {
+    result.error = L"Git diffの対象pathはrepository相対の明示pathにしてください。";
+    return result;
+  }
+  if (git_executable_.empty()) {
+    result.error = L"git.exeが見つかりません。";
+    return result;
+  }
+
+  GitPanelStatus status = Refresh(cancellation_event);
+  if (status.state != GitPanelState::Ready && status.state != GitPanelState::NoRemote) {
+    result.error = status.error.empty() ? L"Git repositoryを確認できません。" : status.error;
+    return result;
+  }
+  const auto selected = std::find_if(status.files.begin(), status.files.end(),
+                                     [&](const GitFileStatus& file) {
+                                       return GitPathArgument(file.path) == value;
+                                     });
+  if (selected == status.files.end()) {
+    result.error = L"選択したpathにGit変更がありません。";
+    return result;
+  }
+
+  const auto run_diff = [&](std::vector<std::wstring> arguments,
+                            bool accept_no_index_difference) {
+    arguments.insert(arguments.begin(), L"--literal-pathspecs");
+    arguments.insert(arguments.begin() + 2, L"--no-ext-diff");
+    arguments.insert(arguments.begin() + 3, L"--no-textconv");
+    ProcessResult process;
+    std::wstring process_error;
+    if (!RunGit(git_executable_, status.repository_root, arguments,
+                cancellation_event, process, process_error)) {
+      result.error = std::move(process_error);
+      return false;
+    }
+    if (process.exit_code != 0 && !(accept_no_index_difference && process.exit_code == 1 &&
+                                   !process.output.empty())) {
+      result.error = process.output.empty() ? L"Git diffを取得できません。" : process.output;
+      return false;
+    }
+    result.diff += process.output;
+    result.truncated = result.truncated || process.truncated;
+    return true;
+  };
+
+  ProcessResult head;
+  std::wstring process_error;
+  if (!RunGit(git_executable_, status.repository_root,
+              {L"rev-parse", L"--verify", L"HEAD"}, cancellation_event,
+              head, process_error)) {
+    result.error = std::move(process_error);
+    return result;
+  }
+  const bool has_head = head.exit_code == 0;
+  if (selected->untracked) {
+    if (!run_diff({L"diff", L"--no-index", L"--", L"/dev/null", value}, true)) return result;
+  } else if (has_head) {
+    if (!run_diff({L"diff", L"HEAD", L"--", value}, false)) return result;
+  } else {
+    if (selected->staged &&
+        !run_diff({L"diff", L"--cached", L"--", value}, false)) return result;
+    if (selected->unstaged &&
+        !run_diff({L"diff", L"--", value}, false)) return result;
+  }
+  result.succeeded = true;
   return result;
 }
 

@@ -50,10 +50,14 @@ add_library(mdlite_core
   src/calendar/JapaneseHolidays.h
   src/calendar/CalendarDayIndex.cpp
   src/calendar/CalendarDayIndex.h
+  src/calendar/CalendarView.cpp
+  src/calendar/CalendarView.h
   src/core/Document.cpp
   src/core/Document.h
   src/editor/EditorAdapter.cpp
   src/editor/EditorAdapter.h
+  src/editor/RichEditTableAdapter.cpp
+  src/editor/RichEditTableAdapter.h
   src/git/Conflict.cpp
   src/git/Conflict.h
   src/git/GitPanel.cpp
@@ -80,7 +84,7 @@ add_library(mdlite_core
 target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mdlite_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite winhttp webp webpdemux
+target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite webp webpdemux
   d2d1 d3d11 dxgi)
 
 add_executable(MDLite WIN32
@@ -88,14 +92,18 @@ add_executable(MDLite WIN32
   src/main.cpp
   src/app/Application.cpp
   src/app/Application.h
+  src/app/DiagnosticsView.cpp
+  src/app/DiagnosticsView.h
 )
 # Application is constructed by value in wWinMain; its stack layout must be
 # rebuilt whenever the class or EffectiveSettings layout changes.
 set_source_files_properties(src/main.cpp PROPERTIES
   OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/app/Application.h;${CMAKE_CURRENT_SOURCE_DIR}/src/settings/Settings.h")
-target_compile_definitions(MDLite PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(MDLite PRIVATE
+  UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+  "MDLITE_VERSION=L\"${PROJECT_VERSION}\"")
 target_compile_options(MDLite PRIVATE /W4 /permissive- /utf-8 /EHsc)
-target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs dwmapi wer)
+target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwapi ole32 uuid windowscodecs dwmapi imm32 psapi wer uxtheme)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -114,6 +122,11 @@ if(BUILD_TESTING)
   target_compile_options(mdlite_table_interaction_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   target_link_libraries(mdlite_table_interaction_tests PRIVATE mdlite_core)
   add_test(NAME mdlite_table_interaction_tests COMMAND mdlite_table_interaction_tests)
+  add_executable(mdlite_richedit_table_tests tests/NativeRichEditTableTests.cpp)
+  target_compile_definitions(mdlite_richedit_table_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_richedit_table_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_richedit_table_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_richedit_table_tests COMMAND mdlite_richedit_table_tests)
   add_executable(mdlite_git_panel_tests tests/GitPanelModelTests.cpp)
   target_compile_definitions(mdlite_git_panel_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(mdlite_git_panel_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -124,6 +137,11 @@ if(BUILD_TESTING)
   target_compile_options(mdlite_calendar_day_index_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   target_link_libraries(mdlite_calendar_day_index_tests PRIVATE mdlite_core)
   add_test(NAME mdlite_calendar_day_index_tests COMMAND mdlite_calendar_day_index_tests)
+  add_executable(mdlite_calendar_view_tests tests/CalendarViewTests.cpp)
+  target_compile_definitions(mdlite_calendar_view_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_calendar_view_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_calendar_view_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_calendar_view_tests COMMAND mdlite_calendar_view_tests)
 endif()
 
 install(TARGETS MDLite RUNTIME DESTINATION .)

@@ -2,6 +2,7 @@
 
 #include "process/ProcessRunner.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -22,7 +23,6 @@ enum class GitPanelState {
 enum class GitOperation {
   Stage,
   Unstage,
-  Commit,
 };
 
 struct GitFileStatus {
@@ -55,10 +55,18 @@ struct GitPanelStatus {
 bool ParseGitStatusPorcelain(std::wstring_view output, GitPanelStatus& status,
                              std::wstring& error);
 
+// A completed asynchronous Git result is current only when its generation and
+// both workspace identities still match the active request.
+bool IsGitResultCurrent(
+    std::uint64_t result_generation,
+    const std::filesystem::path& result_workspace,
+    std::uint64_t current_generation,
+    const std::filesystem::path& active_workspace,
+    const std::filesystem::path& requested_workspace);
+
 struct GitActionRequest {
   GitOperation operation{GitOperation::Stage};
   std::vector<std::filesystem::path> paths;
-  std::wstring commit_message;
 };
 
 struct GitCommand {
@@ -66,7 +74,7 @@ struct GitCommand {
   std::wstring description;
 };
 
-// Every mutating action requires an explicit, repository-relative path list.
+// Builds an explicit Stage or Unstage command for repository-relative paths.
 // This function never emits `--all`, `.`, or an empty pathspec.
 std::optional<GitCommand> BuildGitCommand(const GitActionRequest& request,
                                            std::wstring& error);
@@ -75,6 +83,13 @@ struct GitOperationResult {
   GitPanelState state{GitPanelState::Error};
   ProcessResult process;
   std::wstring error;
+};
+
+struct GitFileDiffResult {
+  bool succeeded{};
+  std::wstring diff;
+  std::wstring error;
+  bool truncated{};
 };
 
 class GitPanelModel final {
@@ -88,6 +103,12 @@ class GitPanelModel final {
   // Executes only one validated explicit action. It never saves documents or
   // stages, commits, or pushes implicitly.
   GitOperationResult Execute(const GitActionRequest& request,
+                             void* cancellation_event = nullptr) const;
+
+  // Read-only diff for one explicit repository-relative file. Untracked files
+  // use `diff --no-index /dev/null`; unborn repositories return staged and
+  // worktree diffs in separate sections.
+  GitFileDiffResult DiffFile(const std::filesystem::path& path,
                              void* cancellation_event = nullptr) const;
 
   static GitPanelStatus OperationInProgress(const GitPanelStatus& current);

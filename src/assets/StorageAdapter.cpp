@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -41,6 +42,210 @@ void Replace(std::wstring& value, std::wstring_view token, std::wstring_view rep
     value.replace(position, token.size(), replacement);
     position += replacement.size();
   }
+}
+
+bool IsHex(wchar_t character) {
+  return (character >= L'0' && character <= L'9') ||
+         (character >= L'a' && character <= L'f') ||
+         (character >= L'A' && character <= L'F');
+}
+
+bool IsUriUnreserved(wchar_t character) {
+  return (character >= L'A' && character <= L'Z') ||
+         (character >= L'a' && character <= L'z') ||
+         (character >= L'0' && character <= L'9') ||
+         character == L'-' || character == L'.' || character == L'_' || character == L'~';
+}
+
+bool IsUriSubDelimiter(wchar_t character) {
+  return character == L'!' || character == L'$' || character == L'&' ||
+         character == L'\'' || character == L'(' || character == L')' ||
+         character == L'*' || character == L'+' || character == L',' ||
+         character == L';' || character == L'=';
+}
+
+bool IsValidPort(std::wstring_view port) {
+  if (port.empty()) return false;
+  unsigned value{};
+  for (const wchar_t character : port) {
+    if (character < L'0' || character > L'9') return false;
+    const unsigned digit = static_cast<unsigned>(character - L'0');
+    if (value > (65535U - digit) / 10U) return false;
+    value = value * 10U + digit;
+  }
+  return value != 0;
+}
+
+bool IsValidRegName(std::wstring_view host) {
+  if (host.empty()) return false;
+  for (std::size_t index{}; index < host.size(); ++index) {
+    const wchar_t character = host[index];
+    if (character == L'%') {
+      if (index + 2 >= host.size() || !IsHex(host[index + 1]) || !IsHex(host[index + 2]))
+        return false;
+      index += 2;
+    } else if (!IsUriUnreserved(character) && !IsUriSubDelimiter(character)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsValidIpv4Address(std::wstring_view address) {
+  std::size_t cursor{};
+  for (unsigned octet_index{}; octet_index < 4; ++octet_index) {
+    const auto separator = address.find(L'.', cursor);
+    const auto end = separator == std::wstring_view::npos ? address.size() : separator;
+    const auto octet = address.substr(cursor, end - cursor);
+    if (octet.empty() || octet.size() > 3 || (octet.size() > 1 && octet.front() == L'0'))
+      return false;
+    unsigned value{};
+    for (const wchar_t character : octet) {
+      if (character < L'0' || character > L'9') return false;
+      value = value * 10U + static_cast<unsigned>(character - L'0');
+    }
+    if (value > 255U || (octet_index < 3 && separator == std::wstring_view::npos) ||
+        (octet_index == 3 && separator != std::wstring_view::npos)) return false;
+    cursor = end + 1;
+  }
+  return cursor == address.size() + 1;
+}
+
+bool CountIpv6Groups(std::wstring_view part, bool allow_ipv4_tail, unsigned& groups) {
+  if (part.empty()) return true;
+  if (part.front() == L':' || part.back() == L':') return false;
+  std::size_t cursor{};
+  while (cursor < part.size()) {
+    const auto separator = part.find(L':', cursor);
+    const auto end = separator == std::wstring_view::npos ? part.size() : separator;
+    const auto group = part.substr(cursor, end - cursor);
+    if (group.empty()) return false;
+    if (group.find(L'.') != std::wstring_view::npos) {
+      if (!allow_ipv4_tail || separator != std::wstring_view::npos ||
+          !IsValidIpv4Address(group)) return false;
+      groups += 2;
+    } else {
+      if (group.size() > 4 ||
+          !std::ranges::all_of(group, [](wchar_t character) { return IsHex(character); }))
+        return false;
+      ++groups;
+    }
+    if (separator == std::wstring_view::npos) break;
+    cursor = separator + 1;
+  }
+  return true;
+}
+
+bool IsValidIpv6Address(std::wstring_view address) {
+  const auto compression = address.find(L"::");
+  unsigned groups{};
+  if (compression == std::wstring_view::npos) {
+    if (address.empty() || address.front() == L':' || address.back() == L':' ||
+        !CountIpv6Groups(address, true, groups)) return false;
+    return groups == 8;
+  }
+  if (address.find(L"::", compression + 2) != std::wstring_view::npos) return false;
+  const auto left = address.substr(0, compression);
+  const auto right = address.substr(compression + 2);
+  if (!CountIpv6Groups(left, false, groups) ||
+      !CountIpv6Groups(right, true, groups)) return false;
+  return groups < 8;
+}
+
+bool IsValidIpvFuture(std::wstring_view literal) {
+  if (literal.size() < 4 || (literal.front() != L'v' && literal.front() != L'V')) return false;
+  const auto dot = literal.find(L'.', 1);
+  if (dot == std::wstring_view::npos || dot == 1 || dot + 1 == literal.size()) return false;
+  for (std::size_t index = 1; index < dot; ++index) {
+    if (!IsHex(literal[index])) return false;
+  }
+  for (std::size_t index = dot + 1; index < literal.size(); ++index) {
+    if (!IsUriUnreserved(literal[index]) && !IsUriSubDelimiter(literal[index]) &&
+        literal[index] != L':') return false;
+  }
+  return true;
+}
+
+bool IsValidIpLiteral(std::wstring_view literal) {
+  const auto zone_marker = literal.find(L"%25");
+  if (zone_marker != std::wstring_view::npos) {
+    if (literal.front() == L'v' || literal.front() == L'V') return false;
+    const auto zone = literal.substr(zone_marker + 3);
+    if (zone.empty()) return false;
+    for (std::size_t index{}; index < zone.size(); ++index) {
+      if (IsUriUnreserved(zone[index])) continue;
+      if (zone[index] != L'%' || index + 2 >= zone.size() ||
+          !IsHex(zone[index + 1]) || !IsHex(zone[index + 2])) return false;
+      index += 2;
+    }
+    literal = literal.substr(0, zone_marker);
+  }
+  if (literal.empty()) return false;
+  return literal.front() == L'v' || literal.front() == L'V'
+      ? IsValidIpvFuture(literal) : IsValidIpv6Address(literal);
+}
+
+bool IsValidUriPchar(wchar_t character) {
+  return IsUriUnreserved(character) || IsUriSubDelimiter(character) ||
+         character == L':' || character == L'@';
+}
+
+bool IsValidUriRemainder(std::wstring_view remainder) {
+  bool in_fragment{};
+  for (std::size_t index{}; index < remainder.size(); ++index) {
+    const wchar_t character = remainder[index];
+    if (character == L'%') {
+      if (index + 2 >= remainder.size() || !IsHex(remainder[index + 1]) ||
+          !IsHex(remainder[index + 2])) return false;
+      index += 2;
+    } else if (character == L'#') {
+      if (in_fragment) return false;
+      in_fragment = true;
+    } else if (character != L'/' && character != L'?' && !IsValidUriPchar(character)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsValidHttpsReference(std::wstring_view reference) {
+  // The adapter result is inserted into Markdown verbatim, so require a syntactically valid
+  // absolute HTTPS URI before accepting it as a successful upload reference.
+  constexpr std::wstring_view prefix = L"https://";
+  if (reference.size() <= prefix.size()) return false;
+  for (std::size_t index{}; index < prefix.size(); ++index) {
+    const wchar_t character = reference[index];
+    const wchar_t folded = character >= L'A' && character <= L'Z'
+        ? static_cast<wchar_t>(character + (L'a' - L'A')) : character;
+    if (folded != prefix[index]) return false;
+  }
+  const auto authority_end = reference.find_first_of(L"/?#", prefix.size());
+  const auto authority = reference.substr(
+      prefix.size(), authority_end == std::wstring_view::npos
+          ? reference.size() - prefix.size() : authority_end - prefix.size());
+  if (authority.empty() || authority.front() == L'@' || authority.front() == L':') return false;
+  if (authority.find(L'@') != std::wstring_view::npos) return false;
+  if (authority.front() == L'[') {
+    const auto closing_bracket = authority.find(L']');
+    if (closing_bracket == std::wstring_view::npos || closing_bracket == 1 ||
+        (closing_bracket + 1 < authority.size() && authority[closing_bracket + 1] != L':'))
+      return false;
+    if (!IsValidIpLiteral(authority.substr(1, closing_bracket - 1))) return false;
+    if (closing_bracket + 1 < authority.size() &&
+        !IsValidPort(authority.substr(closing_bracket + 2))) return false;
+  } else {
+    const auto port_separator = authority.find(L':');
+    if (port_separator != std::wstring_view::npos) {
+      if (authority.find(L':', port_separator + 1) != std::wstring_view::npos ||
+          !IsValidPort(authority.substr(port_separator + 1))) return false;
+    }
+    const auto host = authority.substr(0, port_separator);
+    if (!IsValidRegName(host)) return false;
+  }
+
+  const auto remainder = authority_end == std::wstring_view::npos
+      ? std::wstring_view{} : reference.substr(authority_end);
+  return IsValidUriRemainder(remainder);
 }
 
 }  // namespace
@@ -108,7 +313,10 @@ bool UploadWithStorageAdapter(const StorageAdapter& adapter, const std::filesyst
   std::wistringstream lines(result.process.output);
   std::getline(lines, result.reference);
   while (!result.reference.empty() && (result.reference.back() == L'\r' || result.reference.back() == L'\n')) result.reference.pop_back();
-  if (!result.reference.starts_with(L"https://")) { error = L"adapterはhttps参照を1行目へ返す必要があります。"; return false; }
+  if (!IsValidHttpsReference(result.reference)) {
+    error = L"adapterは空白や不正な% escapeを含まない絶対https URIを1行目へ返す必要があります。";
+    return false;
+  }
   return true;
 }
 

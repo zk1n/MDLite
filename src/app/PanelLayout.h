@@ -67,13 +67,10 @@ class PanelLayout {
 
  private:
   std::array<PanelState, 4> panels_{{
-      {PanelId::Explorer, PanelSlot::LeftTop, 280.0, 240.0, false, false},
-      // Keep the secondary calendar collapsed from the first launch, matching
-      // the native editor's established compact initial view. The View menu
-      // can reveal it without changing the source document.
-      {PanelId::Calendar, PanelSlot::LeftBottom, 280.0, 240.0, false, true},
-      {PanelId::Outline, PanelSlot::RightTop, 280.0, 240.0, false, false},
-      {PanelId::Git, PanelSlot::RightBottom, 280.0, 240.0, false, false},
+      {PanelId::Explorer, PanelSlot::LeftTop, 308.0, 240.0, false, false},
+      {PanelId::Calendar, PanelSlot::LeftBottom, 308.0, 240.0, false, false},
+      {PanelId::Outline, PanelSlot::RightTop, 368.0, 240.0, false, false},
+      {PanelId::Git, PanelSlot::RightBottom, 368.0, 240.0, false, false},
   }};
 };
 

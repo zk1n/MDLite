@@ -83,6 +83,10 @@ bool IsWithin(const std::filesystem::path& root, const std::filesystem::path& ca
   return true;
 }
 
+bool HasParentPathComponent(const std::filesystem::path& path) {
+  return std::ranges::any_of(path, [](const auto& component) { return component == L".."; });
+}
+
 bool AtomicWriteBytes(const std::filesystem::path& path, std::string_view bytes, std::wstring& error) {
   std::filesystem::path temporary = path;
   temporary += L".new";
@@ -323,13 +327,13 @@ bool WorkspaceStore::WriteSessionState(const SessionState& state, std::wstring& 
   for (const auto& recent : state.recent_documents) {
     std::error_code relative_error;
     const auto relative = std::filesystem::relative(recent, root_, relative_error);
-    if (relative_error || relative.empty() || relative.native().starts_with(L"..")) continue;
+    if (relative_error || relative.empty() || HasParentPathComponent(relative)) continue;
     session += L"recent = \"" + relative.generic_wstring() + L"\"\n";
   }
   for (const auto& document : state.documents) {
     std::error_code relative_error;
     const auto relative = std::filesystem::relative(document.path, root_, relative_error);
-    if (relative_error || relative.empty() || relative.native().starts_with(L"..")) continue;
+    if (relative_error || relative.empty() || HasParentPathComponent(relative)) continue;
     session += L"\n[[document]]\npath = \"" + relative.generic_wstring() + L"\"\n" +
                L"selection_begin = " + std::to_wstring(document.selection_begin) + L"\n" +
                L"selection_end = " + std::to_wstring(document.selection_end) + L"\n" +
@@ -339,6 +343,12 @@ bool WorkspaceStore::WriteSessionState(const SessionState& state, std::wstring& 
                L"y = " + std::to_wstring(document.y) + L"\n" +
                L"width = " + std::to_wstring(document.width) + L"\n" +
                L"height = " + std::to_wstring(document.height) + L"\n";
+    if (document.first_visible_source_offset)
+      session += L"first_visible_source_offset = " +
+                 std::to_wstring(*document.first_visible_source_offset) + L"\n";
+    if (document.horizontal_left_edge_source_offset)
+      session += L"horizontal_left_edge_source_offset = " +
+                 std::to_wstring(*document.horizontal_left_edge_source_offset) + L"\n";
   }
   return AtomicWriteUtf8(state_root() / L"session.toml", session, error);
 }
@@ -396,7 +406,7 @@ bool WorkspaceStore::ReadSessionState(SessionState& state, std::wstring& error) 
         const auto candidate = (root_ / normalized).lexically_normal();
         std::error_code filesystem_error;
         if (!relative.is_absolute() && !normalized.empty() &&
-            !normalized.native().starts_with(L"..") &&
+            !HasParentPathComponent(normalized) &&
             std::filesystem::is_regular_file(candidate, filesystem_error))
           state.recent_documents.push_back(candidate);
       }
@@ -415,13 +425,22 @@ bool WorkspaceStore::ReadSessionState(SessionState& state, std::wstring& error) 
       const std::filesystem::path relative(value.substr(1, value.size() - 2));
       if (relative.is_absolute()) continue;
       const auto normalized = relative.lexically_normal();
-      if (normalized.empty() || normalized.native().starts_with(L"..")) continue;
+      if (normalized.empty() || HasParentPathComponent(normalized)) continue;
       const auto candidate = (root_ / normalized).lexically_normal();
       std::error_code filesystem_error;
       if (std::filesystem::is_regular_file(candidate, filesystem_error)) current->path = candidate;
     } else if (key == L"selection_begin") current->selection_begin = static_cast<std::size_t>(std::max(0LL, number(value)));
     else if (key == L"selection_end") current->selection_end = static_cast<std::size_t>(std::max(0LL, number(value)));
     else if (key == L"first_visible_line") current->first_visible_line = static_cast<int>(std::max(0LL, number(value)));
+    else if (key == L"first_visible_source_offset") {
+      const auto offset = number(value, -1);
+      if (offset >= 0) current->first_visible_source_offset = static_cast<std::size_t>(offset);
+    }
+    else if (key == L"horizontal_left_edge_source_offset") {
+      const auto offset = number(value, -1);
+      if (offset >= 0) current->horizontal_left_edge_source_offset =
+          static_cast<std::size_t>(offset);
+    }
     else if (key == L"compact") current->compact = value == L"true";
     else if (key == L"x") current->x = static_cast<int>(number(value));
     else if (key == L"y") current->y = static_cast<int>(number(value));

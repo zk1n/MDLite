@@ -824,6 +824,7 @@ bool InspectImageSafety(const std::filesystem::path& path, bool& safe,
 bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem::path& workspace,
                       const std::filesystem::path& document, AssetImportResult& result,
                       std::wstring& error) {
+  result.created_new_asset = false;
   if (!IsSupportedImage(source) || !std::filesystem::is_regular_file(source)) {
     error = L"PNG、JPEG、GIF、WebP、SVGの画像を選択してください。";
     return false;
@@ -856,19 +857,32 @@ bool ImportImageAsset(const std::filesystem::path& source, const std::filesystem
     result.stored_path = asset_directory /
         (stem + L"_" + std::to_wstring(suffix + 1) + extension);
   }
+  bool created_by_this_import{};
+  const auto cleanup_created_asset = [&] {
+    if (!created_by_this_import) return;
+    std::error_code cleanup_error;
+    std::filesystem::remove(result.stored_path, cleanup_error);
+    created_by_this_import = false;
+  };
   if (!std::filesystem::exists(result.stored_path)) {
     if (!CopyFileW(canonical_source.c_str(), result.stored_path.c_str(), TRUE)) {
       error = L"画像をassetsへ安全にコピーできません。本文にはリンクを挿入していません。";
       return false;
     }
+    created_by_this_import = true;
   }
   const auto relative = std::filesystem::relative(result.stored_path, document.parent_path(), filesystem_error);
   if (filesystem_error) {
+    cleanup_created_asset();
     error = L"文書から画像への相対パスを作成できません。";
     return false;
   }
   result.relative_reference = relative.generic_wstring();
-  if (!InspectImageSafety(result.stored_path, result.safe_to_render, result.safety_message, error)) return false;
+  if (!InspectImageSafety(result.stored_path, result.safe_to_render, result.safety_message, error)) {
+    cleanup_created_asset();
+    return false;
+  }
+  result.created_new_asset = created_by_this_import;
   return true;
 }
 

@@ -1,6 +1,9 @@
 #pragma once
 
+#include "table/Table.h"
+
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,7 +19,9 @@ enum class SpanKind {
   Strike,
   Code,
   CodeFence,
-  Link
+  Link,
+  ListMarker,
+  OrderedListMarker
 };
 
 enum class BlockKind {
@@ -52,6 +57,9 @@ struct ImageReference {
   std::wstring alternate_text;
   std::wstring target;
   unsigned width_dip{};
+  std::size_t target_begin{};
+  std::size_t target_end{};
+  wchar_t target_quote{};
 };
 
 struct LinkReference {
@@ -60,11 +68,6 @@ struct LinkReference {
   std::size_t text_begin{};
   std::size_t text_end{};
   std::wstring target;
-};
-
-struct TableBlock {
-  std::size_t begin{};
-  std::size_t end{};
 };
 
 struct MarkdownBlock {
@@ -78,7 +81,7 @@ struct MarkdownParseResult {
   std::vector<Heading> headings;
   std::vector<ImageReference> images;
   std::vector<LinkReference> links;
-  std::vector<TableBlock> tables;
+  std::vector<GfmTable> tables;
   std::vector<MarkdownBlock> blocks;
 };
 
@@ -89,6 +92,15 @@ struct SectionMoveResult {
 };
 
 MarkdownParseResult ParseMarkdown(std::wstring_view source);
+const ImageReference* FindImageAtSourcePosition(const MarkdownParseResult& parsed,
+                                               std::size_t source_position) noexcept;
+// Rewrites only the parsed image destination, preserving its alt text and all
+// surrounding Markdown/HTML source. HTML attribute values are escaped in place.
+std::optional<std::wstring> ReplaceImageReferenceTarget(
+    std::wstring_view source, const ImageReference& image,
+    std::wstring_view replacement_target);
+std::optional<std::wstring> ResizeHtmlImageWidth(std::wstring_view markup,
+                                                 unsigned width_dip);
 std::vector<ImageReference> ParseMarkdownImages(std::wstring_view source);
 SectionMoveResult MoveHeadingSection(std::wstring_view source, std::size_t source_begin,
                                      std::size_t target_begin);

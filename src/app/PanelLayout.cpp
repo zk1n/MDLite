@@ -121,7 +121,14 @@ struct ParsedPanel {
 
 }  // namespace
 
-PanelLayout PanelLayout::Default() { return PanelLayout{}; }
+PanelLayout PanelLayout::Default() {
+  PanelLayout layout;
+  layout.panels_ = {{{PanelId::Explorer, PanelSlot::LeftTop, 308.0, 240.0, false, false},
+                     {PanelId::Calendar, PanelSlot::LeftBottom, 308.0, 240.0, false, false},
+                     {PanelId::Outline, PanelSlot::RightTop, 368.0, 240.0, false, false},
+                     {PanelId::Git, PanelSlot::RightBottom, 368.0, 240.0, false, false}}};
+  return layout;
+}
 
 PanelState* PanelLayout::Find(PanelId id) noexcept {
   if (!IsEnumValue(id, kPanelIds)) return nullptr;

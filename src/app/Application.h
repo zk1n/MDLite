@@ -1,9 +1,12 @@
 #pragma once
 #include "app/PanelLayout.h"
 
+#include "calendar/CalendarView.h"
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
+#include "editor/RichEditTableAdapter.h"
 #include "git/Conflict.h"
+#include "git/GitPanel.h"
 #include "markdown/Markdown.h"
 #include "profiles/Profiles.h"
 #include "search/Search.h"
@@ -15,6 +18,7 @@
 #include <commctrl.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -37,11 +41,23 @@ class Application {
   void OpenInitialPath(const std::filesystem::path& path);
 
  private:
+  enum class EditorProjectionRebuildResult {
+    Failed,
+    Native,
+    FlatSourceFallback,
+  };
+
   struct DocumentView {
+    using PendingNativeEditKind = EditorEditKind;
+
     struct SourceEdit {
       std::size_t begin{};
       std::wstring before;
       std::wstring after;
+      SourceSelection selection_before;
+      SourceSelection selection_after;
+      // A virtual Markdown cell has no unique plain-text projection offset.
+      std::optional<TableCellIntent> selection_before_virtual_cell;
     };
 
     struct AnimatedImageState {
@@ -79,10 +95,18 @@ class Application {
 
     Document document;
     HWND editor{};
+    SourceSelection suspended_selection{};
+    std::size_t suspended_first_visible_source{};
+    std::optional<std::size_t> suspended_horizontal_left_edge_source;
+    bool suspended_view_state_valid{};
     MarkdownParseResult parse;
     EditorSnapshot editor_snapshot;
     std::uint64_t derived_image_revision{std::numeric_limits<std::uint64_t>::max()};
+    std::uint64_t presentation_revision{std::numeric_limits<std::uint64_t>::max()};
     int active_line{-1};
+    std::size_t active_source_line_begin{std::numeric_limits<std::size_t>::max()};
+    bool active_line_update_pending{};
+    std::uint64_t active_line_update_revision{std::numeric_limits<std::uint64_t>::max()};
     HWND compact_window{};
     std::shared_ptr<WorkspaceStore> workspace_store;
     ULONGLONG autosave_due{};
@@ -97,6 +121,24 @@ class Application {
     bool ime_composing{};
     bool native_edit_in_flight{};
     bool native_edit_pending{};
+    bool native_readback_failed{};
+    bool editor_locked_for_readback{};
+    bool editor_readonly_lock_applied{};
+    bool editor_enabled_before_readback_lock{};
+    bool editor_projection_invalid{};
+    bool flat_source_fallback_pending{};
+    bool flat_source_fallback_retry_used{};
+    unsigned editor_projection_repair_attempts{};
+    unsigned force_editor_readback_failures_for_test{};
+    bool force_markdown_presentation_failure_for_test{};
+    bool force_partial_markdown_presentation_failure_for_test{};
+    std::uint32_t native_projection_failures_for_test{};
+    std::optional<SourceSelection> pending_selection_before;
+    PendingNativeEditKind pending_native_edit_kind{PendingNativeEditKind::Unknown};
+    std::optional<SourceSelection> ime_selection_before;
+    std::optional<TableCellIntent> pending_virtual_table_cell;
+    wchar_t pending_table_high_surrogate{};
+    bool native_tables_ready{};
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;
     bool painting_table_grid{};
@@ -105,6 +147,7 @@ class Application {
   struct TableGridRow {
     std::size_t begin{};
     std::size_t end{};
+    std::size_t source_cell_count{};
     std::vector<TableVisualCell> cells;
     int top{};
     int bottom{};
@@ -117,21 +160,38 @@ class Application {
     std::vector<TableGridRow> rows;
   };
 
+  struct CalendarDetailTarget {
+    std::size_t begin{};
+    std::size_t end{};
+    std::filesystem::path path;
+  };
+
   enum class SaveAllResult { AllSaved, RecoveryOnly, Discarded, Cancelled };
   enum class SaveIntent { UserRequested, BackgroundAutosave };
-  enum class SaveResult { Saved, RecoverySaved, NoChange, Cancelled, Failed };
+  enum class SaveResult { Saved, RecoverySaved, NoChange, Cancelled, ReadbackFailed, Failed };
 
   enum class TableAction { InsertRowBefore, InsertRowAfter, DeleteRow, InsertColumnBefore,
                            InsertColumnAfter, DeleteColumn };
+  enum class SplitterDrag { None, LeftWidth, RightWidth, LeftHeight, RightHeight };
 
   static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   static LRESULT CALLBACK CompactWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   static LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                           UINT_PTR subclass_id, DWORD_PTR reference);
-  static LRESULT CALLBACK CalendarSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
-                                            UINT_PTR subclass_id, DWORD_PTR reference);
   static LRESULT CALLBACK TreeDragSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                             UINT_PTR subclass_id, DWORD_PTR reference);
+  static LRESULT CALLBACK PanelHeaderSubclass(HWND window, UINT message, WPARAM wparam,
+                                               LPARAM lparam, UINT_PTR subclass_id,
+                                               DWORD_PTR reference);
+  static LRESULT CALLBACK ChromeBarSubclass(HWND window, UINT message, WPARAM wparam,
+                                             LPARAM lparam, UINT_PTR subclass_id,
+                                             DWORD_PTR reference);
+  static LRESULT CALLBACK TabStripSubclass(HWND window, UINT message, WPARAM wparam,
+                                            LPARAM lparam, UINT_PTR subclass_id,
+                                            DWORD_PTR reference);
+  static LRESULT CALLBACK CalendarDetailsSubclass(HWND window, UINT message, WPARAM wparam,
+                                                   LPARAM lparam, UINT_PTR subclass_id,
+                                                   DWORD_PTR reference);
   LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
 
   void CreateControls();
@@ -141,7 +201,17 @@ class Application {
   void MovePanelToSlot(PanelId id, PanelSlot slot);
   void MoveFocusedPanelToSlot(PanelSlot slot);
   void ResizeFocusedPanel(double delta);
+  void ResizeFocusedPanelHeight(double delta);
   void UpdatePanelHeaders();
+  void DrawChromeButton(const DRAWITEMSTRUCT& draw) const;
+  void DrawTabItem(const DRAWITEMSTRUCT& draw) const;
+  void ActivatePanel(PanelId id);
+  void GoToCalendarToday();
+  void SetStatusSegments(std::array<std::wstring, 4> segments);
+  std::vector<std::filesystem::path> SelectedGitPaths() const;
+  void RenderGitPanel();
+  void UpdateGitPanelActions();
+  void ShowSelectedGitDiff();
   void CreateMenuBar();
   void ApplyChromeTheme();
   void SetStatusText(std::wstring_view text);
@@ -154,11 +224,16 @@ class Application {
   void QuickOpen();
   void OpenWorkspace(const std::filesystem::path& path);
   void PopulateWorkspaceTree();
+  void RefreshCalendarAfterWorkspaceMutation();
   void AddTreeDirectory(HTREEITEM parent, const std::filesystem::path& directory, int depth);
   void OpenDocument(const std::filesystem::path& path);
   void OpenDocumentView(Document document, std::wstring tab_name);
   void OpenRecoverySnapshot(const std::filesystem::path& path);
   void ActivateDocument(std::size_t index);
+  bool EnsureEditor(DocumentView& view);
+  bool SuspendEditor(DocumentView& view);
+  void CaptureEditorViewState(DocumentView& view);
+  void RestoreEditorViewState(DocumentView& view);
   SaveResult SaveDocument(DocumentView& view, SaveIntent intent);
   SaveResult SaveDocumentAs(DocumentView& view);
   void ReloadDocumentFromDisk();
@@ -167,25 +242,62 @@ class Application {
   bool SaveAllRequired(bool interactive);
   DocumentView* FindDocumentView(HWND editor);
   void SelectDocumentForEditor(HWND editor);
-  void ApplySourceTextWithUndo(DocumentView& view, std::wstring text, bool record_history = true);
+  bool ApplySourceTextWithUndo(DocumentView& view, std::wstring text, bool record_history = true,
+                               std::optional<SourceSelection> selection_after = std::nullopt,
+                               std::optional<SourceSelection> selection_before = std::nullopt,
+                               std::optional<TableCellIntent> selection_before_virtual_cell =
+                                   std::nullopt);
+  bool ConsumeNativeProjectionFailureForTest(DocumentView& view, std::uint32_t stage);
+  bool SetEditorFlatTextVerified(DocumentView& view, const EditorSnapshot& expected,
+                                 std::uint32_t test_failure_stage = 0);
+  void QuarantineEditorProjection(DocumentView& view, SourceSelection selection,
+                                  std::wstring_view status_text);
+  void ProcessDeferredEditorRepairs();
   bool ApplySourceHistory(DocumentView& view, bool redo);
+  bool PrepareTableProjectionForNativeMutation(DocumentView& view, UINT message,
+                                               WPARAM wparam);
+  void UpdatePendingVirtualTableCellFromCaret(DocumentView& view,
+                                              const POINT* click_point = nullptr);
+  bool InsertTextIntoPendingVirtualTableCell(DocumentView& view,
+                                              std::wstring_view text,
+                                              std::optional<SourceSelection> selection_before = std::nullopt);
+  SourceSelection CaptureSourceSelection(HWND editor, const EditorSnapshot& snapshot) const;
+  std::optional<std::size_t> CaptureVisibleLeftEdgeSourceOffset(
+      HWND editor, const EditorSnapshot& snapshot) const;
+  std::optional<POINT> SourceAnchoredScrollPosition(
+      HWND editor, const EditorSnapshot& snapshot, std::size_t viewport_source_offset) const;
+  SourceSelection CaptureViewSelection(HWND editor, const EditorSnapshot& snapshot) const;
+  void RestoreSourceSelection(HWND editor, const EditorSnapshot& snapshot,
+                              SourceSelection selection) const;
+  bool RestoreVirtualTableCellCaret(DocumentView& view,
+                                    const TableCellIntent& intent);
+  RichEditTableStyle TableStyleForEditor(HWND editor) const;
+  EditorProjectionRebuildResult RebuildEditorProjection(
+      DocumentView& view, EditorSnapshot target, SourceSelection selection);
   void OnEditorChanged(HWND editor);
   void CommitPendingNativeEdit(DocumentView& view);
   void SchedulePresentation(DocumentView& view);
-  void SyncDocumentFromEditor(DocumentView& view);
-  void ApplyMarkdownPresentation(DocumentView& view, bool force);
+  void ScheduleFlatSourceFallbackRetry(DocumentView& view);
+  void QueueActiveLinePresentation(DocumentView& view);
+  void ApplyPendingActiveLinePresentations();
+  void ApplyActiveLinePresentation(DocumentView& view);
+  bool SyncDocumentFromEditor(DocumentView& view);
+  void ApplyMarkdownPresentation(
+      DocumentView& view, bool force,
+      std::optional<SourceSelection> source_selection = std::nullopt);
   void InvalidateTableGrid(DocumentView& view);
   std::vector<TableGridGeometry> BuildTableGridGeometry(const DocumentView& view,
                                                         const RECT& client,
                                                         HDC metrics_dc = nullptr) const;
-  std::optional<std::size_t> HitTestTableCell(const DocumentView& view, POINT point) const;
-  void DrawTableGrid(const DocumentView& view, HDC paint_dc, const RECT& clip);
+  std::optional<TableCellIntent> HitTestTableCell(const DocumentView& view, POINT point) const;
+  void DrawTableGrid(DocumentView& view, HDC paint_dc, const RECT& clip);
   void RefreshDerivedImages(DocumentView& view);
   void AdvanceAnimatedImages(DocumentView& view, ULONGLONG now);
   static bool ReadImageFileIdentity(const std::filesystem::path& path,
                                     DocumentView::ImageFileIdentity& identity);
   void RebuildOutline(const DocumentView& view);
-  bool EditorText(HWND editor, const EditorSnapshot& snapshot, std::wstring& text) const;
+  bool EditorText(HWND editor, EditorSnapshot& snapshot, std::wstring& text,
+                  std::wstring* raw_native_text = nullptr) const;
   void UpdateStatus();
   void ShowFindBar();
   SearchQuery SearchQueryFromFindBar() const;
@@ -201,7 +313,12 @@ class Application {
   void CreateProfile(BuiltInProfile profile);
   void CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date);
   void OpenSelectedCalendarDate();
+  void OpenCalendarDate(CalendarDate date);
+  bool OpenCalendarDetailAtOffset(std::size_t offset);
   void UpdateCalendarDetails(const SYSTEMTIME& date);
+  void UpdateCalendarDetails(CalendarDate date);
+  void UpdateCalendarViewTheme();
+  void UpdateCalendarViewMarkers();
   void CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date);
   void ApplyTableAction(TableAction action);
   void MoveOutlineSection(std::size_t source_begin, std::size_t target_begin);
@@ -218,6 +335,15 @@ class Application {
   void ShowSelectedInExplorer();
   void SetWorkspaceTrust(bool trusted);
   void RunGitStatus();
+  void StartGitStatusRefresh();
+  void CompleteGitStatus(void* payload);
+  void CompleteGitStatusDeliveryFailure();
+  void StopGitStatusWorker();
+  void StartGitAction(int command, std::filesystem::path git_path,
+                      GitActionRequest request);
+  void CompleteGitAction(void* payload);
+  void CompleteGitActionDeliveryFailure();
+  void StopGitActionWorker();
   void RunGitAction(int command);
   bool QueryGitConflicts(std::vector<std::filesystem::path>& files, std::wstring& error);
   void ShowGitConflicts();
@@ -229,6 +355,8 @@ class Application {
   void OpenWorkspaceSettingsFiles();
   void ManageProfiles();
   void ShowCommandPalette();
+  void ShowDiagnostics();
+  void RecordDiagnosticSummary(std::wstring_view summary);
   void LoadAndApplySettings();
   void ApplySettings();
   void RebuildAccelerators();
@@ -238,11 +366,8 @@ class Application {
   void ResizeImageAtCaret(unsigned width_dip);
   void OpenLinkAtSourcePosition(DocumentView& view, std::size_t source_position, bool activate);
   void ImportHolidayData();
-  void StartHolidayUpdate(bool manual);
   void LoadHolidayCache();
-  void CompleteHolidayUpdate(void* payload);
-  void ScheduleHolidayUpdate();
-  void UpdateCalendarTooltip(POINT point);
+  void UpdateCalendarTooltip(std::optional<CalendarDate> date);
   bool IsDocumentOpen(const std::filesystem::path& path) const;
   std::filesystem::path SelectedTreePath() const;
   std::vector<std::filesystem::path> SelectedTreePaths() const;
@@ -250,6 +375,14 @@ class Application {
   HINSTANCE instance_{};
   HWND window_{};
   HMENU menu_{};
+  HWND chrome_bar_{};
+  HWND activity_rail_{};
+  HWND brand_{};
+  HWND command_search_{};
+  HWND tab_new_{};
+  HWND tab_close_{};
+  std::array<HWND, 3> window_buttons_{};
+  std::array<HWND, 5> activity_buttons_{};
   HWND workspace_tree_{};
   HWND tabs_{};
   HWND outline_{};
@@ -271,31 +404,66 @@ class Application {
   HWND calendar_{};
   HWND calendar_tooltip_{};
   HWND git_panel_{};
+  HWND git_files_{};
+  HWND git_diff_view_{};
+  HWND git_commit_edit_{};
+  HWND git_refresh_{};
+  HWND git_stage_{};
+  HWND git_unstage_{};
+  HWND git_diff_{};
+  HWND git_commit_{};
+  HWND git_trust_{};
   HWND calendar_details_{};
+  std::vector<CalendarDetailTarget> calendar_detail_targets_;
   std::array<HWND, 4> panel_headers_{};
   std::filesystem::path workspace_;
   std::vector<std::filesystem::path> copied_files_;
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
   std::vector<std::unique_ptr<DocumentView>> documents_;
   std::vector<std::filesystem::path> recent_documents_;
+  std::vector<std::wstring> recent_diagnostic_summaries_;
   std::vector<SearchMatch> workspace_search_results_;
   std::size_t workspace_search_issue_count_{};
   std::jthread workspace_search_worker_;
-  std::jthread holiday_update_worker_;
+  std::jthread git_status_worker_;
+  std::jthread git_action_worker_;
   std::uint64_t workspace_search_generation_{};
-  std::uint64_t holiday_update_generation_{};
+  std::uint64_t git_status_generation_{};
+  std::uint64_t git_action_generation_{};
+  std::atomic_bool git_status_delivery_failed_{};
+  std::atomic_bool git_action_delivery_failed_{};
+  HANDLE git_status_cancellation_event_{};
+  HANDLE git_action_cancellation_event_{};
+  std::filesystem::path git_status_workspace_;
+  std::filesystem::path git_action_workspace_;
+  bool git_status_refresh_pending_{};
+  bool git_action_active_{};
   ULONGLONG workspace_search_due_{};
   bool workspace_search_started_{};
   bool holiday_cache_loaded_{};
-  bool holiday_update_running_{};
   bool save_dialog_active_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
+  bool editor_projection_repair_message_posted_{};
+  ULONGLONG editor_projection_repair_retry_due_{};
   bool external_operation_active_{};
   bool outline_dragging_{};
   bool workspace_dragging_{};
   bool workspace_pane_collapsed_{};
   bool outline_pane_collapsed_{};
+  SplitterDrag splitter_drag_{SplitterDrag::None};
+  int left_width_splitter_x_{};
+  int right_width_splitter_x_{};
+  int left_height_splitter_y_{};
+  int right_height_splitter_y_{};
+  int current_rail_width_{};
+  int current_tree_width_{};
+  int current_outline_width_{};
+  int current_splitter_width_{};
+  int current_topbar_height_{};
+  int current_status_height_{};
+  bool left_height_splitter_visible_{};
+  bool right_height_splitter_visible_{};
   std::size_t outline_drag_source_{};
   std::vector<std::filesystem::path> workspace_drag_sources_;
   std::shared_ptr<WorkspaceStore> workspace_store_;
@@ -318,11 +486,13 @@ class Application {
   bool dark_theme_{};
   std::vector<std::unique_ptr<std::wstring>> menu_labels_;
   std::wstring status_text_;
+  std::array<std::wstring, 4> status_segments_{};
   PanelLayout panel_layout_ = PanelLayout::Default();
   PanelId focused_panel_{PanelId::Explorer};
   EffectiveSettings settings_;
+  GitPanelStatus git_panel_status_;
   std::wstring calendar_tooltip_text_;
-  std::wstring holiday_update_status_;
+  std::wstring holiday_data_status_;
 };
 
 }  // namespace mdlite

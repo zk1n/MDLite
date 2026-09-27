@@ -42,8 +42,7 @@ link、background、paragraph spacing/border を明示的に解除し、source�
 
 ## 休日データ
 
-同梱データは通常起動時に通信しない。内閣府 CSV のローカル取込みは検証後に全置換し、空、重複、壊れた
-encoding、HTML相当の入力は拒否する。月次の公式取得許可は user-wide settings の `holiday_auto_update`
-（既定 `false`）で、Workspace 設定だけでは有効化できない。許可時の実装は固定host/URLのWinHTTPを
-非同期で一度だけ確認し、TLS、timeout、サイズ、redirect、304、件数減少、原子的last-known-good cacheを
-適用する。実サイトの正常系取得とHuman GUIは別欄で未実施として扱い、取込み失敗時も同梱データを保持する。
+Rev2では休日データを小さな同梱データから読み、更新は新しい同梱版または利用者によるローカルCSV取込みに
+限る。通常起動、月移動、カレンダー表示では通信しない。ローカル取込みは全件を検証してから置換し、空、重複、
+壊れたencoding、HTML相当の入力を拒否する。自動取得設定やアプリ内HTTP取得経路は設けず、失敗時は既知の
+同梱データを維持する。

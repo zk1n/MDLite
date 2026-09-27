@@ -3,6 +3,7 @@
 #include "app/PanelLayout.h"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,10 @@ struct SessionDocument {
   int y{};
   int width{720};
   int height{520};
+  // UTF-16 source offset at the start of the first visible logical line, when available.
+  std::optional<std::size_t> first_visible_source_offset;
+  // UTF-16 source offset of the character at the formatting rectangle's left edge.
+  std::optional<std::size_t> horizontal_left_edge_source_offset;
 };
 
 struct SessionState {

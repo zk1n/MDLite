@@ -10,9 +10,66 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+function Get-SourceFingerprint([string]$Root) {
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    $paths = @(
+        Get-ChildItem -LiteralPath (Join-Path $Root 'src') -File -Recurse -Force | Select-Object -ExpandProperty FullName
+        Join-Path $Root 'CMakeLists.txt'
+        Join-Path $Root 'CMakePresets.json'
+    )
+    [string[]]$paths = $paths
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $manifest = foreach ($path in $paths) {
+        $relativePath = [IO.Path]::GetFullPath($path).Substring($rootPrefix.Length).Replace('\', '/')
+        '{0}:{1}' -f $relativePath, ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant())
+    }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sha256 = [BitConverter]::ToString($hasher.ComputeHash($utf8.GetBytes([string]::Join("`n", [string[]]$manifest)))).Replace('-', '').ToLowerInvariant()
+    } finally { $hasher.Dispose() }
+    return [pscustomobject]@{ sha256 = $sha256; file_count = $paths.Count }
+}
+
 $executable = Join-Path $repoRoot "build\$Preset\MDLite.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Build first: $executable" }
 if (-not $OutputPath) { $OutputPath = Join-Path $repoRoot "build\verification\performance-$Preset-$Profile.json" }
+$measurementRunId = [guid]::NewGuid().ToString('N')
+$executableSha256AtStart = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
+$buildReceiptPath = Join-Path $repoRoot "build\verification\build-receipt-$Preset.json"
+if (-not (Test-Path -LiteralPath $buildReceiptPath -PathType Leaf)) {
+    throw "Successful-build receipt is missing: $buildReceiptPath. Run .\tools\Invoke-Build.ps1 -Preset $Preset first."
+}
+$buildReceiptSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $buildReceiptPath).Hash.ToLowerInvariant()
+$sourceAtMeasurementStart = Get-SourceFingerprint $repoRoot
+$buildReceipt = Get-Content -Raw -LiteralPath $buildReceiptPath | ConvertFrom-Json
+if ($buildReceipt.schema -ne 'mdlite-build-receipt-v2') { throw 'Build receipt schema is unsupported.' }
+$buildRunId = [guid]::Empty
+if (-not [guid]::TryParseExact([string]$buildReceipt.build_run_id, 'N', [ref]$buildRunId)) {
+    throw 'Build receipt has an invalid build run ID.'
+}
+if ($buildReceipt.preset -ne $Preset) { throw 'Build receipt preset does not match the selected preset.' }
+if ($buildReceipt.build_status -ne 'PASS' -or
+    [int]$buildReceipt.configure_exit_code -ne 0 -or
+    [int]$buildReceipt.build_exit_code -ne 0 -or
+    ([bool]$buildReceipt.test_requested -and [int]$buildReceipt.test_exit_code -ne 0)) {
+    throw 'Build receipt does not record a successful configure, build, and requested test run.'
+}
+if ([IO.Path]::GetFullPath([string]$buildReceipt.executable_path) -ne [IO.Path]::GetFullPath($executable)) {
+    throw 'Build receipt executable path does not match this preset output.'
+}
+if ([string]$buildReceipt.executable_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    [string]$buildReceipt.executable_sha256 -ine $executableSha256AtStart) {
+    throw 'Build receipt executable SHA-256 does not match the executable being measured.'
+}
+if ($buildReceipt.source_file_count -ne $sourceAtMeasurementStart.file_count -or
+    [string]$buildReceipt.source_sha256 -ine $sourceAtMeasurementStart.sha256) {
+    throw 'Build receipt source fingerprint does not match the current source inputs.'
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $buildReceiptPath).Hash.ToLowerInvariant() -ne $buildReceiptSha256) {
+    throw 'Build receipt changed while it was being verified.'
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -1054,14 +1111,42 @@ try {
         } catch {}
     }
     $scenarioFailureCount = @($scenarios | Where-Object { $_.status -eq 'FAILED' }).Count
+    $executableSha256AtEnd = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
+    $executableUnchangedDuringRun = $executableSha256AtStart -eq $executableSha256AtEnd
+    $sourceAtMeasurementEnd = Get-SourceFingerprint $repoRoot
+    $sourceUnchangedDuringRun = $sourceAtMeasurementStart.sha256 -eq $sourceAtMeasurementEnd.sha256
+    $buildReceiptSha256AtEnd = (Get-FileHash -Algorithm SHA256 -LiteralPath $buildReceiptPath).Hash.ToLowerInvariant()
+    $buildReceiptUnchangedDuringRun = $buildReceiptSha256 -eq $buildReceiptSha256AtEnd
     $result = [pscustomobject]@{
-        schema = 'mdlite-performance-v3'
+        schema = 'mdlite-performance-v5'
+        run_id = $measurementRunId
         timestamp_utc = [DateTime]::UtcNow.ToString('o')
-        measurement_status = if ($scenarioFailureCount -eq 0 -and $p5Failures -eq 0) { 'PASS' } else { 'FAILED_OR_INCOMPLETE' }
+        measurement_status = if ($scenarioFailureCount -eq 0 -and $p5Failures -eq 0 -and
+            $executableUnchangedDuringRun -and $sourceUnchangedDuringRun -and
+            $buildReceiptUnchangedDuringRun) { 'PASS' } else { 'FAILED_OR_INCOMPLETE' }
         profile = $Profile
         preset = $Preset
-        executable_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
+        executable_sha256 = $executableSha256AtStart
+        source_sha256_at_start = $sourceAtMeasurementStart.sha256
+        source_sha256_at_end = $sourceAtMeasurementEnd.sha256
+        source_unchanged_during_run = $sourceUnchangedDuringRun
         build = [pscustomobject]@{
+            build_run_id = $buildReceipt.build_run_id
+            receipt_path = [IO.Path]::GetFullPath($buildReceiptPath)
+            receipt_sha256 = $buildReceiptSha256
+            receipt_sha256_at_end = $buildReceiptSha256AtEnd
+            receipt_unchanged_during_run = $buildReceiptUnchangedDuringRun
+            completed_utc = $buildReceipt.completed_utc
+            configure_exit_code = $buildReceipt.configure_exit_code
+            build_exit_code = $buildReceipt.build_exit_code
+            test_requested = $buildReceipt.test_requested
+            test_exit_code = $buildReceipt.test_exit_code
+            executable_path = [IO.Path]::GetFullPath($executable)
+            executable_sha256 = $buildReceipt.executable_sha256.ToLowerInvariant()
+            executable_sha256_at_end = $executableSha256AtEnd
+            executable_unchanged_during_run = $executableUnchangedDuringRun
+            source_sha256 = $buildReceipt.source_sha256
+            source_file_count = $buildReceipt.source_file_count
             git_head = $buildSha
             worktree_dirty = $worktreeDirty
             compiler_path = $compilerPath
@@ -1116,7 +1201,9 @@ try {
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding utf8
     $result | ConvertTo-Json -Depth 5
-    if ($scenarioFailureCount -ne 0 -or $p5Failures -ne 0) { exit 1 }
+    if ($scenarioFailureCount -ne 0 -or $p5Failures -ne 0 -or
+        -not $executableUnchangedDuringRun -or -not $sourceUnchangedDuringRun -or
+        -not $buildReceiptUnchangedDuringRun) { exit 1 }
 }
 finally {
     if (Test-Path -LiteralPath $runRoot) {

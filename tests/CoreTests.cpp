@@ -2404,6 +2404,65 @@ void TestSettings(const std::filesystem::path& root) {
   const std::string legacy_saved_text(legacy_saved.begin(), legacy_saved.end());
   Check(legacy_saved_text.find("holiday_auto_update") == std::string::npos,
         "settings save does not restore the removed holiday network setting");
+
+  const auto guarded_path = directory / L"guarded-settings.toml";
+  mdlite::SettingsLayer baseline;
+  baseline.auto_save = false;
+  baseline.auto_save_delay_ms = 1250;
+  baseline.font_size_pt = 11;
+  Check(mdlite::SaveSettingsLayer(guarded_path, baseline, error), "guarded settings fixture saved");
+  mdlite::SettingsFileSnapshot snapshot;
+  mdlite::SettingsLayer captured;
+  Check(mdlite::CaptureSettingsFile(guarded_path, snapshot, error) &&
+        mdlite::ParseSettingsSnapshot(snapshot, captured, error),
+        "settings values parse from the same captured file snapshot");
+  auto external = baseline;
+  external.auto_save = true;
+  external.auto_save_delay_ms = 1900;
+  external.font_size_pt = 14;
+  Check(mdlite::SaveSettingsLayer(guarded_path, external, error), "peer changes settings after form capture");
+  const auto peer_bytes = ReadBytes(guarded_path);
+  mdlite::SettingsLayer captured_again;
+  Check(mdlite::ParseSettingsSnapshot(snapshot, captured_again, error) &&
+        captured_again.auto_save_delay_ms == 1250,
+        "parsing retained snapshot does not silently reload peer values");
+  Check(!mdlite::SaveSettingsSnapshot(snapshot, captured, error) &&
+        ReadBytes(guarded_path) == peer_bytes,
+        "unchanged serialization still rejects a stale settings snapshot without overwriting peer bytes");
+
+  Check(mdlite::CaptureSettingsFile(guarded_path, snapshot, error), "recapture current settings snapshot");
+  std::filesystem::remove(guarded_path);
+  Check(!mdlite::SaveSettingsSnapshot(snapshot, baseline, error) &&
+        !std::filesystem::exists(guarded_path),
+        "deleted settings are not recreated from a stale existing-file snapshot");
+
+  const auto missing_path = directory / L"new-settings-directory" / L"settings.toml";
+  Check(mdlite::CaptureSettingsFile(missing_path, snapshot, error) && !snapshot.existed,
+        "missing settings have an explicit absent-file snapshot");
+  Check(mdlite::SaveSettingsLayer(missing_path, external, error), "peer creates missing settings after capture");
+  const auto created_peer_bytes = ReadBytes(missing_path);
+  Check(!mdlite::SaveSettingsSnapshot(snapshot, baseline, error) &&
+        ReadBytes(missing_path) == created_peer_bytes,
+        "absent-file snapshot rejects peer-created settings");
+  std::filesystem::remove(missing_path);
+  Check(mdlite::CaptureSettingsFile(missing_path, snapshot, error) &&
+        mdlite::SaveSettingsSnapshot(snapshot, baseline, error) && snapshot.existed &&
+        !snapshot.document.HasExternalChange(),
+        "guarded first settings save creates a file and advances its snapshot");
+  const auto unchanged_bytes = ReadBytes(missing_path);
+  const auto unchanged_time = std::filesystem::last_write_time(missing_path);
+  Check(mdlite::SaveSettingsSnapshot(snapshot, baseline, error) &&
+        ReadBytes(missing_path) == unchanged_bytes &&
+        std::filesystem::last_write_time(missing_path) == unchanged_time,
+        "unchanged settings apply succeeds without rewriting the file");
+  auto same_size = unchanged_bytes;
+  const std::string unchanged_text(unchanged_bytes.begin(), unchanged_bytes.end());
+  const auto delay_position = unchanged_text.find("1250");
+  same_size[delay_position] = '2';
+  WriteBytes(missing_path, same_size);
+  std::filesystem::last_write_time(missing_path, unchanged_time);
+  Check(!mdlite::SaveSettingsSnapshot(snapshot, baseline, error) && ReadBytes(missing_path) == same_size,
+        "settings content fingerprint rejects same-size same-timestamp peer changes");
 }
 
 void TestGitConflicts() {

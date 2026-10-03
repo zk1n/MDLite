@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <array>
 #include <chrono>
@@ -48,6 +49,7 @@ namespace {
 
 constexpr wchar_t kWindowClass[] = L"MDLite.MainWindow";
 constexpr wchar_t kCompactWindowClass[] = L"MDLite.CompactWindow";
+bool test_trust_ui_enabled{};
 constexpr UINT_PTR kAutosaveTimer = 1;
 constexpr UINT kTimerPollMs = 50;
 constexpr ULONGLONG kEditorSyncDelayMs = 500;
@@ -96,6 +98,7 @@ constexpr UINT kRepairInvalidEditorProjectionMessage = WM_APP + 65;
 constexpr UINT kTestRefreshWorkspaceTreeMessage = WM_APP + 66;
 constexpr UINT kTestTrustWorkspaceForGitMessage = WM_APP + 67;
 constexpr UINT kTestGetGitActionActiveMessage = WM_APP + 68;
+constexpr UINT kTestGetDocumentStateMessage = WM_APP + 69;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticWrite = 1U << 0U;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticRestore = 1U << 1U;
 constexpr std::uint32_t kNativeProjectionFaultIncrementalWrite = 1U << 2U;
@@ -162,6 +165,44 @@ std::size_t MapPositionBetweenViews(std::wstring_view from, std::wstring_view to
   return prefix + std::min(position - prefix, new_suffix - prefix);
 }
 
+std::optional<std::wstring> ReadClipboardUnicodeText(HWND owner) {
+  if (!OpenClipboard(owner)) return std::nullopt;
+  std::optional<std::wstring> text;
+  if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+    const SIZE_T bytes = GlobalSize(data);
+    if (bytes >= sizeof(wchar_t) && bytes % sizeof(wchar_t) == 0 &&
+        bytes / sizeof(wchar_t) <= static_cast<SIZE_T>(LONG_MAX)) {
+      if (const auto* value = static_cast<const wchar_t*>(GlobalLock(data))) {
+        std::size_t length{};
+        const std::size_t capacity = bytes / sizeof(wchar_t);
+        while (length < capacity && value[length] != L'\0') ++length;
+        if (length < capacity) {
+          try { text.emplace(value, length); }
+          catch (const std::bad_alloc&) { /* Keep the selected source intact. */ }
+        }
+        GlobalUnlock(data);
+      }
+    }
+  }
+  CloseClipboard();
+  return text;
+}
+
+bool PublishClipboardUnicodeText(HWND owner, std::wstring_view text) {
+  HGLOBAL data = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
+  if (!data) return false;
+  auto* value = static_cast<wchar_t*>(GlobalLock(data));
+  if (!value) { GlobalFree(data); return false; }
+  std::memcpy(value, text.data(), text.size() * sizeof(wchar_t));
+  value[text.size()] = L'\0';
+  GlobalUnlock(data);
+  if (!OpenClipboard(owner)) { GlobalFree(data); return false; }
+  const bool published = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, data);
+  CloseClipboard();
+  if (!published) GlobalFree(data);
+  return published;
+}
+
 bool TestAutomationSilent() {
   wchar_t enabled[2]{};
   return GetEnvironmentVariableW(L"MDLITE_TEST_SILENT", enabled, 2) == 1 && enabled[0] == L'1';
@@ -199,8 +240,10 @@ std::optional<std::wstring> ReadImeResultString(HWND window) {
 
 int TestAwareMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
   if (!TestAutomationSilent()) return ::MessageBoxW(owner, text, caption, type);
+  if (test_trust_ui_enabled && caption && wcscmp(caption, L"Workspace Trust") == 0)
+    return ::MessageBoxW(owner, text, caption, type);
 
-  // Acceptance automation must never surface a modal dialog or play the
+  // Other silent acceptance routes never surface a modal dialog or play the
   // Windows message-box sound.  Expected affirmative choices are handled at
   // their call sites; unexpected confirmations fail closed here.
   switch (type & MB_TYPEMASK) {
@@ -957,6 +1000,7 @@ struct NativeFormField {
 
 struct NativeFormContext {
   std::vector<NativeFormField>* fields{};
+  std::function<bool()> apply;
   NativeDialogTheme theme;
   int width{680};
   int height{220};
@@ -1106,6 +1150,7 @@ LRESULT CALLBACK NativeFormWindowProc(HWND window, UINT message, WPARAM wparam, 
         if (!field.control) continue;
         field.value = ControlText(field.control);
       }
+      if (context->apply && !context->apply()) return 0;
       context->accepted = true;
     }
     context->completed = true;
@@ -1121,7 +1166,8 @@ LRESULT CALLBACK NativeFormWindowProc(HWND window, UINT message, WPARAM wparam, 
 }
 
 bool RunNativeForm(HWND owner, HINSTANCE instance, std::wstring_view title,
-                   std::vector<NativeFormField>& fields, NativeDialogTheme theme) {
+                   std::vector<NativeFormField>& fields, NativeDialogTheme theme,
+                   std::function<bool()> apply = {}) {
   constexpr wchar_t form_class[] = L"MDLite.NativeFormWindow";
   WNDCLASSEXW existing{sizeof(existing)};
   if (!GetClassInfoExW(instance, form_class, &existing)) {
@@ -1140,6 +1186,7 @@ bool RunNativeForm(HWND owner, HINSTANCE instance, std::wstring_view title,
   height = std::clamp(height, ScaleDip(owner, 220), ScaleDip(owner, 760));
   NativeFormContext context;
   context.fields = &fields;
+  context.apply = std::move(apply);
   context.theme = theme;
   context.width = width;
   context.height = height;
@@ -1502,6 +1549,16 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
                                                UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
   auto* view = app->FindDocumentView(window);
+  std::optional<std::wstring> body_scalar;
+  if (view && (view->editor_projection_invalid || view->native_readback_failed ||
+      message == WM_KILLFOCUS || (message == WM_KEYDOWN && wparam != VK_PACKET) || message == WM_SYSKEYDOWN ||
+      message == WM_LBUTTONDOWN || message == WM_IME_STARTCOMPOSITION ||
+      message == WM_IME_COMPOSITION || message == WM_IME_ENDCOMPOSITION ||
+      message == WM_CUT || message == WM_CLEAR || message == WM_PASTE ||
+      message == WM_UNDO || message == EM_REDO || message == EM_REPLACESEL ||
+      message == WM_NCDESTROY ||
+      (!app->suppress_editor_change_ && (message == EM_SETSEL || message == EM_EXSETSEL))))
+    view->pending_body_high_surrogate = 0;
   if (view && view->editor_projection_invalid) {
     if (message == WM_NCDESTROY) RemoveWindowSubclass(window, EditorSubclass, 1);
     if (message == WM_DESTROY || message == WM_NCDESTROY)
@@ -1570,6 +1627,33 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     view->pending_virtual_table_cell.reset();
     view->pending_table_high_surrogate = 0;
     return 0;
+  }
+  if (view && !view->pending_virtual_table_cell && !view->ime_composing && message == WM_CHAR) {
+    const wchar_t character = static_cast<wchar_t>(wparam & 0xffffU);
+    const bool high = character >= 0xd800 && character <= 0xdbff;
+    const bool low = character >= 0xdc00 && character <= 0xdfff;
+    if (high || low) {
+      if (!app->SyncDocumentFromEditor(*view)) {
+        view->pending_body_high_surrogate = 0;
+        return 0;
+      }
+      const auto selection = app->CaptureSourceSelection(window, view->editor_snapshot);
+      if (high) {
+        view->pending_body_high_surrogate = character;
+        view->pending_body_surrogate_selection = selection;
+        view->pending_body_surrogate_revision = view->document.revision();
+        return 0;
+      }
+      const wchar_t pending = view->pending_body_high_surrogate;
+      view->pending_body_high_surrogate = 0;
+      if (pending == 0 || view->pending_body_surrogate_revision != view->document.revision() ||
+          selection.anchor != view->pending_body_surrogate_selection.anchor ||
+          selection.active != view->pending_body_surrogate_selection.active) return 0;
+      const wchar_t pair[]{pending, character};
+      body_scalar.emplace(pair, 2);
+    } else {
+      view->pending_body_high_surrogate = 0;
+    }
   }
   if (view && view->pending_virtual_table_cell && !view->ime_composing &&
       message == WM_CHAR) {
@@ -1657,7 +1741,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       (message == WM_CHAR || message == WM_CUT || message == WM_CLEAR ||
        message == WM_PASTE || message == WM_IME_COMPOSITION ||
        message == WM_IME_ENDCOMPOSITION ||
-       (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE ||
+       (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE || wparam == VK_RETURN ||
           (((GetKeyState(VK_CONTROL) & 0x8000) != 0) &&
            (wparam == L'V' || wparam == L'X')) ||
           (((GetKeyState(VK_SHIFT) & 0x8000) != 0) &&
@@ -1839,7 +1923,69 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       ? ReadImeResultString(window) : std::optional<std::wstring>{};
   if (needs_table_paint && !GetUpdateRect(window, &update_rect, FALSE))
     GetClientRect(window, &update_rect);
-  const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+  UINT native_message = body_scalar ? EM_REPLACESEL : message;
+  WPARAM native_wparam = body_scalar ? TRUE : wparam;
+  LPARAM native_lparam = body_scalar ? reinterpret_cast<LPARAM>(body_scalar->c_str()) : lparam;
+  std::optional<std::wstring> literal_paste;
+  if (view && native_mutation && !view->ime_composing &&
+      !view->native_edit_pending && view->sync_due == 0 &&
+      view->pending_selection_before && !view->pending_virtual_table_cell) {
+    const auto selection = *view->pending_selection_before;
+    const std::size_t begin = std::min(selection.anchor, selection.active);
+    const std::size_t end = std::max(selection.anchor, selection.active);
+    const auto& source = view->document.text();
+    const bool paragraph_end_selected = begin < end && end <= source.size() &&
+        (source[end - 1] == L'\r' || source[end - 1] == L'\n');
+    const bool cut = message == WM_CUT ||
+        (message == WM_KEYDOWN && ((control && (wparam == L'X' || wparam == L'x')) ||
+                                  (shift && wparam == VK_DELETE)));
+    const bool paste = (message == WM_PASTE ||
+        (message == WM_KEYDOWN && ((control && (wparam == L'V' || wparam == L'v')) ||
+                                  (shift && wparam == VK_INSERT)))) &&
+        IsClipboardFormatAvailable(CF_UNICODETEXT) &&
+        !IsClipboardFormatAvailable(CF_BITMAP) && !IsClipboardFormatAvailable(CF_DIB) &&
+        !IsClipboardFormatAvailable(CF_DIBV5);
+    const bool deletion = message == WM_KEYDOWN &&
+        (wparam == VK_BACK || wparam == VK_DELETE);
+    const bool character = body_scalar || (message == WM_CHAR && !control &&
+        wparam >= L' ' && wparam != 0x7f && !(wparam >= 0xd800 && wparam <= 0xdfff));
+    // RichEdit's ordinary typing/cut/delete paths retain the last selected
+    // paragraph mark. Markdown range edits must replace the literal range.
+    // Bypass only that native adjustment, inside the existing outer mutation,
+    // so EN_CHANGE/readback still produces one source history transaction.
+    if (paragraph_end_selected && (cut || deletion || character || paste)) {
+      bool clipboard_ready = true;
+      if (cut) clipboard_ready = PublishClipboardUnicodeText(
+          window, std::wstring_view(source).substr(begin, end - begin));
+      if (paste) {
+        literal_paste = ReadClipboardUnicodeText(window);
+        clipboard_ready = literal_paste && !literal_paste->empty();
+      }
+      if (!clipboard_ready) {
+        view->native_edit_in_flight = false;
+        if (!had_pending_edit_selection) {
+          view->pending_selection_before.reset();
+          view->pending_native_edit_kind = DocumentView::PendingNativeEditKind::Unknown;
+        }
+        app->SetStatusText(L"クリップボードを確認できなかったため編集を中止しました。本文と選択範囲は保持されています。");
+        return 0;
+      }
+      if (cut || deletion) {
+        native_message = WM_CLEAR;
+        native_wparam = 0;
+        native_lparam = 0;
+      } else {
+        // Direct native dispatch avoids a nested subclass/history commit.
+        DefSubclassProc(window, WM_CLEAR, 0, 0);
+        if (paste) {
+          native_message = EM_REPLACESEL;
+          native_wparam = TRUE;
+          native_lparam = reinterpret_cast<LPARAM>(literal_paste->c_str());
+        }
+      }
+    }
+  }
+  const LRESULT result = DefSubclassProc(window, native_message, native_wparam, native_lparam);
   if (message == WM_KILLFOCUS && view && IsWindow(window) &&
       first_visible_line_on_focus_loss >= 0) {
     const LRESULT current_first_visible_line =
@@ -1892,7 +2038,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     const bool ordinary_edit = !view->ime_composing &&
         (message == WM_CHAR || message == WM_CUT || message == WM_CLEAR ||
          message == WM_PASTE ||
-         (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE ||
+         (message == WM_KEYDOWN && (wparam == VK_BACK || wparam == VK_DELETE || wparam == VK_RETURN ||
           (((GetKeyState(VK_CONTROL) & 0x8000) != 0) &&
            (wparam == L'V' || wparam == L'X')) ||
           (((GetKeyState(VK_SHIFT) & 0x8000) != 0) &&
@@ -2717,8 +2863,18 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       }
       return TRUE;
     case kTestFailNextMarkdownPresentationMessage:
-      if (!TestAutomationSilent() || wparam >= documents_.size()) return FALSE;
-      documents_[static_cast<std::size_t>(wparam)]->force_markdown_presentation_failure_for_test = true;
+      if (!TestAutomationSilent() || wparam >= documents_.size() || lparam < 0 || lparam > 2) return FALSE;
+      if (lparam == 2) {
+        auto& view = *documents_[static_cast<std::size_t>(wparam)];
+        if (!view.editor || !IsWindow(view.editor) || view.editor_projection_invalid ||
+            view.native_readback_failed || view.sync_due != 0 || view.native_edit_in_flight ||
+            view.native_edit_pending || view.ime_composing || view.editor_snapshot.tables.empty()) return FALSE;
+        view.force_table_cell_formatting_failure_for_test = true;
+        ApplyMarkdownPresentation(view, true);
+      } else if (lparam == 1)
+        documents_[static_cast<std::size_t>(wparam)]->force_table_cell_formatting_failure_for_test = true;
+      else
+        documents_[static_cast<std::size_t>(wparam)]->force_markdown_presentation_failure_for_test = true;
       return TRUE;
     case kTestFailMarkdownPresentationAfterFirstTableMessage:
       if (!TestAutomationSilent() || wparam >= documents_.size()) return FALSE;
@@ -2742,8 +2898,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case kTestTrustWorkspaceForGitMessage: {
       if (!TestAutomationSilent() || workspace_.empty() || !workspace_store_ || git_action_active_)
         return FALSE;
+      if (wparam != 0 && wparam != 1) return FALSE;
       const auto test_trust_root = workspace_store_->metadata_root() / L".state" / L"test-trust";
       SetTrustStoreRootForTesting(test_trust_root);
+      test_trust_ui_enabled = wparam == 1;
+      if (test_trust_ui_enabled) return TRUE;
       std::wstring error;
       if (!SetWorkspaceTrusted(workspace_, true, error)) {
         SetStatusText(error);
@@ -2776,21 +2935,27 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       const auto source_begin = static_cast<std::size_t>(wparam);
       const auto source_end = static_cast<std::size_t>(lparam);
       if (source_begin >= source_end || source_end > view.document.text().size()) return 0;
-      CHARRANGE selection{};
-      SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-      const LRESULT event_mask = SendMessageW(view.editor, EM_GETEVENTMASK, 0, 0);
-      SendMessageW(view.editor, EM_SETEVENTMASK, 0, 0);
       const auto native_begin = view.editor_snapshot.SourceToNative(source_begin);
       const auto native_end = view.editor_snapshot.SourceToNative(source_end);
-      SendMessageW(view.editor, EM_SETSEL, static_cast<WPARAM>(native_begin),
-                   static_cast<LPARAM>(native_end));
-      CHARFORMAT2W format{sizeof(format)};
-      const auto format_mask = SendMessageW(view.editor, EM_GETCHARFORMAT, SCF_SELECTION,
-                                             reinterpret_cast<LPARAM>(&format));
-      SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-      SendMessageW(view.editor, EM_SETEVENTMASK, 0, event_mask);
-      const auto packed = (static_cast<std::uint64_t>(static_cast<DWORD>(format_mask)) << 32) |
-                          static_cast<DWORD>(format.dwEffects);
+      IRichEditOle* rich_edit{};
+      ITextDocument* document{};
+      ITextRange* range{};
+      ITextFont* font{};
+      LONG hidden = tomUndefined;
+      const bool inspected = SendMessageW(view.editor, EM_GETOLEINTERFACE, 0,
+          reinterpret_cast<LPARAM>(&rich_edit)) && rich_edit &&
+          SUCCEEDED(rich_edit->QueryInterface(__uuidof(ITextDocument),
+              reinterpret_cast<void**>(&document))) && document &&
+          SUCCEEDED(document->Range(static_cast<LONG>(native_begin),
+              static_cast<LONG>(native_end), &range)) && range &&
+          SUCCEEDED(range->GetFont(&font)) && font && SUCCEEDED(font->GetHidden(&hidden));
+      if (font) font->Release();
+      if (range) range->Release();
+      if (document) document->Release();
+      if (rich_edit) rich_edit->Release();
+      if (!inspected || hidden == tomUndefined) return 0;
+      const auto packed = (static_cast<std::uint64_t>(CFM_HIDDEN) << 32) |
+                          (hidden == tomTrue ? CFE_HIDDEN : 0);
       return static_cast<LRESULT>(packed);
     }
     case kTestSetSelectionBySourceMessage: {
@@ -2861,6 +3026,24 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return SendMessageW(view.editor, EM_CHARFROMPOS, 0,
                           reinterpret_cast<LPARAM>(&point));
     }
+    case kTestGetDocumentStateMessage: {
+      if (!TestAutomationSilent() || active_document_ >= documents_.size()) return -1;
+      const auto& view = *documents_[active_document_];
+      // Scalar-only inspection avoids cross-process pointers and does not save,
+      // synchronize, or otherwise change the state being verified.
+      switch (wparam) {
+        case 0: return view.document.dirty();
+        case 1: return static_cast<LRESULT>(view.source_undo.size());
+        case 2: return static_cast<LRESULT>(view.source_redo.size());
+        case 3: return static_cast<LRESULT>(view.document.revision());
+        case 4: return static_cast<LRESULT>(view.document.text().size());
+        case 6: return static_cast<LRESULT>(view.document.saved_revision());
+        case 5:
+          return static_cast<std::size_t>(lparam) < view.document.text().size()
+              ? static_cast<LRESULT>(view.document.text()[static_cast<std::size_t>(lparam)]) : -1;
+        default: return -1;
+      }
+    }
     case kTestGetLastHistoryBeforeMessage: {
       if (!TestAutomationSilent() || active_document_ >= documents_.size()) return -1;
       const auto& history = documents_[active_document_]->source_undo;
@@ -2922,6 +3105,8 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return TRUE;
     }
     case WM_COMMAND: {
+      if (HIWORD(wparam) == 0)
+        for (auto& view : documents_) view->pending_body_high_surrogate = 0;
       const int command = LOWORD(wparam);
       if (command == kCommandSearch) ShowCommandPalette();
       else if (command == kWindowMinimize)
@@ -4589,12 +4774,13 @@ void Application::LayoutControls() {
           formatting_rect.right = formatting_rect.left + 1;
         if (formatting_rect.bottom <= formatting_rect.top)
           formatting_rect.bottom = formatting_rect.top + 1;
-        RECT previous_formatting_rect{};
-        SendMessageW(view->editor, EM_GETRECT, 0,
-                     reinterpret_cast<LPARAM>(&previous_formatting_rect));
-        if (!EqualRect(&previous_formatting_rect, &formatting_rect)) {
+        // EM_GETRECT may round the request by a few pixels. Compare requests
+        // for this live HWND so unchanged layout does not schedule full styling.
+        if (!view->editor_formatting_rect_request ||
+            !EqualRect(&*view->editor_formatting_rect_request, &formatting_rect)) {
           SendMessageW(view->editor, EM_SETRECTNP, 0,
                        reinterpret_cast<LPARAM>(&formatting_rect));
+          view->editor_formatting_rect_request = formatting_rect;
           InvalidateRect(view->editor, nullptr, TRUE);
           if (!view->parse.tables.empty()) SchedulePresentation(*view);
         }
@@ -5083,9 +5269,22 @@ void Application::ActivateDocument(std::size_t index) {
   // the old active document and editor available for retry.
   LayoutControls();
   if (IsMarkdownFile(target.document.path())) {
-    if (restore_view_state)
+    const bool reuse_current_presentation =
+        restore_view_state && previous_active_document == index &&
+        target.presentation_revision == target.document.revision() &&
+        target.presentation_due == 0 && target.sync_due == 0 &&
+        !target.ime_composing && !target.native_edit_in_flight &&
+        !target.native_edit_pending && !target.native_readback_failed &&
+        !target.flat_source_fallback_pending &&
+        !target.force_markdown_presentation_failure_for_test &&
+        !target.force_table_cell_formatting_failure_for_test &&
+        !target.force_partial_markdown_presentation_failure_for_test;
+    const bool force_presentation = restore_view_state && !reuse_current_presentation;
+    if (reuse_current_presentation)
+      RestoreSourceSelection(target.editor, target.editor_snapshot, target.suspended_selection);
+    if (force_presentation)
       target.presentation_revision = std::numeric_limits<std::uint64_t>::max();
-    ApplyMarkdownPresentation(target, restore_view_state,
+    ApplyMarkdownPresentation(target, force_presentation,
                               restore_view_state
                                   ? std::optional<SourceSelection>(target.suspended_selection)
                                   : std::nullopt);
@@ -5128,6 +5327,7 @@ bool Application::EnsureEditor(DocumentView& view) {
   if (view.editor_projection_invalid) return false;
   if (view.editor && IsWindow(view.editor)) return true;
   if (view.compact_window) return false;
+  view.editor_formatting_rect_request.reset();
   view.editor = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, nullptr,
                                 WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL |
@@ -5304,17 +5504,17 @@ bool Application::SuspendEditor(DocumentView& view) {
     return false;
   CaptureEditorViewState(view);
   if (IsMarkdownFile(view.document.path())) {
-    if (view.presentation_due != 0 || view.presentation_revision != view.document.revision()) {
-      ApplyMarkdownPresentation(view, true);
-      if (view.presentation_revision != view.document.revision()) return false;
-      RestoreEditorViewState(view);
-    }
+    // Only source synchronization and source anchors are needed before this
+    // native view is destroyed. Reformatting the outgoing table re-enters
+    // RichEdit layout/scrollbar work during activation; the recreated target
+    // receives its required presentation in ActivateDocument instead.
     view.presentation_due = 0;
   }
   if (GetFocus() == view.editor) SetFocus(window_);
   ShowWindow(view.editor, SW_HIDE);
   DestroyWindow(view.editor);
   view.editor = nullptr;
+  view.editor_formatting_rect_request.reset();
   view.native_tables_ready = false;
   view.active_line = -1;
   view.active_source_line_begin = std::numeric_limits<std::size_t>::max();
@@ -5371,6 +5571,7 @@ bool Application::CloseDocument(std::size_t index) {
   }
   if (view.editor) DestroyWindow(view.editor);
   view.editor = nullptr;
+  view.editor_formatting_rect_request.reset();
   TabCtrl_DeleteItem(tabs_, static_cast<int>(index));
   documents_.erase(documents_.begin() + static_cast<std::ptrdiff_t>(index));
   if (documents_.empty()) {
@@ -6402,6 +6603,7 @@ void Application::QuarantineEditorProjection(DocumentView& view, SourceSelection
                                              std::wstring_view status_text) {
   const auto source_size = view.document.text().size();
   view.editor_projection_invalid = true;
+  view.editor_formatting_rect_request.reset();
   view.native_readback_failed = false;
   view.editor_locked_for_readback = false;
   view.editor_readonly_lock_applied = false;
@@ -6446,6 +6648,7 @@ void Application::ProcessDeferredEditorRepairs() {
 
     const HWND unusable_editor = view.editor;
     view.editor = nullptr;
+    view.editor_formatting_rect_request.reset();
     if (unusable_editor && IsWindow(unusable_editor)) {
       RemoveWindowSubclass(unusable_editor, EditorSubclass, 1);
       DestroyWindow(unusable_editor);
@@ -7107,9 +7310,9 @@ void Application::ApplyMarkdownPresentation(
       SendMessageW(view.editor, EM_LINEFROMCHAR, native_active, 0));
   RefreshDerivedImages(view);
   const LONG length = GetWindowTextLengthW(view.editor);
-  SendMessageW(view.editor, EM_SETSEL, 0, length);
   const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
   const COLORREF background = theme_editor_;
+  SendMessageW(view.editor, EM_SETSEL, 0, length);
   CHARFORMAT2W normal{sizeof(normal)};
   normal.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_STRIKEOUT |
                   CFM_UNDERLINE | CFM_EFFECTS | CFM_HIDDEN | CFM_BACKCOLOR | CFM_LINK;
@@ -7251,23 +7454,16 @@ void Application::ApplyMarkdownPresentation(
                                           dark ? RGB(38, 42, 48) : RGB(244, 247, 250));
   const COLORREF table_header = ThemeColor(settings_, L"table_header_background",
                                             dark ? RGB(31, 40, 52) : RGB(231, 236, 242));
-  for (const auto& table : view.editor_snapshot.tables) {
-    for (std::size_t row_index{}; row_index < table.visual_rows.size(); ++row_index) {
-      const COLORREF row_background = row_index == 0 ? table_header : table_body;
-      for (const auto& cell : table.visual_rows[row_index].cells) {
-        if (cell.virtual_cell || cell.native_begin >= cell.native_end ||
-            cell.native_begin >= static_cast<std::size_t>(length)) continue;
-        SendMessageW(view.editor, EM_SETSEL,
-                     static_cast<WPARAM>(cell.native_begin),
-                     static_cast<LPARAM>(std::min<std::size_t>(cell.native_end, length)));
-        CHARFORMAT2W table_format{sizeof(table_format)};
-        table_format.dwMask = CFM_FACE | CFM_BACKCOLOR;
-        wcscpy_s(table_format.szFaceName, L"Cascadia Mono");
-        table_format.crBackColor = row_background;
-        SendMessageW(view.editor, EM_SETCHARFORMAT, SCF_SELECTION,
-                     reinterpret_cast<LPARAM>(&table_format));
-      }
-    }
+  const bool force_cell_failure = TestAutomationSilent() && view.force_table_cell_formatting_failure_for_test;
+  view.force_table_cell_formatting_failure_for_test = false;
+  if (force_cell_failure || !FormatRichEditTableCells(view.editor, view.editor_snapshot, table_header, table_body)) {
+    view.presentation_revision = std::numeric_limits<std::uint64_t>::max();
+    SchedulePresentation(view);
+    RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+    SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(view.editor, nullptr, FALSE);
+    SetStatusText(L"表のセル装飾を更新できませんでした。本文と編集履歴は保持されています。");
+    return;
   }
   for (const auto& table : view.parse.tables) {
     const std::size_t visible_columns = table.alignments.size();
@@ -8339,7 +8535,9 @@ void Application::CreateProfileById(std::wstring id, const SYSTEMTIME* requested
   }
   OpenDocument(result.path);
   if (result.created && active_document_ < documents_.size()) {
-    SendMessageW(documents_[active_document_]->editor, EM_SETSEL, result.cursor, result.cursor);
+    auto& view = *documents_[active_document_];
+    RestoreSourceSelection(view.editor, view.editor_snapshot,
+                           SourceSelection{result.cursor, result.cursor});
   }
   PopulateWorkspaceTree();
 }
@@ -9778,8 +9976,7 @@ void Application::ApplySettings() {
       ScopedEditorChangeSuppression suppression(suppress_editor_change_);
       PresentationUndoGuard guard(view->editor);
       if (!guard) continue;
-      CHARRANGE selection{};
-      SendMessageW(view->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+      const auto selection = CaptureSourceSelection(view->editor, view->editor_snapshot);
       SendMessageW(view->editor, EM_SETBKGNDCOLOR, 0, theme_editor_);
       CHARFORMAT2W format{};
       format.cbSize = sizeof(format);
@@ -9789,7 +9986,7 @@ void Application::ApplySettings() {
       wcsncpy_s(format.szFaceName, settings_.font_face.c_str(), _TRUNCATE);
       SendMessageW(view->editor, EM_SETSEL, 0, -1);
       SendMessageW(view->editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
-      SendMessageW(view->editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+      RestoreSourceSelection(view->editor, view->editor_snapshot, selection);
     }
     ApplyMarkdownPresentation(*view, true);
   }
@@ -9848,8 +10045,13 @@ void Application::OpenWorkspaceSettings() {
   const auto target = scope == L"common" ? common_path : workspace_path;
   if (target.empty()) return;
   SettingsLayer layer;
+  SettingsFileSnapshot common_snapshot, workspace_snapshot;
   std::wstring error;
-  if (!LoadSettingsLayer(target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
+  if (!CaptureSettingsFile(common_path, common_snapshot, error) ||
+      (!workspace_path.empty() && !CaptureSettingsFile(workspace_path, workspace_snapshot, error)) ||
+      !ParseSettingsSnapshot(scope == L"common" ? common_snapshot : workspace_snapshot, layer, error)) {
+    MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return;
+  }
   std::wstring colors;
   for (const auto& [name, value] : layer.colors) colors += name + L"=" + value + L"\r\n";
   std::wstring bindings;
@@ -9871,115 +10073,126 @@ void Application::OpenWorkspaceSettings() {
       {L"カスタム色（1行1件: name=#RRGGBB。削除は行を消す）", colors, NativeFormFieldKind::Multiline},
       {L"キー割当て（1行1件: command=shortcut。noneで解除）", bindings, NativeFormFieldKind::Multiline},
   };
-  if (!RunNativeForm(window_, instance_, L"MDLite 設定", fields,
-                     NativeDialogTheme{theme_background_, theme_surface_, theme_input_,
-                                       theme_foreground_, theme_muted_, theme_accent_,
-                                       theme_border_})) return;
-  scope = fields[0].value;
-  std::ranges::transform(scope, scope.begin(), towlower);
-  if (scope == L"reset-common" || scope == L"reset-workspace") {
-    const auto reset_target = scope == L"reset-common" ? common_path : workspace_path;
-    if (reset_target.empty()) {
-      MessageBoxW(window_, L"Workspaceが開かれていません。", L"設定", MB_ICONWARNING); return;
+  bool settings_saved{};
+  const auto apply_settings = [&]() -> bool {
+    scope = fields[0].value;
+    std::ranges::transform(scope, scope.begin(), towlower);
+    if (scope == L"reset-common" || scope == L"reset-workspace") {
+      const auto reset_target = scope == L"reset-common" ? common_path : workspace_path;
+      if (reset_target.empty()) {
+        MessageBoxW(window_, L"Workspaceが開かれていません。", L"設定", MB_ICONWARNING); return false;
+      }
+      if (MessageBoxW(window_, (reset_target.wstring() + L"\nの上書きを解除して継承へ戻しますか？").c_str(),
+                      L"設定を既定へ戻す", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return false;
+      const auto& reset_snapshot = scope == L"reset-common" ? common_snapshot : workspace_snapshot;
+      if (!CheckSettingsSnapshot(reset_snapshot, error)) {
+        MessageBoxW(window_, error.c_str(), L"設定の競合", MB_ICONWARNING); return false;
+      }
+      std::error_code remove_error;
+      std::filesystem::remove(reset_target, remove_error);
+      if (remove_error) {
+        MessageBoxW(window_, L"設定上書きを削除できません。", L"設定", MB_ICONERROR); return false;
+      }
+      LoadAndApplySettings();
+      return true;
     }
-    if (MessageBoxW(window_, (reset_target.wstring() + L"\nの上書きを解除して継承へ戻しますか？").c_str(),
-                    L"設定を既定へ戻す", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
-    std::error_code remove_error;
-    std::filesystem::remove(reset_target, remove_error);
-    if (remove_error) {
-      MessageBoxW(window_, L"設定上書きを削除できません。", L"設定", MB_ICONERROR); return;
+    if ((scope == L"workspace" && workspace_path.empty()) || (scope != L"common" && scope != L"workspace")) {
+      MessageBoxW(window_, L"保存先の編集範囲が不正か、Workspaceが開かれていません。", L"設定", MB_ICONWARNING);
+      return false;
+    }
+    // Each attempt starts from its captured scope, including retries after a
+    // conflict, so unknown fields cannot leak from a previously selected layer.
+    if (!ParseSettingsSnapshot(scope == L"common" ? common_snapshot : workspace_snapshot, layer, error)) {
+      MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return false;
+    }
+    auto lower = [](std::wstring value) { std::ranges::transform(value, value.begin(), towlower); return value; };
+    const auto auto_save = lower(fields[1].value);
+    if (auto_save == L"inherit") layer.auto_save.reset();
+    else if (auto_save == L"on") layer.auto_save = true;
+    else if (auto_save == L"off") layer.auto_save = false;
+    else { MessageBoxW(window_, L"自動保存の値が不正です。", L"設定", MB_ICONWARNING); return false; }
+    const auto delay = lower(fields[2].value);
+    if (delay == L"inherit") layer.auto_save_delay_ms.reset();
+    else {
+      try { std::size_t consumed{}; const auto parsed = std::stoul(delay, &consumed);
+        if (consumed != delay.size()) throw std::invalid_argument("trailing characters");
+        layer.auto_save_delay_ms = static_cast<unsigned>(parsed);
+      } catch (...) { MessageBoxW(window_, L"自動保存待機時間が数値ではありません。", L"設定", MB_ICONWARNING); return false; }
+    }
+    const auto theme = lower(fields[3].value);
+    if (theme == L"inherit") layer.theme.reset();
+    else {
+      const auto parsed = ParseTheme(theme);
+      if (!parsed) { MessageBoxW(window_, L"テーマの値が不正です。", L"設定", MB_ICONWARNING); return false; }
+      layer.theme = *parsed;
+    }
+    const auto font = fields[4].value;
+    if (lower(font) == L"inherit") layer.font_face.reset(); else layer.font_face = font;
+    const auto size = lower(fields[5].value);
+    if (size == L"inherit") layer.font_size_pt.reset();
+    else {
+      try { std::size_t consumed{}; const auto parsed = std::stoul(size, &consumed);
+        if (consumed != size.size()) throw std::invalid_argument("trailing characters");
+        layer.font_size_pt = static_cast<unsigned>(parsed);
+      } catch (...) { MessageBoxW(window_, L"フォントサイズが数値ではありません。", L"設定", MB_ICONWARNING); return false; }
+    }
+    if (scope == L"common") {
+      const auto memo = fields[6].value;
+      if (lower(memo) == L"inherit" || memo.empty()) layer.default_memo_workspace.reset();
+      else layer.default_memo_workspace = std::filesystem::path(memo);
+    }
+    layer.colors.clear();
+    {
+      std::wistringstream stream(fields[7].value);
+      std::wstring line;
+      while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty()) continue;
+        const auto equals = line.find(L'=');
+        if (equals == std::wstring::npos) { MessageBoxW(window_, L"カスタム色はname=#RRGGBB形式で入力してください。", L"設定", MB_ICONWARNING); return false; }
+        const auto name = line.substr(0, equals);
+        const auto value = line.substr(equals + 1);
+        if (value != L"inherit") layer.colors[name] = value;
+      }
+    }
+    layer.keybindings.clear();
+    {
+      std::wistringstream stream(fields[8].value);
+      std::wstring line;
+      while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.empty()) continue;
+        const auto equals = line.find(L'=');
+        if (equals == std::wstring::npos) { MessageBoxW(window_, L"キー割当てはcommand=shortcut形式で入力してください。", L"設定", MB_ICONWARNING); return false; }
+        layer.keybindings[line.substr(0, equals)] = line.substr(equals + 1);
+      }
+    }
+    if (!ValidateSettingsLayer(layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONWARNING); return false; }
+    SettingsLayer common, workspace_layer;
+    if (!LoadSettingsLayer(common_path, common, error) ||
+        (!workspace_path.empty() && !LoadSettingsLayer(workspace_path, workspace_layer, error))) {
+      MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return false;
+    }
+    if (scope == L"common") common = layer; else workspace_layer = layer;
+    auto effective_bindings = DefaultSettingsLayer().keybindings;
+    for (const auto& item : common.keybindings) effective_bindings[item.first] = item.second;
+    for (const auto& item : workspace_layer.keybindings) effective_bindings[item.first] = item.second;
+    if (!ValidateKeybindingConflicts(effective_bindings, error)) {
+      MessageBoxW(window_, error.c_str(), L"キー割当て競合", MB_ICONWARNING); return false;
+    }
+    auto& selected_snapshot = scope == L"common" ? common_snapshot : workspace_snapshot;
+    if (!SaveSettingsSnapshot(selected_snapshot, layer, error)) {
+      MessageBoxW(window_, error.c_str(), L"設定の競合・保存エラー", MB_ICONERROR); return false;
     }
     LoadAndApplySettings();
-    return;
-  }
-  if ((scope == L"workspace" && workspace_path.empty()) || (scope != L"common" && scope != L"workspace")) {
-    MessageBoxW(window_, L"保存先の編集範囲が不正か、Workspaceが開かれていません。", L"設定", MB_ICONWARNING);
-    return;
-  }
-  const auto save_target = scope == L"common" ? common_path : workspace_path;
-  // The form starts from the selected layer.  If the user changes scope, load
-  // that layer now and apply the entered values as an explicit override.
-  if (save_target != target && !LoadSettingsLayer(save_target, layer, error)) {
-    MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return;
-  }
-  auto lower = [](std::wstring value) { std::ranges::transform(value, value.begin(), towlower); return value; };
-  const auto auto_save = lower(fields[1].value);
-  if (auto_save == L"inherit") layer.auto_save.reset();
-  else if (auto_save == L"on") layer.auto_save = true;
-  else if (auto_save == L"off") layer.auto_save = false;
-  else { MessageBoxW(window_, L"自動保存の値が不正です。", L"設定", MB_ICONWARNING); return; }
-  const auto delay = lower(fields[2].value);
-  if (delay == L"inherit") layer.auto_save_delay_ms.reset();
-  else {
-    try { std::size_t consumed{}; const auto parsed = std::stoul(delay, &consumed);
-      if (consumed != delay.size()) throw std::invalid_argument("trailing characters");
-      layer.auto_save_delay_ms = static_cast<unsigned>(parsed);
-    } catch (...) { MessageBoxW(window_, L"自動保存待機時間が数値ではありません。", L"設定", MB_ICONWARNING); return; }
-  }
-  const auto theme = lower(fields[3].value);
-  if (theme == L"inherit") layer.theme.reset();
-  else {
-    const auto parsed = ParseTheme(theme);
-    if (!parsed) { MessageBoxW(window_, L"テーマの値が不正です。", L"設定", MB_ICONWARNING); return; }
-    layer.theme = *parsed;
-  }
-  const auto font = fields[4].value;
-  if (lower(font) == L"inherit") layer.font_face.reset(); else layer.font_face = font;
-  const auto size = lower(fields[5].value);
-  if (size == L"inherit") layer.font_size_pt.reset();
-  else {
-    try { std::size_t consumed{}; const auto parsed = std::stoul(size, &consumed);
-      if (consumed != size.size()) throw std::invalid_argument("trailing characters");
-      layer.font_size_pt = static_cast<unsigned>(parsed);
-    } catch (...) { MessageBoxW(window_, L"フォントサイズが数値ではありません。", L"設定", MB_ICONWARNING); return; }
-  }
-  if (scope == L"common") {
-    const auto memo = fields[6].value;
-    if (lower(memo) == L"inherit" || memo.empty()) layer.default_memo_workspace.reset();
-    else layer.default_memo_workspace = std::filesystem::path(memo);
-  }
-  layer.colors.clear();
-  {
-    std::wistringstream stream(fields[7].value);
-    std::wstring line;
-    while (std::getline(stream, line)) {
-      if (!line.empty() && line.back() == L'\r') line.pop_back();
-      if (line.empty()) continue;
-      const auto equals = line.find(L'=');
-      if (equals == std::wstring::npos) { MessageBoxW(window_, L"カスタム色はname=#RRGGBB形式で入力してください。", L"設定", MB_ICONWARNING); return; }
-      const auto name = line.substr(0, equals);
-      const auto value = line.substr(equals + 1);
-      if (value != L"inherit") layer.colors[name] = value;
-    }
-  }
-  layer.keybindings.clear();
-  {
-    std::wistringstream stream(fields[8].value);
-    std::wstring line;
-    while (std::getline(stream, line)) {
-      if (!line.empty() && line.back() == L'\r') line.pop_back();
-      if (line.empty()) continue;
-      const auto equals = line.find(L'=');
-      if (equals == std::wstring::npos) { MessageBoxW(window_, L"キー割当てはcommand=shortcut形式で入力してください。", L"設定", MB_ICONWARNING); return; }
-      layer.keybindings[line.substr(0, equals)] = line.substr(equals + 1);
-    }
-  }
-  if (!ValidateSettingsLayer(layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONWARNING); return; }
-  SettingsLayer common, workspace_layer;
-  if (!LoadSettingsLayer(common_path, common, error) ||
-      (!workspace_path.empty() && !LoadSettingsLayer(workspace_path, workspace_layer, error))) {
-    MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return;
-  }
-  if (scope == L"common") common = layer; else workspace_layer = layer;
-  auto effective_bindings = DefaultSettingsLayer().keybindings;
-  for (const auto& item : common.keybindings) effective_bindings[item.first] = item.second;
-  for (const auto& item : workspace_layer.keybindings) effective_bindings[item.first] = item.second;
-  if (!ValidateKeybindingConflicts(effective_bindings, error)) {
-    MessageBoxW(window_, error.c_str(), L"キー割当て競合", MB_ICONWARNING); return;
-  }
-  if (!SaveSettingsLayer(save_target, layer, error)) { MessageBoxW(window_, error.c_str(), L"設定", MB_ICONERROR); return; }
-  LoadAndApplySettings();
-  if (!TestAutomationSilent())
+    settings_saved = true;
+    return true;
+  };
+  const bool applied = RunNativeForm(window_, instance_, L"MDLite 設定", fields,
+                     NativeDialogTheme{theme_background_, theme_surface_, theme_input_,
+                                       theme_foreground_, theme_muted_, theme_accent_,
+                                       theme_border_}, apply_settings);
+  if (applied && settings_saved && !TestAutomationSilent())
     MessageBoxW(window_, L"設定を保存して適用しました。", L"設定", MB_ICONINFORMATION);
 }
 

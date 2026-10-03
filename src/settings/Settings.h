@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/Document.h"
+
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -34,9 +36,18 @@ struct EffectiveSettings {
   std::map<std::wstring, std::wstring> origins;
 };
 
+struct SettingsFileSnapshot {
+  Document document;
+  bool existed{};
+};
+
 SettingsLayer DefaultSettingsLayer();
 bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, std::wstring& error);
 bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& layer, std::wstring& error);
+bool CaptureSettingsFile(const std::filesystem::path& path, SettingsFileSnapshot& snapshot, std::wstring& error);
+bool ParseSettingsSnapshot(const SettingsFileSnapshot& snapshot, SettingsLayer& layer, std::wstring& error);
+bool CheckSettingsSnapshot(const SettingsFileSnapshot& snapshot, std::wstring& error);
+bool SaveSettingsSnapshot(SettingsFileSnapshot& snapshot, const SettingsLayer& layer, std::wstring& error);
 bool ResolveSettings(const std::filesystem::path& common_path, const std::filesystem::path& workspace_path,
                      EffectiveSettings& settings, std::wstring& error);
 bool ValidateSettingsLayer(const SettingsLayer& layer, std::wstring& error);

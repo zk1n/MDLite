@@ -95,6 +95,7 @@ class Application {
 
     Document document;
     HWND editor{};
+    std::optional<RECT> editor_formatting_rect_request;
     SourceSelection suspended_selection{};
     std::size_t suspended_first_visible_source{};
     std::optional<std::size_t> suspended_horizontal_left_edge_source;
@@ -131,6 +132,7 @@ class Application {
     unsigned editor_projection_repair_attempts{};
     unsigned force_editor_readback_failures_for_test{};
     bool force_markdown_presentation_failure_for_test{};
+    bool force_table_cell_formatting_failure_for_test{};
     bool force_partial_markdown_presentation_failure_for_test{};
     std::uint32_t native_projection_failures_for_test{};
     std::optional<SourceSelection> pending_selection_before;
@@ -138,6 +140,9 @@ class Application {
     std::optional<SourceSelection> ime_selection_before;
     std::optional<TableCellIntent> pending_virtual_table_cell;
     wchar_t pending_table_high_surrogate{};
+    wchar_t pending_body_high_surrogate{};
+    SourceSelection pending_body_surrogate_selection{};
+    std::uint64_t pending_body_surrogate_revision{};
     bool native_tables_ready{};
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;

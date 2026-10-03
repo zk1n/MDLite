@@ -1,6 +1,8 @@
 #include "editor/RichEditTableAdapter.h"
 
 #include <richedit.h>
+#include <richole.h>
+#include <tom.h>
 
 #include <algorithm>
 #include <array>
@@ -216,6 +218,44 @@ bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
 }
 
 }  // namespace
+
+bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
+                             COLORREF header_background, COLORREF body_background) {
+  if (snapshot.tables.empty()) return true;
+  IRichEditOle* rich_edit{};
+  if (!SendMessageW(editor, EM_GETOLEINTERFACE, 0,
+                    reinterpret_cast<LPARAM>(&rich_edit)) || !rich_edit) return false;
+  ITextDocument* document{};
+  const HRESULT queried = rich_edit->QueryInterface(__uuidof(ITextDocument),
+                                                    reinterpret_cast<void**>(&document));
+  rich_edit->Release();
+  if (FAILED(queried) || !document) return false;
+  BSTR face = SysAllocString(L"Cascadia Mono");
+  bool formatted = face != nullptr;
+  for (const auto& table : snapshot.tables) {
+    for (std::size_t row_index{}; formatted && row_index < table.visual_rows.size(); ++row_index) {
+      for (const auto& cell : table.visual_rows[row_index].cells) {
+        if (cell.virtual_cell || cell.native_begin >= cell.native_end) continue;
+        if (cell.native_end > static_cast<std::size_t>(LONG_MAX)) { formatted = false; break; }
+        ITextRange* range{};
+        ITextFont* font{};
+        formatted = SUCCEEDED(document->Range(static_cast<LONG>(cell.native_begin),
+                                              static_cast<LONG>(cell.native_end), &range)) && range &&
+                    SUCCEEDED(range->GetFont(&font)) && font &&
+                    SUCCEEDED(font->SetName(face)) &&
+                    SUCCEEDED(font->SetBackColor(static_cast<LONG>(
+                        row_index == 0 ? header_background : body_background)));
+        if (font) font->Release();
+        if (range) range->Release();
+        if (!formatted) break;
+      }
+    }
+    if (!formatted) break;
+  }
+  SysFreeString(face);
+  document->Release();
+  return formatted;
+}
 
 bool ReadRichEditNativeText(HWND editor, std::wstring& text) {
   text.clear();

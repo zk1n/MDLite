@@ -189,14 +189,9 @@ bool ValidateSettingsLayer(const SettingsLayer& layer, std::wstring& error) {
   return ValidateKeybindingConflicts(layer.keybindings, error);
 }
 
-bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, std::wstring& error) {
+static bool ParseSettingsText(std::wstring_view text, SettingsLayer& layer, std::wstring& error) {
   layer = {};
-  std::ifstream input(path, std::ios::binary);
-  if (!input) return true;
-  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-  std::wstring text;
-  if (!DecodeUtf8(bytes, text)) { error = L"設定ファイルはUTF-8で保存してください: " + path.wstring(); return false; }
-  std::wistringstream lines(text);
+  std::wistringstream lines{std::wstring(text)};
   std::wstring line;
   bool schema_seen{};
   while (std::getline(lines, line)) {
@@ -267,9 +262,19 @@ bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, 
   return ValidateSettingsLayer(layer, error);
 }
 
-bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& layer, std::wstring& error) {
+bool LoadSettingsLayer(const std::filesystem::path& path, SettingsLayer& layer, std::wstring& error) {
+  layer = {};
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return true;
+  const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  std::wstring text;
+  if (!DecodeUtf8(bytes, text)) { error = L"設定ファイルはUTF-8で保存してください: " + path.wstring(); return false; }
+  return ParseSettingsText(text, layer, error);
+}
+
+static bool SerializeSettings(const SettingsLayer& layer, std::wstring& text, std::wstring& error) {
   if (!ValidateSettingsLayer(layer, error)) return false;
-  std::wstring text = L"schema_version = 1\n";
+  text = L"schema_version = 1\n";
   if (layer.auto_save) text += L"auto_save = " + std::wstring(*layer.auto_save ? L"true" : L"false") + L"\n";
   if (layer.auto_save_delay_ms) text += L"auto_save_delay_ms = " + std::to_wstring(*layer.auto_save_delay_ms) + L"\n";
   if (layer.theme) text += L"theme = \"" + ThemeName(*layer.theme) + L"\"\n";
@@ -283,6 +288,56 @@ bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& l
     text += L"\n# Preserved settings not managed by this MDLite build\n";
     for (const auto& line : layer.preserved_lines) text += line + L"\n";
   }
+  return true;
+}
+
+bool CaptureSettingsFile(const std::filesystem::path& path, SettingsFileSnapshot& snapshot, std::wstring& error) {
+  snapshot = {};
+  std::error_code filesystem_error;
+  snapshot.existed = std::filesystem::exists(path, filesystem_error);
+  if (filesystem_error) { error = L"設定ファイルの状態を確認できません。"; return false; }
+  if (snapshot.existed) return snapshot.document.Load(path, error);
+  snapshot.document.CreateUntitled(path);
+  return true;
+}
+
+bool ParseSettingsSnapshot(const SettingsFileSnapshot& snapshot, SettingsLayer& layer, std::wstring& error) {
+  layer = {};
+  if (!snapshot.existed) return true;
+  if (snapshot.document.encoding() == TextEncoding::Cp932) {
+    error = L"設定ファイルはUTF-8で保存してください: " + snapshot.document.path().wstring();
+    return false;
+  }
+  return ParseSettingsText(snapshot.document.text(), layer, error);
+}
+
+bool CheckSettingsSnapshot(const SettingsFileSnapshot& snapshot, std::wstring& error) {
+  std::error_code filesystem_error;
+  const bool exists = std::filesystem::exists(snapshot.document.path(), filesystem_error);
+  if (filesystem_error || exists != snapshot.existed ||
+      (snapshot.existed && snapshot.document.HasExternalChange())) {
+    error = L"設定ファイルが外部で変更、作成または削除されています。上書きせず、入力内容を保持しています。";
+    return false;
+  }
+  return true;
+}
+
+bool SaveSettingsSnapshot(SettingsFileSnapshot& snapshot, const SettingsLayer& layer, std::wstring& error) {
+  std::wstring text;
+  if (!SerializeSettings(layer, text, error) || !CheckSettingsSnapshot(snapshot, error)) return false;
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(snapshot.document.path().parent_path(), filesystem_error);
+  if (filesystem_error) { error = L"設定フォルダーを作成できません。"; return false; }
+  snapshot.document.MarkEdited(std::move(text));
+  const bool saved = snapshot.existed ? snapshot.document.Save(error)
+      : snapshot.document.SaveAs(snapshot.document.path(), error);
+  if (saved) snapshot.existed = true;
+  return saved;
+}
+
+bool SaveSettingsLayer(const std::filesystem::path& path, const SettingsLayer& layer, std::wstring& error) {
+  std::wstring text;
+  if (!SerializeSettings(layer, text, error)) return false;
   std::string bytes;
   if (!EncodeUtf8(text, bytes)) { error = L"設定をUTF-8へ変換できません。"; return false; }
   std::error_code filesystem_error;

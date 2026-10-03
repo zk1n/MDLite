@@ -86,12 +86,41 @@ public static class MDLiteNative {
     public static extern int GetWindowTextLength(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, string lparam);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam);
+    public static IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam) {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        IntPtr result;
+        IntPtr api = SendMessageTimeoutW(window, message, wparam, lparam, 2, 5000, out result);
+        return CheckMessageResult(api, result, window, message, elapsed);
+    }
+    public static IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, string lparam) {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        IntPtr result;
+        IntPtr api = SendMessageTimeoutText(window, message, wparam, lparam, 2, 5000, out result);
+        return CheckMessageResult(api, result, window, message, elapsed);
+    }
+    public static IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam) {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        IntPtr result;
+        IntPtr api = SendMessageTimeoutBuffer(window, message, wparam, lparam, 2, 5000, out result);
+        return CheckMessageResult(api, result, window, message, elapsed);
+    }
+    private static IntPtr CheckMessageResult(IntPtr api, IntPtr result, IntPtr window,
+                                            uint message, System.Diagnostics.Stopwatch elapsed) {
+        if (api != IntPtr.Zero) return result;
+        int error = Marshal.GetLastWin32Error();
+        uint owner;
+        uint thread = GetWindowThreadProcessId(window, out owner);
+        throw new TimeoutException("Native message failed: hwnd=" + window + ", owner_pid=" + owner +
+            ", thread=" + thread + ", message=0x" + message.ToString("X") +
+            ", configured_timeout_ms=5000, elapsed_ms=" + elapsed.Elapsed.TotalMilliseconds +
+            ", win32_error=" + error + ", is_window=" + IsWindow(window));
+    }
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SendMessageTimeoutText(IntPtr window, uint message, IntPtr wparam,
+        string lparam, uint flags, uint timeoutMilliseconds, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SendMessageTimeoutBuffer(IntPtr window, uint message, IntPtr wparam,
+        StringBuilder lparam, uint flags, uint timeoutMilliseconds, out IntPtr result);
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true)]
     public static extern IntPtr SendMessageTimeoutW(
         IntPtr window, uint message, IntPtr wparam, IntPtr lparam,

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [ValidateSet('debug','release')]
@@ -287,8 +287,8 @@ function Get-PositionForSource([IntPtr]$Editor, [int]$Index) {
     if ($packed -eq -1) { throw "Could not get native position for source offset $Index" }
     $packed = $packed -band 0xffffffffL
     return [pscustomobject]@{
-        x = [int][short]($packed -band 0xffff)
-        y = [int][short](($packed -shr 16) -band 0xffff)
+        x = [int][BitConverter]::ToInt16([BitConverter]::GetBytes([uint16]($packed -band 0xffff)), 0)
+        y = [int][BitConverter]::ToInt16([BitConverter]::GetBytes([uint16](($packed -shr 16) -band 0xffff)), 0)
     }
 }
 
@@ -913,7 +913,7 @@ try {
     }
     Invoke-TableCase 'continuous_unicode_input_no_accumulation' {
         param($main, $editor, $path, $process)
-        $payload = 'x' * 128
+        $payload = ('日本語' + [char]0xd83d + [char]0xde00 + 'e' + [char]0x0301) * 16
         Set-Selection $editor $nativeView.Length
         $input = Send-UnicodeCharacters $editor $payload
         if ($input.status -ne 'PASS') {
@@ -923,7 +923,10 @@ try {
         $saved = Save-Source $main $path
         [pscustomobject]@{
             pass = $saved -eq ($source + $payload)
-            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
+            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' }
+                elseif ($saved -eq $source) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
+                else { 'FAIL_SOURCE_AFTER_OBSERVED_OS_INPUT' }
+            delivery = $input
             expected_length = ($source + $payload).Length
             actual_length = $saved.Length
         }
@@ -940,16 +943,21 @@ try {
         if ($firstInput.status -ne 'PASS') {
             return [pscustomobject]@{ pass = $false; status = $firstInput.status; delivery = $firstInput; reason = 'OS Ctrl+Z was not delivered to the target RichEdit.' }
         }
+        Start-Sleep -Milliseconds 150
         $undoOne = Save-Source $main $path
         Start-Sleep -Milliseconds 100
         $secondInput = Send-ControlKey $editor $VK_Z
         if ($secondInput.status -ne 'PASS') {
             return [pscustomobject]@{ pass = $false; status = $secondInput.status; delivery = $secondInput; reason = 'Second OS Ctrl+Z was not delivered to the target RichEdit.' }
         }
+        Start-Sleep -Milliseconds 150
         $undoTwo = Save-Source $main $path
         [pscustomobject]@{
             pass = $afterTwo -ne $afterRow -and $undoOne -eq $afterRow -and $undoTwo -eq $source
-            status = if ($undoOne -eq $afterRow -and $undoTwo -eq $source) { 'PASS_OS_INPUT_ONE_TRANSACTION' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
+            status = if ($undoOne -eq $afterRow -and $undoTwo -eq $source) { 'PASS_OS_INPUT_ONE_TRANSACTION' }
+                elseif ($undoOne -eq $afterTwo -and $undoTwo -eq $afterTwo) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
+                else { 'FAIL_HISTORY_AFTER_OBSERVED_OS_INPUT' }
+            delivery = @($firstInput, $secondInput)
             after_row = $afterRow
             after_two = $afterTwo
             undo_one = $undoOne
@@ -963,10 +971,13 @@ try {
         if ($input.status -ne 'PASS') {
             return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $input; reason = 'OS arrow repeat was not delivered to the target RichEdit.' }
         }
+        Start-Sleep -Milliseconds 150
         $selection = Get-Selection $editor
         $saved = Save-Source $main $path
         $pass = $saved -eq $source -and $selection.start -ge $two -and $selection.end -eq $selection.start -and $selection.start -lt $three
-        [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' } else { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
+        [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' }
+            elseif ($selection.start -eq ($one + 3) -and $selection.end -eq $selection.start -and $saved -eq $source) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
+            else { 'FAIL_BOUNDARY_AFTER_OBSERVED_OS_INPUT' }; delivery = $input; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
     }
     Invoke-TableCase 'table_paint_reentry' {
         param($main, $editor, $path, $process)

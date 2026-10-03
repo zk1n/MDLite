@@ -7,7 +7,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $OutputPath) { $OutputPath = Join-Path $repoRoot 'build\verification\git-local-first-final11.json' }
+$runId = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$verificationRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build\verification'))
+$evidenceRoot = [IO.Path]::GetFullPath((Join-Path $verificationRoot 'prehuman-calendar-git'))
+if (-not $OutputPath) { $OutputPath = Join-Path $evidenceRoot "git-local-acceptance-$runId.json" }
 
 $gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue
 $gitExe = if ($gitCommand) { $gitCommand.Source } else { 'C:\Program Files\Git\cmd\git.exe' }
@@ -23,12 +26,14 @@ function Invoke-Git([string]$Root, [string[]]$Arguments) {
 
 $outputDirectory = Split-Path -Parent $OutputPath
 if ($outputDirectory) { New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null }
-$probeRoot = Join-Path $repoRoot ('.git-local-first-' + [guid]::NewGuid().ToString('N'))
+$probeRoot = Join-Path $evidenceRoot ("git-local-model-$runId")
+$ownerMarker = Join-Path $probeRoot '.git-local-model-owner'
 $checks = [ordered]@{}
 $result = $null
 
 try {
     New-Item -ItemType Directory -Path $probeRoot | Out-Null
+    [IO.File]::WriteAllText($ownerMarker, $runId, [Text.UTF8Encoding]::new($false))
     $init = Invoke-Git $probeRoot @('init', '--initial-branch=main')
     if ($init.exit_code -ne 0) { throw "git init failed: $($init.output)" }
     foreach ($pair in @(
@@ -88,7 +93,9 @@ try {
         generated_at_utc = [DateTime]::UtcNow.ToString('o')
         git_executable = $gitExe
         git_version = (Invoke-Git $probeRoot @('--version')).output
-        probe = 'isolated repository; no user Workspace or remote changed'
+        evidence_lane = 'MODEL_AND_DIRECT_GIT_FIXTURE_ONLY'
+        product_gui_route = 'NOT_RUN; covered by Invoke-GitPanelProductAcceptance.ps1'
+        probe = 'isolated repository beneath build/verification; no user Workspace or remote changed'
         checks = $checks
         status = if ($checks.all_checks_pass) { 'PASS' } else { 'FAIL' }
         caveat = 'This proves the local Git/index boundary and command shape; it does not replace Human GUI, hook, credential, or offline-network acceptance.'
@@ -97,7 +104,11 @@ try {
     if (-not $checks.all_checks_pass) { throw "Git local acceptance failed; see $OutputPath" }
 }
 finally {
-    if (Test-Path -LiteralPath $probeRoot) {
+    $canonicalProbeRoot = [IO.Path]::GetFullPath($probeRoot)
+    $canonicalEvidenceRoot = [IO.Path]::GetFullPath($evidenceRoot).TrimEnd('\') + '\'
+    if ((Test-Path -LiteralPath $ownerMarker -PathType Leaf) -and
+        [IO.File]::ReadAllText($ownerMarker) -ceq $runId -and
+        $canonicalProbeRoot.StartsWith($canonicalEvidenceRoot, [StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $probeRoot -Recurse -Force
     }
 }

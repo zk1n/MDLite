@@ -1,11 +1,207 @@
 # MDLite 表示・UI再構築 実装・受入状況
 
+更新日: 2026-10-04
+
+以下の2026-10-04 Current Statusが最新のsource 76ab状況である。Build/CTest/CoreのPASSは製品全体の受入PASSを意味しない。source 99d5、CDF、過去snapshotは各source laneの歴史記録として分離し、source 76abへ引き継いだPASSとは扱わない。受入の権威はcurrent Task、latest HANDOFF、current implementation、latest user instructions。Drive資料や過去のintegrated-spec copyは、これらと矛盾する場合はreference-onlyであり、新しい要求や機能の根拠にしない。
+
+## Current Status — 2026-10-04 (source 76ab)
+
+**Overall acceptance: NOT PASS.** source `76abdfc0da4478ca11834cb61a1c361ddfbf33b3dc43c394071116ef71cad4aa` has passing Debug/Release build and CTest plus 397 core checks. The final nine-case Save artifact is 7 PASS, 2 BLOCKED, 0 FAIL. Git, Calendar, Trust, palette, latest UI, Release product-task, and full P0–P5 evidence were not run on source 76ab. The read-only reviewer closed a focused settings addendum with no new concrete finding; that is not overall product acceptance.
+
+### Current build, product, and review evidence
+
+| Lane | Current result | Evidence / boundary |
+|---|---|---|
+| Final source/build | PASS: 48 files; Debug and Release build/CTest 7/7 each; 397 core checks | Source SHA-256 `76abdfc0da4478ca11834cb61a1c361ddfbf33b3dc43c394071116ef71cad4aa`. Debug receipt [build-receipt-debug.json](../build/verification/build-receipt-debug.json), run `fafd231a214342cca916d57e2bef7bac`, EXE `c43856f988061bb303c4c1450d91382302315f1c2e3e38d59d2c7467adbaf757`; Release receipt [build-receipt-release.json](../build/verification/build-receipt-release.json), run `5eb3473bc0db4b89baee2336841a6948`, EXE `b879f123ff307632c1843af8db125fa43a04ec2aef45053c74f9901803c4ab6a`. Core-test receipt [settings-snapshot-final-test-file-receipt.json](../build/verification/prehuman-edit/settings-snapshot-final-test-file-receipt.json), 397 checks. |
+| Focused Settings snapshot | PASS: two selected native cases | [settings-snapshot-native-focused.json](../build/verification/prehuman-edit/settings-snapshot-native-focused.json) verifies Cancel/Apply/restart and external-change handling, including retained bytes, form values, and runtime state. This focused run used source `76fba413243bcbb67090e4a885286f90cbc8f1c1cabe7801ba79f00f990a96db`; [findings-progress.json](../build/verification/prehuman-edit/findings-progress.json) records that the final 76ab source differs from this candidate only by callback indentation. The focused run is not the full Save matrix. |
+| Final 76ab default Save | PARTIAL: 7 PASS, 2 BLOCKED, 0 FAIL (9 cases) | [corrected-save-final-source-20261004-014414.json](../build/verification/prehuman-save/corrected-save-final-source-20261004-014414.json), run `20261003-164415-344088cb`, artifact SHA-256 `717350fecd355d920c56b363728e4f68414ed4230743ce3152a62d2ef4587aaf`; source/EXE identity matches the 76ab Debug receipt. `empty_untitled_explicit_save` is BLOCKED because the dialog showed `untitled.md` instead of the expected `empty-save.md`; profile persistence is BLOCKED by the PowerShell 5 caption-decoding false negative. Settings Apply/restart and external-change cases PASS; the latter retained peer bytes and kept the form open. |
+| Profile-caption harness correction | PASS (offline parser/decode/C# check) / NOT_RUN (product GUI rerun) | [focused-harness-offline-validation-utf8-caption-20261004.json](../build/verification/prehuman-save/focused-harness-offline-validation-utf8-caption-20261004.json) validates harness SHA-256 `ba5a0f5c50fce736809e38c404b944911b43060e32c749bd7d2d504fb41ba27d` under Windows PowerShell 5.1; `gui_process_started` is false. The profile-caption case remains BLOCKED in the default nine-case artifact. |
+| Save-result reporting discrepancy | RESOLVED by artifact authority; prior narrative corrected | An earlier worker narrative carried the source 99d5 external-settings failure into the 76ab run. The 76ab artifact above is 7 PASS / 2 BLOCKED / 0 FAIL; the 99d5 failure remains recorded in its own historical lane below. Neither lane establishes overall acceptance. |
+| Git / Calendar / Trust / palette / latest UI | NOT_RUN on 76ab | The latest product routes were not relaunched on the final 76ab source. Historical CDF fixture results remain source-specific and are summarized below. Offline harness validation does not establish product behavior. |
+| Release product task / full performance | NOT_RUN on 76ab | Release build/CTest passed, but Release UI acceptance and the full P0–P5 performance suite were not run on this source. Older P0–P5 results remain historical only. |
+| F5 / sample preservation | BLOCKED (actual IDE debugger launch in earlier attempt) / NOT_RUN (76ab F5 route) / PASS (17/17 sample baseline) | Literal Orca F5 delivery was unsupported; the `cppvsdbg` unsupported modal blocked the actual UI debugger launch. The sample baseline [samples-baseline.json](../build/verification/prehuman-f5-ui/samples-baseline.json), SHA-256 `67cf8220003c14427708b10ef08ba09572b77d9acd1002e89a420acc72780fad`, records 17 demo-workspace files with exact bytes, hashes, sizes, and attributes; the F5 worker repeatedly verified 17/17 unchanged. This is fixture preservation evidence, not a debugger-session PASS. |
+| Clipboard publisher/caller models | PASS (offline only: publisher 5/5; cut caller 6/6) / NOT_RUN (real clipboard) / UNCONFIRMED (both cleanup attempts) | [clipboard-mutation-tracking-offline.json](../build/verification/prehuman-edit/clipboard-mutation-tracking-offline.json) and [cut-ownership-tracking-offline.json](../build/verification/prehuman-edit/cut-ownership-tracking-offline.json) use fake APIs and contain no private clipboard contents. Real clipboard dispatch was not executed. Original and subsequent cleanup results remain UNCONFIRMED; no private history was read. |
+| Independent review | CLOSED (settings addendum; no new concrete finding) | The read-only reviewer completed the focused addendum against final 76ab. This does not replace product, Human, Release, or delivery acceptance. |
+| Infrastructure run note | RECORDED; not a product finding | A worker run returned `Agent errored: Selected model is at capacity. Please try a different model.` before the final 99d5 build. The same owner/model/effort resumed once from saved diffs and completed; settings and routing were not changed. No automated retry loop is authorized under the current cutoff. |
+
+### Current E01–E25 crosswalk
+
+Statuses below apply to final source 76ab unless the row explicitly says historical. A build or focused subcase PASS does not establish the complete product path.
+
+| ID | Latest 76ab status | Current coverage / remaining scope |
+|---|---|---|
+| E01 | NOT_RUN | Multi-untitled, close, and recovery route not run on 76ab. The empty explicit Save BLOCKED case is E02 evidence, not E01 recovery evidence. |
+| E02 | PARTIAL: 7 PASS / 2 BLOCKED / 0 FAIL | The exact nine-case result is linked above. Empty Save observed `untitled.md`; profile persistence stopped at caption decoding. The two current blockers do not establish product failures. |
+| E03 | NOT_RUN | Crash, close, prompt, and recovery branches not run on 76ab. |
+| E04 | PASS (Daily/Meeting/Memo date-repeat/no-overwrite) / BLOCKED (profile definition persistence) / NOT_RUN (full matrix) | Daily reuse/no-overwrite and Meeting/Memo `_01` repeat behavior passed in the 76ab Save artifact. Profile definition persistence remains blocked by the caption false negative. |
+| E05 | NOT_RUN (76ab); HISTORICAL PASS (focused selection probes) | Current heading/input/Undo/Redo/save matrix not run. The prior CDF focused selection result remains source-specific in the historical checkpoint. |
+| E06 | NOT_RUN (Human) | Physical Microsoft IME/ATOK composition, commit, cancel, and reconversion were not exercised. |
+| E07 | NOT_RUN (real clipboard) / UNCONFIRMED (cleanup) / HISTORICAL FAIL (synthetic ReversePaste no-op) | Publisher/caller model checks passed offline 5/5 and 6/6; they do not prove real clipboard dispatch. Both cleanup attempts remain unconfirmed; the earlier CDF no-op is historical and its root cause is unresolved. |
+| E08 | NOT_RUN (76ab); HISTORICAL PASS (99d5 packet probe 4/4) | The prior packet probe verified exact source and one Undo/Redo cycle only. Full document, cross-tab, clipboard, and presentation-history acceptance is not established. |
+| E09 | NOT_RUN (76ab); HISTORICAL PASS (selected synthetic routes) / BLOCKED (four OS-input routes) | Earlier CDF synthetic boundary/navigation cases and OS-input limitations remain historical. No physical/full matrix was run on 76ab. |
+| E10 | NOT_RUN | No physical arrow-hold or timed caret/selection/scroll recording on 76ab. |
+| E11 | NOT_RUN (76ab); HISTORICAL PASS (synthetic boundary arrows) | Earlier synthetic Arrow-right/Arrow-down checks are source-specific; physical regression remains untested. |
+| E12 | NOT_RUN (76ab); HISTORICAL PASS (same-layout 3, resize 2) | Earlier table geometry checks do not establish the combined IME, scroll, DPI, continuous visual, and input matrix. |
+| E13 | NOT_RUN (approved/Human visual); HISTORICAL PASS (three synthetic invariants) | The 76ab route and approved theme/background comparison were not performed; Human judgment remains open. |
+| E14 | NOT_RUN | Current panel-header, splitter, drag, restore, and narrow-width matrix not run on 76ab. |
+| E15 | NOT_RUN (visible alternative on 76ab); HISTORICAL BLOCKED (synthetic WM_NOTIFY) | Earlier cross-process outline drag returned Win32 error 5. No actual visible/OS-native drag PASS is claimed. |
+| E16 | NOT_RUN | Current Calendar panel/month/holiday visual and interaction matrix not run on 76ab. |
+| E17 | NOT_RUN | Current Calendar activation, no-create hover/focus, and duplicate-creation route not run on 76ab. |
+| E18 | NOT_RUN (76ab); HISTORICAL BLOCKED (Save-dialog control discovery) | Earlier Calendar Rename/Move reached the native dialog but stopped before filename readback or fixture mutation. The harness InvokePattern correction was checked offline only; no GUI rerun occurred. |
+| E19 | NOT_RUN (76ab); HISTORICAL PASS (NoRepo, mixed no-remote rows, stale refresh) | Earlier CDF fixture status results do not establish final 76ab behavior. NoGit after Trust was not reached in that earlier route. |
+| E20 | NOT_RUN (76ab); HISTORICAL PASS (Stage/edit/recovery, Unstage, fixture Commit) | Earlier CDF fixture proved Stage/Unstage and Commit (HEAD `66ad59b633f88d74540740b6618f79487928307a`); the raw acceptance artifact's BLOCKED was post-commit evidence assembly, not a failed product Commit. This is fixture evidence, not a real-repository commit. |
+| E21 | PARTIAL: 7 PASS / 2 BLOCKED / 0 FAIL; HISTORICAL FAIL (external-settings conflict on 99d5) | The 76ab default nine-case artifact and focused settings evidence show retained bytes/form/runtime. The 99d5 overwrite is preserved as a separate baseline result, not carried into the 76ab status. Full Save/recovery matrix remains open. |
+| E22 | PASS (76ab Debug/Release build/CTest and 397 core checks) / NOT_RUN (76ab debugger session) / HISTORICAL BLOCKED (IDE launch) | The prior literal F5/`cppvsdbg` attempt did not establish a debugger session. The 17/17 sample baseline is a separate preservation check. |
+| E23 | NOT_RUN (AI comparison and Human visual judgment) | Approved image/DPI/theme/native-window comparison not performed on 76ab. |
+| E24 | NOT_RUN | Current Calendar hover/tooltip/resize visual route not run on 76ab. |
+| E25 | NOT_RUN (76ab); HISTORICAL BLOCKED (palette/focus driver) | Previous product palette/focus route was blocked by PS5 type resolution and Fetch control discovery. Harness corrections were validated offline; no 76ab product route was run. |
+
+### Current R-01–R-20 crosswalk
+
+| ID | Latest 76ab status | Current coverage / remaining scope |
+|---|---|---|
+| R-01 Workspace/file operations | NOT_RUN (76ab); HISTORICAL BLOCKED (Rename/Move harness) | The earlier Save dialog route did not set/read back a destination or mutate the fixture. Offline InvokePattern correction does not establish the product route. |
+| R-02 Live editing | NOT_RUN (complete 76ab route); HISTORICAL focused PASS / FAIL / BLOCKED lanes retained | Core and native probes are limited to their named artifacts. Real clipboard was not executed; the ReversePaste no-op and both cleanup uncertainties remain separate historical facts. |
+| R-03 Markdown/GFM/live rendering | PASS (Debug/Release CTest and 397 core checks) / NOT_RUN (76ab approved live edit/render and Human visual) | Core checks do not establish the full live editor route. |
+| R-04 Navigation | NOT_RUN | Current tabs, Quick Open, Outline, and link route not run on 76ab. |
+| R-05 Search/replace | NOT_RUN | Current Find/Replace and Workspace Search route not run on 76ab. |
+| R-06 Templates/profiles/Daily/calendar | PASS (selected Daily/Meeting/Memo date/repeat) / BLOCKED (profile caption route) / NOT_RUN (Calendar/full matrix) | The 76ab Save artifact passes date/repeat behavior; profile persistence is blocked at caption decoding, and Calendar GUI acceptance was not run. |
+| R-07 Autosave/safe save/recovery | PARTIAL: 7 PASS / 2 BLOCKED / 0 FAIL on 76ab; HISTORICAL FAIL on 99d5 | The 76ab artifact passes external-settings conflict with peer bytes unchanged and form retained. The 99d5 stale-overwrite failure remains a separate historical baseline. Multi-untitled and full recovery/race cases remain open. |
+| R-08 Encoding/EOL | PASS (selected CP932 conversion rejection) / NOT_RUN (full matrix) | The 76ab Save artifact preserves original CP932 bytes and recovery on unrepresentable input; UTF-8/BOM/EOL user-path acceptance is not complete. |
+| R-09 Recovery/session | NOT_RUN (76ab full route) | The real clipboard was not executed; original and subsequent cleanup results remain UNCONFIRMED and are not document-recovery evidence. |
+| R-10 Git assistance | NOT_RUN (76ab); HISTORICAL PASS (CDF isolated fixture) | Earlier NoRepo/mixed/stale/Stage/Unstage and fixture Commit evidence are source-specific. No local-repository commit, push, or final 76ab Git panel acceptance is established here. |
+| R-11 Settings/configuration | PASS (focused snapshot and 76ab default settings cases) / BLOCKED (profile caption route) / HISTORICAL FAIL (99d5 external overwrite) | The focused two-case probe and 76ab nine-case artifact show retained peer bytes/form/runtime. The 99d5 overwrite failure remains visible as historical baseline; profile UI persistence was not verified. |
+| R-12 Appearance/theme/font | NOT_RUN (76ab approved visual); HISTORICAL PASS (focused synthetic invariants) | No 76ab approved UI/reference comparison or Human visual review was performed. |
+| R-13 Palette/keybindings | NOT_RUN | Palette/focus/custom-binding routes were not run on 76ab. |
+| R-14 Window/compact mode | NOT_RUN (76ab full matrix); HISTORICAL OPEN (10.30-second startup latency) | Earlier functional startup evidence is not a current latency or compact-mode PASS. |
+| R-15 Trust/communication safety | NOT_RUN (76ab); HISTORICAL BLOCKED (Trust decision) | Earlier CDF test selected a fixture store and captured the Trust prompt, but no accept/deny/revoke decision occurred. No global Trust write is claimed. |
+| R-16 Diagnostics/maintenance/updates | NOT_RUN | Current diagnostics and dependency/maintenance paths not run on 76ab. |
+| R-17 Performance | NOT_RUN (full P0–P5 on 76ab); HISTORICAL PASS (older full automated run) | No current overall performance PASS is claimed. |
+| R-18 Large documents | NOT_RUN (76ab); HISTORICAL measurements only | Current final-source 20/100 MiB routes were not rerun. |
+| R-19 VS Code/F5 development | PASS (76ab build/CTest) / NOT_RUN (76ab actual debugger session) / HISTORICAL BLOCKED (IDE debugger launch) | Literal Orca F5 was unsupported and the `cppvsdbg` modal blocked the earlier launch. The 17/17 sample baseline is preserved separately; it is not debugger acceptance. |
+| R-20 Local Git/public operation | NOT_RUN (product evidence); Root-owned delivery checks separate | Fixture Commit `66ad…` is not a project-repository commit or remote push. Root owns local Git/HANDOFF/Drive readback; Task Inbox remains retained because the Task is incomplete. |
+
+### Current requirements, evidence boundaries, and next-development cases
+
+- Current Task, latest HANDOFF, current implementation, and latest user instructions govern. Drive and older integrated-spec copies are reference-only when they conflict. The Task Inbox remains retained; no overall acceptance PASS or Task closure is claimed here.
+- Statuses are source-specific: 99d5 and CDF results remain historical checkpoints, while the current build lane is 76ab. A later-source PASS does not erase an earlier-source finding, and an earlier-source PASS does not prove the latest product route.
+- The Task's remaining evidence cases are those marked BLOCKED/NOT_RUN above: the two 76ab Save blockers, full Safe Save/recovery, current Git/Calendar/Trust/palette UI, actual debugger/Release product task, full P0–P5, and physical keyboard/IME/DPI/Human review. Under the current morning cutoff these are backlog only; no additional product fix or GUI investigation is authorized by this closeout.
+- The older template-insert-into-existing-document request is historical/reference-only. The current profile route creates a new document; no template-insertion feature is added. `OpenWorkspace` still launches a separate process for a different Workspace; same-instance switching is not provided.
+- Clipboard publisher/caller offline models do not prove real clipboard behavior. Both cleanup results remain UNCONFIRMED; no private history or clipboard payload is included in this document.
+- A historical fixture Commit and Root-owned repository delivery are separate. No project repository push, remote OID, or Drive delivery claim is made by this product status section.
+
+## Historical checkpoint — source 99d5 (2026-10-03 to 2026-10-04)
+
+The 99d5 validation/review lane is retained separately from final source 76ab; its review artifacts apply only to 99d5. Debug receipt [final-review-closure-debug-receipt.json](../build/verification/prehuman-edit/final-review-closure-debug-receipt.json) completed `2026-10-03T15:27:37Z`, run `c03737444ae54ce6b5010ec6b35e9b0a`, source SHA-256 `99d5cbf07633715a8a8da16c5a5b855f94ffa1f58aa220eba213870b0b67bdd3`, EXE `534d4806f458d8be3946c0f1f5afa7536d42242112d2748efe2f3361474da0b4`; Release receipt [final-review-closure-release-receipt.json](../build/verification/prehuman-edit/final-review-closure-release-receipt.json) completed `2026-10-03T15:28:13Z`, run `591d4da40dee41e48f25f21571a3f28c`, EXE `ea7a84986237f8306e942f3d7e1472271d0bf7b495290e4d915495d9e0f62f53`. Both builds and CTest runs passed 7/7 for 48 source files.
+
+The 99d5 Save artifact [corrected-save-final-source-20261004-003511.json](../build/verification/prehuman-save/corrected-save-final-source-20261004-003511.json), run `20261003-153512-7f8bea7a`, completed `2026-10-03T15:37:25Z` and has 7 PASS, 1 BLOCKED, and 1 FAIL. The failure is `settings_external_change_conflict`, which observed stale overwrite; it remains a baseline finding for 99d5. The latest 76ab artifact reports that same case PASS with peer bytes unchanged and form retained. The profile form case was BLOCKED in the 99d5 run. This source-specific difference is kept explicit rather than replacing either result.
+
+The 99d5 focused packet probe passed 4/4 and the offline cut-caller model passed 6/6; the latter uses fake APIs and does not prove real clipboard delivery. A worker run before the final 99d5 build reported `Agent errored: Selected model is at capacity. Please try a different model.` The same owner/model/effort resumed once from saved diffs and completed without settings changes. This infrastructure event is not a product finding; no retry loop is authorized under the current cutoff.
+
+## Historical checkpoint — CDF source (2026-10-03)
+
+The CDF source lane is `cd0f839476a33e506ffa85aa98828d0d6791f0c1516f2f6c66e501fd6fb7c14f`, 48 files. Debug receipt run `e38e1eb426bb4f0c94576f2facda7702` completed `2026-10-03T12:18:53Z`, EXE `4f491a45d7121261bdbea6b3d3316787e64443a120608555d078fd312a22a36f`; Release receipt run `dae931eec25f43bd83aa27b1a92967d6`, EXE `4d4975ebedb4ef0d051797eeae88fa2c9aa545e37f95b02b7d3f21471e77e1f5`. Build/CTest passed 7/7. The focused requested-rectangle, table-geometry, and selected native-table evidence in this lane remains historical and is not a 76ab rerun.
+
+The CDF Git fixture run at `2026-10-03T12:58:48Z` used Debug receipt `f2db37eb04a44a0cb95716bb9c5fe458`. Its isolated NoRepo/mixed/no-remote/stale-refresh/Stage/Unstage checks passed. Product Commit also succeeded in the fixture: HEAD was `66ad59b633f88d74540740b6618f79487928307a`, `tracked.md` in HEAD contained the staged version, and the cached index was empty. The raw acceptance artifact marked Commit BLOCKED only because post-commit evidence assembly tried to read `.output` from a string array. This proves a fixture commit on CDF, not a real-repository commit, push, or 76ab Git PASS.
+
+Other CDF boundaries remain: NoGit panel state after Trust and any Trust decision were not reached; the saved prompt screenshot showed the dialog but no accept/deny/revoke occurred. Calendar Rename/Move stopped at Save-dialog control discovery before filename readback or fixture mutation. Palette/Fetch and latest UI routes were incomplete. A prior CDF Save artifact had a stale `settings_text` assertion; the later 99d5 and 76ab runs are separately recorded above. No CDF result promotes the full Task to PASS.
+
+## Historical detailed checkpoint — CDF source — 2026-10-03
+
+The following detailed 2026-10-03 table is the CDF source lane (`cd0f839476a33e506ffa85aa98828d0d6791f0c1516f2f6c66e501fd6fb7c14f`) only. Its statuses are historical and are superseded by the separate 99d5 and current 76ab records above. Focused PASS/FAIL/BLOCKED results do not imply overall acceptance.
+
+### Build and focused evidence lanes
+
+| Lane | Current result | Evidence / boundary |
+|---|---|---|
+| Final source/build | PASS: 48 source files, SHA-256 `cd0f839476a33e506ffa85aa98828d0d6791f0c1516f2f6c66e501fd6fb7c14f` | Debug receipt [final-no-trace-debug-build-receipt.json](../build/verification/prehuman-edit/final-no-trace-debug-build-receipt.json): run `e38e1eb426bb4f0c94576f2facda7702`, EXE `4f491a45d7121261bdbea6b3d3316787e64443a120608555d078fd312a22a36f`, CTest 7/7. Release receipt [build-receipt-release.json](../build/verification/build-receipt-release.json): run `dae931eec25f43bd83aa27b1a92967d6`, EXE `4d4975ebedb4ef0d051797eeae88fa2c9aa545e37f95b02b7d3f21471e77e1f5`, CTest 7/7. |
+| Requested-rectangle / heading selection | PASS, focused 3/3 | [requested-rect-focused result](../build/verification/prehuman-edit/requested-rect-focused-a2da215d920c46c8945cfaf118b5936f/result.json). This does not establish the full editor, table, clipboard, or Human-input matrix. |
+| Table geometry | PASS, focused same-layout 3 and resize 2 | [table-layout-focused result](../build/verification/prehuman-edit/table-layout-focused-d3abe7b517d6480685bb214074e6fd03/result.json) records exact state and geometry for those cases only. |
+| Native table automated lane | PASS for automated product checks; four OS-input cases BLOCKED | [final-native-table-debug.json](../build/verification/prehuman-edit/final-native-table-debug.json). No foreground delivery was available for those four inputs. |
+| Clipboard paste / cleanup | FAIL (earlier ReversePaste no-op observed) / BLOCKED (latest paste before dispatch and busyPaste) / cleanup UNCONFIRMED | [final-clipboard-outline-debug.json](../build/verification/prehuman-edit/final-clipboard-outline-debug.json) records the earlier no-op; the later [paste-dispatch observation](../build/verification/prehuman-edit/final-paste-dispatch-observation-debug.json) is blocked before dispatch because clipboard inspection could not open the clipboard. Root cause remains unproven. The [latest cleanup record](../build/verification/prehuman-edit/clipboard-cleanup-final-publication-failure.json) is UNCONFIRMED after publication; the original in-memory snapshot is no longer reachable. |
+| Outline drag | BLOCKED for the synthetic route only | Cross-process `WM_NOTIFY` returned Win32 error 5. A visible/OS-native drag alternative is NOT_RUN; this is not evidence that the whole platform or all input routes are impossible. |
+| Startup | PASS (functional start/readiness case) / OPEN (latency finding) | Latest ready time is 10.30 seconds. The functional case passed; the latency finding remains open and is not an overall performance PASS. |
+| Corrected Save | PARTIAL: 3 PASS, 1 FAIL, 5 BLOCKED (9 cases total) | [corrected-save-fresh artifact](../build/verification/prehuman-save/corrected-save-fresh-20261003-213919.json), Debug run `f2db37eb04a44a0cb95716bb9c5fe458`, final source/EXE hashes unchanged. PASS: empty untitled Save, Daily/Meeting/Memo date-repeat/no-overwrite, CP932 conversion rejection. The sole FAIL is `settings_cancel_apply_persist_restart`: its `settings_text` assertion read stale pre-Apply values, while `after_apply` bytes and `restored_form` show the expected applied values; this was not reverified after the harness correction. The other five cases timed out finding visible editor controls; these timeouts do not establish product failures. |
+| Corrected Git GUI | PARTIAL: NoRepo, no-remote mixed status, stale refresh, Stage/edit/recovery, Unstage, and fixture Commit PASS; Trust decision, palette/focus, and Fetch remain BLOCKED or NOT_RUN; NoGit post-trust state NOT_RUN | [Git product artifact](../build/verification/prehuman-calendar-git/git-product-acceptance-20261003-125809-25535d7c.json), Debug receipt `f2db37eb04a44a0cb95716bb9c5fe458`, source `cd0f839476a33e506ffa85aa98828d0d6791f0c1516f2f6c66e501fd6fb7c14f`, EXE `4f491a45d7121261bdbea6b3d3316787e64443a120608555d078fd312a22a36f`; pre/post source/EXE identities match. The raw Commit status is BLOCKED only by post-commit evidence assembly; fixture HEAD `66ad59b633f88d74540740b6618f79487928307a` and empty cached index prove the product Commit occurred. NoRepo and mixed rows used only the isolated fixture (`GIT_CEILING_DIRECTORIES`); no project repository was mutated. Product buttons/palette used synthetic Win32 messages and OS `SendInput`; physical input, IME, and Human visual acceptance are not established. |
+| IDE F5 / approved visual review | PASS (Start Debugging preLaunch build/CTest) / BLOCKED (debugger launch) / NOT_RUN (debugger session, visual review) | The attempt used Debug receipt `f2db37eb04a44a0cb95716bb9c5fe458`; source/EXE identity stayed unchanged. PreLaunch CTest passed 7/7. Literal Orca F5 was unsupported before key delivery; the `cppvsdbg` unsupported modal blocked debugger launch. No installation or header probe was run. Approved-reference, DPI, Human visual, physical keyboard, and IME/ATOK acceptance remain open. |
+| Independent final review / delivery | NOT_RUN | A `sol61_high` review was selected, but dispatch failed with `ROUTING_FAILURE` under the archived/read-only follow-up thread limit. This is not replaced by a Root self-review. No Git/HANDOFF delivery or remote OID verification is recorded. |
+
+Detailed edit findings and artifact provenance: [findings-progress.json](../build/verification/prehuman-edit/findings-progress.json).
+
+### CDF-lane E01–E25 crosswalk
+
+These rows preserve the CDF-source status as of 2026-10-03. They are superseded for current status by the source 76ab crosswalk above; focused PASS does not imply full row acceptance. Older Revision 1/2 rows below remain historical.
+
+| ID | CDF status (historical) | CDF evidence / limit |
+|---|---|---|
+| E01 | NOT_RUN | The E01 multi-untitled/recovery case was not run on the final source. The focused no-trace heading3 PASS belongs to E05/E08/E13; it does not establish E01. |
+| E02 | PASS (3 cases) / FAIL (`settings_cancel_apply_persist_restart` assertion; recheck pending) / BLOCKED (5 cases) | Corrected Save artifact has 9 cases total. The failed case's `settings_text` assertion contains stale pre-Apply values; `after_apply` bytes and `restored_form` show the expected values. It has not been reverified after the harness correction. The other five cases timed out on visible editor controls. |
+| E03 | NOT_RUN | Current crash, close, prompt, and recovery branches have not been rerun on the final source. |
+| E04 | PASS (focused path/date/repeat/no-overwrite) / BLOCKED (profile persistence) / NOT_RUN (full matrix) | Corrected Save artifact passed Daily/Meeting/Memo date/repeat/no-overwrite; profile-form persistence was blocked by visible editor control timeout. |
+| E05 | PASS (focused heading3/selection) / NOT_RUN (full) | No-trace heading3 focused probe passed 3/3; full editor input, Undo/Redo, caret, and save matrix is not established. |
+| E06 | NOT_RUN (Human) | Microsoft IME/ATOK composition, commit, cancel, and reconversion were not exercised. |
+| E07 | PASS (automated product checks) / FAIL (earlier ReversePaste no-op observed; root cause unproven) / BLOCKED (latest paste before dispatch; four OS inputs; busyPaste) | Latest clipboard inspection stopped before dispatch. Clipboard cleanup after publication remains UNCONFIRMED. |
+| E08 | PASS (focused heading3/history invariants) / NOT_RUN (full) | Focused heading3/history probes pass; full per-document, cross-tab, clipboard, and presentation-history matrix is not established. |
+| E09 | PASS (selected synthetic boundary/navigation routes) / BLOCKED (four OS-input routes) / NOT_RUN (physical/full matrix) | Arrow-right boundary, arrow-down column, Tab-to-next-cell, and Tab-appends-row synthetic checks pass. Four OS-input paths lacked foreground delivery. |
+| E10 | NOT_RUN | No physical arrow-hold or timed caret/selection/scroll recording. |
+| E11 | PASS (focused synthetic boundary-arrow cases) / NOT_RUN (physical regression) | Arrow-right boundary and arrow-down column synthetic routes pass; physical arrow behavior remains untested. |
+| E12 | PASS (focused) / NOT_RUN (full case) | Three same-layout and two resize checks pass; combined IME, scroll, DPI, continuous visual, and input matrix remains unrun. |
+| E13 | PASS (focused synthetic reverse-selection invariants) / NOT_RUN (approved/Human visual) | Three theme/selection invariants pass; approved theme/background visual comparison and Human judgment remain open. |
+| E14 | NOT_RUN | Current panel-header, splitter, drag, restore, and narrow-width matrix has not been run. |
+| E15 | BLOCKED (synthetic route) / NOT_RUN (visible alternative) | Cross-process outline drag via `WM_NOTIFY` failed with Win32 error 5. Visible/OS-native drag remains untested. |
+| E16 | NOT_RUN | Current Calendar panel/month/holiday visual and interaction matrix has not been rerun. |
+| E17 | NOT_RUN | Current Calendar date activation, no-create hover/focus, and duplicate-creation route has not been rerun. |
+| E18 | BLOCKED (harness control discovery) / NOT_RUN (visible field inspection and fixture mutation) | Creation-date list provenance/open evidence is historical. Rename/move reached the native common Save dialog, but control discovery stopped. No filename destination was set and no fixture rename/move was completed. |
+| E19 | PASS (NoRepo, remoteなし mixed rows, stale refresh) / NOT_RUN (NoGit panel after Trust) | Final-source artifact records the NoRepo panel and the mixed `staged 1 / unstaged 1 / untracked 2` rows with no remote. The separate NoGit fixture reached Workspace未信頼; its post-Trust Git-missing state was not reached. |
+| E20 | HISTORICAL PASS (Stage with concurrent edit/recovery, Unstage, fixture Commit) | Stage preserved dirty source, undo/caret, unchanged disk hash, and recovery input; Unstage removed only the selected staged path. The fixture Commit succeeded with HEAD `66ad59b633f88d74540740b6618f79487928307a`; the raw artifact was BLOCKED only during post-commit evidence assembly when it read `.output` from a string array. |
+| E21 | PASS (3 cases) / FAIL (`settings_cancel_apply_persist_restart` assertion; recheck pending) / BLOCKED (5 cases) / NOT_RUN (full matrix) | See the 9-case corrected Save artifact. The failed case's `settings_text` assertion is stale despite expected `after_apply` bytes and `restored_form`; harness-corrected evidence has not yet been collected. |
+| E22 | PASS (Debug/Release build and preLaunch CTest) / BLOCKED (debugger launch) / NOT_RUN (actual debugger session) | PreLaunch CTest passed 7/7 using Debug receipt `f2db37eb04a44a0cb95716bb9c5fe458`; source/EXE identity stayed unchanged. Orca F5 key was unsupported before delivery; an unsupported `cppvsdbg` modal blocked debugger launch. No installation/header probe was run. |
+| E23 | NOT_RUN (AI image comparison) / NOT_RUN (Human visual judgment) | Approved image/DPI/theme/native-window comparison has not been performed; keep AI comparison and Human judgment as separate gates. |
+| E24 | NOT_RUN | Current Calendar hover/tooltip/resize visual route has not been rerun; older synthetic traces are historical. |
+| E25 | BLOCKED (palette/focus driver) / NOT_RUN (binding/hint consistency and caret restoration) | Final-source custom-binding/Escape probes from editor, Git, Explorer, and Calendar were blocked by PowerShell `[ushort]` type lookup. Fetch palette control discovery also failed; no TaskDialog cancellation was exercised. |
+
+### CDF-lane R-01–R-20 crosswalk
+
+| ID | CDF status (historical) | CDF evidence / limit |
+|---|---|---|
+| R-01 Workspace/file operations | BLOCKED (Rename/Move harness) / NOT_RUN (visible field inspection and fixture mutation) | Rename/move control discovery stopped at the native Save dialog. No destination was set and no fixture mutation completed. No product failure is inferred. |
+| R-02 Live editing | PASS (focused probes) / BLOCKED (four OS-input routes) / FAIL (earlier ReversePaste no-op observed) / NOT_RUN (full) | Latest paste attempt blocked before dispatch and busyPaste blocked; clipboard cleanup after publication remains unconfirmed. |
+| R-03 Markdown/GFM/live rendering | PASS (Debug/Release CTest) / NOT_RUN (approved live-render/edit and Human visual) | CTest does not establish the complete live editor route. |
+| R-04 Navigation | NOT_RUN | Current full tab/Quick Open/Outline/link route was not run. |
+| R-05 Search/replace | NOT_RUN | Current Find/Replace and Workspace Search route was not run. |
+| R-06 Templates/profiles/Daily/calendar | PASS (focused Daily/Meeting/Memo date/repeat/no-overwrite) / BLOCKED (profile persistence control) / NOT_RUN (full template/calendar) | The current corrected Save artifact covers the date/repeat case. Current profile form persistence was blocked by visible editor control timeout. The historical template-insert-into-existing-document reference is not the current route. |
+| R-07 Autosave/safe save/recovery | PASS (3 cases) / FAIL (`settings_cancel_apply_persist_restart` assertion; recheck pending) / BLOCKED (5 cases) / NOT_RUN (full matrix) | [corrected-save-fresh artifact](../build/verification/prehuman-save/corrected-save-fresh-20261003-213919.json) has 9 cases. The failed case's `settings_text` assertion is stale, while `after_apply` bytes and `restored_form` show expected values; this has not been reverified after the harness correction. The other five cases timed out on visible editor controls. |
+| R-08 Encoding/EOL | PASS (CP932 conversion rejection case and CTest) / NOT_RUN (full encoding matrix) | Complete UTF-8/BOM/CP932/EOL user-path acceptance is not established on this Task’s final build. |
+| R-09 Recovery/session | NOT_RUN (current full route) | Clipboard cleanup is tracked separately under the clipboard/test limitation; it is not document recovery/session evidence. |
+| R-10 Git assistance | HISTORICAL PASS (NoRepo, no-remote mixed status, stale refresh, Stage/edit/recovery, Unstage, fixture Commit) / BLOCKED (Fetch route) / NOT_RUN (NoGit post-trust state) | Final-source-at-the-time evidence is in [Git product artifact](../build/verification/prehuman-calendar-git/git-product-acceptance-20261003-125809-25535d7c.json). NoRepo is distinct from NoGit: the isolated NoRepo fixture rendered `repositoryなし`; the NoGit fixture remained Workspace未信頼, so the Git-missing panel state was not reached. Commit succeeded; only post-commit evidence assembly failed. Fetch palette discovery did not reach a TaskDialog. |
+| R-11 Settings/configuration | FAIL (`settings_cancel_apply_persist_restart` stale `settings_text` assertion; recheck pending) / BLOCKED (profile-form control discovery) | The artifact's `after_apply` bytes and `restored_form` show the expected values despite the stale text assertion. This was not reverified after the harness correction, so the product persistence result remains unconfirmed. |
+| R-12 Appearance/theme/font | PASS (three focused synthetic reverse-selection invariants) / NOT_RUN (AI image comparison and Human visual) | The approved UI/reference comparison remains pending. |
+| R-13 Palette/keybindings | BLOCKED (palette/focus driver) / NOT_RUN (binding/hint match and caret restoration) | Final-source palette/focus probes stopped on PowerShell `[ushort]` type lookup; Fetch palette discovery also failed before a cancel dialog. |
+| R-14 Window/compact mode | PASS (functional startup/readiness case, 10.30 seconds) / NOT_RUN (full window/compact matrix) | Functional startup completed; the latency finding remains OPEN and is not an overall performance PASS. |
+| R-15 Trust/communication safety | PASS (test-store selection and untrusted rendering) / BLOCKED (Trust decision driver) / NOT_RUN (accept/deny/revoke) | In the CDF run, mode 1 selected the empty fixture-only `.mdlite/.state/test-trust` store and rendered Workspace未信頼. The saved screenshot visibly shows the Japanese prompt and Yes/No buttons, although `WM_GETTEXT` returned an empty Static body; no decision was taken. No Orca interaction or accept/deny/revoke occurred, and no global Trust write is claimed. The main Git fixture used a separately labeled mode-0 direct fixture grant for Git checks. |
+| R-16 Diagnostics/maintenance/updates | NOT_RUN | Current diagnostics and dependency/maintenance paths were not run. |
+| R-17 Performance | PASS (functional startup measurement) / OPEN (10.30-second latency finding) / NOT_RUN (final performance suite) | No overall performance PASS is claimed. |
+| R-18 Large documents | NOT_RUN | Current final-build 20/100 MiB routes were not rerun. |
+| R-19 VS Code/F5 | PASS (Debug/Release build, CTest, preLaunch) / BLOCKED (debugger launch) / NOT_RUN (debugger session) | PreLaunch used Debug receipt `f2db37eb04a44a0cb95716bb9c5fe458`; source/EXE identity stayed unchanged. Literal Orca F5 was unsupported before key delivery; an unsupported `cppvsdbg` modal blocked debugger launch. No installation/header probe was run. |
+| R-20 Local Git/public operation | NOT_RUN | No final Git integration, remote OID readback, push, or HANDOFF delivery is recorded. |
+
+### CDF-lane scope and reference boundaries (historical)
+
+- Current Task/latest HANDOFF/current implementation/latest user instructions govern. Drive and older integrated-spec copies are reference-only where they conflict.
+- The older template-insert-into-existing-document request is historical/reference-only. The current profile route creates a new document; no template-insertion feature is added here.
+- Existing `OpenWorkspace` behavior launches a separate process for a different Workspace; same-instance Workspace switching is not provided. This is the current route boundary, not a pending test or a request to add a switch feature.
+- No overall Task acceptance PASS is claimed. Build/CTest PASS, focused subcase PASS, BLOCKED input/control routes, and NOT_RUN product/Human routes remain separate.
+
+## Historical snapshot — 2026-09-28
+
+The following sections are preserved as the 2026-09-28 Task `20260925-mdlite-approved-ui-live-editor-rebuild` Revision 2 record. Their previous “current” and “final” labels describe that snapshot only and are superseded by the 2026-10-03 status above.
+
 更新日: 2026-09-28
 対象Task: `20260925-mdlite-approved-ui-live-editor-rebuild` Revision 2
 
-この表は実装、自動試験、実GUI経路試験、Human確認、外部準備待ちを分離する。
+この歴史的スナップショットは実装、自動試験、実GUI経路試験、Human確認、外部準備待ちを分離する。
 `実装済み`や`自動PASS`はHumanの操作感・見た目の受入を意味しない。性能値と
-R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-report.md) に記録する。今回の座標・UI設計は
+R-01〜R-08の当時の根拠は [acceptance-hardening-report.md](acceptance-hardening-report.md) に記録する。当時の座標・UI設計は
 [ui-design.md](ui-design.md) と [adr-20260921-native-coordinate-ui.md](adr-20260921-native-coordinate-ui.md) に記録する。
 
 ## 今回の変更と境界
@@ -18,7 +214,7 @@ R-01〜R-08の根拠は [acceptance-hardening-report.md](acceptance-hardening-re
 - 設定と作成profileは、共通のnative formで項目を一括編集し、適用／取消を選べるようにした。scope reset、継承値、keybinding／色の複数行、profile入力項目は既存のSettings/Profile validatorとatomic saveへ渡し、連続Prompt/MessageBoxを通常編集経路から除去した。Quick Open／command paletteも共通の検索可能なnative picker（filter Edit＋候補ListBox＋選択／取消）へ統一した。最新 `gui-acceptance-settings-final21.json` で実modal formの設定Apply/Cancelとprofile Apply/Cancelを確認し、設定Cancel・profile Cancel・profile Applyのsilent確認拒否でfixture SHA-256が不変であること、OS/RichEdit/DPI/window/client/font設定/source/settings hashを同じnative起動から記録した。workspace/outline tree、outline pane折畳み／復元、calendar表示／非表示、Quick Open／command paletteの候補filter・選択も同じfixtureで確認した。
 - 祝日は同梱データと検証付きローカルCSV取込みを維持する。ネットワーク更新service、scheduled/manual HTTP経路、WinHTTP link、`holiday_auto_update` 設定surfaceは削除済み。Debug/Release CTestは現行parser/import codeを通過。過去のHTTP更新policy・mock HTTP試験は履歴であり、現行機能の受入根拠ではない。
 
-## 現在の構成
+## 構成記録 (historical 2026-09-28 snapshot)
 
 - C++20、Win32、RichEdit、Common Controls v6、CMake／Ninja／MSVC。WebView、JavaScript／Node.js、汎用pluginを製品へ含めない。
 - Markdown sourceを正本とし、書式・画像・表は派生表示とする。source変更はDocumentのtransaction/Undo履歴を経由し、RichEdit native Undoは表示更新後に破棄する。
@@ -79,7 +275,7 @@ Authority: immutable Task Inbox Revision 1 snapshot, read once at task start. Th
 
 Fresh shared gates: Debug build/CTest passed 7/7 in 6.84s and Release build/CTest passed 7/7 in 5.52s. `../build/verification/gui-acceptance-debug-rev2-final-20260928.json` and `../build/verification/gui-acceptance-release-rev2-final-20260928.json` both pass (Debug SHA-256 `03806808316bc5696b85fa9ecb631a969e167220d6437ea00e319d064cecadca`; Release SHA-256 `54dc744e3bd7e9e99f14762449531f475f4c11b8b54d46a9388594abaf14433d`). They include E01/E02 untitled recovery and Save As cancel/resume/retry with snapshot payload identity checks; E18 details-row open; E20 delayed Stage during compact editing/recovery plus concurrent Commit rejection; palette Escape selection/focus/buffer/disk preservation; editor suspension, session anchors, table rollback/retry, and history checks. `../build/verification/rev2-performance-release-full-20260928.json` passes P0–P5 with 0 scenario failures and P5 100/100. Dedicated NativeTable, PanelLayout, Calendar Daily/Hover and performance artifacts remain synthetic/native evidence, separate from physical input and Human acceptance.
 
-### E01–E25
+### E01–E25 (historical Revision 2 closeout, 2026-09-28)
 
 | ID | Current evidence | Revision 2 status |
 |---|---|---|
@@ -109,7 +305,7 @@ Fresh shared gates: Debug build/CTest passed 7/7 in 6.84s and Release build/CTes
 | E24 | `../build/verification/calendar-hover-acceptance-rev2-final-20260928.json` passes a 30.06-second synthetic route: 435/435 messages delivered and hover-state checks matched, six PrintWindow frames, zero Daily files. Physical mouse UNKNOWN. | **PARTIAL synthetic / Human input UNKNOWN** |
 | E25 | Current GUI artifacts cover picker filtering, Settings form selection, posted Escape cancellation, directional selection and editor focus restoration, and unchanged buffer/disk SHA-256. Panel-header/focus entry, physical keyboard, and custom binding/hint consistency remain unproven. | **PARTIAL synthetic** |
 
-### R-01–R-20
+### R-01–R-20 (historical Revision 2 closeout, 2026-09-28)
 
 | ID / scope | Current evidence | Revision 2 status |
 |---|---|---|
@@ -140,7 +336,7 @@ The current full P0–P5 run uses GUID-owned fixtures, alternates UTF-8 and Wind
 
 Authority at the time: a separate immutable Task snapshot from 2026-09-26. This historical table is distinct from the 2026-09-27 closeout Task Revision 1 above. Its ID descriptions and artifact dates are not evidence of the later closeout. No tests or UI runs from that historical snapshot are implied by the table. Cited GUI/model evidence was prior evidence; `NOT_RUN` meant the full stated case lacked current evidence at that time. Product routes refer to implementation paths, not proof that routes were exercised.
 
-### E01–E25
+### E01–E25 (historical Revision 1 Task snapshot)
 
 | ID | Implementation and product route | Existing evidence and Revision 1 status |
 |---|---|---|
@@ -170,7 +366,7 @@ Authority at the time: a separate immutable Task snapshot from 2026-09-26. This 
 | E24 | `src/calendar/CalendarView.cpp`, `src/app/Application.cpp`; calendar hover/tooltip/month/resize. | Prior calendar toggle trace is not continuous hover/flicker evidence. No required frame/paint observation recorded. **NOT_RUN**. |
 | E25 | `src/app/Application.cpp`, `src/settings/Settings.cpp`; command palette from editor/panels, command dispatch, Esc and Settings rail action. | Prior palette filter/selection observation exists; all-focus dispatch, binding/hint match and caret restoration are not evidenced. **NOT_RUN (full case)**. |
 
-### Original R-01–R-20
+### Original R-01–R-20 (historical Revision 1 Task snapshot)
 
 | ID / scope | Implementation path and product route | Existing evidence and Revision 1 status |
 |---|---|---|

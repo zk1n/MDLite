@@ -10,6 +10,10 @@
 
 namespace mdlite {
 
+// Apply cell typography without moving RichEdit's live selection/caret.
+bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
+                             COLORREF header_background, COLORREF body_background);
+
 struct RichEditTableStyle {
   LONG available_width_twips{7200};
   LONG minimum_cell_width_twips{1200};

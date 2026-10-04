@@ -1,10 +1,42 @@
 # MDLite 表示・UI再構築 実装・受入状況
 
-更新日: 2026-10-04
+更新日: 2026-10-05
 
-以下の2026-10-04 Current Statusが最新のsource 76ab状況である。Build/CTest/CoreのPASSは製品全体の受入PASSを意味しない。source 99d5、CDF、過去snapshotは各source laneの歴史記録として分離し、source 76abへ引き継いだPASSとは扱わない。受入の権威はcurrent Task、latest HANDOFF、current implementation、latest user instructions。Drive資料や過去のintegrated-spec copyは、これらと矛盾する場合はreference-onlyであり、新しい要求や機能の根拠にしない。
+以下の2026-10-05 Current Statusが最新のsource 5968状況である。Build/CTest/CoreのPASSは製品全体の受入PASSを意味しない。f01、f5、76ab、99d5、CDF、過去snapshotは各source laneの歴史記録として分離し、source 5968へ引き継いだPASSとは扱わない。受入の権威はcurrent Task、latest HANDOFF、current implementation、latest user instructions。Drive資料や過去のintegrated-spec copyは、これらと矛盾する場合はreference-onlyであり、新しい要求や機能の根拠にしない。
 
-## Current Status — 2026-10-04 (source 76ab)
+## Current Status — 2026-10-05 (source 5968)
+
+**Overall acceptance: INCOMPLETE / NOT PASS. Verification checkpoint before Git/HANDOFF delivery.** Actual delivery is recorded separately in the final HANDOFF. Current source is `5968e404fb1410c1c2be49ffafbc2c7bd363f53ea77a5448870958e9c538baee`. The post-f01 delta changes only `RenderGitPanel` display line breaks to CRLF for native readonly EDIT. Fresh [Debug](../build/verification/build-receipt-debug.json) and [Release](../build/verification/build-receipt-release.json) builds/CTest pass 7/7, with 397 core checks. Debug EXE: `b1b55e6b3a8ed6c26d0ef241bf0b601b1dc60f8c3575a896d4029e55928ffd88`; Release EXE: `6fc5e932519d3987b53caf467b8ac0f68767c38dfebd3dbacf061034dc40b0b5`.
+
+[Focused current Git/E20](../build/verification/gui-final-crlf-e20.json) passes the native-message/local temporary-index responsiveness route; it is not the full 19-case Git matrix. Current [Debug Save](../build/verification/save-final-crlf-debug.json) and [Release Save](../build/verification/save-final-crlf-release.json) each pass 9/9 with matching stable source/executable identity. Root's current Debug OS Shift+Tab 62→56 and forward Tab 56→62 pass with collapsed selection and unchanged source/Dirty/history/revisions; the remaining OS-input cases are not inferred. Current normal/narrow 900×720 pixels show separate readable Git state/reason, accessible Trust and Calendar/Daily/details. The current caption helper has baseline PASS, two selected cases BLOCKED `CAPTION_COORDINATE_UNPROVEN` (UIA maximize-button bounds not proved), all others NOT_RUN; current caption gestures are not PASS.
+
+Current actual OS F5 debugger path PASS: the existing VS Code preLaunchTask/cppvsdbg route produced the requested demo-workspace process with positive `CheckRemoteDebuggerPresent` inside its 60s observation budget. Fresh Debug receipt `08af5fa64db74bf6acfc1d06f1f94a3c` retains source 5968 / EXE b1b55 unchanged. Stop, owned debuggee exit and owned Code-window close are confirmed; 15 selected stable sample files are unchanged, 0 added. F5 pixels remain BLOCKED (provider window not found); the first no-input foreground-blocked helper attempt is preserved. Private proofs remain local.
+
+No full GUI/P0–P5/ATOK matrix was repeated for the display-string-only delta; f01 results below remain source-specific. The unresolved P2, Git, OS-input, Microsoft IME and Human conditions remain open. This is a feature-only verification checkpoint before project Git/HANDOFF delivery; the develop-integration condition is unmet. Actual delivery belongs to the final HANDOFF; no Inbox cleanup is claimed by this checkpoint.
+
+## Preserved integration checkpoint — source f01 (2026-10-05)
+
+Source `f01aedf35ba08237f297b063358309fb786da75f0dfc3a65874a298e69cbd5cb` (50 files) completed the integration runs below. Debug and Release build/CTest passed 7/7, including 397 core checks; dependency and source/executable receipt gates remained enabled. Debug EXE: `abe2aa6ca770ccf494903f4240a1b67ccc666934ea45695ef15d6f54f3ab08a9`; Release EXE: `fce007a9bda21188a6d2565eaee2d82689d9bf50805ee54d506ecccc3f68092e`. Its preserved receipt identities are retained by the corresponding artifacts; mutable current receipt filenames now identify 5968.
+
+| f01 lane | Actual result | Evidence / boundary |
+|---|---|---|
+| Build | PASS, Debug/Release CTest 7/7 | Recorded f01 hashes above and embedded Calendar/Git Release receipt; build is separate from GUI/IME/performance acceptance |
+| Save / settings / profiles | 9 PASS each in Debug and Release | [Debug](../build/verification/save-final-f01-debug.json), [Release](../build/verification/save-final-f01-release.json), source/executable identities match. Exact filename/bytes/state and native form persistence are covered |
+| Calendar Daily / creation / Rename / Move | 9 PASS | [calendar-daily-final-f01.json](../build/verification/calendar-daily-final-f01.json), native-message/bytes/index/session route; physical input and Human/DPI acceptance remain separate |
+| Git | 18 PASS / 1 BLOCKED, raw `pass=false` | [git-final-f01.json](../build/verification/git-final-f01.json). Custom-binding Escape/editor case blocked by 10s palette-readiness timeout. Commit and loopback Fetch cancellation pass; these isolated fixture actions are not project Git delivery |
+| Native table | 15 PASS / 4 BLOCKED | [native-table-final-f01.json](../build/verification/native-table-final-f01.json). Shift+Tab, Unicode, Ctrl+Z and arrow repeat are `BLOCKED_FOREGROUND_NOT_ESTABLISHED`; no current actual-keyboard PASS is inferred from f5 |
+| Full GUI | PASS for the finite synthetic regression | [gui-final-f01-release.json](../build/verification/gui-final-f01-release.json): all 237 top-level Boolean fields true, including session viewport and Calendar restoration; recorded f01 Release EXE identity matches. Real IME, physical input and Human acceptance are not established by this result |
+| Real ATOK | Four finite cases PASS on f01 | Root observed actual preedit/commit/reconversion pixels and exact source/history readback. The first cancellation raw `FAILED_STEP` (autosave saved revision 1→4 with unchanged source/history) is preserved; a controlled clean-baseline cancellation passes all fields without settings changes. Private artifacts remain local |
+| Full Release performance | FAILED_OR_INCOMPLETE, source stable | [performance-final-f01-full-100.json](../build/verification/performance-final-f01-full-100.json): P2 one/six-document startup tab-count queries fail with configured 60,000ms budget, `Win32=0`, `hung=true`; input/search/cancellation stages not reached. P5 completed 100 iterations / 0 failures |
+| Microsoft IME / F5 / Human / delivery | NOT COMPLETED on f01 | Earlier f5 IDE F5 evidence remains historical. Physical/visual/DPI conditions, unresolved editor/Git/performance scope, and repository/HANDOFF delivery do not have an overall PASS |
+
+P1's one/six-document workloads each open 1 MiB aggregate source. Sampled working-set peaks are 42.27 / 39.79 MiB, below the typical 50MB target for these workloads; document readiness is 38,921.802 / 33,207.226 ms, distinct from early main-window appearance. P2's 10,000-file / 200 MiB collection has failure snapshots of CPU 14,796.875 / 38,703.125 ms and working sets 31,621,120 / 33,378,304 bytes; these are not completed-load peaks. UI responsiveness fails at the startup-query boundary; the exact tree/shell/layout or rendering hotspot remains unproven. No budget extension or repeated benchmark is claimed.
+
+P3 20/100 MiB plain-source workloads have sampled working-set peaks 254.20 / 1,103.09 MiB, private-byte peaks 255.86 / 1,195.66 MiB and input p95 368.221 / 2,358.373 ms. The 51-character synthetic ASCII edit/save suffix round trips pass; large rich-feature/IME performance is not established. P5 private bytes move from 5,459,968 to 5,480,448 (+20 KiB); this is not proof of no leaks for the failed P2 workload. Detailed current/historical boundaries and unchanged finite criteria: [approved UI verification](verification-approved-ui-20261004.md).
+
+Historical f5 GUI retains its two failed subcases; its later focused Calendar pair passes while session-readiness timeout leaves viewport assertions unreached. Historical f5 EditHistory is 44 PASS / 5 FAIL / 5 BLOCKED. f5 ATOK/F5 and earlier-source UI/editor results are not relabeled as f01 or 5968. The f01 ATOK and integration matrix above remain attached to f01. The older checkpoints and original acceptance crosswalks below remain preserved. The Task remains incomplete; no repository push, HANDOFF upload/readback or Inbox cleanup is claimed.
+
+## Historical checkpoint — source 76ab (2026-10-04)
 
 **Overall acceptance: NOT PASS.** source `76abdfc0da4478ca11834cb61a1c361ddfbf33b3dc43c394071116ef71cad4aa` has passing Debug/Release build and CTest plus 397 core checks. The final nine-case Save artifact is 7 PASS, 2 BLOCKED, 0 FAIL. Git, Calendar, Trust, palette, latest UI, Release product-task, and full P0–P5 evidence were not run on source 76ab. The read-only reviewer closed a focused settings addendum with no new concrete finding; that is not overall product acceptance.
 

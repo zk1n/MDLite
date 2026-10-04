@@ -45,6 +45,8 @@ $nativeStatusCapture = $null
 $messageReceipts = [ordered]@{}
 $commandPaletteInteractions = [Collections.Generic.List[object]]::new()
 $renameDialogMetadata = $null
+$repeatActiveObservation = $null
+$finalSessionOpenedFilePath = $null
 $previousSilentSetting = $env:MDLITE_TEST_SILENT
 $env:MDLITE_TEST_SILENT = '1'
 
@@ -65,11 +67,31 @@ public static class MDLiteCalendarDailyNative {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out RECT rect);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr window, out RECT rect);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr window);
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW")] private static extern IntPtr SendBounded(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)] private static extern IntPtr ReadBounded(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode)] private static extern IntPtr WriteBounded(IntPtr window, uint message, IntPtr wparam, string lparam, uint flags, uint timeout, out IntPtr result);
+    public static long WindowStyle(IntPtr window) { return GetWindowLongPtr(window, -16).ToInt64(); }
+    public static string ReadControlText(IntPtr window) {
+        IntPtr result;
+        if (SendBounded(window, 14, IntPtr.Zero, IntPtr.Zero, 2, 1000, out result)==IntPtr.Zero) throw new TimeoutException("Native filename WM_GETTEXTLENGTH failed.");
+        var buffer=new StringBuilder(Math.Max(2,result.ToInt32()+1));
+        if (ReadBounded(window, 13, new IntPtr(buffer.Capacity), buffer, 2, 1000, out result)==IntPtr.Zero) throw new TimeoutException("Native filename WM_GETTEXT failed.");
+        return buffer.ToString();
+    }
+    public static long WriteControlText(IntPtr window, string value) {
+        IntPtr result;
+        if (WriteBounded(window, 12, IntPtr.Zero, value, 2, 1000, out result)==IntPtr.Zero) throw new TimeoutException("Native filename WM_SETTEXT failed.");
+        return result.ToInt64();
+    }
+
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll", EntryPoint = "SendMessageW")] public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
@@ -423,14 +445,64 @@ function Invoke-ProductCommandFromPalette([string]$Query) {
     return $interaction
 }
 
-function Set-CommonFileDialogDestination([IntPtr]$Dialog, [string]$SourceName, [string]$SourcePath, [string]$TargetPath) {
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
-    if ($null -eq $root) { throw 'UI Automation could not attach to the real common file dialog.' }
+function Get-CommonFilenameCandidates([object[]]$Candidates, [string]$SourceName) {
+    # No arbitrary sole-Edit fallback: the native source name must already be
+    # populated, and only writable, visible, enabled filename providers qualify.
+    return @($Candidates | Where-Object {
+        -not $_.is_read_only -and $_.enabled -and -not $_.offscreen -and
+        $_.automation_id -notmatch '^System\.' -and
+        ($_.name -match '(?i)file.?name|ファイル名' -or $_.automation_id -match '(?i)^(file.?name.*|edt1|1152|0480)$') -and
+        $_.value.EndsWith($SourceName, [StringComparison]::OrdinalIgnoreCase) -and
+        ($_.control_type -eq 'ControlType.Edit' -or $_.control_type -eq 'ControlType.ComboBox')
+    })
+}
+function Get-NativeCommonDialogInputs([IntPtr]$Dialog, [uint32]$OwnerPid, [object]$Elements, [string]$SourceName) {
+    # Observed Win11 contract: semantic FileNameControlHost -> ComboBox -> Edit
+    # (ID1001 here). Do not substitute a shell-list ItemNameDisplay edit or ID alone.
+    $filenameHosts = @($Elements | Where-Object { $_.Current.AutomationId -ceq 'FileNameControlHost' -and
+        $_.Current.ProcessId -eq $OwnerPid -and $_.Current.NativeWindowHandle -ne 0 -and
+        $_.Current.IsEnabled -and -not $_.Current.IsOffscreen })
+    if ($filenameHosts.Count -ne 1) { return $null }
+    $filenameHost = [IntPtr]$filenameHosts[0].Current.NativeWindowHandle
+    $class = New-Object Text.StringBuilder 128
+    [void][MDLiteCalendarDailyNative]::GetClassName($filenameHost, $class, $class.Capacity)
+    if ($class.ToString() -ne 'ComboBox' -or [MDLiteCalendarDailyNative]::RootWindow($filenameHost) -ne $Dialog) { return $null }
+    $edits = @(Find-Children $filenameHost 1001 'Edit' | Where-Object {
+        [MDLiteCalendarDailyNative]::ParentWindow($_) -eq $filenameHost -and
+        [MDLiteCalendarDailyNative]::RootWindow($_) -eq $Dialog -and
+        [MDLiteCalendarDailyNative]::IsWindowVisible($_) -and [MDLiteCalendarDailyNative]::IsWindowEnabled($_) -and
+        ([MDLiteCalendarDailyNative]::WindowStyle($_) -band 0x800) -eq 0
+    })
+    if ($edits.Count -ne 1) { return $null }
+    $edit = $edits[0]; $editOwner=[uint32]0
+    [void][MDLiteCalendarDailyNative]::GetWindowThreadProcessId($edit,[ref]$editOwner)
+    $before = [MDLiteCalendarDailyNative]::ReadControlText($edit)
+    if ($editOwner -ne $OwnerPid -or -not $before.EndsWith($SourceName,[StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $buttons = @(Find-Children $Dialog 1 'Button' | Where-Object {
+        [MDLiteCalendarDailyNative]::ParentWindow($_) -eq $Dialog -and
+        [MDLiteCalendarDailyNative]::IsWindowVisible($_) -and [MDLiteCalendarDailyNative]::IsWindowEnabled($_)
+    })
+    if ($buttons.Count -ne 1) { return $null }
+    $button=$buttons[0]; $buttonOwner=[uint32]0
+    [void][MDLiteCalendarDailyNative]::GetWindowThreadProcessId($button,[ref]$buttonOwner)
+    $label=[MDLiteCalendarDailyNative]::ReadControlText($button)
+    if ($buttonOwner -ne $OwnerPid -or $label -notmatch '^(保存|Save)(\(&[A-Za-z]\))?$') { return $null }
+    return [pscustomobject]@{
+        host_hwnd=$filenameHost.ToInt64(); host_automation_id='FileNameControlHost'
+        edit_hwnd=$edit.ToInt64(); edit_id=1001; edit_class='Edit'; source_value=$before
+        edit_style=[MDLiteCalendarDailyNative]::WindowStyle($edit); owner_pid=$OwnerPid
+        root_hwnd=$Dialog.ToInt64(); root_owner_hwnd=[MDLiteCalendarDailyNative]::RootOwnerWindow($edit).ToInt64()
+        save_hwnd=$button.ToInt64(); save_id=1; save_text=$label; save_style=[MDLiteCalendarDailyNative]::WindowStyle($button)
+    }
+}
+function Set-CommonFileDialogDestination([IntPtr]$Dialog, [string]$SourceName, [string]$SourcePath,
+    [string]$TargetPath, [datetime]$ReadinessDeadlineUtc = [datetime]::MinValue) {
+    $readyStartedUtc = [DateTime]::UtcNow
+    if ($ReadinessDeadlineUtc -eq [datetime]::MinValue) { $ReadinessDeadlineUtc = $readyStartedUtc.AddSeconds(10) }
     [uint32]$dialogOwnerPid = 0
     [void][MDLiteCalendarDailyNative]::GetWindowThreadProcessId($Dialog, [ref]$dialogOwnerPid)
     $dialogClassBuffer = New-Object Text.StringBuilder 128
     [void][MDLiteCalendarDailyNative]::GetClassName($Dialog, $dialogClassBuffer, $dialogClassBuffer.Capacity)
-    $rootCurrent = $root.Current
     $script:renameDialogMetadata = [ordered]@{
         dialog_hwnd = $Dialog.ToInt64(); dialog_caption = Get-WindowTextValue $Dialog
         dialog_class = $dialogClassBuffer.ToString(); dialog_owner_pid = $dialogOwnerPid
@@ -438,99 +510,130 @@ function Set-CommonFileDialogDestination([IntPtr]$Dialog, [string]$SourceName, [
         dialog_owner_hwnd = [MDLiteCalendarDailyNative]::OwnerWindow($Dialog).ToInt64()
         dialog_root_hwnd = [MDLiteCalendarDailyNative]::RootWindow($Dialog).ToInt64()
         dialog_root_owner_hwnd = [MDLiteCalendarDailyNative]::RootOwnerWindow($Dialog).ToInt64()
-        ui_automation_process_id = $rootCurrent.ProcessId; ui_automation_native_hwnd = $rootCurrent.NativeWindowHandle
-        selected_tree_item_text = $SourceName
-        selected_tree_source_path = $SourcePath
+        ui_automation_process_id = $null; ui_automation_native_hwnd = $null
+        selected_tree_item_text = $SourceName; selected_tree_source_path = $SourcePath
         selected_tree_source_sha256_before = if (Test-Path -LiteralPath $SourcePath -PathType Leaf) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SourcePath).Hash.ToLowerInvariant() } else { '' }
+        initial_visible = [MDLiteCalendarDailyNative]::IsWindowVisible($Dialog)
+        readiness_started_utc = $readyStartedUtc.ToString('o'); readiness_deadline_utc = $ReadinessDeadlineUtc.ToString('o')
+        first_visible_utc = $null; controls_ready_utc = $null
+        uia_text_labels = @(); uia_edit_controls = @(); uia_save_buttons = @(); last_uia_error = $null
+        input_route=$null; native_inputs=$null
     }
-    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.Condition]::TrueCondition)
-    $valueCandidates = [Collections.Generic.List[object]]::new()
-    $uiaControls = [Collections.Generic.List[object]]::new()
-    $uiaLabels = [Collections.Generic.List[string]]::new()
-    foreach ($element in $all) {
-        $current = $element.Current
-        if ($current.ControlType.ProgrammaticName -eq 'ControlType.Text' -and $current.Name) { $uiaLabels.Add($current.Name) }
-        $pattern = $null
-        $hasValuePattern = $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
-        $value = ''
-        $isReadOnly = $true
-        if ($hasValuePattern) {
-            $valuePattern = [System.Windows.Automation.ValuePattern]$pattern
-            $value = $valuePattern.Current.Value
-            $isReadOnly = $valuePattern.Current.IsReadOnly
-        }
-        if ($current.ControlType.ProgrammaticName -match 'ControlType\.(Edit|ComboBox)' -or $hasValuePattern) {
-            $uiaControls.Add([pscustomobject]@{
-                name = $current.Name; automation_id = $current.AutomationId
-                control_type = $current.ControlType.ProgrammaticName; process_id = $current.ProcessId
-                native_hwnd = $current.NativeWindowHandle; value = $value
-                has_value_pattern = $hasValuePattern; is_read_only = $isReadOnly
-            })
-        }
-        if (-not $hasValuePattern) { continue }
-        $valuePattern = [System.Windows.Automation.ValuePattern]$pattern
-        $candidate = [pscustomobject]@{
-            element = $element; pattern = $valuePattern; name = $current.Name; automation_id = $current.AutomationId
-            control_type = $current.ControlType.ProgrammaticName; process_id = $current.ProcessId
-            value = $value; is_read_only = $isReadOnly
-        }
-        $valueCandidates.Add($candidate)
+    if ($dialogClassBuffer.ToString() -ne '#32770' -or $script:renameDialogMetadata.dialog_caption -cne '新しい名前または移動先') {
+        throw 'Rename/move dialog did not match the actual native Save dialog contract.'
     }
-    $script:renameDialogMetadata.uia_text_labels = @($uiaLabels.ToArray())
-    $script:renameDialogMetadata.uia_edit_controls = @($uiaControls.ToArray())
-    $filenameCandidates = @($valueCandidates | Where-Object {
-        $_.name -match '(?i)file.?name|ファイル名' -or $_.automation_id -match '(?i)file.?name|edt1|1152|0480' -or
-        (-not $_.is_read_only -and $_.value.EndsWith($SourceName, [StringComparison]::OrdinalIgnoreCase))
-    })
-    if ($filenameCandidates.Count -eq 0 -and $valueCandidates.Count -eq 1 -and -not $valueCandidates[0].is_read_only) {
-        $filenameCandidates = @($valueCandidates[0])
-    }
-    if ($filenameCandidates.Count -ne 1) {
-        $summary = $uiaControls.ToArray() | ConvertTo-Json -Depth 5 -Compress
-        throw "The Save dialog filename ValuePattern was not unique for source '$SourceName' (dialog=$($Dialog.ToInt64()), pid=$dialogOwnerPid, labels=$($uiaLabels -join '|'), controls=$summary)."
-    }
-
-    $filename = $filenameCandidates[0]
-    $before = $filename.pattern.Current.Value
-    $filename.pattern.SetValue($TargetPath)
-    $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    $readback = ''
+    $ready = $false
+    $nativeInputs=$null
     do {
-        $readback = $filename.pattern.Current.Value
+        if ([DateTime]::UtcNow -ge $ReadinessDeadlineUtc) { break }
+        if (-not [MDLiteCalendarDailyNative]::IsWindow($Dialog)) { throw 'The captured rename/move dialog disappeared before readiness.' }
+        if ([MDLiteCalendarDailyNative]::IsWindowVisible($Dialog) -and [MDLiteCalendarDailyNative]::IsWindowEnabled($Dialog)) {
+            if ($null -eq $script:renameDialogMetadata.first_visible_utc) { $script:renameDialogMetadata.first_visible_utc = [DateTime]::UtcNow.ToString('o') }
+            try {
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
+                if ($null -ne $root) {
+                    $rootCurrent = $root.Current
+                    if ($rootCurrent.ProcessId -ne $dialogOwnerPid) { throw 'UI Automation dialog owner did not match the captured native PID.' }
+                    $script:renameDialogMetadata.ui_automation_process_id = $rootCurrent.ProcessId
+                    $script:renameDialogMetadata.ui_automation_native_hwnd = $rootCurrent.NativeWindowHandle
+                    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                    $valueCandidates = [Collections.Generic.List[object]]::new()
+                    $uiaControls = [Collections.Generic.List[object]]::new()
+                    $uiaLabels = [Collections.Generic.List[string]]::new()
+                    $saveCandidates = [Collections.Generic.List[object]]::new()
+                    foreach ($element in $all) {
+                        $current = $element.Current
+                        if ($current.ControlType.ProgrammaticName -eq 'ControlType.Text' -and $current.Name) { $uiaLabels.Add($current.Name) }
+                        $pattern = $null
+                        $hasValuePattern = $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+                        if ($hasValuePattern) {
+                            $valuePattern = [System.Windows.Automation.ValuePattern]$pattern
+                            $candidate = [pscustomobject]@{
+                                element=$element; pattern=$valuePattern; name=$current.Name; automation_id=$current.AutomationId
+                                control_type=$current.ControlType.ProgrammaticName; process_id=$current.ProcessId; native_hwnd=$current.NativeWindowHandle
+                                value=$valuePattern.Current.Value; is_read_only=$valuePattern.Current.IsReadOnly
+                                enabled=$current.IsEnabled; offscreen=$current.IsOffscreen
+                            }
+                            $uiaControls.Add(($candidate | Select-Object name,automation_id,control_type,process_id,native_hwnd,value,is_read_only,enabled,offscreen))
+                            if ($current.ProcessId -eq $dialogOwnerPid) { $valueCandidates.Add($candidate) }
+                        }
+                        if ($current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and
+                            ($current.Name -match '(?i)save|保存' -or $current.AutomationId -eq '1')) {
+                            $invoke = $null
+                            if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                                $saveCandidates.Add([pscustomobject]@{ element=$element; pattern=$invoke; name=$current.Name; automation_id=$current.AutomationId
+                                    process_id=$current.ProcessId; enabled=$current.IsEnabled; offscreen=$current.IsOffscreen })
+                            }
+                        }
+                    }
+                    $script:renameDialogMetadata.uia_text_labels = @($uiaLabels.ToArray())
+                    $script:renameDialogMetadata.uia_edit_controls = @($uiaControls.ToArray())
+                    $script:renameDialogMetadata.uia_save_buttons = @($saveCandidates.ToArray() | Select-Object name,automation_id,process_id,enabled,offscreen)
+                    $filenameCandidates = @(Get-CommonFilenameCandidates $valueCandidates.ToArray() $SourceName)
+                    $readySaveButtons = @($saveCandidates.ToArray() | Where-Object { $_.process_id -eq $dialogOwnerPid -and $_.enabled -and -not $_.offscreen })
+                    if ($filenameCandidates.Count -eq 1 -and $readySaveButtons.Count -eq 1 -and [DateTime]::UtcNow -lt $ReadinessDeadlineUtc) {
+                        $saveButton = $readySaveButtons[0]
+                        $script:renameDialogMetadata.input_route='uia_patterns'
+                        $ready = $true
+                        $script:renameDialogMetadata.controls_ready_utc = [DateTime]::UtcNow.ToString('o')
+                        break
+                    }
+                    $nativeInputs=Get-NativeCommonDialogInputs $Dialog $dialogOwnerPid $all $SourceName
+                    if ($null -ne $nativeInputs -and [DateTime]::UtcNow -lt $ReadinessDeadlineUtc) {
+                        $script:renameDialogMetadata.input_route='native_filename_host'
+                        $script:renameDialogMetadata.native_inputs=$nativeInputs
+                        $script:renameDialogMetadata.controls_ready_utc=[DateTime]::UtcNow.ToString('o')
+                        $ready=$true
+                        break
+                    }
+                }
+            } catch [System.Windows.Automation.ElementNotAvailableException] { $script:renameDialogMetadata.last_uia_error = $_.Exception.Message }
+        }
+        Start-Sleep -Milliseconds 40
+    } while ([DateTime]::UtcNow -lt $ReadinessDeadlineUtc)
+    if (-not $ready) {
+        $summary = $script:renameDialogMetadata.uia_edit_controls | ConvertTo-Json -Depth 5 -Compress
+        throw "The visible Save dialog did not expose one ready filename ValuePattern and Save InvokePattern for '$SourceName' within its existing readiness budget (dialog=$($Dialog.ToInt64()), pid=$dialogOwnerPid, controls=$summary)."
+    }
+    if ($null -ne $nativeInputs) {
+        $before=$nativeInputs.source_value
+        $setResult=[MDLiteCalendarDailyNative]::WriteControlText([IntPtr]$nativeInputs.edit_hwnd,$TargetPath)
+        if ($setResult -eq 0) { throw 'Confirmed native filename Edit rejected WM_SETTEXT.' }
+        $filenameMetadata=[ordered]@{name='FileNameControlHost/Edit';native_hwnd=$nativeInputs.edit_hwnd;control_id=$nativeInputs.edit_id;process_id=$dialogOwnerPid;value_before=$before}
+        $saveButtonMetadata=[ordered]@{name=$nativeInputs.save_text;native_hwnd=$nativeInputs.save_hwnd;control_id=$nativeInputs.save_id;process_id=$dialogOwnerPid}
+    } else {
+        $filename=$filenameCandidates[0]
+        $before=$filename.pattern.Current.Value
+        $filename.pattern.SetValue($TargetPath)
+        $filenameMetadata=[ordered]@{name=$filename.name;automation_id=$filename.automation_id;control_type=$filename.control_type;process_id=$filename.process_id;value_before=$before}
+        $saveButtonMetadata=[ordered]@{name=$saveButton.name;automation_id=$saveButton.automation_id;process_id=$saveButton.process_id}
+    }
+    $deadline=[DateTime]::UtcNow.AddSeconds(3)
+    $readback=''
+    do {
+        $readback=if ($null -ne $nativeInputs) { [MDLiteCalendarDailyNative]::ReadControlText([IntPtr]$nativeInputs.edit_hwnd) } else { $filename.pattern.Current.Value }
         if ($readback -ceq $TargetPath) { break }
         Start-Sleep -Milliseconds 40
     } while ([DateTime]::UtcNow -lt $deadline)
-    if ($readback -cne $TargetPath) {
-        throw "The Save dialog filename did not read back the requested target (before='$before', after='$readback')."
-    }
-
-    $buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button)
-    $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
-    $saveButton = $null
-    foreach ($button in $buttons) {
-        $current = $button.Current
-        if ($current.Name -match '(?i)save|保存' -or $current.AutomationId -eq '1') { $saveButton = $button; break }
-    }
-    if ($null -eq $saveButton) { throw 'The common file dialog Save button was not exposed through UI Automation.' }
-    $savePattern = $null
-    if (-not $saveButton.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$savePattern)) {
-        throw "The common file dialog Save button has no InvokePattern (name='$($saveButton.Current.Name)')."
-    }
-    $savePattern.Invoke()
+    if ($readback -cne $TargetPath) { throw "The Save dialog filename did not read back the requested target (before='$before', after='$readback')." }
+    $filenameMetadata.value_after=$readback
+    if ($null -ne $nativeInputs) {
+        if (-not [MDLiteCalendarDailyNative]::PostMessage($Dialog,$WM_COMMAND,[IntPtr]$nativeInputs.save_id,[IntPtr]$nativeInputs.save_hwnd)) { throw 'Confirmed native Save button response could not be posted.' }
+    } else { $saveButton.pattern.Invoke() }
     return [ordered]@{
-        route = 'UI Automation ValuePattern on the actual filename field, readback, and InvokePattern on Save'
-        source_name_from_selected_tree_item = $SourceName
-        filename_control = [ordered]@{
-            name = $filename.name; automation_id = $filename.automation_id; control_type = $filename.control_type
-            process_id = $filename.process_id; value_before = $before; value_after = $readback
-        }
-        save_button = [ordered]@{ name = $saveButton.Current.Name; automation_id = $saveButton.Current.AutomationId; process_id = $saveButton.Current.ProcessId }
+        route=$script:renameDialogMetadata.input_route; source_name_from_selected_tree_item=$SourceName
+        filename_control=$filenameMetadata; save_button=$saveButtonMetadata; readiness=$script:renameDialogMetadata
     }
 }
 
+
+function Test-DailyActiveObservation([string]$Caption, [string]$EditorText, [string]$DateText,
+    [string[]]$NamedFiles, [string]$ExpectedPath, [string]$WorkspaceName, [int]$TabIndex) {
+    $expectedCaption = '^MDLite — ' + [regex]::Escape([IO.Path]::GetFileName($ExpectedPath)) +
+        '(?: \*)? — ' + [regex]::Escape($WorkspaceName) + '$'
+    return $TabIndex -ge 0 -and $Caption -cmatch $expectedCaption -and $EditorText.Contains($DateText) -and
+        $NamedFiles.Count -eq 1 -and [IO.Path]::GetFullPath($NamedFiles[0]) -ieq [IO.Path]::GetFullPath($ExpectedPath)
+}
 function Invoke-ProductRename([string]$OldName, [string]$SourcePath, [string]$TargetPath) {
     if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) { throw "Rename source file was not present in the fixture: $SourcePath" }
     if ([IO.Path]::GetFileName($SourcePath) -cne $OldName) { throw "Tree item label does not match the requested source file: $OldName / $SourcePath" }
@@ -540,9 +643,11 @@ function Invoke-ProductRename([string]$OldName, [string]$SourcePath, [string]$Ta
     if ($item -eq [IntPtr]::Zero) { throw "Workspace tree item was not found: $OldName" }
     if (-not [MDLiteCalendarDailyNative]::SelectTreeItem($tree, $item)) { throw "Workspace tree selection failed: $OldName" }
     $paletteResult = Invoke-ProductCommandFromPalette 'Workspace: 名前変更・移動'
-    $dialog = Wait-TopLevelWindowByTitle $process.Id '新しい名前または移動先'
     $dialogReadyWatch = [Diagnostics.Stopwatch]::StartNew()
-    $dialogResult = Set-CommonFileDialogDestination $dialog $OldName $SourcePath $TargetPath
+    $readinessDeadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
+    $remainingMs = [int][Math]::Max(0, [Math]::Floor(($readinessDeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+    $dialog = Wait-TopLevelWindowByTitle $process.Id '新しい名前または移動先' $remainingMs
+    $dialogResult = Set-CommonFileDialogDestination $dialog $OldName $SourcePath $TargetPath $readinessDeadlineUtc
     $dialogReadyWatch.Stop()
     $paletteResult.destination_path = $TargetPath
     $paletteResult.common_dialog = $dialogResult
@@ -553,7 +658,22 @@ function Invoke-ProductRename([string]$OldName, [string]$SourcePath, [string]$Ta
 function Get-CalendarDetailsControl([IntPtr]$MainWindow) {
     foreach ($candidate in (Find-Children $MainWindow -1 'Edit')) {
         $text = Get-WindowTextValue $candidate
-        if ($text.StartsWith('選択日:')) { return $candidate }
+        if (-not $text.StartsWith('選択日:')) { continue }
+        if (-not [MDLiteCalendarDailyNative]::IsWindowVisible($candidate)) {
+            $toggle = Find-Child $MainWindow 134 'Button' # kCalendarDetailsToggle
+            if ($toggle -eq [IntPtr]::Zero -or -not [MDLiteCalendarDailyNative]::IsWindowVisible($toggle)) {
+                throw 'Calendar details disclosure is not visible.'
+            }
+            if (-not [MDLiteCalendarDailyNative]::PostMessage($toggle, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)) {
+                throw 'Could not activate Calendar details disclosure.'
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not [MDLiteCalendarDailyNative]::IsWindowVisible($candidate) -and [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 40
+            }
+            if (-not [MDLiteCalendarDailyNative]::IsWindowVisible($candidate)) { throw 'Calendar details did not become visible within 5 seconds.' }
+        }
+        return $candidate
     }
     return [IntPtr]::Zero
 }
@@ -584,16 +704,23 @@ function Get-DailyFiles {
 function Get-CalendarGeometry([IntPtr]$Calendar) {
     [MDLiteCalendarDailyNative+RECT]$client = New-Object MDLiteCalendarDailyNative+RECT
     if (-not [MDLiteCalendarDailyNative]::GetClientRect($Calendar, [ref]$client)) { throw 'GetClientRect failed for CalendarView.' }
-    $width = $client.Right - $client.Left
-    $height = $client.Bottom - $client.Top
-    $header = [Math]::Min($height, [Math]::Max(24, [Math]::Min(36, [int][Math]::Floor($height / 5))))
+    return Get-CalendarGridGeometry ($client.Right - $client.Left) ($client.Bottom - $client.Top) ([MDLiteCalendarDailyNative]::GetDpiForWindow($Calendar))
+}
+
+function Get-CalendarGridGeometry([int]$Width, [int]$Height, [uint32]$Dpi = 96) {
+    # Match CalculateCalendarViewGeometry: positive MulDiv rounds halves upward.
+    if ($Dpi -eq 0) { $Dpi = 96 }
+    $width = [Math]::Max(0, $Width)
+    $height = [Math]::Max(0, $Height)
+    $dip = { param([int]$Value) [int][Math]::Floor(($Value * [long]$Dpi + 48) / 96.0) }
+    $header = [Math]::Min($height, [Math]::Max((& $dip 24), [Math]::Min((& $dip 36), [int][Math]::Floor($height / 5))))
     $weekday = [Math]::Min($height - $header,
-        [Math]::Max(20, [Math]::Min(24, [int][Math]::Floor(($height - $header) / 8))))
+        [Math]::Max((& $dip 20), [Math]::Min((& $dip 24), [int][Math]::Floor(($height - $header) / 8))))
     $gridTop = $header + $weekday
     $footer = [Math]::Min([Math]::Max(0, $height - $gridTop),
-        [Math]::Max(24, [Math]::Min(32, [int][Math]::Floor($height / 9))))
+        [Math]::Max((& $dip 24), [Math]::Min((& $dip 32), [int][Math]::Floor($height / 9))))
     $gridBottom = [Math]::Max($gridTop, $height - $footer)
-    return [pscustomobject]@{ width = $width; height = $height; header = $header; gridTop = $gridTop; gridBottom = $gridBottom; navWidth = [Math]::Min(44, [int][Math]::Floor($width / 3)) }
+    return [pscustomobject]@{ width = $width; height = $height; dpi = $Dpi; header = $header; gridTop = $gridTop; gridBottom = $gridBottom; navWidth = [Math]::Min((& $dip 44), [int][Math]::Floor($width / 5)) }
 }
 
 function Get-DatePoint([object]$Geometry, [DateTime]$Day) {
@@ -909,6 +1036,22 @@ collision = "open-existing"
         visible_editor_count = $visibleEditorsAfterEnter.Count; activation_messages = $messageReceipts.enter_activation
     })
     [void](Capture-Status 'after_enter_repeat')
+    # Observe the active Daily at its logical point, before deliberately closing
+    # that tab for the following Rename/Move workflow. Shutdown session is later.
+    $repeatCaption=Get-WindowTextValue $main
+    $repeatEditorText=if($visibleEditorsAfterEnter.Count -eq 1){Get-WindowTextValue $visibleEditorsAfterEnter[0]}else{''}
+    $tabs=Find-Child $main 101 'SysTabControl32'
+    $repeatTabIndex=if($tabs -ne [IntPtr]::Zero){[MDLiteCalendarDailyNative]::SendMessage($tabs,0x130B,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32()}else{-1}
+    $namedDailyFiles=@([IO.Directory]::GetFiles($workspace,[IO.Path]::GetFileName($createdFilePath),[IO.SearchOption]::AllDirectories))
+    $repeatPathPass=Test-DailyActiveObservation $repeatCaption $repeatEditorText $date.ToString('yyyy-MM-dd') $namedDailyFiles $createdFilePath ([IO.Path]::GetFileName($workspace)) $repeatTabIndex
+    $openedFilePath=if($repeatPathPass){$namedDailyFiles[0]}else{''}
+    $repeatActiveObservation=[ordered]@{
+        logical_point='after_repeat_activation_before_intentional_close_and_rename_move'
+        main_hwnd=$main.ToInt64(); caption=$repeatCaption; selected_tab_index=$repeatTabIndex
+        visible_editor_count=$visibleEditorsAfterEnter.Count; editor_contains_selected_date=$repeatEditorText.Contains($date.ToString('yyyy-MM-dd'))
+        matching_filename_paths=$namedDailyFiles; active_document_path=$openedFilePath; expected_path=$createdFilePath
+    }
+    Add-Check 'daily_file_is_active_document_after_repeat_activation' ([bool]$repeatPathPass) $repeatActiveObservation
 
     $closeInteraction = Invoke-ProductCommandFromPalette 'ファイル: タブを閉じる'
     $messageReceipts.close_source_from_palette = $closeInteraction
@@ -977,14 +1120,9 @@ collision = "open-existing"
     $sessionDocuments = @([regex]::Matches($sessionText, '(?m)^path = "([^"]+)"$') | ForEach-Object { $_.Groups[1].Value })
     $activeMatch = [regex]::Match($sessionText, '(?m)^active_index = (\d+)$')
     $activeIndex = if ($activeMatch.Success) { [int]$activeMatch.Groups[1].Value } else { -1 }
-    if ($activeIndex -ge 0 -and $activeIndex -lt $sessionDocuments.Count) {
-        $openedFilePath = Join-Path $workspace ($sessionDocuments[$activeIndex] -replace '/', '\')
-    }
-    $openedPathPass = $openedFilePath -and [IO.Path]::GetFullPath($openedFilePath) -ieq [IO.Path]::GetFullPath($createdFilePath)
-    Add-Check 'daily_file_is_active_document_after_repeat_activation' $openedPathPass ([ordered]@{
-        session_path = $sessionPath; active_index = $activeIndex; session_documents = $sessionDocuments
-        active_document_path = $openedFilePath; expected_path = $createdFilePath
-    })
+    $finalSessionOpenedFilePath=if($activeIndex -ge 0 -and $activeIndex -lt $sessionDocuments.Count){
+        Join-Path $workspace ($sessionDocuments[$activeIndex] -replace '/', '\')
+    }else{''}
     $status = if (@($checks.Values | Where-Object { $_.status -eq 'FAIL' }).Count -eq 0) { 'PASS_SYNTHETIC_NATIVE_MESSAGE_ROUTE' } else { 'FAIL_NATIVE_MESSAGE_ROUTE' }
 } catch {
     $errorMessage = $_.Exception.Message
@@ -1043,6 +1181,8 @@ $result = [ordered]@{
     calendar_move_target_exists_after = $movedSourceExistsAfter
     calendar_move_target_sha256_after = $movedSourceHashAfter
     active_open_file_path = $openedFilePath
+    active_document_after_repeat_observation = $repeatActiveObservation
+    final_session_active_open_file_path = $finalSessionOpenedFilePath
     daily_file_counts = $dailyCounts
     session_documents = $sessionDocuments
     native_status_capture = $nativeStatusCapture

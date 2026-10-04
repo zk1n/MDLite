@@ -111,6 +111,17 @@ function Find-MainWindow([Diagnostics.Process]$Target, [int]$TimeoutMs = 15000) 
     throw "Main window was not created for process $($Target.Id)."
 }
 
+function Wait-WorkspaceCaption([IntPtr]$Window, [string]$Expected) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $caption = [Text.StringBuilder]::new(512)
+        [void][MDLitePanelNative]::GetWindowText($Window, $caption, $caption.Capacity)
+        if ($caption.ToString() -ceq $Expected) { return }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Workspace startup caption was not reached within 10 seconds."
+}
+
 function Find-Control([IntPtr]$Parent, [int]$Id) {
     $script:foundControl = [IntPtr]::Zero
     $callback = [MDLitePanelNative+EnumChildWindowsProc]{
@@ -186,6 +197,7 @@ try {
 
     $process = Start-Process -FilePath $executable -ArgumentList @($workspace) -WorkingDirectory $repoRoot -PassThru
     $main = Find-MainWindow $process
+    Wait-WorkspaceCaption $main ('MDLite ' + [char]0x2014 + ' ' + [IO.Path]::GetFileName($workspace))
     Start-Sleep -Milliseconds 400
     if (-not [MDLitePanelNative]::SetWindowPos($main, [IntPtr]::Zero, 80, 80, 1440, 960,
             $SWP_NOZORDER -bor $SWP_NOACTIVATE)) { throw 'Could not size the native test window.' }
@@ -298,11 +310,29 @@ try {
     Stop-TargetProcess
     $process = Start-Process -FilePath $executable -ArgumentList @($workspace) -WorkingDirectory $repoRoot -PassThru
     $main = Find-MainWindow $process
-    Start-Sleep -Milliseconds 500
-    $restartedCalendarHeader = Wait-Control $main $kPanelHeaderCalendar
-    $restartedOutlineHeader = Wait-Control $main $kPanelHeaderOutline
-    $restartedCalendar = Get-Bounds $restartedCalendarHeader
-    $restartedOutline = Get-Bounds $restartedOutlineHeader
+    Wait-WorkspaceCaption $main ('MDLite ' + [char]0x2014 + ' ' + [IO.Path]::GetFileName($workspace))
+    # HWND creation precedes async workspace metadata/layout restoration.
+    # Wait only for actual visible, nonzero controls; keep the slot oracle below.
+    $restartedCalendar = [pscustomobject]@{visible=$false;width=0;height=0}
+    $restartedOutline = [pscustomobject]@{visible=$false;width=0;height=0}
+    $restartReadyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $restartedCalendarHeader = Find-Control $main $kPanelHeaderCalendar
+        $restartedOutlineHeader = Find-Control $main $kPanelHeaderOutline
+        if ($restartedCalendarHeader -ne [IntPtr]::Zero -and $restartedOutlineHeader -ne [IntPtr]::Zero) {
+            $restartedCalendar = Get-Bounds $restartedCalendarHeader
+            $restartedOutline = Get-Bounds $restartedOutlineHeader
+            if ($restartedCalendar.visible -and $restartedOutline.visible -and
+                $restartedCalendar.width -gt 0 -and $restartedCalendar.height -gt 0 -and
+                $restartedOutline.width -gt 0 -and $restartedOutline.height -gt 0) { break }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $restartReadyDeadline)
+    if (-not $restartedCalendar.visible -or -not $restartedOutline.visible -or
+        $restartedCalendar.width -le 0 -or $restartedOutline.width -le 0 -or
+        $restartedCalendar.height -le 0 -or $restartedOutline.height -le 0) {
+        throw 'Restarted panel layout did not become visible within 10 seconds.'
+    }
     $afterRestartLayout = Wait-LayoutFile $layoutPath
     $restartMovePass = $restartedCalendar.centerX -gt $restartedOutline.centerX -and
         $restartedCalendar.centerY -lt $restartedOutline.centerY

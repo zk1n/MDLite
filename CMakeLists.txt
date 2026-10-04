@@ -92,6 +92,8 @@ add_executable(MDLite WIN32
   src/main.cpp
   src/app/Application.cpp
   src/app/Application.h
+  src/app/UiIcons.cpp
+  src/app/UiIcons.h
   src/app/DiagnosticsView.cpp
   src/app/DiagnosticsView.h
 )

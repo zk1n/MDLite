@@ -52,7 +52,7 @@ struct CalendarViewDateMarker {
   CalendarViewMarkerFlags flags{CalendarViewMarkerFlags::None};
 };
 
-CalendarViewGeometry CalculateCalendarViewGeometry(RECT client) noexcept;
+CalendarViewGeometry CalculateCalendarViewGeometry(RECT client, UINT dpi = 96) noexcept;
 CalendarViewMonthDates GetCalendarViewMonthDates(CalendarDate displayed_month) noexcept;
 std::optional<std::size_t> CalendarViewHitTestDate(
     const CalendarViewGeometry& geometry, POINT point) noexcept;

@@ -30,6 +30,10 @@ public static class MDLiteNative {
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int left; public int top; public int right; public int bottom; }
     [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x; public int y; }
+    [DllImport("user32.dll")]
+    public static extern bool ScreenToClient(IntPtr window, ref POINT point);
+    [StructLayout(LayoutKind.Sequential)]
     public struct SCROLLINFO {
         public uint cbSize;
         public uint fMask;
@@ -161,6 +165,27 @@ public static class MDLiteNative {
     public static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
     [DllImport("user32.dll")]
     public static extern IntPtr SetFocus(IntPtr window);
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint source, uint target, bool attach);
+    public static bool FocusKeyboardControl(IntPtr main, IntPtr control) {
+        uint processId;
+        uint targetThread = GetWindowThreadProcessId(control, out processId);
+        uint currentThread = GetCurrentThreadId();
+        bool attached = false;
+        try {
+            if (targetThread != currentThread) attached = AttachThreadInput(currentThread, targetThread, true);
+            if (targetThread != currentThread && !attached) return false;
+            SetForegroundWindow(main);
+            SetFocus(control);
+        } finally {
+            if (attached && !AttachThreadInput(currentThread, targetThread, false)) throw new InvalidOperationException("Could not detach keyboard focus setup.");
+        }
+        return GetFocusedWindow(control) == control;
+    }
     public static IntPtr GetFocusedWindow(IntPtr window) {
         uint processId;
         uint threadId = GetWindowThreadProcessId(window, out processId);
@@ -280,6 +305,7 @@ $BST_UNCHECKED = 0
 $BST_CHECKED = 1
 $IDOK = 1
 $IDCANCEL = 2
+$script:workspaceDocumentReadinessTraces = [Collections.Generic.List[object]]::new()
 
 function Wait-ProcessWindow([Diagnostics.Process]$Process, [int]$TimeoutMs = 10000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -413,6 +439,190 @@ function Get-WindowText([IntPtr]$Window) {
     $text = New-Object Text.StringBuilder ($length + 1)
     [void][MDLiteNative]::SendMessage($Window, $WM_GETTEXT, [IntPtr]($length + 1), $text)
     return $text.ToString()
+}
+
+function Wait-WorkspaceDocumentReady([IntPtr]$Main, [Diagnostics.Process]$Target, [string]$DocumentName,
+    [string]$Workspace, [int]$TimeoutMs = 10000) {
+    $started = [DateTime]::UtcNow
+    $deadline = $started.AddMilliseconds($TimeoutMs)
+    $caption = 'MDLite — ' + $DocumentName + ' — ' + [IO.Path]::GetFileName($Workspace)
+    $stable = 0; $lastEditor = [IntPtr]::Zero
+    $samples = [Collections.Generic.List[object]]::new()
+    $trace = [ordered]@{ document = $DocumentName; owner_pid = $Target.Id; main_hwnd = $Main.ToInt64(); started_utc = $started.ToString('o'); timeout_ms = $TimeoutMs; status = 'WAITING'; samples = $samples }
+    $script:workspaceDocumentReadinessTraces.Add($trace)
+    do {
+        $sampleStarted = [DateTime]::UtcNow
+        $Target.Refresh()
+        if ($Target.HasExited) { $trace.status = 'PROCESS_EXITED'; throw 'Workspace process exited before final document readiness.' }
+        $owner = [uint32]0
+        [void][MDLiteNative]::GetWindowThreadProcessId($Main, [ref]$owner)
+        $class = [Text.StringBuilder]::new(64)
+        [void][MDLiteNative]::GetClassName($Main, $class, $class.Capacity)
+        if ($owner -ne $Target.Id -or $class.ToString() -cne 'MDLite.MainWindow') {
+            $trace.status = 'OWNERSHIP_MISMATCH'; $trace.observed_owner_pid = $owner
+            throw 'Workspace caption observation requires the owned top-level MDLite window.'
+        }
+        # Foreign-process top-level caption reads use the OS caption cache,
+        # avoiding two separately bounded WM_GETTEXT calls during startup.
+        $captionText = [Text.StringBuilder]::new([Math]::Max(1024, $caption.Length + 2))
+        [void][MDLiteNative]::GetWindowText($Main, $captionText, $captionText.Capacity)
+        $captionMatches = $captionText.ToString() -ceq $caption
+        $editors = @(Get-CurrentVisibleEditors $Main $Target.Id)
+        $enabled = $editors.Count -eq 1 -and [MDLiteNative]::IsWindowEnabled($editors[0])
+        $ready = [IntPtr]::Zero; $readyApi = [IntPtr]::Zero
+        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($captionMatches -and $enabled -and $remaining -gt 0) {
+            $readyApi = [MDLiteNative]::SendMessageTimeoutW($Main, 0x8036, [IntPtr]::Zero, [IntPtr]::Zero, 2, [uint32][Math]::Min(250, $remaining), [ref]$ready)
+        }
+        $sourceReady = $readyApi -ne [IntPtr]::Zero -and ($ready.ToInt64() -band 5) -eq 5
+        if ($captionMatches -and $enabled -and $sourceReady) {
+            if ($editors[0] -eq $lastEditor) { $stable++ } else { $stable = 1; $lastEditor = $editors[0] }
+        } else { $stable = 0 }
+        $observed = [DateTime]::UtcNow
+        if ($samples.Count -lt 256) { $samples.Add([ordered]@{
+            started_elapsed_ms = [Math]::Round(($sampleStarted - $started).TotalMilliseconds, 3)
+            finished_elapsed_ms = [Math]::Round(($observed - $started).TotalMilliseconds, 3)
+            caption_matches = $captionMatches; editor_count = $editors.Count; editor_enabled = $enabled
+            editor_hwnd = if ($editors.Count -eq 1) { $editors[0].ToInt64() } else { 0 }
+            readiness_api_ok = $readyApi -ne [IntPtr]::Zero; readiness_flags = $ready.ToInt64()
+            stable_reads = $stable; within_deadline = $observed -lt $deadline
+        }) }
+        if ($stable -ge 2 -and [DateTime]::UtcNow -lt $deadline) {
+            $trace.status = 'READY_IN_BUDGET'; $trace.elapsed_ms = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds, 3)
+            if ([DateTime]::UtcNow -lt $deadline) { return $editors[0] }
+        }
+        Start-Sleep -Milliseconds 40
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $trace.status = 'TIMEOUT'; $trace.elapsed_ms = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds, 3)
+    throw "Final workspace/document readiness did not settle within $TimeoutMs ms; see caption/editor/readiness observation trace."
+}
+
+function Invoke-CalendarToggleCheck([IntPtr]$Main, [int]$TimeoutMs = 5000) {
+    $calendar = Find-ChildClassWindow $Main 'MDLite.CalendarView'
+    if ($calendar -eq [IntPtr]::Zero) { throw 'Calendar control was not created.' }
+    $initial = [MDLiteNative]::IsWindowVisible($calendar)
+    $started = [DateTime]::UtcNow; $deadline = $started.AddMilliseconds($TimeoutMs)
+    $observations = [Collections.Generic.List[object]]::new()
+    foreach ($expected in @((-not $initial), $initial)) {
+        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0) { throw 'Calendar toggle exhausted its shared command/observation deadline.' }
+        $reply = [IntPtr]::Zero
+        $api = [MDLiteNative]::SendMessageTimeoutW($Main, 0x0111, [IntPtr]1026, [IntPtr]::Zero, 2, [uint32]$remaining, [ref]$reply)
+        if ($api -eq [IntPtr]::Zero) { throw 'Calendar menu toggle did not complete within its deadline.' }
+        $matched = $false
+        do {
+            $visible = [MDLiteNative]::IsWindowVisible($calendar)
+            $observed = [DateTime]::UtcNow
+            if ($visible -eq $expected -and $observed -lt $deadline) { $matched = $true; break }
+            Start-Sleep -Milliseconds 25
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $matched) { throw 'Calendar visibility did not reach the exact expected toggle state before deadline.' }
+        $observations.Add([ordered]@{ expected_visible = $expected; observed_visible = $visible; elapsed_ms = [Math]::Round(($observed - $started).TotalMilliseconds, 3); command_completed = $true })
+    }
+    $result = [ordered]@{ calendar_control = $true; calendar_visible = $observations[0].observed_visible -ne $initial; calendar_hidden = $observations[1].observed_visible -eq $initial
+        calendar_toggle_trace = [ordered]@{ initial_visible = $initial; after_first_command = $observations[0].observed_visible; after_second_command = $observations[1].observed_visible; observations = $observations.ToArray(); timeout_ms = $TimeoutMs } }
+    if ([DateTime]::UtcNow -ge $deadline) { throw 'Calendar toggle result missed its shared command/observation deadline.' }
+    return $result
+}
+
+function Test-WholeSourceSelection($Selection, [int]$SourceLength) {
+    return $SourceLength -gt 0 -and [Math]::Min($Selection.anchor, $Selection.active) -eq 0 -and
+        [Math]::Max($Selection.anchor, $Selection.active) -eq $SourceLength
+}
+
+function Get-WorkspaceSplitterPosition([IntPtr]$Main) {
+    $header = Find-Control $Main 1072 'Button'
+    if ($header -eq [IntPtr]::Zero -or -not [MDLiteNative]::IsWindowVisible($header)) { throw 'Explorer header is not visible for splitter geometry.' }
+    $rect = [MDLiteNative+RECT]::new()
+    if (-not [MDLiteNative]::GetWindowRect($header, [ref]$rect)) { throw 'Explorer header bounds are unavailable.' }
+    $dpi = [int][MDLiteNative]::GetDpiForWindow($Main)
+    if ($dpi -eq 0) { $dpi = 96 }
+    $splitterWidth = [int][Math]::Floor((4 * $dpi + 48) / 96.0)
+    $point = [MDLiteNative+POINT]::new()
+    $point.x = $rect.right + [int][Math]::Floor($splitterWidth / 2)
+    $point.y = $rect.bottom + [int][Math]::Floor((24 * $dpi + 48) / 96.0)
+    if (-not [MDLiteNative]::ScreenToClient($Main, [ref]$point)) { throw 'Could not map splitter geometry into main-client coordinates.' }
+    return [pscustomobject]@{ x = $point.x; y = $point.y; dpi = $dpi; splitter_width = $splitterWidth; header_hwnd = $header.ToInt64() }
+}
+
+function Wait-SaveAsControlsReady([Diagnostics.Process]$Target, [int]$TimeoutMs = 10000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0) { break }
+        $dialog = Wait-ProcessClassWindow $Target '#32770' $remaining
+        if ([MDLiteNative]::IsWindowVisible($dialog)) {
+            $edit = Find-Control $dialog 1001 'Edit'
+            $save = Find-Control $dialog 1 'Button'
+            if ($edit -ne [IntPtr]::Zero -and $save -ne [IntPtr]::Zero -and
+                [MDLiteNative]::IsWindowVisible($edit) -and [MDLiteNative]::IsWindowEnabled($edit) -and
+                [MDLiteNative]::IsWindowVisible($save) -and [MDLiteNative]::IsWindowEnabled($save) -and
+                (Get-WindowText $save) -match '^(保存|Save)') {
+                if ([DateTime]::UtcNow -ge $deadline) { throw 'Save As controls matched only after the existing readiness deadline.' }
+                return [pscustomobject]@{ dialog = $dialog; edit = $edit; save = $save }
+            }
+        }
+        Start-Sleep -Milliseconds 40
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Visible Save As filename host and semantic Save button were not ready within $TimeoutMs ms."
+}
+
+function Get-CurrentVisibleEditors([IntPtr]$Main, [int]$OwnerPid) {
+    $script:quickOpenEditors=[Collections.Generic.List[IntPtr]]::new()
+    $callback=[MDLiteNative+EnumWindowsProc]{
+        param([IntPtr]$window,[IntPtr]$parameter)
+        if(-not [MDLiteNative]::IsWindowVisible($window) -or [MDLiteNative]::GetDlgCtrlID($window) -ne 102){return $true}
+        $owner=[uint32]0
+        [void][MDLiteNative]::GetWindowThreadProcessId($window,[ref]$owner)
+        $class=New-Object Text.StringBuilder 128
+        [void][MDLiteNative]::GetClassName($window,$class,$class.Capacity)
+        if($owner -eq $OwnerPid -and $class.ToString() -ceq 'RICHEDIT50W'){$script:quickOpenEditors.Add($window)}
+        return $true
+    }
+    [void][MDLiteNative]::EnumChildWindows($Main,$callback,[IntPtr]::Zero)
+    return @($script:quickOpenEditors.ToArray())
+}
+function Wait-QuickOpenDocumentEditor([IntPtr]$Main, $Target, [string]$DocumentName,
+    [string]$ExpectedText, [switch]$Prefix, [int]$TimeoutMs=10000) {
+    $started=[DateTime]::UtcNow;$deadline=$started.AddMilliseconds($TimeoutMs)
+    $captionPattern='^MDLite — '+[regex]::Escape($DocumentName)+'(?: \*)? — .+$'
+    $previousEditor=[IntPtr]::Zero;$previousText=$null;$stable=0;$invalidHandleRetries=0
+    $last=[ordered]@{pid=$Target.Id;main_hwnd=$Main.ToInt64();expected_document=$DocumentName;caption=$null;editor_hwnd=$null;visible_editor_count=0;text_matches=$false;elapsed_ms=0;last_transient_error=$null}
+    while([DateTime]::UtcNow -lt $deadline){
+        $Target.Refresh()
+        if($Target.HasExited){throw "Quick Open process exited before '$DocumentName' editor readiness (pid=$($Target.Id))."}
+        $last.caption=Get-WindowText $Main
+        $last.elapsed_ms=[Math]::Round(([DateTime]::UtcNow-$started).TotalMilliseconds,3)
+        $current=@(Get-CurrentVisibleEditors $Main $Target.Id)
+        $last.visible_editor_count=$current.Count
+        if($last.caption -cmatch $captionPattern -and $current.Count -eq 1){
+            $candidate=$current[0];$last.editor_hwnd=$candidate.ToInt64()
+            try{$text=(Get-WindowText $candidate) -replace "`r`n","`n"}
+            catch{
+                $message=$_.Exception.GetBaseException().Message
+                if($message -match 'win32_error=1400, is_window=False'){
+                    $invalidHandleRetries++;$last.last_transient_error=$message
+                    $stable=0;$previousEditor=[IntPtr]::Zero
+                    Start-Sleep -Milliseconds 40
+                    continue
+                }
+                throw
+            }
+            $confirmed=@(Get-CurrentVisibleEditors $Main $Target.Id)
+            $confirmedCaption=Get-WindowText $Main
+            $last.text_matches=if($Prefix){$text.StartsWith($ExpectedText,[StringComparison]::Ordinal)}else{$text -ceq $ExpectedText}
+            if($confirmed.Count -eq 1 -and $confirmed[0] -eq $candidate -and [MDLiteNative]::IsWindow($candidate) -and
+                $confirmedCaption -ceq $last.caption -and $last.text_matches){
+                $stable=if($previousEditor -eq $candidate -and $previousText -ceq $text){$stable+1}else{1}
+                $previousEditor=$candidate;$previousText=$text
+                if($stable -ge 2 -and [DateTime]::UtcNow -lt $deadline){
+                    return [pscustomobject]@{Editor=$candidate;Text=$text;Evidence=[ordered]@{pid=$Target.Id;main_hwnd=$Main.ToInt64();editor_hwnd=$candidate.ToInt64();document=$DocumentName;caption=$confirmedCaption;started_utc=$started.ToString('o');ready_utc=[DateTime]::UtcNow.ToString('o');elapsed_ms=[Math]::Round(([DateTime]::UtcNow-$started).TotalMilliseconds,3);invalid_handle_retries=$invalidHandleRetries;stable_reads=$stable;expected_text_matched=$true}}
+                }
+            }else{$stable=0;$previousEditor=[IntPtr]::Zero}
+        }else{$stable=0;$previousEditor=[IntPtr]::Zero}
+        Start-Sleep -Milliseconds 40
+    }
+    throw "Quick Open selected-document readiness timed out (configured_timeout_ms=$TimeoutMs, invalid_handle_retries=$invalidHandleRetries): $($last | ConvertTo-Json -Compress)."
 }
 
 function Save-WindowCapture([IntPtr]$Window, [string]$Path) {
@@ -699,6 +909,7 @@ function Invoke-SuspendedEditorLifecycle([string]$Directory) {
 }
 
 function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
+    $readinessTraceStart = $script:workspaceDocumentReadinessTraces.Count
     [IO.Directory]::CreateDirectory((Join-Path $Directory '.mdlite')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $Directory '.mdlite\settings.toml'),
         "schema_version = 1`nauto_save = false`n", [Text.UTF8Encoding]::new($false))
@@ -735,7 +946,7 @@ function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
     $script:readbackProcesses.Add($child)
     $main = Wait-ProcessWindow $child
     $tabs = Wait-Control $main 101 'SysTabControl32'
-    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W' 10000 'session-long-line-startup'
+    $editor = Wait-WorkspaceDocumentReady $main $child 'long-horizontal.md' $Directory
     $longAnchor = $longLine.IndexOf('0123456789', [StringComparison]::Ordinal) + 12000
     [void][MDLiteNative]::SendMessage(
         $main, $testSetSelectionBySourceMessage, [IntPtr]$longAnchor, [IntPtr]$longAnchor)
@@ -891,6 +1102,8 @@ function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
     $main = Wait-ProcessWindow $child
     $tabs = Wait-Control $main 101 'SysTabControl32'
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    $editor = Wait-WorkspaceDocumentReady $main $child ([IO.Path]::GetFileName($sessionDocumentPaths[$sessionActiveIndex])) $Directory $remaining
     do {
         $restoredTabCount = [MDLiteNative]::SendMessage(
             $tabs, 0x1304, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
@@ -903,13 +1116,29 @@ function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
     if ($restoredActiveIndex -ne $sessionActiveIndex) {
         throw "Workspace restart selected tab $restoredActiveIndex, expected saved active index $sessionActiveIndex."
     }
-    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W' 10000 'session-restart-table-active'
-    $restoredTableVerticalOffset = [MDLiteNative]::SendMessage(
-        $main, $testGetVerticalSourceOffsetMessage, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    if ($remaining -le 0) { throw 'Workspace restart exhausted its existing readiness budget before viewport observation.' }
+    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W' $remaining 'session-restart-table-active'
+    $viewportMatchedInBudget = $false
+    do {
+        $restoredTableVerticalOffset = [MDLiteNative]::SendMessage(
+            $main, $testGetVerticalSourceOffsetMessage, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+        $restoredTableHorizontalScrollPosition = [MDLiteNative]::GetScrollPosition($editor, 0)
+        $restoredTableLeftEdgeOffset = [MDLiteNative]::SendMessage(
+            $main, $testGetVisibleSourceOffsetMessage, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+        if ($restoredTableVerticalOffset -eq $sessionTableVerticalOffset -and $restoredTableLeftEdgeOffset -eq $sessionTableHorizontalOffset) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw 'Saved session viewport matched only after the shared restart deadline.' }
+            $viewportMatchedInBudget = $true
+            break
+        }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $viewportMatchedInBudget) { throw 'Saved session viewport did not settle within the shared restart deadline.' }
     if ($restoredTableVerticalOffset -lt $tableSource.IndexOf('| row-001', [StringComparison]::Ordinal) -or
         $restoredTableVerticalOffset -ge $tableSource.Length) {
         throw "Restarted table vertical anchor left the body rows: offset=$restoredTableVerticalOffset."
     }
+    if ($restoredTableVerticalOffset -ne $sessionTableVerticalOffset) { throw "Restarted table saved vertical source anchor did not settle: expected=$sessionTableVerticalOffset actual=$restoredTableVerticalOffset." }
     $restoredTableHorizontalScrollPosition = [MDLiteNative]::GetScrollPosition($editor, 0)
     $restoredTableLeftEdgeOffset = [MDLiteNative]::SendMessage(
         $main, $testGetVisibleSourceOffsetMessage, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
@@ -1028,6 +1257,7 @@ height = 520
         long_source_restored = $longEditorSourceRestored
         table_editor_content_restored = $tableEditorContentRestored
         source_files_unchanged = $true
+        workspace_document_readiness_traces = @($script:workspaceDocumentReadinessTraces.ToArray() | Select-Object -Skip $readinessTraceStart)
         suspended_editor_count_after_tab_switch = $suspendedEditorCount
         synthetic_input = 'Cross-process Win32 messages and a test-only visible-source-offset probe; no physical input.'
         evidence_boundary = 'Automated native observation only; Human visual, physical input, and IME acceptance remain unknown.'
@@ -1045,7 +1275,7 @@ function Start-ReadbackFixture([string]$Name, [AllowEmptyString()][string]$Initi
     $fixtureProcess = Start-Process -FilePath $executable -ArgumentList @($source) -PassThru
     $script:readbackProcesses.Add($fixtureProcess)
     $main = Wait-ProcessWindow $fixtureProcess
-    $editor = Wait-Control $main 102 'RICHEDIT50W'
+    $editor = Wait-WorkspaceDocumentReady $main $fixtureProcess 'fixture.md' $directory
     return [pscustomobject]@{
         Process = $fixtureProcess
         Main = $main
@@ -1226,48 +1456,24 @@ function Invoke-UntitledLifecycleAcceptance() {
 
         $target = Join-Path $fixture.Directory 'untitled.md'
         [void][MDLiteNative]::PostMessage($fixture.Main, $WM_COMMAND, [IntPtr]1005, [IntPtr]::Zero)
-        $retryDialog = Wait-ProcessClassWindow $fixture.Process '#32770' 5000
-        $fileNameEdit = [IntPtr]::Zero
-        if ($retryDialog -ne [IntPtr]::Zero) {
-            $fileNameDeadline = [DateTime]::UtcNow.AddSeconds(5)
-            do {
-                foreach ($childHandle in [MDLiteNative]::GetChildWindowHandles($retryDialog)) {
-                    $childClass = New-Object Text.StringBuilder 128
-                    [void][MDLiteNative]::GetClassName($childHandle, $childClass, $childClass.Capacity)
-                    if ([MDLiteNative]::GetDlgCtrlID($childHandle) -eq 1001 -and
-                        $childClass.ToString() -eq 'Edit') {
-                        $fileNameEdit = $childHandle
-                        break
-                    }
-                }
-                if ($fileNameEdit -ne [IntPtr]::Zero) { break }
-                Start-Sleep -Milliseconds 50
-            } while ([DateTime]::UtcNow -lt $fileNameDeadline)
-            $details.save_as_file_name_control = if ($fileNameEdit -ne [IntPtr]::Zero) {
-                [MDLiteNative]::GetDlgCtrlID($fileNameEdit).ToString() + ':Edit'
-            } else { 'NOT_FOUND' }
-            if ($fileNameEdit -ne [IntPtr]::Zero) {
-                [void][MDLiteNative]::SendMessage($fileNameEdit, $WM_SETTEXT, [IntPtr]::Zero,
-                    [IO.Path]::GetFileName($target))
-                $details.save_as_file_name_value = Get-WindowText $fileNameEdit
-            }
-            $saveButton = Find-Control $retryDialog $IDOK 'Button'
-            $details.save_button_found = $saveButton -ne [IntPtr]::Zero
-            if ($fileNameEdit -ne [IntPtr]::Zero -and $saveButton -ne [IntPtr]::Zero) {
-                [void][MDLiteNative]::SendMessage($saveButton, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-            }
-            $saveDialogDeadline = [DateTime]::UtcNow.AddSeconds(5)
-            do {
-                if (-not [MDLiteNative]::IsWindow($retryDialog)) { break }
-                Start-Sleep -Milliseconds 50
-            } while ([DateTime]::UtcNow -lt $saveDialogDeadline)
-            $details.save_dialog_closed_after_click = -not [MDLiteNative]::IsWindow($retryDialog)
-            if ([MDLiteNative]::IsWindow($retryDialog)) {
-                $details.retry_dialog_children_after_click = [MDLiteNative]::DescribeChildWindows($retryDialog)
-                [void][MDLiteNative]::SendMessage($retryDialog, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero)
-                Wait-ProcessClassWindowGone $fixture.Process '#32770' 5000
-            }
-        }
+        # Preserve the previous 5s dialog + 5s filename budget as one readiness deadline.
+        $saveReady = Wait-SaveAsControlsReady $fixture.Process 10000
+        $retryDialog = $saveReady.dialog
+        $fileNameEdit = $saveReady.edit
+        $saveButton = $saveReady.save
+        $requestedPath = [IO.Path]::GetFullPath($target)
+        if (Test-Path -LiteralPath $requestedPath) { throw 'Save retry target already exists in this fresh fixture.' }
+        $setName = [MDLiteNative]::SendMessage($fileNameEdit, $WM_SETTEXT, [IntPtr]::Zero, $requestedPath).ToInt64()
+        $readName = Get-WindowText $fileNameEdit
+        $details.save_as_file_name_control = '1001:Edit'
+        $details.save_as_file_name_value = $readName
+        $details.save_as_requested_path = $requestedPath
+        $details.save_button_found = $true
+        $details.save_as_host_visible = [MDLiteNative]::IsWindowVisible($retryDialog)
+        if ($setName -eq 0 -or $readName -cne $requestedPath) { throw 'Save retry filename host did not accept/read back the exact absolute fixture path.' }
+        [void][MDLiteNative]::SendMessage($saveButton, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-ProcessClassWindowGone $fixture.Process '#32770' 5000
+        $details.save_dialog_closed_after_click = -not [MDLiteNative]::IsWindow($retryDialog)
         $checks.save_as_retry_writes_exact_pending_buffer =
             $retryDialog -ne [IntPtr]::Zero -and $fileNameEdit -ne [IntPtr]::Zero -and
             (Test-Path -LiteralPath $target -PathType Leaf) -and
@@ -1346,10 +1552,28 @@ function Invoke-GitActionResponsiveness([string]$Directory) {
         [IO.File]::WriteAllText($pendingFile, 'E20 delayed stage fixture' + $newLine, [Text.UTF8Encoding]::new($false))
 
         $env:MDLITE_TEST_GIT_ACTION_DELAY_MS = '7000'
-        $child = Start-Process -FilePath $executable -ArgumentList ('"{0}"' -f $Directory) -PassThru
+        $fixtureReadme=Join-Path $Directory 'README.md'
+        $child = Start-Process -FilePath $executable -ArgumentList ('"{0}"' -f $fixtureReadme) -PassThru
         $env:MDLITE_TEST_GIT_ACTION_DELAY_MS = $previousDelay
         $main = Wait-ProcessWindow $child
         $gitFiles = Wait-Control $main 0 'SysListView32'
+        # Created controls precede metadata initialization. The existing tracked
+        # README makes normal positive document readiness observable before trust.
+        $workspaceReadyStarted=[DateTime]::UtcNow
+        $workspaceReadyDeadline=$workspaceReadyStarted.AddSeconds(10)
+        $workspaceReady=$false;$readyFlags=0;$readySourceLength=0;$readyCaption='';$metadataReady=$false
+        do {
+            $readyFlags=[MDLiteNative]::SendMessage($main,$testGetEditorReadinessMessage,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32()
+            $readySourceLength=[MDLiteNative]::SendMessage($main,0x8045,[IntPtr]4,[IntPtr]::Zero).ToInt64()
+            $readyCaption=Get-WindowText $main
+            $metadataReady=(Test-Path -LiteralPath (Join-Path $Directory '.mdlite/workspace.toml') -PathType Leaf) -and
+                (Test-Path -LiteralPath (Join-Path $Directory '.mdlite/profiles.toml') -PathType Leaf)
+            if([DateTime]::UtcNow -lt $workspaceReadyDeadline -and ($readyFlags -band 5) -eq 5 -and $readySourceLength -gt 0 -and $metadataReady -and
+                $readyCaption.StartsWith('MDLite — README.md — ',[StringComparison]::Ordinal)){$workspaceReady=$true;break}
+            Start-Sleep -Milliseconds 40
+        }while([DateTime]::UtcNow -lt $workspaceReadyDeadline)
+        $details.workspace_ready_before_trust=[ordered]@{pid=$child.Id;main_hwnd=$main.ToInt64();ready=$workspaceReady;flags=$readyFlags;source_length=$readySourceLength;metadata_initialized=$metadataReady;caption=$readyCaption;elapsed_ms=[Math]::Round(([DateTime]::UtcNow-$workspaceReadyStarted).TotalMilliseconds,3);deadline_ms=10000;fixture_document=$fixtureReadme}
+        if(-not $workspaceReady){throw 'E20 workspace/document did not reach positive native readiness before trust; trust was not dispatched.'}
         $trustResult = [MDLiteNative]::SendMessage(
             $main, $testTrustWorkspaceForGitMessage, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
         if ($trustResult -eq 1) {
@@ -1562,11 +1786,13 @@ function Invoke-TableTopologyReplacement($Fixture, [string]$CaseName,
     $beforeEditor = (Get-WindowText $Fixture.Editor) -replace "`r`n", "`n"
     $beforeEnabled = [MDLiteNative]::IsWindowEnabled($Fixture.Editor)
     $beforeReadback = Wait-TableTopologyReadback $Fixture.Main $true
+    $wholeSourceLength = [MDLiteNative]::SendMessage($Fixture.Main, 0x8045, [IntPtr]4, [IntPtr]::Zero).ToInt32()
     if ($SelectionMode -eq 'select-all') {
         [void][MDLiteNative]::SendMessage(
             $Fixture.Editor, $EM_SETSEL, [IntPtr]::Zero, [IntPtr](-1))
         $sourceSelection = Get-EditorSelection $Fixture.Editor
-        $selectionResult = if ($sourceSelection.start -eq 0 -and $sourceSelection.end -gt 0) { 1 } else { 0 }
+        $wholeSourceSelection = Get-SourceSelectionByMessage $Fixture.Main
+        $selectionResult = if (Test-WholeSourceSelection $wholeSourceSelection $wholeSourceLength) { 1 } else { 0 }
     } else {
         $selectionResult = [MDLiteNative]::SendMessage(
             $Fixture.Main, $testSetSelectionBySourceMessage,
@@ -1578,10 +1804,13 @@ function Invoke-TableTopologyReplacement($Fixture, [string]$CaseName,
         }
     }
     $nativeSelection = Get-EditorSelection $Fixture.Editor
-    $nativeSelectionSet = $selectionResult -eq 1 -and
-        $nativeSelection.start -eq $sourceSelection.start -and
-        $nativeSelection.end -eq $sourceSelection.end -and
-        $nativeSelection.start -ne $nativeSelection.end
+    $nativeSelectionSet = if ($SelectionMode -eq 'select-all') {
+        $wholeSourceSelection = Get-SourceSelectionByMessage $Fixture.Main
+        $selectionResult -eq 1 -and (Test-WholeSourceSelection $wholeSourceSelection $wholeSourceLength)
+    } else {
+        $selectionResult -eq 1 -and $nativeSelection.start -eq $sourceSelection.start -and
+            $nativeSelection.end -eq $sourceSelection.end -and $nativeSelection.start -ne $nativeSelection.end
+    }
     if ($selectionResult -ne 0) {
         # Selection is established by EM_SETSEL for Select All or by the
         # source probe plus EM_SETSEL for a Markdown range. Send through the
@@ -1662,6 +1891,8 @@ function Invoke-TableTopologyReplacement($Fixture, [string]$CaseName,
         selection_end = $SelectionEnd
         selection_result = $selectionResult
         native_selection_before_input = $nativeSelection
+        source_selection_before_input = if ($SelectionMode -eq 'select-all') { $wholeSourceSelection } else { $null }
+        whole_source_length = $wholeSourceLength
         editor_text_before = $beforeEditor
         editor_text_after_edit = $editedText
         editor_enabled_before = [bool]$beforeEnabled
@@ -2338,6 +2569,7 @@ try {
     $main = Wait-ProcessWindow $process
     $editor = Wait-Control $main 102 'RICHEDIT50W'
     $checks.main_window = $true
+    $editor = Wait-WorkspaceDocumentReady $main $process 'first.md' $workspace
     $checks.initial_view = ((Get-WindowText $editor) -replace "`r`n", "`n") -eq $initial
     $checks.runtime_environment = Get-NativeRuntimeSnapshot $process $main $editor $first $firstInitialHash $settingsFile
 
@@ -2362,6 +2594,7 @@ try {
         $workspaceSessionViewRestore = [ordered]@{
             pass = $false
             error = $_.Exception.Message
+            workspace_document_readiness_traces = $script:workspaceDocumentReadinessTraces.ToArray()
             synthetic_input = 'Cross-process Win32 messages and a test-only visible-source-offset probe; no physical input.'
             evidence_boundary = 'Automated native observation only; Human visual, physical input, and IME acceptance remain unknown.'
         }
@@ -2471,7 +2704,7 @@ try {
         '末尾 日本語') -join "`r`n"
     $topologyOriginal += "`r`n"
     $topologyPlainReplacement = '置'
-    $topologyPlainExpected = $topologyPlainReplacement + "`r`n"
+    $topologyPlainExpected = $topologyPlainReplacement
     $topologyFixture = $null
     try {
         $topologyFixture = Start-ReadbackFixture 'table-topology-full-document' $topologyOriginal
@@ -2560,8 +2793,9 @@ try {
     [MDLiteNative+RECT]$treeBefore = New-Object MDLiteNative+RECT
     [void][MDLiteNative]::GetWindowRect($tree, [ref]$treeBefore)
     $beforeTreeWidth = $treeBefore.right - $treeBefore.left
-    $splitterX = 56 + $beforeTreeWidth + 2
-    $splitterY = 190
+    $splitterBefore = Get-WorkspaceSplitterPosition $main
+    $splitterX = $splitterBefore.x
+    $splitterY = $splitterBefore.y
     $makePoint = {
         param([int]$x, [int]$y)
         return [IntPtr]([long](($y -band 0xffff) -shl 16) -bor ($x -band 0xffff))
@@ -2572,7 +2806,8 @@ try {
     [MDLiteNative+RECT]$treeDragged = New-Object MDLiteNative+RECT
     [void][MDLiteNative]::GetWindowRect($tree, [ref]$treeDragged)
     $draggedTreeWidth = $treeDragged.right - $treeDragged.left
-    [void][MDLiteNative]::SendMessage($main, 0x0201, [IntPtr]1, (& $makePoint ($splitterX + 24) $splitterY))
+    $splitterDragged = Get-WorkspaceSplitterPosition $main
+    [void][MDLiteNative]::SendMessage($main, 0x0201, [IntPtr]1, (& $makePoint $splitterDragged.x $splitterDragged.y))
     [void][MDLiteNative]::SendMessage($main, 0x0200, [IntPtr]1, (& $makePoint $splitterX $splitterY))
     [void][MDLiteNative]::SendMessage($main, 0x0202, [IntPtr]::Zero, (& $makePoint $splitterX $splitterY))
     [MDLiteNative+RECT]$treeRestored = New-Object MDLiteNative+RECT
@@ -2584,6 +2819,8 @@ try {
         before = $beforeTreeWidth
         dragged = $draggedTreeWidth
         restored = $restoredTreeWidth
+        initial_geometry = $splitterBefore
+        dragged_geometry = $splitterDragged
     }
 
     # View -> compact. Focus selection must follow the editor, and EN_CHANGE must route to its new parent.
@@ -2663,29 +2900,17 @@ try {
         $treeFirstChild -ne [IntPtr]::Zero -and $treeSelectResult -ne 0
     $checks.outline_tree_items = [MDLiteNative]::SendMessage(
         $outlineTree, $TVM_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -gt 0
-    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
-    $checks.outline_pane_collapsed = -not [MDLiteNative]::IsWindowVisible($outlineTree)
-    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
-    $checks.outline_pane_restored = [MDLiteNative]::IsWindowVisible($outlineTree)
+    $outlineBefore = [MDLiteNative]::IsWindowVisible($outlineTree)
+    [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
+    $outlineAfterCollapse = [MDLiteNative]::IsWindowVisible($outlineTree)
+    $checks.outline_pane_collapsed = $outlineBefore -and -not $outlineAfterCollapse
+    [void][MDLiteNative]::SendMessage($main, $WM_COMMAND, [IntPtr]1066, [IntPtr]::Zero)
+    $outlineAfterRestore = [MDLiteNative]::IsWindowVisible($outlineTree)
+    $checks.outline_pane_restored = $outlineBefore -and -not $outlineAfterCollapse -and $outlineAfterRestore
+    $checks.outline_toggle_trace = [ordered]@{ initial_visible = $outlineBefore; after_collapse_visible = $outlineAfterCollapse; after_restore_visible = $outlineAfterRestore; caption = Get-WindowText $main; status = if (-not $outlineBefore) { 'BLOCKED_INITIAL_OUTLINE_NOT_VISIBLE' } elseif ($checks.outline_pane_collapsed -and $checks.outline_pane_restored) { 'PASS_OBSERVED_COLLAPSE_RESTORE' } else { 'FAIL_VISIBILITY_TOGGLE' } }
 
-    $calendar = Find-ChildClassWindow $main 'MDLite.CalendarView'
-    $checks.calendar_control = $calendar -ne [IntPtr]::Zero
-    $calendarInitialVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
-    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
-    $calendarFirstVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
-    $checks.calendar_visible = $calendarFirstVisible -ne $calendarInitialVisible
-    [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1026, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 100
-    $calendarSecondVisible = $calendar -ne [IntPtr]::Zero -and [MDLiteNative]::IsWindowVisible($calendar)
-    $checks.calendar_hidden = $calendarSecondVisible -eq $calendarInitialVisible
-    $checks.calendar_toggle_trace = [ordered]@{
-        initial_visible = $calendarInitialVisible
-        after_first_command = $calendarFirstVisible
-        after_second_command = $calendarSecondVisible
-    }
+    $calendarToggle = Invoke-CalendarToggleCheck $main
+    foreach ($key in $calendarToggle.Keys) { $checks[$key] = $calendarToggle[$key] }
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
     $quickOpenPicker = Wait-ProcessClassWindow $process 'MDLite.NativePickerWindow'
@@ -2699,9 +2924,10 @@ try {
     $checks.quick_open_filter_single = $quickOpenCount -eq 1
     [void][MDLiteNative]::SendMessage($quickOpenPicker, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativePickerWindow'
-    Start-Sleep -Milliseconds 150
-    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W'
-    $checks.quick_open_editor_after_selection = ((Get-WindowText $editor) -replace "`r`n", "`n")
+    $quickOpenReady=Wait-QuickOpenDocumentEditor $main $process 'second.md' 'second WorkspaceHit'
+    $editor=$quickOpenReady.Editor
+    $checks.quick_open_selected_document_readiness=$quickOpenReady.Evidence
+    $checks.quick_open_editor_after_selection=$quickOpenReady.Text
     $checks.quick_open_candidate_selected = $checks.quick_open_editor_after_selection -eq 'second WorkspaceHit'
 
     [void][MDLiteNative]::PostMessage($main, $WM_COMMAND, [IntPtr]1003, [IntPtr]::Zero)
@@ -2715,24 +2941,37 @@ try {
     $checks.quick_open_return_filter_single = $quickOpenCount -eq 1
     [void][MDLiteNative]::SendMessage($quickOpenPicker, $WM_COMMAND, [IntPtr]$IDOK, [IntPtr]::Zero)
     Wait-ProcessClassWindowGone $process 'MDLite.NativePickerWindow'
-    Start-Sleep -Milliseconds 150
-    $editor = Wait-VisibleControl $main 102 'RICHEDIT50W'
-    $checks.quick_open_returned_to_first = ((Get-WindowText $editor) -replace "`r`n", "`n").StartsWith('CaseToken')
+    $quickOpenReturnReady=Wait-QuickOpenDocumentEditor $main $process 'first.md' 'CaseToken' -Prefix
+    $editor=$quickOpenReturnReady.Editor
+    $checks.quick_open_return_document_readiness=$quickOpenReturnReady.Evidence
+    $checks.quick_open_returned_to_first=$quickOpenReturnReady.Text.StartsWith('CaseToken')
     $tabs = Wait-Control $main 101 'SysTabControl32'
     $tabStyle = [int64][MDLiteNative]::GetWindowLongPtr($tabs, $GWL_STYLE).ToInt64()
     $tabCount = [MDLiteNative]::SendMessage($tabs, 0x1304, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
     $checks.native_tab_owner_draw_style = ($tabStyle -band $TCS_OWNERDRAWFIXED) -ne 0
     $checks.native_tab_close_action = (Find-Control $main 129 'Button') -ne [IntPtr]::Zero
     $tabBefore = [MDLiteNative]::SendMessage($tabs, 0x130B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
-    [void][MDLiteNative]::SetFocus($tabs)
+    if (-not [MDLiteNative]::FocusKeyboardControl($main, $tabs)) { throw 'Native tab keyboard focus could not be verified on the target GUI thread.' }
+    [void][MDLiteNative]::SendMessage($tabs, 0x1330, [IntPtr]$tabBefore, [IntPtr]::Zero)
     [void][MDLiteNative]::SendMessage($tabs, 0x0100, [IntPtr]0x27, [IntPtr]::Zero)
     [void][MDLiteNative]::SendMessage($tabs, 0x0101, [IntPtr]0x27, [IntPtr]::Zero)
+    $tabFocusAfterRight = [MDLiteNative]::SendMessage($tabs, 0x132F, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    [void][MDLiteNative]::SendMessage($tabs, 0x0100, [IntPtr]0x20, [IntPtr]::Zero)
+    [void][MDLiteNative]::SendMessage($tabs, 0x0101, [IntPtr]0x20, [IntPtr]::Zero)
     $tabAfterRight = [MDLiteNative]::SendMessage($tabs, 0x130B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $tabRightReady = Wait-QuickOpenDocumentEditor $main $process 'second.md' 'second WorkspaceHit'
+    if (-not [MDLiteNative]::FocusKeyboardControl($main, $tabs)) { throw 'Native tab return focus could not be verified on the target GUI thread.' }
+    [void][MDLiteNative]::SendMessage($tabs, 0x1330, [IntPtr]$tabAfterRight, [IntPtr]::Zero)
     [void][MDLiteNative]::SendMessage($tabs, 0x0100, [IntPtr]0x25, [IntPtr]::Zero)
     [void][MDLiteNative]::SendMessage($tabs, 0x0101, [IntPtr]0x25, [IntPtr]::Zero)
+    $tabFocusAfterLeft = [MDLiteNative]::SendMessage($tabs, 0x132F, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    [void][MDLiteNative]::SendMessage($tabs, 0x0100, [IntPtr]0x20, [IntPtr]::Zero)
+    [void][MDLiteNative]::SendMessage($tabs, 0x0101, [IntPtr]0x20, [IntPtr]::Zero)
     $tabAfterLeft = [MDLiteNative]::SendMessage($tabs, 0x130B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
     $checks.native_tab_keyboard_selection = $tabCount -ge 2 -and
-        $tabBefore -ge 0 -and $tabAfterRight -ne $tabBefore -and $tabAfterLeft -eq $tabBefore
+        $tabBefore -eq 0 -and $tabFocusAfterRight -ne $tabBefore -and $tabAfterRight -eq $tabFocusAfterRight -and
+        $tabFocusAfterLeft -eq $tabBefore -and $tabAfterLeft -eq $tabBefore
+    $checks.native_tab_keyboard_trace = [ordered]@{ before_selected = $tabBefore; right_focused = $tabFocusAfterRight; right_selected_after_space = $tabAfterRight; left_focused = $tabFocusAfterLeft; left_selected_after_space = $tabAfterLeft; right_document_ready = $tabRightReady.Evidence }
     # Tab switching may destroy and recreate the RichEdit HWND. Refresh the
     # handle for the first document before sending subsequent editor messages.
     $editor = Wait-VisibleControl $main 102 'RICHEDIT50W'
@@ -3890,7 +4129,8 @@ try {
 }
 finally {
     if ($process -and -not $process.HasExited) {
-        $main = [MDLiteNative]::FindWindow('MDLite.MainWindow', $null)
+        $process.Refresh()
+        $main = $process.MainWindowHandle
         if ($main -ne [IntPtr]::Zero) { [void][MDLiteNative]::PostMessage($main, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) }
         if (-not $process.WaitForExit(3000)) { $process.Kill() }
         $process.Dispose()

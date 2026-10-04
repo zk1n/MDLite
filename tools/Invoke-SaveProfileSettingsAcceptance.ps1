@@ -85,6 +85,7 @@ public static class SaveProbeNative {
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr window);
     [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr OpenThread(uint access, bool inherit, uint threadId);
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetThreadTimes(IntPtr thread, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
@@ -92,6 +93,8 @@ public static class SaveProbeNative {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr window, StringBuilder value, int capacity);
     [DllImport("user32.dll")] private static extern int GetWindowTextLengthW(IntPtr window);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+    public static long StyleOf(IntPtr window) { return GetWindowLongPtr(window, -16).ToInt64(); }
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)]
     private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wparam, IntPtr lparam,
         uint flags, uint timeout, out IntPtr result);
@@ -245,13 +248,42 @@ function Wait-Child([IntPtr]$Parent, [int]$Id, [string]$ClassName, [int]$Timeout
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for child id=$Id class=$ClassName."
 }
-function Wait-VisibleChild([IntPtr]$Parent, [int]$Id, [string]$ClassName, [int]$TimeoutMs = 5000) {
+function Wait-VisibleChild([IntPtr]$Parent, [int]$Id, [string]$ClassName, [int]$TimeoutMs = 5000,
+    [System.Collections.IDictionary]$Startup = $null, [string]$ReadyCaptionPrefix = '') {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    if ($Startup) { $deadline = [DateTime]::Parse($Startup.deadline_utc).ToUniversalTime() }
     do {
+        if ($Startup -and [DateTime]::UtcNow -ge $deadline) { break }
         foreach ($child in [SaveProbeNative]::Children($Parent)) {
-            if ($child.Id -eq $Id -and $child.ClassName -eq $ClassName -and [SaveProbeNative]::IsWindowVisible($child.Handle)) {
-                return $child
+            if ($child.Id -ne $Id -or $child.ClassName -ne $ClassName) { continue }
+            $now = [DateTime]::UtcNow
+            if ($Startup -and $null -eq $Startup.first_editor_utc) {
+                $Startup.first_editor_utc = $now.ToString('o')
+                $Startup.first_editor_elapsed_ms = [Math]::Round(($now - [DateTime]::Parse($Startup.started_utc).ToUniversalTime()).TotalMilliseconds, 3)
             }
+            if (-not [SaveProbeNative]::IsWindowVisible($child.Handle)) { continue }
+            if ($Startup -and $null -eq $Startup.first_visible_utc) {
+                $Startup.first_visible_utc = $now.ToString('o')
+                $Startup.first_visible_elapsed_ms = [Math]::Round(($now - [DateTime]::Parse($Startup.started_utc).ToUniversalTime()).TotalMilliseconds, 3)
+            }
+            # The requested document caption is published after ActivateDocument's
+            # presentation and outline work. A created/visible editor alone is earlier.
+            if ($ReadyCaptionPrefix) {
+                $caption = [SaveProbeNative]::CaptionOf($Parent)
+                $documentReady = $caption -ceq $ReadyCaptionPrefix -or $caption -ceq ($ReadyCaptionPrefix + ' *') -or
+                    $caption.StartsWith($ReadyCaptionPrefix + ' — ', [StringComparison]::Ordinal) -or
+                    $caption.StartsWith($ReadyCaptionPrefix + ' * — ', [StringComparison]::Ordinal)
+                if (-not $documentReady) { continue }
+            }
+            if ($Startup) {
+                $now = [DateTime]::UtcNow
+                if ($now -ge $deadline) { break }
+                $Startup.ready_utc = $now.ToString('o')
+                $Startup.ready_elapsed_ms = [Math]::Round(($now - [DateTime]::Parse($Startup.started_utc).ToUniversalTime()).TotalMilliseconds, 3)
+                $Startup.phase = 'ready'
+                $Startup.ready_caption = [SaveProbeNative]::CaptionOf($Parent)
+            }
+            return $child
         }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -265,16 +297,43 @@ function Set-ComboIndex([IntPtr]$Parent, [int]$Id, [int]$Index) {
 function Read-Utf8Fixture([string]$Path) {
     return [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
 }
-function Wait-Window([Diagnostics.Process]$Process, [string]$ClassName, [int]$TimeoutMs = 10000) {
+function Test-ProfileDefinition([string]$Text, [System.Collections.IDictionary]$Values) {
+    $blocks = @([regex]::Split($Text, '(?m)^\[\[profiles\]\]\s*\r?$') | Where-Object {
+        $_ -cmatch ('(?m)^id = "' + [regex]::Escape($Values.id) + '"\r?$')
+    })
+    if ($blocks.Count -ne 1) { return $false }
+    foreach ($key in @('id', 'name', 'directory', 'filename', 'template', 'collision')) {
+        $pattern = '(?m)^' + $key + ' = "' + [regex]::Escape($Values[$key]) + '"\r?$'
+        if ([regex]::Matches($blocks[0], '(?m)^' + $key + '\s*=').Count -ne 1 -or
+            [regex]::Matches($blocks[0], $pattern).Count -ne 1) { return $false }
+    }
+    return $true
+}
+function Wait-Window([Diagnostics.Process]$Process, [string]$ClassName, [int]$TimeoutMs = 10000, [switch]$VisibleOnly,
+    [System.Collections.IDictionary]$Initialization = $null) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    if ($Initialization) { $deadline = [DateTime]::Parse($Initialization.deadline_utc).ToUniversalTime() }
     do {
+        if ($Initialization -and [DateTime]::UtcNow -ge $deadline) { break }
         $Process.Refresh()
         if ($Process.HasExited) { throw "MDLite PID $($Process.Id) exited with code $($Process.ExitCode)." }
-        $found = @([SaveProbeNative]::TopLevel([uint32]$Process.Id) | Where-Object { $_.ClassName -eq $ClassName })
-        if ($found.Count) { return $found[0] }
+        $found = @([SaveProbeNative]::TopLevel([uint32]$Process.Id) | Where-Object {
+            $visible = if ($VisibleOnly -or $Initialization) { [SaveProbeNative]::IsWindowVisible($_.Handle) } else { $true }
+            if ($Initialization -and $_.ClassName -eq $ClassName) {
+                $checkpoint = if ($visible) { 'first_visible' } else { 'first_hidden' }
+                if ($null -eq $Initialization[$checkpoint + '_utc']) {
+                    $now = [DateTime]::UtcNow
+                    $Initialization[$checkpoint + '_utc'] = $now.ToString('o')
+                    $Initialization[$checkpoint + '_elapsed_ms'] = [Math]::Round(($now - [DateTime]::Parse($Initialization.started_utc).ToUniversalTime()).TotalMilliseconds, 3)
+                    $Initialization[$checkpoint + '_hwnd'] = $_.Handle.ToInt64()
+                }
+            }
+            $_.ClassName -eq $ClassName -and (-not $VisibleOnly -or $visible)
+        })
+        if ($found.Count -and (-not $Initialization -or [DateTime]::UtcNow -lt $deadline)) { return $found[0] }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Timed out waiting for window class $ClassName from PID $($Process.Id)."
+    throw "Timed out waiting for window class $ClassName from PID $($Process.Id), visible_only=$VisibleOnly, configured_timeout_ms=$TimeoutMs."
 }
 function Wait-WindowGone([Diagnostics.Process]$Process, [string]$ClassName, [int]$TimeoutMs = 5000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -284,6 +343,14 @@ function Wait-WindowGone([Diagnostics.Process]$Process, [string]$ClassName, [int
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Window class $ClassName did not close."
+}
+function Wait-NativeWindowGone([IntPtr]$Window, [int]$TimeoutMs = 5000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        if (-not [SaveProbeNative]::IsWindow($Window)) { return }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for native window dismissal: $([SaveProbeNative]::GetWindowContext($Window)), configured_timeout_ms=$TimeoutMs."
 }
 function Get-Modal([Diagnostics.Process]$Process) {
     $found = @([SaveProbeNative]::TopLevel([uint32]$Process.Id) | Where-Object { $_.ClassName -eq '#32770' })
@@ -299,9 +366,83 @@ function Wait-Modal([Diagnostics.Process]$Process, [int]$TimeoutMs = 5000) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for a native dialog from PID $($Process.Id)."
 }
-function Dismiss-Modal([Diagnostics.Process]$Process, [SaveProbeWindow]$Dialog, [int]$Command = 1) {
-    [void](Send $Dialog.Handle 0x0111 $Command 0)
-    Wait-WindowGone $Process $Dialog.ClassName
+function Select-ProfileSuccessOkButton([object[]]$Children) {
+    $buttons = @($Children | Where-Object { $_.class -eq 'Button' })
+    if ($buttons.Count -eq 0) { return $null }
+    if ($buttons.Count -ne 1 -or $buttons[0].text -cne 'OK') {
+        throw 'Profile success dialog does not contain exactly one semantic OK button.'
+    }
+    if (-not $buttons[0].visible -or -not $buttons[0].enabled) { return $null }
+    return $buttons[0]
+}
+function Get-ModalChildInventory([IntPtr]$Window) {
+    return @([SaveProbeNative]::Children($Window) | ForEach-Object {
+        [ordered]@{ hwnd = $_.Handle.ToInt64(); id = $_.Id; class = $_.ClassName; text = $_.Text
+            visible = [SaveProbeNative]::IsWindowVisible($_.Handle); enabled = [SaveProbeNative]::IsWindowEnabled($_.Handle)
+            style = [SaveProbeNative]::StyleOf($_.Handle); owner_pid = $_.ProcessId }
+    })
+}
+function Dismiss-Modal([Diagnostics.Process]$Process, [SaveProbeWindow]$Dialog, [int]$Command = 1, [switch]$ProfileSavedOk) {
+    if ($ProfileSavedOk -and ($Dialog.ClassName -ne '#32770' -or $Dialog.Text -cne '作成プロファイル' -or $Command -ne 1)) {
+        throw 'Semantic Profile OK selection requires the exact success dialog contract.'
+    }
+    $startedUtc = [DateTime]::UtcNow
+    $deadlineUtc = $startedUtc.AddMilliseconds(5000)
+    $script:lastModalDismissal = [ordered]@{
+        dialog_hwnd = $Dialog.Handle.ToInt64(); caption = $Dialog.Text; command_id = $Command
+        started_utc = $startedUtc.ToString('o'); budget_ms = 5000
+        initial = $null; ready = $null; dispatch_utc = $null; closed_utc = $null
+        phase = 'waiting_button_ready'; last_children = @(); semantic_ok = [bool]$ProfileSavedOk
+        actual_button = $null; dispatch_command_id = $null
+    }
+    do {
+        if (-not [SaveProbeNative]::IsWindow($Dialog.Handle)) { throw 'Captured modal disappeared before its response button was ready.' }
+        if ($ProfileSavedOk) {
+            $script:lastModalDismissal.last_children = Get-ModalChildInventory $Dialog.Handle
+            $bodyMatches = @($script:lastModalDismissal.last_children | Where-Object {
+                $_.class -eq 'Static' -and $_.text.Contains('profileを保存しました。')
+            }).Count -gt 0
+            if (-not $bodyMatches) { throw 'Profile success body changed before its OK response.' }
+            $actualButton = Select-ProfileSuccessOkButton $script:lastModalDismissal.last_children
+            $button = if ($actualButton) { Find-Child $Dialog.Handle $actualButton.id 'Button' } else { $null }
+            if ($actualButton) { $script:lastModalDismissal.actual_button = $actualButton }
+        } else {
+            $button = Find-Child $Dialog.Handle $Command 'Button'
+        }
+        $observation = [ordered]@{
+            utc = [DateTime]::UtcNow.ToString('o')
+            window_visible = [SaveProbeNative]::IsWindowVisible($Dialog.Handle)
+            window_enabled = [SaveProbeNative]::IsWindowEnabled($Dialog.Handle)
+            caption_matches = [SaveProbeNative]::CaptionOf($Dialog.Handle) -ceq $Dialog.Text
+            button_hwnd = if ($button) { $button.Handle.ToInt64() } else { $null }
+            button_visible = $button -and [SaveProbeNative]::IsWindowVisible($button.Handle)
+            button_enabled = $button -and [SaveProbeNative]::IsWindowEnabled($button.Handle)
+        }
+        if ($null -eq $script:lastModalDismissal.initial) { $script:lastModalDismissal.initial = $observation }
+        if ($observation.window_visible -and $observation.window_enabled -and $observation.caption_matches -and
+            $observation.button_visible -and $observation.button_enabled) {
+            if ([DateTime]::UtcNow -ge $deadlineUtc) { break }
+            $script:lastModalDismissal.ready = $observation
+            # BN_CLICKED with the actual button sender distinguishes it from a
+            # menu-style IDOK command delivered during MessageBox initialization.
+            $dispatchCommand = if ($ProfileSavedOk) { $button.Id } else { $Command }
+            $script:lastModalDismissal.dispatch_command_id = $dispatchCommand
+            if (-not [SaveProbeNative]::Post($Dialog.Handle, 0x0111, $dispatchCommand, $button.Handle.ToInt64())) {
+                throw 'Could not post the captured modal button response.'
+            }
+            $script:lastModalDismissal.dispatch_utc = [DateTime]::UtcNow.ToString('o')
+            $script:lastModalDismissal.phase = 'waiting_captured_close'
+            $remainingMs = [int][Math]::Max(0, [Math]::Floor(($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+            Wait-NativeWindowGone $Dialog.Handle $remainingMs
+            $script:lastModalDismissal.closed_utc = [DateTime]::UtcNow.ToString('o')
+            $script:lastModalDismissal.phase = 'closed'
+            return
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadlineUtc)
+    # Capture the real initialized children before caller cleanup can replace them.
+    $script:lastModalDismissal.last_children = Get-ModalChildInventory $Dialog.Handle
+    throw "Timed out waiting for captured modal response button id=$Command hwnd=$($Dialog.Handle), configured_timeout_ms=5000."
 }
 function Bytes-Evidence([string]$Name, [byte[]]$Bytes) {
     $hasher = [Security.Cryptography.SHA256]::Create()
@@ -349,15 +490,37 @@ function New-Workspace([string]$Name, [string]$FileName = 'README.md', [string]$
 }
 function Start-App([string]$Source) {
     $process = Start-Process -FilePath $executable -ArgumentList @(('"{0}"' -f $Source)) -WorkingDirectory $repoRoot -PassThru
-    $app = [pscustomobject]@{ process = $process; main = [IntPtr]::Zero; editor = [IntPtr]::Zero; process_id = $process.Id; source = $Source }
+    $startedUtc = $process.StartTime.ToUniversalTime()
+    # Reuse the existing 10s main + 5s editor allowance as one startup budget.
+    $startupBudgetMs = 10000 + 5000
+    $deadlineUtc = $startedUtc.AddMilliseconds($startupBudgetMs)
+    $startup = [ordered]@{
+        started_utc = $startedUtc.ToString('o'); deadline_utc = $deadlineUtc.ToString('o')
+        budget_ms = $startupBudgetMs; phase = 'waiting_main'
+        main_utc = $null; main_elapsed_ms = $null; main_hwnd = $null
+        first_editor_utc = $null; first_editor_elapsed_ms = $null
+        first_visible_utc = $null; first_visible_elapsed_ms = $null
+        ready_utc = $null; ready_elapsed_ms = $null; ready_caption = $null
+    }
+    $app = [pscustomobject]@{ process = $process; main = [IntPtr]::Zero; editor = [IntPtr]::Zero; process_id = $process.Id; source = $Source; startup_readiness = $startup }
+    $script:startupEvidence.Add([ordered]@{ pid = $process.Id; source = $Source; checkpoints = $startup })
     try {
-        $main = Wait-Window $process 'MDLite.MainWindow'
+        $remainingMs = [int][Math]::Max(0, [Math]::Floor(($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+        $main = Wait-Window $process 'MDLite.MainWindow' ([Math]::Min(10000, $remainingMs))
         $app.main = $main.Handle
-        $editor = Wait-VisibleChild $main.Handle 102 'RICHEDIT50W'
+        $startup.main_hwnd = $main.Handle.ToInt64()
+        $now = [DateTime]::UtcNow
+        $startup.main_utc = $now.ToString('o')
+        $startup.main_elapsed_ms = [Math]::Round(($now - $startedUtc).TotalMilliseconds, 3)
+        $startup.phase = 'waiting_document_ready'
+        $remainingMs = [int][Math]::Max(0, [Math]::Floor(($deadlineUtc - $now).TotalMilliseconds))
+        $captionPrefix = 'MDLite — ' + [IO.Path]::GetFileName($Source)
+        $editor = Wait-VisibleChild $main.Handle 102 'RICHEDIT50W' $remainingMs -Startup $startup -ReadyCaptionPrefix $captionPrefix
         $app.editor = $editor.Handle
         return $app
     } catch {
         $failure = $_.Exception.Message
+        $startup.phase = 'failed_' + $startup.phase
         $diagnostics = Get-AppDiagnostics $app
         $cleanupError = $null
         try {
@@ -412,20 +575,49 @@ function Append-Editor([IntPtr]$Main, [string]$Text) {
         ($state | ConvertTo-Json -Compress -Depth 4))
 }
 function Save-As([pscustomobject]$App, [string]$Name) {
+    $startedUtc = [DateTime]::UtcNow
+    # Reuse the existing 5s window + 5s filename allowance as one initialization budget.
+    $initializationBudgetMs = 5000 + 5000
+    $deadlineUtc = $startedUtc.AddMilliseconds($initializationBudgetMs)
+    $initialization = [ordered]@{
+        started_utc = $startedUtc.ToString('o'); deadline_utc = $deadlineUtc.ToString('o')
+        budget_ms = $initializationBudgetMs
+        first_hidden_utc = $null; first_hidden_elapsed_ms = $null; first_hidden_hwnd = $null
+        first_visible_utc = $null; first_visible_elapsed_ms = $null; first_visible_hwnd = $null
+        filename_ready_utc = $null; filename_ready_elapsed_ms = $null
+    }
+    $script:lastSaveAsEvidence = [ordered]@{ requested_filename = $Name; phase = 'dispatch'; initialization = $initialization }
     [void][SaveProbeNative]::Post($App.main, 0x0111, 1005, 0)
-    $dialog = Wait-Window $App.process '#32770' 5000
-    $edit = Wait-Child $dialog.Handle 1001 'Edit' 5000
+    # GetSaveFileName creates its HWND before initializing lpstrFile and showing the dialog.
+    # Writing to that hidden Edit can be overwritten by the dialog's initialization.
+    $remainingMs = [int][Math]::Max(0, [Math]::Floor(($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+    $dialog = Wait-Window $App.process '#32770' $remainingMs -VisibleOnly -Initialization $initialization
+    $script:lastSaveAsEvidence.phase = 'waiting_filename'
+    $remainingMs = [int][Math]::Max(0, [Math]::Floor(($deadlineUtc - [DateTime]::UtcNow).TotalMilliseconds))
+    $edit = Wait-VisibleChild $dialog.Handle 1001 'Edit' $remainingMs
+    $now = [DateTime]::UtcNow
+    if ($now -ge $deadlineUtc) { throw 'Save As initialization budget expired before filename control readiness.' }
+    $initialization.filename_ready_utc = $now.ToString('o')
+    $initialization.filename_ready_elapsed_ms = [Math]::Round(($now - $startedUtc).TotalMilliseconds, 3)
     if (-not $dialog.IsWindow -or -not $edit.IsWindow) { throw 'Save As dialog or filename Edit control is no longer a window.' }
-    [void](Send-Text $edit.Handle 0x000C $Name)
+    $script:lastSaveAsEvidence.dialog = [ordered]@{ hwnd = $dialog.Handle.ToInt64(); class = $dialog.ClassName; caption = $dialog.Text; owner_pid = $dialog.ProcessId; visible = [SaveProbeNative]::IsWindowVisible($dialog.Handle) }
+    $script:lastSaveAsEvidence.filename_edit = [ordered]@{ hwnd = $edit.Handle.ToInt64(); class = $edit.ClassName; control_id = $edit.Id; owner_pid = $edit.ProcessId; visible = [SaveProbeNative]::IsWindowVisible($edit.Handle); before = [SaveProbeNative]::TextOf($edit.Handle) }
+    $script:lastSaveAsEvidence.phase = 'filename_input'
+    $setTextResult = Send-Text $edit.Handle 0x000C $Name
+    $script:lastSaveAsEvidence.set_text_result = $setTextResult
     $readBack = [SaveProbeNative]::TextOf($edit.Handle)
+    $script:lastSaveAsEvidence.filename_edit.readback = $readBack
+    if ($setTextResult -eq 0) { throw 'Save As filename Edit rejected WM_SETTEXT.' }
     if ($readBack -cne $Name) { throw "Save As filename readback mismatch: expected '$Name', observed '$readBack'." }
-    $button = Wait-Child $dialog.Handle 1 'Button' 5000
+    $button = Wait-VisibleChild $dialog.Handle 1 'Button' 5000
     if (-not $button.IsWindow) { throw 'Save As confirmation button is no longer a window.' }
     [void](Send $button.Handle 0x00F5 0 0)
     Wait-WindowGone $App.process '#32770' 5000
+    $script:lastSaveAsEvidence.phase = 'confirmed'
     return [pscustomobject]@{
+        initialization = $initialization
         dialog = [ordered]@{ hwnd = $dialog.Handle.ToInt64(); class = $dialog.ClassName; caption = $dialog.Text; owner_pid = $dialog.ProcessId; owner_thread_id = $dialog.ThreadId }
-        filename_edit = [ordered]@{ hwnd = $edit.Handle.ToInt64(); class = $edit.ClassName; control_id = $edit.Id; owner_pid = $edit.ProcessId; owner_thread_id = $edit.ThreadId; value = $readBack }
+        filename_edit = [ordered]@{ hwnd = $edit.Handle.ToInt64(); class = $edit.ClassName; control_id = $edit.Id; owner_pid = $edit.ProcessId; owner_thread_id = $edit.ThreadId; before = $script:lastSaveAsEvidence.filename_edit.before; set_text_result = $setTextResult; value = $readBack }
         save_button = [ordered]@{ hwnd = $button.Handle.ToInt64(); class = $button.ClassName; control_id = $button.Id; owner_pid = $button.ProcessId }
     }
 }
@@ -513,6 +705,7 @@ function Get-AppDiagnostics([pscustomobject]$App) {
         }
     }
     return [ordered]@{
+        startup_readiness = if ($App.PSObject.Properties['startup_readiness']) { $App.startup_readiness } else { $null }
         pid = $process.Id
         source = $App.source
         has_exited = $hasExited
@@ -579,6 +772,7 @@ function Record-BlockedCase([string]$Name, [string]$Expected, [string]$Fixture,
 
 $cases = [Collections.Generic.List[object]]::new()
 $apps = [Collections.Generic.List[object]]::new()
+$script:startupEvidence = [Collections.Generic.List[object]]::new()
 $script:allCaseNames = @(
     'empty_untitled_explicit_save',
     'daily_meeting_memo_date_repeat_no_overwrite',
@@ -619,6 +813,7 @@ try {
     $emptyBefore = $null
     $emptyPath = $null
     $tabCount = $null
+    $script:lastSaveAsEvidence = $null
     try {
         $emptyFixture = New-Workspace 'empty-untitled'
         $app = Start-App $emptyFixture.source
@@ -667,6 +862,7 @@ try {
             target = $emptyPath
             target_after_failure = if ($emptyPath -and (Test-Path -LiteralPath $emptyPath -PathType Leaf)) { File-Evidence $emptyPath } else { $null }
             tab_count = $tabCount
+            save_as = $script:lastSaveAsEvidence
         }
         Record-BlockedCase 'empty_untitled_explicit_save' 'Save As creates a zero-byte file and marks the empty source clean' 'empty-untitled' $_ $app $emptyCheckpoint
     } finally {
@@ -853,6 +1049,8 @@ sequence_format = "_%02d"
     $success = $null
     $successText = ''
     $profileCleanup = 'not-needed'
+    $script:lastModalDismissal = $null
+    $profileDismissalBeforeCleanup = $null
     $profileApplyFixture = $null
     $profileApplyApp = $null
     $profilesPath = $null
@@ -911,29 +1109,39 @@ sequence_format = "_%02d"
         }
         [void][SaveProbeNative]::Post($profileForm.Handle, 0x0111, 1, 0)
         Wait-WindowGone $profileApplyApp.process 'MDLite.NativeFormWindow'
-        $confirm = Wait-Modal $profileApplyApp.process
+        $confirm = Wait-Window $profileApplyApp.process '#32770' 5000 -VisibleOnly
         $confirmText = @([SaveProbeNative]::Children($confirm.Handle) | ForEach-Object {
             try { [SaveProbeNative]::TextOf($_.Handle) } catch { '' }
         } | Where-Object { $_ }) -join ' | '
-        # Application.cpp builds this MessageBox from the submitted scope, profile id, and preview.
-        # The native child-text probe exposes only its buttons, so verify the exact form values and saved file.
-        if ($confirm.Text -ne '作成プロファイル') {
+        # Keep this script UTF-8 with BOM: Windows PowerShell 5.1 otherwise decodes Japanese literals as ANSI.
+        # Require the exact workspace confirmation before accepting its Yes action.
+        $confirmYes = Wait-VisibleChild $confirm.Handle 6 'Button'
+        $confirmNo = Wait-VisibleChild $confirm.Handle 7 'Button'
+        $previewRoot = Join-Path $profileApplyFixture.root 'QAProfiles'
+        if ($confirm.Text -cne '作成プロファイル' -or
+            -not $confirmText.Contains('範囲: workspace') -or -not $confirmText.Contains('id: qaProfile') -or
+            -not $confirmText.Contains($previewRoot + [IO.Path]::DirectorySeparatorChar)) {
             throw "Unexpected profile confirmation caption='$($confirm.Text)' buttons='$confirmText'."
         }
         [void](Send $confirm.Handle 0x0111 6 0)
-        $success = Wait-Modal $profileApplyApp.process
+        Wait-NativeWindowGone $confirm.Handle
+        $success = Wait-Window $profileApplyApp.process '#32770' 5000 -VisibleOnly
         $successText = @([SaveProbeNative]::Children($success.Handle) | ForEach-Object {
             try { [SaveProbeNative]::TextOf($_.Handle) } catch { '' }
         } | Where-Object { $_ }) -join ' | '
-        Dismiss-Modal $profileApplyApp.process $success 1
+        if ($success.Text -cne '作成プロファイル' -or -not $successText.Contains('profileを保存しました。')) {
+            throw "Unexpected profile Apply result caption='$($success.Text)' text='$successText'."
+        }
+        Dismiss-Modal $profileApplyApp.process $success 1 -ProfileSavedOk
         $profilesText = Read-Utf8Fixture $profilesPath
-        $profileApplyPass = ($profilesText -match '(?m)^id = "qaProfile"$' -and $profilesText -match '(?m)^collision = "sequence"$')
-        $cases.Add([pscustomobject]@{ case='profile_form_apply_persists_workspace_definition'; status=$(if($profileApplyPass){'PASS'}else{'FAIL'}); expected='Profile Apply writes the definition in the isolated workspace layer'; observed=[ordered]@{ form_values=$profileFormValues; form_values_match=$profileFormValuesMatch; confirmation_caption=$confirm.Text; confirmation_buttons=$confirmText; success_dialog=$successText; file=File-Evidence $profilesPath; profile_text=$profilesText }; fixture='profile-apply' })
+        $profileApplyPass = Test-ProfileDefinition $profilesText $profileFormValues
+        $cases.Add([pscustomobject]@{ case='profile_form_apply_persists_workspace_definition'; status=$(if($profileApplyPass){'PASS'}else{'FAIL'}); expected='Profile Apply writes the definition in the isolated workspace layer'; observed=[ordered]@{ form_values=$profileFormValues; form_values_match=$profileFormValuesMatch; confirmation_caption=$confirm.Text; confirmation_buttons=$confirmText; success_dialog=$successText; modal_dismissal=$script:lastModalDismissal; file=File-Evidence $profilesPath; profile_text=$profilesText }; fixture='profile-apply' })
     } catch {
         $profileFailure = $_
+        $profileDismissalBeforeCleanup = $script:lastModalDismissal
         try {
             if ($success -and [SaveProbeNative]::IsWindow($success.Handle)) {
-                Dismiss-Modal $profileApplyApp.process $success 1
+                Dismiss-Modal $profileApplyApp.process $success 1 -ProfileSavedOk
                 $profileCleanup = 'dismissed success dialog'
             } elseif ($confirm -and [SaveProbeNative]::IsWindow($confirm.Handle)) {
                 Dismiss-Modal $profileApplyApp.process $confirm 7
@@ -957,6 +1165,8 @@ sequence_format = "_%02d"
             form_values_match = $profileFormValuesMatch
             confirmation_caption = if ($confirm) { $confirm.Text } else { $null }
             confirmation_buttons = $confirmText
+            modal_dismissal = $profileDismissalBeforeCleanup
+            cleanup_dismissal = $script:lastModalDismissal
             cleanup = $profileCleanup
             file_after_failure = $profileFileAfterFailure
             text_after_failure = $profileTextAfterFailure
@@ -1262,6 +1472,7 @@ sequence_format = "_%02d"
         scope_status = if ($script:onlyCases.Count -gt 0) { 'Explicit case selection; inspect selected_cases and not_run_cases before interpreting pass.' } else { 'Focused acceptance subset only; inspect not_run_cases before interpreting pass.' }
         selected_cases = $selectedCases
         not_run_cases = $allNotRunCases
+        startup_readiness = $script:startupEvidence.ToArray()
         cases = $cases.ToArray()
         pass = ($failed.Count -eq 0 -and $identityMatches)
     }
@@ -1292,6 +1503,7 @@ sequence_format = "_%02d"
         fixture_root=[IO.Path]::GetFullPath($runRoot)
         selected_cases=$selectedCases
         not_run_cases=$allNotRunCases
+        startup_readiness=$script:startupEvidence.ToArray()
         cases=$cases.ToArray()
         pass=$false
     }

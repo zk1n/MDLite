@@ -3,6 +3,8 @@
 #include "assets/Assets.h"
 #include "assets/StorageAdapter.h"
 #include "app/DiagnosticsView.h"
+#include "app/UiIcons.h"
+#include <windowsx.h>
 #include "editor/RichEditTableAdapter.h"
 #include "calendar/JapaneseHolidays.h"
 #include "calendar/CalendarDayIndex.h"
@@ -431,9 +433,7 @@ enum ControlId : int {
   kTabNew,
   kTabClose,
   kGitCommitEdit,
-  kWindowMinimize = 131,
-  kWindowMaximize,
-  kWindowClose,
+  kCalendarDetailsToggle = 134,
   kFileOpenWorkspace = 1000,
   kFileNew,
   kFileOpen,
@@ -1383,6 +1383,7 @@ Application::~Application() {
   }
   if (accelerator_table_) DestroyAcceleratorTable(accelerator_table_);
   if (editor_font_) DeleteObject(editor_font_);
+  if (ui_font_) DeleteObject(ui_font_);
   if (background_brush_) DeleteObject(background_brush_);
   if (surface_brush_) DeleteObject(surface_brush_);
   if (input_brush_) DeleteObject(input_brush_);
@@ -1420,20 +1421,8 @@ bool Application::Initialize(int show_command) {
   window_ = CreateWindowExW(0, kWindowClass, L"MDLite", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                             CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800, nullptr, nullptr, instance_, this);
   if (window_ == nullptr) return false;
-  // WS_SYSMENU restores WS_CAPTION during creation, so remove only the caption
-  // after creation and recalculate the frame. The resize and window-operation
-  // styles remain available to the custom title area.
-  const LONG_PTR window_style = GetWindowLongPtrW(window_, GWL_STYLE);
-  if (window_style == 0) return false;
-  if ((window_style & WS_CAPTION) != 0) {
-    SetLastError(ERROR_SUCCESS);
-    const LONG_PTR previous_style = SetWindowLongPtrW(
-        window_, GWL_STYLE, window_style & ~static_cast<LONG_PTR>(WS_CAPTION));
-    if (previous_style == 0 && GetLastError() != ERROR_SUCCESS) return false;
-    if (!SetWindowPos(window_, nullptr, 0, 0, 0, 0,
-                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                          SWP_FRAMECHANGED)) return false;
-  }
+  // Keep the OS caption and its buttons: Windows owns Snap, drag restoration,
+  // the system menu, accessible caption names and the outer resize frame.
   LoadAndApplySettings();
   ShowWindow(window_, show_command);
   UpdateWindow(window_);
@@ -1445,6 +1434,22 @@ int Application::Run() {
   MSG message{};
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {
     if (!accelerator_table_ || !TranslateAcceleratorW(window_, accelerator_table_, &message)) {
+      if (message.message == WM_KEYDOWN && message.wParam == VK_TAB &&
+          FindDocumentView(message.hwnd)) {
+        // TranslateMessage would queue a second native table navigation as
+        // WM_CHAR(Tab). Let the existing custom keydown route decide first.
+        table_tab_keydown_handled_ = false;
+        DispatchMessageW(&message);
+        const bool handled = table_tab_keydown_handled_;
+        table_tab_keydown_handled_ = false;
+        if (!handled) TranslateMessage(&message);
+        continue;
+      }
+      const bool editor_focused = std::ranges::any_of(documents_, [](const auto& view) {
+        return view->editor == GetFocus();
+      });
+      if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && !editor_focused &&
+          IsDialogMessageW(window_, &message)) continue;
       TranslateMessage(&message);
       DispatchMessageW(&message);
     }
@@ -1788,6 +1793,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       IsMarkdownFile(view->document.path())) {
     view->pending_table_high_surrogate = 0;
     if (!app->SyncDocumentFromEditor(*view)) {
+      app->table_tab_keydown_handled_ = true;
       app->SetStatusText(L"入力内容を読み取れなかったため表の移動を中止しました。再試行してください。");
       return 0;
     }
@@ -1804,6 +1810,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     if (edit.changed) {
       if (!app->ApplySourceTextWithUndo(*view, edit.text, true,
                                         SourceSelection{edit.selection, edit.selection})) {
+        app->table_tab_keydown_handled_ = true;
         view->pending_virtual_table_cell.reset();
         app->SetStatusText(L"本文が同期中のため表の移動を中止しました。再試行してください。");
         return 0;
@@ -1815,6 +1822,7 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       const auto view_caret = view->editor_snapshot.SourceToNative(
           edit.target_cell->source_position);
       SendMessageW(window, EM_SETSEL, view_caret, view_caret);
+      app->table_tab_keydown_handled_ = true;
       return 0;
     }
   }
@@ -2385,26 +2393,75 @@ LRESULT CALLBACK Application::CalendarDetailsSubclass(HWND window, UINT message,
 LRESULT CALLBACK Application::ChromeBarSubclass(HWND window, UINT message, WPARAM wparam,
                                                  LPARAM lparam, UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
-  if (app && message == WM_LBUTTONDOWN) {
-    POINT position{};
-    GetCursorPos(&position);
-    SetFocus(app->window_);
-    ReleaseCapture();
-    SendMessageW(app->window_, WM_NCLBUTTONDOWN, HTCAPTION,
-                 MAKELPARAM(position.x, position.y));
+  if (app && message == WM_KEYDOWN && wparam == VK_RETURN && IsWindowEnabled(window)) {
+    SendMessageW(app->window_, WM_COMMAND,
+                 MAKEWPARAM(GetDlgCtrlID(window), BN_CLICKED), reinterpret_cast<LPARAM>(window));
     return 0;
   }
-  if (app && message == WM_LBUTTONDBLCLK) {
-    SendMessageW(app->window_, WM_SYSCOMMAND, IsZoomed(app->window_) ? SC_RESTORE : SC_MAXIMIZE, 0);
+  const bool activity = app && std::ranges::find(app->activity_buttons_.begin(),
+      app->activity_buttons_.begin() + 4, window) != app->activity_buttons_.begin() + 4;
+  if (activity && (message == WM_PAINT || message == WM_PRINTCLIENT)) {
+    PAINTSTRUCT paint{};
+    HDC dc = message == WM_PAINT ? BeginPaint(window, &paint) : reinterpret_cast<HDC>(wparam);
+    DRAWITEMSTRUCT draw{};
+    draw.CtlType = ODT_BUTTON;
+    draw.CtlID = GetDlgCtrlID(window);
+    draw.hwndItem = window;
+    draw.hDC = dc;
+    GetClientRect(window, &draw.rcItem);
+    if (GetFocus() == window) draw.itemState |= ODS_FOCUS;
+    if (!IsWindowEnabled(window)) draw.itemState |= ODS_DISABLED;
+    if (SendMessageW(window, BM_GETSTATE, 0, 0) & BST_PUSHED) draw.itemState |= ODS_SELECTED;
+    app->DrawChromeButton(draw);
+    if (message == WM_PAINT) EndPaint(window, &paint);
     return 0;
   }
-  if (message == WM_NCDESTROY) RemoveWindowSubclass(window, ChromeBarSubclass, 1);
+  if (activity && message == WM_ERASEBKGND) return 1;
+  if (message == WM_MOUSEMOVE && IsWindowEnabled(window)) {
+    if (!GetPropW(window, L"MDLite.Hover")) {
+      SetPropW(window, L"MDLite.Hover", reinterpret_cast<HANDLE>(1));
+      TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+      TrackMouseEvent(&tracking);
+      InvalidateRect(window, nullptr, FALSE);
+    }
+  } else if (message == WM_MOUSELEAVE || message == WM_CAPTURECHANGED ||
+             message == WM_ENABLE) {
+    RemovePropW(window, L"MDLite.Hover");
+    InvalidateRect(window, nullptr, FALSE);
+  } else if (message == WM_NCDESTROY) {
+    RemovePropW(window, L"MDLite.Hover");
+    RemoveWindowSubclass(window, ChromeBarSubclass, 1);
+  }
   return DefSubclassProc(window, message, wparam, lparam);
 }
 
 LRESULT CALLBACK Application::TabStripSubclass(HWND window, UINT message, WPARAM wparam,
                                                 LPARAM lparam, UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
+  if (app && (message == WM_PAINT || message == WM_PRINTCLIENT)) {
+    PAINTSTRUCT paint{};
+    HDC dc = message == WM_PAINT ? BeginPaint(window, &paint) : reinterpret_cast<HDC>(wparam);
+    if (dc) {
+      const int saved = SaveDC(dc);
+      RECT client{};
+      GetClientRect(window, &client);
+      SetDCBrushColor(dc, app->theme_surface_);
+      FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+      for (int index = 0; index < TabCtrl_GetItemCount(window); ++index) {
+        DRAWITEMSTRUCT draw{};
+        draw.CtlType = ODT_TAB; draw.CtlID = GetDlgCtrlID(window);
+        draw.itemID = index; draw.hwndItem = window; draw.hDC = dc;
+        if (!TabCtrl_GetItemRect(window, index, &draw.rcItem)) continue;
+        if (index == TabCtrl_GetCurSel(window)) draw.itemState |= ODS_SELECTED;
+        if (GetFocus() == window && index == TabCtrl_GetCurFocus(window)) draw.itemState |= ODS_FOCUS;
+        if (!IsWindowEnabled(window)) draw.itemState |= ODS_DISABLED;
+        app->DrawTabItem(draw);
+      }
+      if (saved) RestoreDC(dc, saved);
+    }
+    if (message == WM_PAINT) EndPaint(window, &paint);
+    return 0;
+  }
   if (message == WM_ERASEBKGND && app) {
     RECT client{};
     GetClientRect(window, &client);
@@ -2420,8 +2477,55 @@ LRESULT CALLBACK Application::TabStripSubclass(HWND window, UINT message, WPARAM
   return DefSubclassProc(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK Application::StatusBarSubclass(HWND window, UINT message, WPARAM wparam,
+                                                 LPARAM lparam, UINT_PTR, DWORD_PTR reference) {
+  auto* app = reinterpret_cast<Application*>(reference);
+  if (app && (message == WM_PAINT || message == WM_PRINTCLIENT)) {
+    PAINTSTRUCT paint{};
+    HDC dc = message == WM_PAINT ? BeginPaint(window, &paint) : reinterpret_cast<HDC>(wparam);
+    if (dc) {
+      const int saved = SaveDC(dc);
+      RECT client{};
+      GetClientRect(window, &client);
+      SetDCBrushColor(dc, app->theme_surface_);
+      FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+      for (std::size_t index = 0; index < app->status_segments_.size(); ++index) {
+        DRAWITEMSTRUCT draw{};
+        draw.hwndItem = window; draw.hDC = dc; draw.itemID = static_cast<UINT>(index);
+        draw.itemData = reinterpret_cast<ULONG_PTR>(app->status_segments_[index].c_str());
+        if (SendMessageW(window, SB_GETRECT, index, reinterpret_cast<LPARAM>(&draw.rcItem)))
+          app->DrawStatusItem(draw);
+      }
+      if (saved) RestoreDC(dc, saved);
+    }
+    if (message == WM_PAINT) EndPaint(window, &paint);
+    return 0;
+  }
+  if (app && message == WM_ERASEBKGND) return 1;
+  if (message == WM_THEMECHANGED) InvalidateRect(window, nullptr, FALSE);
+  if (message == WM_NCDESTROY) RemoveWindowSubclass(window, StatusBarSubclass, 1);
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
 LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
   switch (message) {
+    case WM_NCHITTEST: {
+      const LRESULT native = DefWindowProcW(window_, message, wparam, lparam);
+      if (native != HTCLIENT) return native;
+      POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      ScreenToClient(window_, &point);
+      RECT client{};
+      GetClientRect(window_, &client);
+      if (point.y >= 0 && point.y < current_topbar_height_ &&
+          point.x >= 0 && point.x < client.right) {
+        RECT search{};
+        GetWindowRect(command_search_, &search);
+        POINT screen_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (!IsWindowVisible(command_search_) || !PtInRect(&search, screen_point))
+          return HTCAPTION;
+      }
+      return native;
+    }
     case kActiveLinePresentationMessage:
       ApplyPendingActiveLinePresentations();
       return 0;
@@ -2434,6 +2538,30 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       LayoutControls();
       InvalidateRect(window_, nullptr, FALSE);
       return 0;
+    case WM_GETMINMAXINFO: {
+      DefWindowProcW(window_, message, wparam, lparam);
+      const auto* calendar = panel_layout_.Find(PanelId::Calendar);
+      if (!calendar || calendar->hidden || calendar->collapsed || !lparam) return 0;
+      const bool left = calendar->slot == PanelSlot::LeftTop || calendar->slot == PanelSlot::LeftBottom;
+      const bool neighbor_visible = std::ranges::any_of(panel_layout_.panels(), [&](const auto& panel) {
+        if (panel.id == PanelId::Calendar || panel.hidden || panel.collapsed ||
+            (panel.id == PanelId::Explorer && workspace_pane_collapsed_) ||
+            (panel.id == PanelId::Outline && outline_pane_collapsed_)) return false;
+        return left == (panel.slot == PanelSlot::LeftTop || panel.slot == PanelSlot::LeftBottom);
+      });
+      const int minimum_side = MinimumCalendarPanelHeight(ScaleDip(window_, kMinimumPaneWidth)) +
+          (neighbor_visible ? ScaleDip(window_, kTabHeight) + 1 + ScaleDip(window_, 4) : 0);
+      RECT minimum_client{0, 0, 0, minimum_side + ScaleDip(window_, kTopbarHeight) +
+          std::max(ScaleDip(window_, 26), current_status_height_)};
+      if (AdjustWindowRectExForDpi(&minimum_client,
+              static_cast<DWORD>(GetWindowLongPtrW(window_, GWL_STYLE)), GetMenu(window_) != nullptr,
+              static_cast<DWORD>(GetWindowLongPtrW(window_, GWL_EXSTYLE)), GetDpiForWindow(window_))) {
+        auto* information = reinterpret_cast<MINMAXINFO*>(lparam);
+        information->ptMinTrackSize.y = std::max(information->ptMinTrackSize.y,
+                                                minimum_client.bottom - minimum_client.top);
+      }
+      return 0;
+    }
     case WM_PAINT: {
       PAINTSTRUCT paint{};
       HDC dc = BeginPaint(window_, &paint);
@@ -3109,12 +3237,6 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         for (auto& view : documents_) view->pending_body_high_surrogate = 0;
       const int command = LOWORD(wparam);
       if (command == kCommandSearch) ShowCommandPalette();
-      else if (command == kWindowMinimize)
-        ShowWindow(window_, SW_MINIMIZE);
-      else if (command == kWindowMaximize)
-        ShowWindow(window_, IsZoomed(window_) ? SW_RESTORE : SW_MAXIMIZE);
-      else if (command == kWindowClose)
-        SendMessageW(window_, WM_CLOSE, 0, 0);
       else if (command == kTabNew) NewUntitledDocument();
       else if (command == kTabClose && active_document_ < documents_.size())
         CloseDocument(active_document_);
@@ -3128,6 +3250,8 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         focused_panel_ = command == kPanelHeaderExplorer ? PanelId::Explorer :
             command == kPanelHeaderCalendar ? PanelId::Calendar :
             command == kPanelHeaderOutline ? PanelId::Outline : PanelId::Git;
+        active_activity_ = focused_panel_ == PanelId::Explorer ? 0 :
+            focused_panel_ == PanelId::Git ? 2 : focused_panel_ == PanelId::Calendar ? 3 : -1;
         SetFocus(panel_headers_[PanelIndex(focused_panel_)]);
         UpdatePanelHeaders();
       }
@@ -3203,6 +3327,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       }
       else if (command == kCalendarOpenSelected) OpenSelectedCalendarDate();
       else if (command == kCalendarGoToToday) GoToCalendarToday();
+      else if (command == kCalendarDetailsToggle) {
+        calendar_details_expanded_ = !calendar_details_expanded_;
+        SetWindowTextW(calendar_details_toggle_, calendar_details_expanded_ ? L"詳細を閉じる" : L"詳細を表示");
+        LayoutControls();
+        SetFocus(calendar_details_expanded_ ? calendar_details_ : calendar_details_toggle_);
+      }
       else if (command == kCalendarImportHolidays) ImportHolidayData();
       else if (command == kViewSettings) OpenWorkspaceSettings();
       else if (command == kViewSettingsFiles) OpenWorkspaceSettingsFiles();
@@ -3278,7 +3408,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
           draw->hwndItem == git_refresh_ || draw->hwndItem == git_stage_ ||
           draw->hwndItem == git_unstage_ || draw->hwndItem == git_diff_ ||
           draw->hwndItem == git_commit_ || draw->hwndItem == git_trust_ ||
-          std::ranges::find(window_buttons_, draw->hwndItem) != window_buttons_.end() ||
+          draw->hwndItem == calendar_daily_ || draw->hwndItem == calendar_details_toggle_ ||
           std::ranges::find(activity_buttons_, draw->hwndItem) != activity_buttons_.end() ||
           std::ranges::find(panel_headers_, draw->hwndItem) != panel_headers_.end()) {
         DrawChromeButton(*draw);
@@ -3288,13 +3418,19 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_NOTIFY: {
       const auto* header = reinterpret_cast<NMHDR*>(lparam);
+      if (header && header->hwndFrom == chrome_tooltip_ && header->code == TTN_GETDISPINFOW) {
+        auto* info = reinterpret_cast<NMTTDISPINFOW*>(lparam);
+        GetWindowTextW(reinterpret_cast<HWND>(header->idFrom), info->szText,
+                       static_cast<int>(std::size(info->szText)));
+        return 0;
+      }
       if (header && header->hwndFrom == git_files_ && header->code == NM_CUSTOMDRAW) {
         auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lparam);
         if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
         if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
         if (draw->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
           const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
-          draw->clrText = selected ? RGB(255, 255, 255) : theme_foreground_;
+          draw->clrText = selected ? theme_selected_text_ : theme_foreground_;
           draw->clrTextBk = selected ? theme_accent_ : theme_surface_;
           return CDRF_NEWFONT;
         }
@@ -3307,7 +3443,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
         if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
           const bool selected = (draw->uItemState & CDIS_SELECTED) != 0;
-          SetTextColor(draw->hdc, selected ? RGB(255, 255, 255) : theme_foreground_);
+          SetTextColor(draw->hdc, selected ? theme_selected_text_ : theme_foreground_);
           SetBkColor(draw->hdc, selected ? theme_accent_ : theme_surface_);
           return CDRF_DODEFAULT;
         }
@@ -3442,7 +3578,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     case WM_SETTINGCHANGE:
-      if (settings_.theme == ThemeMode::System) ApplySettings();
+      if (settings_.theme == ThemeMode::System || wparam == SPI_SETHIGHCONTRAST) ApplySettings();
       return 0;
     case WM_ERASEBKGND: {
       RECT area{};
@@ -3638,12 +3774,10 @@ void Application::CreateControls() {
   chrome_bar_ = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
                                 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kChromeBar),
                                 instance_, nullptr);
-  if (chrome_bar_)
-    SetWindowSubclass(chrome_bar_, ChromeBarSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   activity_rail_ = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
                                    0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kActivityRail),
                                    instance_, nullptr);
-  workspace_tree_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, nullptr,
+  workspace_tree_ = CreateWindowExW(0, WC_TREEVIEWW, nullptr,
                                     WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_SHOWSELALWAYS,
                                     0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kWorkspaceTree), instance_, nullptr);
   if (workspace_tree_) {
@@ -3659,7 +3793,7 @@ void Application::CreateControls() {
   }
   SetWindowSubclass(workspace_tree_, TreeDragSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   tabs_ = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_TABS | TCS_FIXEDWIDTH |
+                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_BUTTONS | TCS_FLATBUTTONS | TCS_FIXEDWIDTH |
                               TCS_OWNERDRAWFIXED,
                           0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kTabs), instance_, nullptr);
   if (tabs_) {
@@ -3670,8 +3804,6 @@ void Application::CreateControls() {
   }
   brand_ = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | SS_OWNERDRAW,
                            0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kBrand), instance_, nullptr);
-  if (brand_)
-    SetWindowSubclass(brand_, ChromeBarSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
   command_search_ = CreateWindowExW(0, L"BUTTON", L"コマンドを検索...",
       WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kCommandSearch), instance_, nullptr);
@@ -3681,31 +3813,22 @@ void Application::CreateControls() {
   tab_close_ = CreateWindowExW(0, L"BUTTON", L"現在の文書を閉じる",
       WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kTabClose), instance_, nullptr);
-  window_buttons_[0] = CreateWindowExW(0, L"BUTTON", L"最小化",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
-      reinterpret_cast<HMENU>(kWindowMinimize), instance_, nullptr);
-  window_buttons_[1] = CreateWindowExW(0, L"BUTTON", L"最大化",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
-      reinterpret_cast<HMENU>(kWindowMaximize), instance_, nullptr);
-  window_buttons_[2] = CreateWindowExW(0, L"BUTTON", L"閉じる",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
-      reinterpret_cast<HMENU>(kWindowClose), instance_, nullptr);
   activity_buttons_[0] = CreateWindowExW(0, L"BUTTON", L"エクスプローラー",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      WS_CHILD | WS_TABSTOP | WS_GROUP | BS_RADIOBUTTON | BS_PUSHLIKE, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kActivityExplorer), instance_, nullptr);
-  activity_buttons_[1] = CreateWindowExW(0, L"BUTTON", L"検索",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+  activity_buttons_[1] = CreateWindowExW(0, L"BUTTON", L"検索・置換（文書 / Workspace）",
+      WS_CHILD | WS_TABSTOP | BS_RADIOBUTTON | BS_PUSHLIKE, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kActivitySearch), instance_, nullptr);
-  activity_buttons_[2] = CreateWindowExW(0, L"BUTTON", L"Git",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+  activity_buttons_[2] = CreateWindowExW(0, L"BUTTON", L"Git（ソース管理）",
+      WS_CHILD | WS_TABSTOP | BS_RADIOBUTTON | BS_PUSHLIKE, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kActivityGit), instance_, nullptr);
   activity_buttons_[3] = CreateWindowExW(0, L"BUTTON", L"カレンダー",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      WS_CHILD | WS_TABSTOP | BS_RADIOBUTTON | BS_PUSHLIKE, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kActivityCalendar), instance_, nullptr);
-  activity_buttons_[4] = CreateWindowExW(0, L"BUTTON", L"設定",
-      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+  activity_buttons_[4] = CreateWindowExW(0, L"BUTTON", L"Workspace設定",
+      WS_CHILD | WS_GROUP | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kActivitySettings), instance_, nullptr);
-  outline_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, nullptr,
+  outline_ = CreateWindowExW(0, WC_TREEVIEWW, nullptr,
                              WS_CHILD | WS_VISIBLE | TVS_HASBUTTONS | TVS_HASLINES |
                                  TVS_LINESATROOT | TVS_SHOWSELALWAYS,
                                  0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kOutline), instance_, nullptr);
@@ -3713,9 +3836,10 @@ void Application::CreateControls() {
   status_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
                              WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                              0, 0, 0, 0, window_, nullptr, instance_, nullptr);
-  SendMessageW(status_, SB_SETMINHEIGHT, ScaleDip(window_, 34), 0);
+  if (status_) SetWindowSubclass(status_, StatusBarSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+  SendMessageW(status_, SB_SETMINHEIGHT, ScaleDip(window_, 26), 0);
   SetStatusText(L"");
-  find_bar_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr, WS_CHILD,
+  find_bar_ = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD,
                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindBar), instance_, nullptr);
   find_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindEdit), instance_, nullptr);
@@ -3747,7 +3871,7 @@ void Application::CreateControls() {
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceOne), instance_, nullptr);
   replace_document_ = CreateWindowExW(0, L"BUTTON", L"文書置換", WS_CHILD | BS_PUSHBUTTON,
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceDocument), instance_, nullptr);
-  find_results_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
+  find_results_ = CreateWindowExW(0, WC_LISTVIEWW, nullptr,
       WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindResults), instance_, nullptr);
   ListView_SetExtendedListViewStyle(find_results_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -3766,8 +3890,8 @@ void Application::CreateControls() {
   } else {
     SetStatusText(L"カレンダーcontrol classを登録できません。");
   }
-  git_panel_ = CreateWindowExW(0, L"STATIC", L"Gitの状態を更新してください。",
-                              WS_CHILD | SS_LEFT | SS_NOPREFIX,
+  git_panel_ = CreateWindowExW(0, L"EDIT", L"Gitの状態を更新してください。",
+                              WS_CHILD | WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
                               0, 0, 0, 0, window_, nullptr, instance_, nullptr);
   git_refresh_ = CreateWindowExW(0, L"BUTTON", L"更新",
       WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
@@ -3803,9 +3927,17 @@ void Application::CreateControls() {
   git_commit_ = CreateWindowExW(0, L"BUTTON", L"Commit",
       WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kGitCommit), instance_, nullptr);
-  git_trust_ = CreateWindowExW(0, L"BUTTON", L"信頼する",
+  git_trust_ = CreateWindowExW(0, L"BUTTON", L"信頼を確認...",
       WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kWorkspaceTrust), instance_, nullptr);
+  calendar_summary_ = CreateWindowExW(0, L"STATIC", L"選択日: —\n文書数: 未取得",
+      WS_CHILD | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  calendar_daily_ = CreateWindowExW(0, L"BUTTON", L"Dailyを開く",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kCalendarOpenSelected), instance_, nullptr);
+  calendar_details_toggle_ = CreateWindowExW(0, L"BUTTON", L"詳細を表示",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kCalendarDetailsToggle), instance_, nullptr);
   calendar_details_ = CreateWindowExW(0, L"EDIT",
                                       L"選択日: （カレンダーから選択）",
                                       WS_CHILD | WS_TABSTOP | ES_MULTILINE | ES_READONLY |
@@ -3840,6 +3972,22 @@ void Application::CreateControls() {
     tool.lpszText = const_cast<wchar_t*>(L"日付");
     SendMessageW(calendar_tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
     SendMessageW(calendar_tooltip_, TTM_SETMAXTIPWIDTH, 0, 420);
+  }
+  chrome_tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+      WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+  for (HWND control : {command_search_, tab_new_, tab_close_, activity_buttons_[0],
+                       activity_buttons_[1], activity_buttons_[2], activity_buttons_[3],
+                       activity_buttons_[4], git_refresh_, git_stage_, git_unstage_, git_diff_,
+                       git_commit_, git_trust_, calendar_daily_, calendar_details_toggle_}) {
+    SetWindowSubclass(control, ChromeBarSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+    if (chrome_tooltip_) {
+      TTTOOLINFOW tool{sizeof(tool)};
+      tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+      tool.hwnd = window_;
+      tool.uId = reinterpret_cast<UINT_PTR>(control);
+      tool.lpszText = LPSTR_TEXTCALLBACKW;
+      SendMessageW(chrome_tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    }
   }
   HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_, replace_edit_,
@@ -3894,13 +4042,13 @@ void Application::SetStatusSegments(std::array<std::wstring, 4> segments) {
   RECT client{};
   GetClientRect(status_, &client);
   const int width = std::max(0, static_cast<int>(client.right));
-  const int first = std::min(width, ScaleDip(window_, 300));
-  const int second = std::min(width, first + ScaleDip(window_, 225));
-  const int third = std::min(width, second + ScaleDip(window_, 175));
+  const int first = std::min(ScaleDip(window_, 300), width * 30 / 100);
+  const int second = first + std::min(ScaleDip(window_, 225), width * 25 / 100);
+  const int third = second + std::min(ScaleDip(window_, 175), width * 20 / 100);
   const int parts[] = {first, second, third, -1};
   SendMessageW(status_, SB_SETPARTS, 4, reinterpret_cast<LPARAM>(parts));
   for (int index = 0; index < static_cast<int>(status_segments_.size()); ++index) {
-    SendMessageW(status_, SB_SETTEXTW, static_cast<WPARAM>(index) | SBT_OWNERDRAW,
+    SendMessageW(status_, SB_SETTEXTW, static_cast<WPARAM>(index) | SBT_OWNERDRAW | SBT_NOBORDERS,
                  reinterpret_cast<LPARAM>(status_segments_[index].c_str()));
   }
   InvalidateRect(status_, nullptr, TRUE);
@@ -3924,7 +4072,7 @@ void Application::MeasureMenuItem(MEASUREITEMSTRUCT& measure) const {
     measure.itemHeight = static_cast<UINT>(ScaleDip(window_, 28));
     return;
   }
-  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   HGDIOBJ previous = SelectObject(dc, font);
   TEXTMETRICW metrics{};
   GetTextMetricsW(dc, &metrics);
@@ -3957,7 +4105,7 @@ void Application::DrawMenuItem(const DRAWITEMSTRUCT& draw) const {
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
   const COLORREF background = selected ? theme_accent_ : theme_surface_;
   const COLORREF foreground = disabled ? theme_muted_ :
-      (selected ? RGB(255, 255, 255) : theme_foreground_);
+      (selected ? theme_selected_text_ : theme_foreground_);
   HBRUSH background_brush = CreateSolidBrush(background);
   if (background_brush) {
     FillRect(draw.hDC, &item, background_brush);
@@ -3977,7 +4125,7 @@ void Application::DrawMenuItem(const DRAWITEMSTRUCT& draw) const {
   }
   const auto* label = reinterpret_cast<const std::wstring*>(draw.itemData);
   if (!label) return;
-  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   HGDIOBJ previous = SelectObject(draw.hDC, font);
   SetBkMode(draw.hDC, TRANSPARENT);
   SetTextColor(draw.hDC, foreground);
@@ -4029,7 +4177,7 @@ void Application::DrawStatusItem(const DRAWITEMSTRUCT& draw) const {
     SelectObject(draw.hDC, previous);
     DeleteObject(pen);
   }
-  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   HGDIOBJ previous = SelectObject(draw.hDC, font);
   SetBkMode(draw.hDC, TRANSPARENT);
   const auto* segment = reinterpret_cast<const wchar_t*>(draw.itemData);
@@ -4082,13 +4230,24 @@ void Application::MoveFocusedPanelToSlot(PanelSlot slot) {
 }
 
 void Application::UpdatePanelHeaders() {
+  const std::array selected{active_activity_ == 0, active_activity_ == 1,
+                            active_activity_ == 2, active_activity_ == 3};
+  for (std::size_t index = 0; index < selected.size(); ++index) {
+    const HWND button = activity_buttons_[index];
+    const LRESULT checked = selected[index] ? BST_CHECKED : BST_UNCHECKED;
+    if (SendMessageW(button, BM_GETCHECK, 0, 0) != checked) {
+      SendMessageW(button, BM_SETCHECK, checked, 0);
+      NotifyWinEvent(EVENT_OBJECT_STATECHANGE, button, OBJID_CLIENT, CHILDID_SELF);
+    }
+    InvalidateRect(button, nullptr, FALSE);
+  }
   for (const auto id : {PanelId::Explorer, PanelId::Calendar, PanelId::Outline, PanelId::Git}) {
     const auto* panel = panel_layout_.Find(id);
     const HWND header = panel_headers_[PanelIndex(id)];
     if (!panel || !header) continue;
     const std::wstring text = PanelName(id);
     SetWindowTextW(header, text.c_str());
-    if (editor_font_) SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(editor_font_), TRUE);
+    if (ui_font_) SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(ui_font_), TRUE);
     InvalidateRect(header, nullptr, FALSE);
   }
 }
@@ -4096,12 +4255,19 @@ void Application::UpdatePanelHeaders() {
 void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
   if (!draw.hDC) return;
   HDC dc = draw.hDC;
+  struct FontSelection {
+    HDC dc;
+    HGDIOBJ previous;
+    ~FontSelection() { if (previous) SelectObject(dc, previous); }
+  } font_selection{dc, SelectObject(dc, ui_font_ ? ui_font_ : GetStockObject(DEFAULT_GUI_FONT))};
   RECT rect = draw.rcItem;
   const int id = static_cast<int>(draw.CtlID);
   const bool focused = (draw.itemState & ODS_FOCUS) != 0;
-  const bool hot = (draw.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) != 0;
+  const bool hot = (draw.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) != 0 ||
+      GetPropW(draw.hwndItem, L"MDLite.Hover") != nullptr;
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
-  const COLORREF foreground = disabled ? theme_muted_ : theme_foreground_;
+  const COLORREF foreground = disabled
+      ? (high_contrast_ ? GetSysColor(COLOR_GRAYTEXT) : theme_muted_) : theme_foreground_;
   const auto fill = [&](RECT bounds, COLORREF color) {
     if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
     SetDCBrushColor(dc, color);
@@ -4132,31 +4298,6 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     DrawTextW(dc, text.data(), static_cast<int>(text.size()), &bounds,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
   };
-  const auto draw_magnifier = [&](int center_x, int center_y, COLORREF color) {
-    HPEN pen = CreatePen(PS_SOLID, ScaleDip(window_, 2), color);
-    if (!pen) return;
-    const HGDIOBJ old_pen = SelectObject(dc, pen);
-    const HGDIOBJ old_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    const int radius = ScaleDip(window_, 6);
-    Ellipse(dc, center_x - radius, center_y - radius, center_x + radius, center_y + radius);
-    MoveToEx(dc, center_x + radius - 1, center_y + radius - 1, nullptr);
-    LineTo(dc, center_x + radius + ScaleDip(window_, 6), center_y + radius + ScaleDip(window_, 6));
-    SelectObject(dc, old_brush);
-    SelectObject(dc, old_pen);
-    DeleteObject(pen);
-  };
-  const auto draw_calendar = [&](int center_x, int center_y, COLORREF color) {
-    RECT icon{center_x - ScaleDip(window_, 9), center_y - ScaleDip(window_, 8),
-              center_x + ScaleDip(window_, 9), center_y + ScaleDip(window_, 8)};
-    stroke(icon, color, ScaleDip(window_, 1));
-    line(icon.left, icon.top + ScaleDip(window_, 5), icon.right, icon.top + ScaleDip(window_, 5), color);
-    line(center_x - ScaleDip(window_, 4), icon.top - ScaleDip(window_, 2),
-         center_x - ScaleDip(window_, 4), icon.top + ScaleDip(window_, 3), color,
-         ScaleDip(window_, 2));
-    line(center_x + ScaleDip(window_, 4), icon.top - ScaleDip(window_, 2),
-         center_x + ScaleDip(window_, 4), icon.top + ScaleDip(window_, 3), color,
-         ScaleDip(window_, 2));
-  };
 
   if (draw.hwndItem == chrome_bar_) {
     fill(rect, theme_surface_);
@@ -4181,7 +4322,7 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     centered(L"M", logo, RGB(255, 255, 255));
     RECT name{logo.right + ScaleDip(window_, 8), rect.top,
               rect.right, rect.bottom};
-    HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     const HGDIOBJ old_font = SelectObject(dc, font);
     SetTextColor(dc, foreground);
     DrawTextW(dc, L"MDLite", 6, &name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -4194,7 +4335,10 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     fill(field, hot ? theme_surface_alt_ : theme_input_);
     stroke(field, focused ? theme_accent_ : theme_border_, focused ? 2 : 1);
     const int center_y = rect.top + (rect.bottom - rect.top) / 2;
-    draw_magnifier(rect.left + ScaleDip(window_, 22), center_y, theme_muted_);
+    const int side = ScaleDip(window_, 16);
+    DrawUiIcon(dc, {rect.left + ScaleDip(window_, 14), center_y - side / 2,
+                   rect.left + ScaleDip(window_, 14) + side, center_y + side / 2},
+               UiIcon::Search, theme_muted_);
     RECT label{rect.left + ScaleDip(window_, 42), rect.top,
                rect.right - ScaleDip(window_, 94), rect.bottom};
     SetBkMode(dc, TRANSPARENT);
@@ -4210,54 +4354,21 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
               DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     return;
   }
-  if (std::ranges::find(window_buttons_, draw.hwndItem) != window_buttons_.end()) {
-    const bool close_button = id == kWindowClose;
-    fill(rect, hot ? (close_button ? RGB(178, 48, 60) : theme_surface_alt_) : theme_surface_);
-    const int center_x = rect.left + (rect.right - rect.left) / 2;
-    const int center_y = rect.top + (rect.bottom - rect.top) / 2;
-    const int half_width = ScaleDip(window_, 6);
-    const int half_height = ScaleDip(window_, 5);
-    const int stroke_width = ScaleDip(window_, 1);
-    if (id == kWindowMinimize) {
-      line(center_x - half_width, center_y + ScaleDip(window_, 3),
-           center_x + half_width, center_y + ScaleDip(window_, 3), foreground, stroke_width);
-    } else if (id == kWindowMaximize && IsZoomed(window_)) {
-      RECT back{center_x - half_width + ScaleDip(window_, 3),
-                center_y - half_height - ScaleDip(window_, 2),
-                center_x + half_width + ScaleDip(window_, 3),
-                center_y + half_height - ScaleDip(window_, 2)};
-      RECT front{center_x - half_width - ScaleDip(window_, 3),
-                 center_y - half_height + ScaleDip(window_, 2),
-                 center_x + half_width - ScaleDip(window_, 3),
-                 center_y + half_height + ScaleDip(window_, 2)};
-      stroke(back, foreground, stroke_width);
-      fill(front, theme_surface_);
-      stroke(front, foreground, stroke_width);
-    } else if (id == kWindowMaximize) {
-      stroke({center_x - half_width, center_y - half_height,
-              center_x + half_width, center_y + half_height}, foreground, stroke_width);
-    } else {
-      line(center_x - half_width, center_y - half_height,
-           center_x + half_width, center_y + half_height, foreground, ScaleDip(window_, 2));
-      line(center_x + half_width, center_y - half_height,
-           center_x - half_width, center_y + half_height, foreground, ScaleDip(window_, 2));
-    }
-    if (focused) {
-      RECT focus{rect.left + ScaleDip(window_, 4), rect.top + ScaleDip(window_, 4),
-                 rect.right - ScaleDip(window_, 4), rect.bottom - ScaleDip(window_, 4)};
-      stroke(focus, theme_accent_);
-    }
-    return;
-  }
   if (draw.hwndItem == tab_new_ || draw.hwndItem == tab_close_) {
     fill(rect, hot ? theme_surface_alt_ : theme_surface_);
-    centered(draw.hwndItem == tab_new_ ? L"+" : L"×", rect, foreground);
+    RECT icon = rect;
+    const int side = ScaleDip(window_, 16);
+    icon.left += (rect.right - rect.left - side) / 2;
+    icon.top += (rect.bottom - rect.top - side) / 2;
+    icon.right = icon.left + side; icon.bottom = icon.top + side;
+    DrawUiIcon(dc, icon, draw.hwndItem == tab_new_ ? UiIcon::Add : UiIcon::Close, foreground);
     if (focused) stroke(rect, theme_accent_);
     return;
   }
   if (draw.hwndItem == git_refresh_ || draw.hwndItem == git_stage_ ||
       draw.hwndItem == git_unstage_ || draw.hwndItem == git_diff_ ||
-      draw.hwndItem == git_commit_ || draw.hwndItem == git_trust_) {
+      draw.hwndItem == git_commit_ || draw.hwndItem == git_trust_ ||
+      draw.hwndItem == calendar_daily_ || draw.hwndItem == calendar_details_toggle_) {
     fill(rect, hot ? theme_surface_alt_ : theme_surface_);
     stroke(rect, focused ? theme_accent_ : theme_border_, focused ? 2 : 1);
     wchar_t label[64]{};
@@ -4273,48 +4384,27 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
   if (std::ranges::find(activity_buttons_, draw.hwndItem) != activity_buttons_.end()) {
     fill(rect, hot ? theme_surface_alt_ : theme_surface_);
     const bool selected =
-        (id == kActivityExplorer && focused_panel_ == PanelId::Explorer) ||
-        (id == kActivityGit && focused_panel_ == PanelId::Git) ||
-        (id == kActivityCalendar && focused_panel_ == PanelId::Calendar) ||
-        (id == kActivitySearch && IsWindowVisible(find_bar_));
+        (id == kActivityExplorer && active_activity_ == 0) ||
+        (id == kActivitySearch && active_activity_ == 1) ||
+        (id == kActivityGit && active_activity_ == 2) ||
+        (id == kActivityCalendar && active_activity_ == 3);
+    if (selected) fill(rect, theme_surface_alt_);
     if (selected) fill({rect.left, rect.top + ScaleDip(window_, 8),
                         rect.left + ScaleDip(window_, 3), rect.bottom - ScaleDip(window_, 8)},
                        theme_accent_);
+    if ((draw.itemState & ODS_SELECTED) != 0) {
+      RECT pressed = rect;
+      InflateRect(&pressed, -ScaleDip(window_, 2), -ScaleDip(window_, 2));
+      stroke(pressed, foreground, ScaleDip(window_, 2));
+    }
     const int cx = rect.left + (rect.right - rect.left) / 2;
     const int cy = rect.top + (rect.bottom - rect.top) / 2;
-    const int glyph = ScaleDip(window_, 20);
-    if (id == kActivitySearch) {
-      draw_magnifier(cx, cy, foreground);
-    } else if (id == kActivityCalendar) {
-      draw_calendar(cx, cy, foreground);
-    } else if (id == kActivityExplorer) {
-      RECT folder{cx - glyph / 2, cy - glyph / 2 + ScaleDip(window_, 2),
-                  cx + glyph / 2, cy + glyph / 2};
-      stroke(folder, foreground, ScaleDip(window_, 2));
-      line(folder.left, folder.top + ScaleDip(window_, 5), folder.right, folder.top + ScaleDip(window_, 5), foreground);
-      line(folder.left, folder.top + ScaleDip(window_, 2), folder.left + ScaleDip(window_, 7),
-           folder.top + ScaleDip(window_, 2), foreground, ScaleDip(window_, 2));
-    } else if (id == kActivityGit) {
-      const int radius = ScaleDip(window_, 3);
-      line(cx, cy - ScaleDip(window_, 6), cx, cy + ScaleDip(window_, 6), foreground, ScaleDip(window_, 2));
-      line(cx, cy - ScaleDip(window_, 3), cx + ScaleDip(window_, 5), cy + ScaleDip(window_, 3),
-           foreground, ScaleDip(window_, 2));
-      const HGDIOBJ old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
-      SetDCBrushColor(dc, foreground);
-      for (const POINT point : {POINT{cx, cy - ScaleDip(window_, 6)}, POINT{cx, cy},
-                                POINT{cx, cy + ScaleDip(window_, 6)},
-                                POINT{cx + ScaleDip(window_, 5), cy + ScaleDip(window_, 3)}})
-        Ellipse(dc, point.x - radius, point.y - radius, point.x + radius, point.y + radius);
-      SelectObject(dc, old_brush);
-    } else {
-      const int radius = ScaleDip(window_, 6);
-      const HGDIOBJ old_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-      stroke({cx - radius, cy - radius, cx + radius, cy + radius}, foreground,
-             ScaleDip(window_, 2));
-      SelectObject(dc, old_brush);
-      line(cx - ScaleDip(window_, 11), cy, cx + ScaleDip(window_, 11), cy, foreground);
-      line(cx, cy - ScaleDip(window_, 11), cx, cy + ScaleDip(window_, 11), foreground);
-    }
+    const int size = ScaleDip(window_, 20);
+    const UiIcon icon = id == kActivityExplorer ? UiIcon::Explorer :
+        id == kActivitySearch ? UiIcon::Search : id == kActivityGit ? UiIcon::GitBranch :
+        id == kActivityCalendar ? UiIcon::Calendar : UiIcon::Settings;
+    DrawUiIcon(dc, {cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2},
+               icon, selected ? theme_accent_ : foreground);
     if (focused) stroke({rect.left + 3, rect.top + 3, rect.right - 3, rect.bottom - 3}, theme_accent_);
     return;
   }
@@ -4338,16 +4428,13 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     DrawTextW(dc, name, -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     const int center_y = rect.top + (rect.bottom - rect.top) / 2;
-    for (int dot = -1; dot <= 1; ++dot) {
-      const int x = rect.right - ScaleDip(window_, 48) + dot * ScaleDip(window_, 4);
-      SetDCBrushColor(dc, theme_muted_);
-      Ellipse(dc, x - 1, center_y - 1, x + 2, center_y + 2);
-    }
-    const int chevron_x = rect.right - ScaleDip(window_, 19);
-    line(chevron_x - ScaleDip(window_, 4), center_y - ScaleDip(window_, 2), chevron_x,
-         center_y + ScaleDip(window_, 2), theme_muted_);
-    line(chevron_x, center_y + ScaleDip(window_, 2), chevron_x + ScaleDip(window_, 4),
-         center_y - ScaleDip(window_, 2), theme_muted_);
+    const int side = ScaleDip(window_, 16);
+    DrawUiIcon(dc, {rect.right - ScaleDip(window_, 56), center_y - side / 2,
+                   rect.right - ScaleDip(window_, 56) + side, center_y + side / 2},
+               UiIcon::More, theme_muted_);
+    DrawUiIcon(dc, {rect.right - ScaleDip(window_, 27), center_y - side / 2,
+                   rect.right - ScaleDip(window_, 27) + side, center_y + side / 2},
+               UiIcon::ChevronDown, theme_muted_);
     if (focused) stroke(rect, theme_accent_);
   }
 }
@@ -4393,16 +4480,13 @@ void Application::DrawTabItem(const DRAWITEMSTRUCT& draw) const {
             item.top + (item.bottom - item.top - ScaleDip(window_, 18)) / 2,
             item.left + ScaleDip(window_, 30),
             item.top + (item.bottom - item.top + ScaleDip(window_, 18)) / 2};
-  SetDCBrushColor(draw.hDC, theme_accent_);
-  FillRect(draw.hDC, &icon, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+  DrawUiIcon(draw.hDC, icon, UiIcon::File, theme_accent_);
   SetBkMode(draw.hDC, TRANSPARENT);
-  SetTextColor(draw.hDC, RGB(255, 255, 255));
-  DrawTextW(draw.hDC, L"M", 1, &icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
   RECT text_rect{item.left + ScaleDip(window_, 40), item.top,
                  item.right - ScaleDip(window_, 12), item.bottom};
   SetTextColor(draw.hDC, foreground);
-  HFONT font = editor_font_ ? editor_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   const HGDIOBJ old_font = SelectObject(draw.hDC, font);
   DrawTextW(draw.hDC, text, -1, &text_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -4429,6 +4513,8 @@ void Application::ActivatePanel(PanelId id) {
     changed = true;
   }
   focused_panel_ = id;
+  active_activity_ = id == PanelId::Explorer ? 0 : id == PanelId::Git ? 2 :
+      id == PanelId::Calendar ? 3 : -1;
   if (changed) SavePanelLayout();
   LayoutControls();
   UpdatePanelHeaders();
@@ -4446,6 +4532,31 @@ void Application::GoToCalendarToday() {
   CalendarView_SetSelection(calendar_, today);
   UpdateCalendarDetails(today);
 }
+int Application::MeasurePanelTextHeight(HWND item, int width) const {
+  if (!item) return ScaleDip(window_, 40);
+  const int length = GetWindowTextLengthW(item);
+  std::wstring text(static_cast<std::size_t>(std::max(0, length)) + 1, L'\0');
+  GetWindowTextW(item, text.data(), length + 1);
+  HDC dc = GetDC(window_);
+  if (!dc) return ScaleDip(window_, 60);
+  HGDIOBJ previous = SelectObject(dc, ui_font_ ? ui_font_ : GetStockObject(DEFAULT_GUI_FONT));
+  RECT measured{0, 0, std::max(1, width), 0};
+  DrawTextW(dc, text.c_str(), -1, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+  SelectObject(dc, previous);
+  ReleaseDC(window_, dc);
+  return std::max(ScaleDip(window_, 20), static_cast<int>(measured.bottom));
+}
+
+int Application::MinimumCalendarPanelHeight(int width) const {
+  const int padding = std::min(ScaleDip(window_, 8), width / 4);
+  const int inner_width = std::max(0, width - padding * 2);
+  const int button_height = ScaleDip(window_, 28);
+  const int actions_height = inner_width >= ScaleDip(window_, 240) ? button_height : button_height * 2;
+  return ScaleDip(window_, kTabHeight) + ScaleDip(window_, 228) + ScaleDip(window_, 8) * 3 +
+      (calendar_details_expanded_ ? ScaleDip(window_, 44) : 0) +
+      MeasurePanelTextHeight(calendar_summary_, inner_width) + actions_height;
+}
+
 void Application::LayoutControls() {
   RECT client{};
   GetClientRect(window_, &client);
@@ -4456,22 +4567,11 @@ void Application::LayoutControls() {
   SetStatusSegments(status_segments_);
   const int topbar_height = ScaleDip(window_, kTopbarHeight);
   const int content_height = std::max(0L, client.bottom - status_height - topbar_height);
-  const int rail_width = ScaleDip(window_, 56);
+  const int rail_width = ScaleDip(window_, 48);
   MoveWindow(chrome_bar_, 0, 0, client.right, topbar_height, TRUE);
   MoveWindow(activity_rail_, 0, topbar_height, rail_width, content_height, TRUE);
   MoveWindow(brand_, ScaleDip(window_, 10), 0, ScaleDip(window_, 130), topbar_height, TRUE);
-  const int window_button_width = std::min(ScaleDip(window_, 44),
-                                            std::max(0, static_cast<int>(client.right) / 3));
-  const int window_buttons_width = window_button_width * static_cast<int>(window_buttons_.size());
-  for (std::size_t index{}; index < window_buttons_.size(); ++index) {
-    const int x = static_cast<int>(client.right) - window_buttons_width +
-                  static_cast<int>(index) * window_button_width;
-    MoveWindow(window_buttons_[index], x, 0, window_button_width, topbar_height, TRUE);
-    ShowWindow(window_buttons_[index], SW_SHOW);
-  }
-  if (window_buttons_[1])
-    SetWindowTextW(window_buttons_[1], IsZoomed(window_) ? L"元に戻す" : L"最大化");
-  const int search_right = std::max(0, static_cast<int>(client.right) - window_buttons_width);
+  const int search_right = std::max(0, static_cast<int>(client.right) - ScaleDip(window_, 24));
   const int search_left = std::min(ScaleDip(window_, 160), search_right);
   const int search_available = std::max(0, search_right - search_left);
   const int search_width = std::min(ScaleDip(window_, 584), search_available);
@@ -4479,8 +4579,8 @@ void Application::LayoutControls() {
   const int search_height = std::min(topbar_height, ScaleDip(window_, kCommandSearchHeight));
   const int search_y = (topbar_height - search_height) / 2;
   MoveWindow(command_search_, search_x, search_y, search_width, search_height, TRUE);
-  ShowWindow(brand_, SW_SHOW);
-  ShowWindow(command_search_, SW_SHOW);
+  ShowWindow(brand_, client.right >= ScaleDip(window_, 300) ? SW_SHOW : SW_HIDE);
+  ShowWindow(command_search_, search_width >= ScaleDip(window_, 140) ? SW_SHOW : SW_HIDE);
   const bool find_visible = IsWindowVisible(find_bar_) != FALSE;
   const bool results_visible = IsWindowVisible(find_results_) != FALSE;
   const auto state_for_slot = [&](PanelSlot slot) -> const PanelState* {
@@ -4557,22 +4657,35 @@ void Application::LayoutControls() {
     ShowWindow(control_for(panel.id), SW_HIDE);
     ShowWindow(header_for(panel.id), SW_HIDE);
   }
-  ShowWindow(calendar_details_, SW_HIDE);
+  for (HWND control : {calendar_details_, calendar_summary_, calendar_daily_, calendar_details_toggle_,
+                       git_files_, git_diff_view_, git_commit_edit_, git_refresh_, git_stage_,
+                       git_unstage_, git_diff_, git_commit_, git_trust_})
+    ShowWindow(control, SW_HIDE);
   const int header_height = ScaleDip(window_, kTabHeight);
   const auto side_height = [&](const PanelState* top, const PanelState* bottom, bool top_visible,
-                               bool bottom_visible) {
+                               bool bottom_visible, int width) {
     if (!top_visible) return 0;
     const int separator = bottom_visible ? splitter_width : 0;
     const int available_height = std::max(0, content_height - separator);
     if (!bottom_visible) return available_height;
-    if (available_height <= header_height * 2 + 2) return available_height / 2;
+    const int minimum_top = top->id == PanelId::Calendar
+        ? MinimumCalendarPanelHeight(width) : header_height + 1;
+    const int minimum_bottom = bottom->id == PanelId::Calendar
+        ? MinimumCalendarPanelHeight(width) : header_height + 1;
+    if (available_height < minimum_top + minimum_bottom) {
+      // A restored/programmatically sized window can precede native minimum-size enforcement.
+      // Keep the calendar's budget whenever the side can fit it, without changing panel state.
+      if (top->id == PanelId::Calendar) return std::min(available_height, minimum_top);
+      if (bottom->id == PanelId::Calendar) return std::max(0, available_height - minimum_bottom);
+      return available_height / 2;
+    }
     const int top_weight = std::max(1, static_cast<int>(top->height));
     const int bottom_weight = std::max(1, static_cast<int>(bottom->height));
     return std::clamp(MulDiv(available_height, top_weight, top_weight + bottom_weight),
-                      header_height + 1, available_height - header_height - 1);
+                      minimum_top, available_height - minimum_bottom);
   };
-  const int left_top_height = side_height(left_top, left_bottom, show_left_top, show_left_bottom);
-  const int right_top_height = side_height(right_top, right_bottom, show_right_top, show_right_bottom);
+  const int left_top_height = side_height(left_top, left_bottom, show_left_top, show_left_bottom, tree_width);
+  const int right_top_height = side_height(right_top, right_bottom, show_right_top, show_right_bottom, outline_width);
   current_rail_width_ = rail_width;
   current_tree_width_ = tree_width;
   current_outline_width_ = outline_width;
@@ -4597,71 +4710,101 @@ void Application::LayoutControls() {
     const int panel_content_height = std::max(0, height - std::min(header_height, height));
     MoveWindow(control, x, content_top, width, panel_content_height, TRUE);
     ShowWindow(control, panel_content_height > 0 ? SW_SHOW : SW_HIDE);
+    const int padding = std::min(ScaleDip(window_, 8), width / 4);
+    const int inner_x = x + padding;
+    const int inner_width = std::max(0, width - padding * 2);
+    const int gap = ScaleDip(window_, 8);
+    const int button_height = ScaleDip(window_, 28);
+    const int bottom = content_top + panel_content_height;
+    const auto place = [&](HWND item, int top, int item_height, bool visible = true) {
+      const int clipped = std::min(std::max(0, item_height), std::max(0, bottom - top));
+      MoveWindow(item, inner_x, top, inner_width, clipped, TRUE);
+      ShowWindow(item, visible && clipped > 0 ? SW_SHOW : SW_HIDE);
+    };
+    const auto text_height = [&](HWND item) {
+      return MeasurePanelTextHeight(item, inner_width -
+          (item == git_panel_ ? GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(window_)) + gap : 0));
+    };
     if (panel->id == PanelId::Calendar) {
-      const int calendar_height = std::max(0, panel_content_height * 2 / 3);
+      const int summary_height = text_height(calendar_summary_);
+      const bool wide = inner_width >= ScaleDip(window_, 240);
+      const int actions_height = wide ? button_height : button_height * 2;
+      const int footer_height = summary_height + actions_height + gap * 3;
+      const int detail_budget = std::max(0, panel_content_height - footer_height - ScaleDip(window_, 228));
+      const int detail_height = calendar_details_expanded_
+          ? std::min(ScaleDip(window_, 120), detail_budget) : 0;
+      const int calendar_height = std::min(ScaleDip(window_, 228),
+          std::max(0, panel_content_height - footer_height - detail_height));
       MoveWindow(calendar_, x, content_top, width, calendar_height, TRUE);
-      MoveWindow(calendar_details_, x, content_top + calendar_height, width,
-                 std::max(0, panel_content_height - calendar_height), TRUE);
       ShowWindow(calendar_, calendar_height > 0 ? SW_SHOW : SW_HIDE);
-      ShowWindow(calendar_details_, calendar_height > 0 ? SW_SHOW : SW_HIDE);
-    } else if (panel->id == PanelId::Git) {
-      const int gap = ScaleDip(window_, 4);
-      const int summary_height = ScaleDip(window_, 30);
-      const int action_height = ScaleDip(window_, 28);
-      const int commit_height = ScaleDip(window_, 30);
-      const int diff_height = std::min(ScaleDip(window_, 96), panel_content_height / 3);
-      const int list_top = content_top + summary_height;
-      const int action_top = content_top + std::max(summary_height,
-          panel_content_height - action_height - commit_height - diff_height - gap * 2);
-      const int list_bottom = std::max(list_top, action_top - diff_height - gap);
-      const int diff_top = list_bottom + gap;
-      const int commit_top = content_top + panel_content_height - commit_height;
-      const bool trusted = !workspace_.empty() && IsWorkspaceTrusted(workspace_);
-      const int refresh_width = ScaleDip(window_, 64);
-      const bool has_workspace = !workspace_.empty();
-      const int trust_width = trusted ? 0 : ScaleDip(window_, 88);
-      MoveWindow(git_panel_, x, content_top,
-                 std::max(0, width - refresh_width - trust_width - gap * 2),
-                 summary_height, TRUE);
-      MoveWindow(git_refresh_, x + width - refresh_width - trust_width - gap, content_top, refresh_width,
-                 summary_height, TRUE);
-      MoveWindow(git_trust_, x + width - trust_width, content_top, trust_width, summary_height, TRUE);
-      EnableWindow(git_refresh_, trusted);
-      ShowWindow(git_trust_, !trusted && has_workspace ? SW_SHOW : SW_HIDE);
-      if (!trusted) {
-        MoveWindow(git_diff_view_, x, list_top, width,
-                   std::max(0, panel_content_height - summary_height - gap), TRUE);
-        ShowWindow(git_files_, SW_HIDE);
-        ShowWindow(git_stage_, SW_HIDE);
-        ShowWindow(git_unstage_, SW_HIDE);
-        ShowWindow(git_diff_, SW_HIDE);
-        ShowWindow(git_commit_edit_, SW_HIDE);
-        ShowWindow(git_commit_, SW_HIDE);
-        ShowWindow(git_diff_view_, has_workspace ? SW_SHOW : SW_HIDE);
+      int top = content_top + calendar_height + gap;
+      place(calendar_summary_, top, summary_height);
+      top += summary_height + gap;
+      place(calendar_daily_, top, button_height);
+      EnableWindow(calendar_daily_, !workspace_.empty());
+      if (wide) {
+        const int half = (inner_width - gap) / 2;
+        const int row_height = std::min(button_height, std::max(0, bottom - top));
+        MoveWindow(calendar_daily_, inner_x, top, half, row_height, TRUE);
+        MoveWindow(calendar_details_toggle_, inner_x + half + gap, top,
+                   inner_width - half - gap, row_height, TRUE);
+        ShowWindow(calendar_details_toggle_, row_height > 0 ? SW_SHOW : SW_HIDE);
       } else {
-        MoveWindow(git_files_, x, list_top, width, std::max(0, list_bottom - list_top), TRUE);
-        MoveWindow(git_diff_view_, x, diff_top, width,
-                   std::max(0, action_top - diff_top - gap), TRUE);
-        const int action_button_width = std::max(0, (width - gap * 2) / 3);
-        MoveWindow(git_stage_, x, action_top, action_button_width, action_height, TRUE);
-        MoveWindow(git_unstage_, x + action_button_width + gap, action_top,
-                   action_button_width, action_height, TRUE);
-        MoveWindow(git_diff_, x + (action_button_width + gap) * 2, action_top,
-                   std::max(0, width - (action_button_width + gap) * 2), action_height, TRUE);
-        const int commit_button_width = ScaleDip(window_, 76);
-        MoveWindow(git_commit_edit_, x, commit_top,
-                   std::max(0, width - commit_button_width - gap), commit_height, TRUE);
-        MoveWindow(git_commit_, x + width - commit_button_width, commit_top,
-                   commit_button_width, commit_height, TRUE);
-        ShowWindow(git_files_, SW_SHOW);
-        ShowWindow(git_stage_, SW_SHOW);
-        ShowWindow(git_unstage_, SW_SHOW);
-        ShowWindow(git_diff_, SW_SHOW);
+        top += button_height;
+        place(calendar_details_toggle_, top, button_height);
+      }
+      top += button_height + gap;
+      place(calendar_details_, top, detail_height, calendar_details_expanded_);
+    } else if (panel->id == PanelId::Git) {
+      const bool has_workspace = !workspace_.empty();
+      const bool trusted = has_workspace && IsWorkspaceTrusted(workspace_);
+      const bool repository_ready = trusted &&
+          (git_panel_status_.state == GitPanelState::Ready ||
+           git_panel_status_.state == GitPanelState::NoRemote);
+      int top = content_top + padding;
+      const int summary_height = text_height(git_panel_);
+      place(git_panel_, top, summary_height);
+      top += summary_height + gap;
+      if (!trusted) {
+        place(git_trust_, top, button_height, has_workspace);
+        return;
+      }
+      place(git_refresh_, top, button_height);
+      EnableWindow(git_refresh_, !git_action_active_ && !git_status_worker_.joinable());
+      top += button_height + gap;
+      if (!repository_ready) return;
+      const int actions_height = button_height * 2 + gap;
+      const int remaining = std::max(0, bottom - top);
+      // Preserve useful content when resized: omit the lower action rows until
+      // a complete row fits rather than drawing them over the list or summary.
+      const bool show_actions = remaining >= actions_height + ScaleDip(window_, 44);
+      const int content_available = std::max(0, remaining - (show_actions ? actions_height + gap : 0));
+      const int diff_height = content_available >= ScaleDip(window_, 100)
+          ? std::min(ScaleDip(window_, 96), content_available / 3) : 0;
+      const int list_height = std::max(0, content_available - diff_height - (diff_height ? gap : 0));
+      place(git_files_, top, list_height);
+      ListView_SetColumnWidth(git_files_, 0, ScaleDip(window_, 42));
+      ListView_SetColumnWidth(git_files_, 1, std::max(0, inner_width - ScaleDip(window_, 46)));
+      top += list_height + (diff_height ? gap : 0);
+      place(git_diff_view_, top, diff_height, diff_height > 0);
+      top += diff_height + gap;
+      if (show_actions) {
+        const int third = std::max(0, (inner_width - gap * 2) / 3);
+        int button_x = inner_x;
+        for (HWND button : {git_stage_, git_unstage_, git_diff_}) {
+          MoveWindow(button, button_x, top, third, button_height, TRUE);
+          ShowWindow(button, SW_SHOW);
+          button_x += third + gap;
+        }
+        top += button_height + gap;
+        const int commit_width = std::min(ScaleDip(window_, 76), inner_width / 2);
+        MoveWindow(git_commit_edit_, inner_x, top, std::max(0, inner_width - commit_width - gap), button_height, TRUE);
+        MoveWindow(git_commit_, inner_x + inner_width - commit_width, top, commit_width, button_height, TRUE);
         ShowWindow(git_commit_edit_, SW_SHOW);
         ShowWindow(git_commit_, SW_SHOW);
-        ShowWindow(git_diff_view_, SW_SHOW);
       }
     }
+
   };
   place_panel(left_top, rail_width, 0, tree_width, left_top_height);
   const int left_splitter_offset = show_left_top && show_left_bottom ? splitter_width : 0;
@@ -5328,7 +5471,7 @@ bool Application::EnsureEditor(DocumentView& view) {
   if (view.editor && IsWindow(view.editor)) return true;
   if (view.compact_window) return false;
   view.editor_formatting_rect_request.reset();
-  view.editor = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, nullptr,
+  view.editor = CreateWindowExW(0, MSFTEDIT_CLASS, nullptr,
                                 WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL |
                                     ES_WANTRETURN,
@@ -7973,10 +8116,19 @@ void Application::UpdateStatus() {
     segments[1] = workspace_.empty() ? L"Workspaceを開いてください" : L"準備完了";
     segments[3] = L"UTF-8    LF";
   }
+  std::wstring title = L"MDLite";
+  if (active_document_ < documents_.size()) {
+    const auto& document = documents_[active_document_]->document;
+    title += L" — " + (document.path().empty() ? std::wstring(L"無題") : document.path().filename().wstring());
+    if (document.dirty()) title += L" *";
+  }
+  if (!workspace_.empty()) title += L" — " + workspace_.filename().wstring();
+  if (ControlText(window_) != title) SetWindowTextW(window_, title.c_str());
   SetStatusSegments(std::move(segments));
 }
 
 void Application::ShowFindBar() {
+  active_activity_ = 1;
   ShowWindow(find_bar_, SW_SHOW);
   ShowWindow(find_edit_, SW_SHOW);
   ShowWindow(find_next_, SW_SHOW);
@@ -9354,10 +9506,10 @@ void Application::RenderGitPanel() {
   const bool has_workspace = !workspace_.empty();
   const bool trusted = has_workspace && IsWorkspaceTrusted(workspace_);
   if (!has_workspace) {
-    SetWindowTextW(git_panel_, L"Git   Workspace未選択");
+    SetWindowTextW(git_panel_, L"Workspace未選択\r\nWorkspaceを開くとGit状態を表示します。");
     if (git_diff_view_) SetWindowTextW(git_diff_view_, L"Workspaceを開くとGit状態を表示します。");
   } else if (!trusted) {
-    SetWindowTextW(git_panel_, L"Git   Workspace未信頼");
+    SetWindowTextW(git_panel_, L"Workspaceは未信頼です\r\nGitコマンドの実行には、このWorkspaceの信頼が必要です。内容を確認してから有効にできます。");
     if (git_diff_view_) SetWindowTextW(git_diff_view_, L"Gitを使うにはWorkspaceを信頼してください。");
   } else {
     const wchar_t* state = L"不明";
@@ -9369,7 +9521,7 @@ void Application::RenderGitPanel() {
       case GitPanelState::OperationInProgress: state = L"操作中"; break;
       case GitPanelState::Error: state = L"エラー"; break;
     }
-    std::wstring summary = L"Git   ";
+    std::wstring summary = std::wstring(state) + L"\r\n";
     summary += git_panel_status_.branch.empty() ? state : git_panel_status_.branch;
     if (git_panel_status_.detached_head) summary += L" (detached)";
     if (git_panel_status_.state == GitPanelState::NoRemote) summary += L"  ·  remoteなし";
@@ -9381,8 +9533,16 @@ void Application::RenderGitPanel() {
           git_panel_status_.files, [](const auto& file) { return file.unstaged; }));
       summary += L"   untracked " + std::to_wstring(std::ranges::count_if(
           git_panel_status_.files, [](const auto& file) { return file.untracked; }));
-    } else {
-      summary += L"   working tree clean";
+    } else if (git_panel_status_.state == GitPanelState::Ready ||
+               git_panel_status_.state == GitPanelState::NoRemote) {
+      summary += L"\r\n変更なし（working tree clean）";
+    }
+    if (!git_panel_status_.error.empty()) {
+      summary += L"\r\n";
+      for (const wchar_t character : git_panel_status_.error) {
+        if (character == L'\n' && summary.back() != L'\r') summary.push_back(L'\r');
+        summary.push_back(character);
+      }
     }
     SetWindowTextW(git_panel_, summary.c_str());
     for (std::size_t index{}; index < git_panel_status_.files.size(); ++index) {
@@ -9410,6 +9570,7 @@ void Application::RenderGitPanel() {
   }
   if (git_refresh_) EnableWindow(git_refresh_, trusted);
   UpdateGitPanelActions();
+  LayoutControls();
 }
 
 void Application::UpdateGitPanelActions() {
@@ -9847,13 +10008,13 @@ void Application::UpdateCalendarViewTheme() {
   theme.background = theme_surface_;
   theme.heading_text = theme_foreground_;
   theme.day_text = theme_foreground_;
-  theme.sunday_text = dark_theme_ ? RGB(218, 139, 145) : RGB(170, 64, 70);
+  theme.sunday_text = high_contrast_ ? theme_foreground_ : dark_theme_ ? RGB(218, 139, 145) : RGB(170, 64, 70);
   theme.saturday_text = theme_accent_;
-  theme.holiday_text = dark_theme_ ? RGB(218, 139, 145) : RGB(170, 64, 70);
+  theme.holiday_text = high_contrast_ ? theme_foreground_ : dark_theme_ ? RGB(218, 139, 145) : RGB(170, 64, 70);
   theme.adjacent_month_text = theme_muted_;
   theme.hover_background = theme_surface_alt_;
   theme.selected_background = theme_accent_;
-  theme.selected_text = RGB(255, 255, 255);
+  theme.selected_text = theme_selected_text_;
   theme.today_outline = theme_accent_;
   theme.focus_outline = theme_foreground_;
   theme.navigation_hover_background = theme_surface_alt_;
@@ -9911,8 +10072,8 @@ void Application::UpdateCalendarViewMarkers() {
 void Application::ApplySettings() {
   const bool dark = settings_.theme == ThemeMode::Dark ||
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
-  const COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
-  const COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
+  COLORREF background = ThemeColor(settings_, L"background", dark ? RGB(31, 31, 31) : RGB(255, 255, 255));
+  COLORREF foreground = ThemeColor(settings_, L"foreground", dark ? RGB(230, 230, 230) : RGB(24, 24, 24));
   theme_surface_ = ThemeColor(settings_, L"surface", dark ? RGB(42, 46, 54) : RGB(248, 250, 253));
   theme_surface_alt_ = ThemeColor(settings_, L"surface_alt", dark ? RGB(50, 55, 64) : RGB(241, 245, 249));
   theme_editor_ = ThemeColor(settings_, L"editor_background", dark ? RGB(28, 31, 36) : RGB(252, 253, 255));
@@ -9920,6 +10081,17 @@ void Application::ApplySettings() {
   theme_border_ = ThemeColor(settings_, L"border", dark ? RGB(83, 92, 105) : RGB(210, 218, 228));
   theme_muted_ = ThemeColor(settings_, L"muted", dark ? RGB(170, 180, 194) : RGB(92, 104, 120));
   theme_accent_ = ThemeColor(settings_, L"accent", dark ? RGB(108, 170, 255) : RGB(56, 112, 194));
+  HIGHCONTRASTW contrast{sizeof(contrast)};
+  high_contrast_ = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+                   (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+  theme_selected_text_ = high_contrast_ ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(255, 255, 255);
+  if (high_contrast_) {
+    background = theme_surface_ = theme_editor_ = theme_input_ = GetSysColor(COLOR_WINDOW);
+    foreground = theme_muted_ = GetSysColor(COLOR_WINDOWTEXT);
+    theme_border_ = GetSysColor(COLOR_WINDOWTEXT);
+    theme_surface_alt_ = GetSysColor(COLOR_BTNFACE);
+    theme_accent_ = GetSysColor(COLOR_HIGHLIGHT);
+  }
   HBRUSH replacement_brush = CreateSolidBrush(background);
   if (replacement_brush) {
     if (background_brush_) DeleteObject(background_brush_);
@@ -9943,17 +10115,29 @@ void Application::ApplySettings() {
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
                                   settings_.font_face.c_str());
-  if (replacement) {
+  HFONT ui_replacement = CreateFontW(-ScaleDip(window_, 14), 0, 0, 0, FW_NORMAL,
+      FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+      CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+  if (ui_replacement) {
     for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_,
                          replace_edit_, find_workspace_, replace_workspace_, find_case_, find_regex_,
                          find_word_, find_include_glob_, find_exclude_glob_, replace_one_,
-                         replace_document_, find_results_, calendar_, git_panel_, calendar_details_, panel_headers_[0], panel_headers_[1],
-                         panel_headers_[2], panel_headers_[3]})
-      if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(replacement), TRUE);
+                         replace_document_, find_results_, calendar_, git_panel_, calendar_details_,
+                         calendar_summary_, calendar_daily_, calendar_details_toggle_,
+                         git_files_, git_diff_view_, git_commit_edit_, brand_, command_search_,
+                         tab_new_, tab_close_, activity_buttons_[0], activity_buttons_[1],
+                         activity_buttons_[2], activity_buttons_[3], activity_buttons_[4],
+                         git_refresh_, git_stage_, git_unstage_, git_diff_, git_commit_, git_trust_,
+                         panel_headers_[0], panel_headers_[1], panel_headers_[2], panel_headers_[3]})
+      if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui_replacement), TRUE);
+    HFONT previous = ui_font_;
+    ui_font_ = ui_replacement;
+    if (previous) DeleteObject(previous);
+  }
+  if (replacement)
     for (const auto& view : documents_)
       if (view->editor) SendMessageW(view->editor, WM_SETFONT,
                                      reinterpret_cast<WPARAM>(replacement), TRUE);
-  }
   TreeView_SetBkColor(workspace_tree_, theme_surface_);
   TreeView_SetTextColor(workspace_tree_, foreground);
   TreeView_SetBkColor(outline_, theme_surface_);
@@ -9996,6 +10180,7 @@ void Application::ApplySettings() {
     if (previous) DeleteObject(previous);
   }
   ApplyChromeTheme();
+  LayoutControls();
   InvalidateRect(window_, nullptr, TRUE);
 }
 
@@ -10989,13 +11174,20 @@ void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
   std::wstring output = L"選択日: " + std::to_wstring(selected.year) + L"-" +
       (selected.month < 10 ? L"0" : L"") + std::to_wstring(selected.month) + L"-" +
       (selected.day < 10 ? L"0" : L"") + std::to_wstring(selected.day);
+  std::wstring count = L"文書数: 未取得";
+  const auto publish = [&] {
+    SetWindowTextW(calendar_details_, output.c_str());
+    const std::wstring summary = output.substr(0, output.find(L'\n')) + L"\n" + count;
+    SetWindowTextW(calendar_summary_, summary.c_str());
+    LayoutControls();
+  };
   if (const auto holiday = JapaneseHolidayName(selected.year, selected.month, selected.day))
     output += L"\n祝日: " + std::wstring(*holiday);
   else if (!JapaneseHolidayYearSupported(selected.year))
     output += L"\n祝日: データ収録範囲外（不明）";
   if (workspace_.empty() || !workspace_store_) {
     output += L"\nテキスト一覧: Workspace未選択";
-    SetWindowTextW(calendar_details_, output.c_str());
+    publish();
     return;
   }
 
@@ -11014,11 +11206,17 @@ void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
   if (!profiles_ok || daily.id.empty()) {
     output += L"\nDaily profile: 不明";
     output += L"\nテキスト一覧: 取得できません";
-    SetWindowTextW(calendar_details_, output.c_str());
+    publish();
     return;
   }
 
   const auto details = BuildCalendarDayDetails(workspace_, selected, daily);
+  switch (details.index.state) {
+    case CalendarIndexState::Zero: count = L"文書数: 0件"; break;
+    case CalendarIndexState::Reading: count = L"文書数: 取得中"; break;
+    case CalendarIndexState::Error: count = L"文書数: 読み取りエラー"; break;
+    case CalendarIndexState::Ready: count = L"文書数: " + std::to_wstring(details.index.files.size()) + L"件"; break;
+  }
   switch (details.index.state) {
     case CalendarIndexState::Zero: output += L"\n作成ファイル: 0件"; break;
     case CalendarIndexState::Reading: output += L"\n作成ファイル: 取得中"; break;
@@ -11054,7 +11252,7 @@ void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
     if (!path_error) output += L"\nDaily path: " + relative.generic_wstring();
   }
   if (!details.workspace_index.error.empty()) output += L"\n" + details.workspace_index.error;
-  SetWindowTextW(calendar_details_, output.c_str());
+  publish();
 }
 
 void Application::UpdateCalendarDetails(CalendarDate date) {

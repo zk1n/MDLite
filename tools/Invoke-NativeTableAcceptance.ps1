@@ -30,6 +30,14 @@ public static class MDLiteTableNative {
     public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO {
+        public uint cbSize, flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetGUIThreadInfo(uint threadId, ref GUITHREADINFO info);
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
     [DllImport("user32.dll")]
@@ -46,6 +54,40 @@ public static class MDLiteTableNative {
     public static extern IntPtr SendMessageText(IntPtr window, uint message, IntPtr wparam, string lparam);
     [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessageGetText(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr SendScalarTimeout(IntPtr window, uint message, IntPtr wparam, IntPtr lparam,
+        uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr SendTextTimeout(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam,
+        uint flags, uint timeout, out IntPtr result);
+    [DllImport("kernel32.dll", EntryPoint = "SetLastError")] static extern void ClearLastError(uint error);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    static Exception ReadFailure(IntPtr window, uint message, long field, long offset, uint timeout,
+        System.Diagnostics.Stopwatch elapsed, int error) {
+        uint owner; uint thread = GetWindowThreadProcessId(window, out owner);
+        var failure = new System.ComponentModel.Win32Exception(error, "Bounded table observation failed.");
+        failure.Data["hwnd"] = "0x" + window.ToInt64().ToString("X");
+        failure.Data["message"] = "0x" + message.ToString("X");
+        failure.Data["field"] = field; failure.Data["offset"] = offset;
+        failure.Data["timeout_ms"] = timeout; failure.Data["call_elapsed_ms"] = elapsed.ElapsedMilliseconds;
+        failure.Data["window_alive"] = IsWindow(window); failure.Data["owner_pid"] = owner;
+        failure.Data["owner_thread"] = thread; failure.Data["failure_utc"] = DateTime.UtcNow.ToString("o");
+        return failure;
+    }
+    public static long ReadBounded(IntPtr window, uint message, long wparam, long lparam, uint timeout) {
+        IntPtr result; var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        ClearLastError(0);
+        if (SendScalarTimeout(window, message, new IntPtr(wparam), new IntPtr(lparam), 2, timeout, out result) == IntPtr.Zero)
+            throw ReadFailure(window, message, wparam, lparam, timeout, elapsed, Marshal.GetLastWin32Error());
+        return result.ToInt64();
+    }
+    public static string ReadTextBounded(IntPtr window, int capacity, uint timeout) {
+        IntPtr result; var text = new StringBuilder(capacity); var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        ClearLastError(0);
+        if (SendTextTimeout(window, 0x000D, new IntPtr(capacity), text, 2, timeout, out result) == IntPtr.Zero)
+            throw ReadFailure(window, 0x000D, capacity, 0, timeout, elapsed, Marshal.GetLastWin32Error());
+        return text.ToString();
+    }
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")]
@@ -132,6 +174,8 @@ public static class MDLiteTableNative {
     }
     [DllImport("user32.dll")]
     public static extern short GetKeyState(int key);
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int key);
     [StructLayout(LayoutKind.Sequential)]
     public struct KEYBDINPUT {
         public ushort wVk;
@@ -150,6 +194,24 @@ public static class MDLiteTableNative {
     public struct INPUT {
         public uint type;
         public INPUT_UNION U;
+    }
+    public static INPUT KeyboardInput(ushort vk, ushort scan, uint flags) {
+        return new INPUT { type = 1, U = new INPUT_UNION {
+            ki = new KEYBDINPUT { wVk = vk, wScan = scan, dwFlags = flags }
+        } };
+    }
+    public static INPUT[] PartialKeyReleases(INPUT[] inputs, uint inserted) {
+        var down = new System.Collections.Generic.Dictionary<uint, INPUT>();
+        for (int i = 0; i < inputs.Length && (uint)i < inserted; ++i) {
+            var input = inputs[i];
+            uint key = ((uint)input.U.ki.wVk << 16) | input.U.ki.wScan;
+            if ((input.U.ki.dwFlags & 2) != 0) down.Remove(key);
+            else down[key] = input;
+        }
+        var releases = new System.Collections.Generic.List<INPUT>();
+        foreach (var input in down.Values)
+            releases.Add(KeyboardInput(input.U.ki.wVk, input.U.ki.wScan, input.U.ki.dwFlags | 2));
+        return releases.ToArray();
     }
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint SendInput(uint count, INPUT[] inputs, int size);
@@ -409,8 +471,12 @@ function Enter-InputTarget([IntPtr]$Editor) {
     $foregroundBefore = [MDLiteTableNative]::GetForegroundWindow()
     [uint32]$foregroundBeforePid = 0
     [uint32]$foregroundBeforeThread = [MDLiteTableNative]::GetWindowThreadProcessId($foregroundBefore, [ref]$foregroundBeforePid)
+    $initialThreadInfo = [MDLiteTableNative+GUITHREADINFO]::new()
+    $initialThreadInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($initialThreadInfo)
+    $initialFocusQuery = [MDLiteTableNative]::GetGUIThreadInfo($targetThread, [ref]$initialThreadInfo)
+    $alreadyFocused = $foregroundBefore -eq $topLevel -and $initialFocusQuery -and $initialThreadInfo.hwndFocus -eq $Editor
     $attached = $false
-    if ($targetThread -ne 0 -and $targetThread -ne $currentThread) {
+    if (-not $alreadyFocused -and $targetThread -ne 0 -and $targetThread -ne $currentThread) {
         $attached = [MDLiteTableNative]::AttachThreadInput($currentThread, $targetThread, $true)
     }
     [void][MDLiteTableNative]::BringWindowToTop($topLevel)
@@ -419,9 +485,21 @@ function Enter-InputTarget([IntPtr]$Editor) {
     [uint32]$foregroundAfterPid = 0
     [uint32]$foregroundAfterThread = [MDLiteTableNative]::GetWindowThreadProcessId($foregroundAfter, [ref]$foregroundAfterPid)
     $foregroundTarget = $foregroundAfter -eq $topLevel
-    if ($foregroundTarget) { [void][MDLiteTableNative]::SetFocus($Editor) }
-    $focusAfter = [MDLiteTableNative]::GetFocus()
-    $canSend = $foregroundTarget -and $focusAfter -eq $Editor
+    if ($foregroundTarget -and ($attached -or $targetThread -eq $currentThread)) { [void][MDLiteTableNative]::SetFocus($Editor) }
+    $focusWhileAttached = if ($attached -or $targetThread -eq $currentThread) { [MDLiteTableNative]::GetFocus() } else { $initialThreadInfo.hwndFocus }
+    # Attach only to establish focus. Do not inject into a shared queue and detach before it is processed.
+    $attachedForFocus = $attached
+    $detached = $true
+    if ($attached) {
+        $detached = [MDLiteTableNative]::AttachThreadInput($currentThread, $targetThread, $false)
+        if (-not $detached) { throw 'Could not detach focus-setup queues before OS input; input was not injected.' }
+        $attached = $false
+    }
+    $threadInfo = [MDLiteTableNative+GUITHREADINFO]::new()
+    $threadInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($threadInfo)
+    $focusQuery = [MDLiteTableNative]::GetGUIThreadInfo($targetThread, [ref]$threadInfo)
+    $focusAfter = $threadInfo.hwndFocus
+    $canSend = $detached -and $focusQuery -and [MDLiteTableNative]::GetForegroundWindow() -eq $topLevel -and $focusAfter -eq $Editor
 
     $targetProcess = Get-Process -Id $targetProcessId -ErrorAction SilentlyContinue
     $foregroundProcess = if ($foregroundAfterPid -ne 0) { Get-Process -Id $foregroundAfterPid -ErrorAction SilentlyContinue } else { $null }
@@ -436,6 +514,11 @@ function Enter-InputTarget([IntPtr]$Editor) {
     $context = [pscustomobject]@{
         can_send = $canSend
         attached = $attached
+        attached_for_focus = $attachedForFocus
+        already_focused_without_attachment = $alreadyFocused
+        detached_before_send = $detached
+        target_thread_focus_query_succeeded = $focusQuery
+        focus_while_attached_window = ('0x{0:X}' -f $focusWhileAttached.ToInt64())
         target_window = ('0x{0:X}' -f $topLevel.ToInt64())
         target_pid = $targetProcessId
         target_thread = $targetThread
@@ -469,6 +552,97 @@ function Exit-InputTarget($Target) {
     }
 }
 
+function Get-TableBudgetRemaining([DateTime]$Deadline) {
+    $remaining = [int][Math]::Ceiling(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    if ($remaining -le 0) { throw [TimeoutException]::new('The shared table observation deadline expired.') }
+    return [uint32]$remaining
+}
+function Read-TableScalar([IntPtr]$Main, [uint32]$Message, [long]$Field, [long]$Offset, [DateTime]$Deadline) {
+    return [MDLiteTableNative]::ReadBounded($Main, $Message, $Field, $Offset, (Get-TableBudgetRemaining $Deadline))
+}
+function Get-TableObservationFailure($FailureRecord, [DateTime]$Deadline) {
+    $failureException = $FailureRecord.Exception
+    while ($failureException.InnerException) { $failureException = $failureException.InnerException }
+    if ($failureException -isnot [TimeoutException] -and $failureException -isnot [ComponentModel.Win32Exception]) {
+        throw $FailureRecord
+    }
+    $details = [ordered]@{}
+    foreach ($detailKey in $failureException.Data.Keys) { $details[[string]$detailKey] = $failureException.Data[$detailKey] }
+    $nativeError = if ($failureException -is [ComponentModel.Win32Exception]) { $failureException.NativeErrorCode } else { $null }
+    $deadlineReached = [DateTime]::UtcNow -ge $Deadline
+    $kind = if ($nativeError -eq 1400 -or ($details.Contains('window_alive') -and -not $details.window_alive)) { 'HWND_GONE' }
+        elseif ($deadlineReached -or $failureException -is [TimeoutException]) { 'DEADLINE_REACHED' }
+        elseif ($nativeError -eq 1460) { 'NATIVE_READ_TIMEOUT' } else { 'NATIVE_READ_FAILURE' }
+    return [pscustomobject]@{
+        kind = $kind; exception_type = $failureException.GetType().FullName; message = $failureException.Message
+        native_error = $nativeError; deadline_reached = $deadlineReached; deadline_utc = $Deadline.ToString('o')
+        recorded_utc = [DateTime]::UtcNow.ToString('o'); details = $details
+    }
+}
+function Get-TableInputObservation([IntPtr]$Main, [IntPtr]$Editor, [DateTime]$Deadline) {
+    $revision = Read-TableScalar $Main 0x8045 3 0 $Deadline
+    $length = Read-TableScalar $Main 0x8045 4 0 $Deadline
+    if ($length -lt 0 -or $length -gt 10000) { throw 'Unexpected fixture source length in table observation.' }
+    $modelText = [Text.StringBuilder]::new([int]$length)
+    for ($offset = 0; $offset -lt $length; $offset++) {
+        $unit = Read-TableScalar $Main 0x8045 5 $offset $Deadline
+        if ($unit -lt 0) { break }
+        [void]$modelText.Append([char]$unit)
+    }
+    $nativeLength = Read-TableScalar $Editor $WM_GETTEXTLENGTH 0 0 $Deadline
+    if ($nativeLength -lt 0 -or $nativeLength -gt 10000) { throw 'Unexpected native fixture length.' }
+    $nativeText = [MDLiteTableNative]::ReadTextBounded($Editor, ([int]$nativeLength + 1), (Get-TableBudgetRemaining $Deadline))
+    $nativeSelection = Read-TableScalar $Editor $EM_GETSEL 0 0 $Deadline
+    $selection = [pscustomobject]@{
+        start = Read-TableScalar $Main $kTestGetSourceAnchorMessage 0 0 $Deadline
+        end = Read-TableScalar $Main $kTestGetSourceActiveMessage 0 0 $Deadline
+    }
+    $result = [pscustomobject]@{
+        utc = [DateTime]::UtcNow.ToString('o'); source = $modelText.ToString(); source_length = $length
+        native_text = $nativeText; selection = $selection
+        native_selection = [pscustomobject]@{ start = $nativeSelection -band 0xffff; end = ($nativeSelection -shr 16) -band 0xffff }
+        readiness = Read-TableScalar $Main $kTestGetEditorReadinessMessage 0 0 $Deadline
+        dirty = Read-TableScalar $Main 0x8045 0 0 $Deadline
+        undo = Read-TableScalar $Main 0x8045 1 0 $Deadline
+        redo = Read-TableScalar $Main 0x8045 2 0 $Deadline
+        revision = $revision; saved_revision = Read-TableScalar $Main 0x8045 6 0 $Deadline
+        consistent = $false
+    }
+    $result.consistent = (Read-TableScalar $Main 0x8045 3 0 $Deadline) -eq $revision -and
+        (Read-TableScalar $Main 0x8045 4 0 $Deadline) -eq $length -and $modelText.Length -eq $length
+    return $result
+}
+function Test-ExactUnicodeObservation($Observation, [string]$Expected, [DateTime]$Deadline) {
+    return [DateTime]::UtcNow -lt $Deadline -and $Observation.consistent -and
+        ($Observation.readiness -band 7) -eq 7 -and ($Observation.readiness -band 248) -eq 0 -and
+        $Observation.source -ceq $Expected -and $Observation.selection.start -eq $Expected.Length -and
+        $Observation.selection.end -eq $Expected.Length
+}
+
+$script:inputCleanupUnconfirmed = $false
+function Send-KeyboardInputBatch([MDLiteTableNative+INPUT[]]$Inputs) {
+    # Do not release a key that was already held before this harness batch.
+    foreach ($inputEvent in $Inputs) {
+        if ($inputEvent.U.ki.wVk -ne 0 -and ($inputEvent.U.ki.dwFlags -band 2) -eq 0 -and
+            [MDLiteTableNative]::GetAsyncKeyState($inputEvent.U.ki.wVk) -lt 0) {
+            return [pscustomobject]@{sent=0;expected=$Inputs.Length;sendinput_called=$false;error=0;status='BLOCKED_PREEXISTING_KEY_STATE';cleanup_expected=0;cleanup_sent=0;cleanup_queue_confirmed=$true}
+        }
+    }
+    $sent = [MDLiteTableNative]::SendInput($Inputs.Length, $Inputs, [Runtime.InteropServices.Marshal]::SizeOf($Inputs[0]))
+    $errorCode = if ($sent -eq $Inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+    $cleanupExpected = 0; $cleanupSent = 0
+    if ($sent -lt $Inputs.Length) {
+        $releases = [MDLiteTableNative]::PartialKeyReleases($Inputs, $sent)
+        $cleanupExpected = $releases.Length
+        if ($cleanupExpected -gt 0) {
+            $cleanupSent = [MDLiteTableNative]::SendInput($cleanupExpected, $releases, [Runtime.InteropServices.Marshal]::SizeOf($releases[0]))
+        }
+    }
+    $cleanupConfirmed = $cleanupSent -eq $cleanupExpected
+    if (-not $cleanupConfirmed) { $script:inputCleanupUnconfirmed = $true }
+    [pscustomobject]@{sent=$sent;expected=$Inputs.Length;sendinput_called=$true;error=$errorCode;status=if(-not $cleanupConfirmed){'BLOCKED_KEY_UP_CLEANUP_UNCONFIRMED'}elseif($sent -eq $Inputs.Length){'QUEUED_EFFECT_UNPROVEN'}else{'BLOCKED_SENDINPUT'};cleanup_expected=$cleanupExpected;cleanup_sent=$cleanupSent;cleanup_queue_confirmed=$cleanupConfirmed}
+}
+
 function Send-UnicodeCharacters([IntPtr]$Editor, [string]$Text) {
     $target = Enter-InputTarget $Editor
     if (-not $target.can_send) {
@@ -476,26 +650,41 @@ function Send-UnicodeCharacters([IntPtr]$Editor, [string]$Text) {
     }
     $inputs = [MDLiteTableNative+INPUT[]]::new($Text.Length * 2)
     for ($index = 0; $index -lt $Text.Length; $index++) {
-        $down = $index * 2; $up = $down + 1; $inputs[$down].type = 1; $inputs[$down].U = [MDLiteTableNative+INPUT_UNION]::new(); $inputs[$down].U.ki.wScan = [uint16][int]$Text[$index]; $inputs[$down].U.ki.dwFlags = $KEYEVENTF_UNICODE
-        $inputs[$up].type = 1; $inputs[$up].U = [MDLiteTableNative+INPUT_UNION]::new(); $inputs[$up].U.ki.wScan = [uint16][int]$Text[$index]; $inputs[$up].U.ki.dwFlags = $KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP
+        $down = $index * 2; $up = $down + 1
+        $inputs[$down] = [MDLiteTableNative]::KeyboardInput(0, [uint16][int]$Text[$index], $KEYEVENTF_UNICODE)
+        $inputs[$up] = [MDLiteTableNative]::KeyboardInput(0, [uint16][int]$Text[$index], ($KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP))
     }
-    $sent = [MDLiteTableNative]::SendInput($inputs.Length, $inputs, [Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); $errorCode = if ($sent -eq $inputs.Length) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }; Exit-InputTarget $target
-    [pscustomobject]@{ sent=$sent; expected=$inputs.Length; sendinput_called=$true; error=$errorCode; status=if($sent -eq $inputs.Length){'PASS'}else{'BLOCKED_SENDINPUT'}; target_context=$target }
+
+    $delivery = Send-KeyboardInputBatch $inputs; Exit-InputTarget $target
+    $delivery | Add-Member NoteProperty target_context $target
+    $delivery
 }
 
 function Send-ControlKey([IntPtr]$Editor, [int]$Key) {
     $target = Enter-InputTarget $Editor; if (-not $target.can_send) { return [pscustomobject]@{ sent=0; expected=4; sendinput_called=$false; status='BLOCKED_FOREGROUND_NOT_ESTABLISHED'; target_context=$target } }
-    $inputs = [MDLiteTableNative+INPUT[]]::new(4); for ($index=0; $index -lt 4; $index++) { $inputs[$index].type=1; $inputs[$index].U=[MDLiteTableNative+INPUT_UNION]::new() }
-    $inputs[0].U.ki.wVk=[uint16]$VK_CONTROL; $inputs[1].U.ki.wVk=[uint16]$Key; $inputs[2].U.ki.wVk=[uint16]$Key; $inputs[2].U.ki.dwFlags=$KEYEVENTF_KEYUP; $inputs[3].U.ki.wVk=[uint16]$VK_CONTROL; $inputs[3].U.ki.dwFlags=$KEYEVENTF_KEYUP
-    $sent=[MDLiteTableNative]::SendInput(4,$inputs,[Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); $errorCode=if($sent -eq 4){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}; Exit-InputTarget $target
-    [pscustomobject]@{ sent=$sent; expected=4; sendinput_called=$true; error=$errorCode; status=if($sent -eq 4){'PASS'}else{'BLOCKED_SENDINPUT'}; target_context=$target }
+    $inputs = [MDLiteTableNative+INPUT[]]@(
+        [MDLiteTableNative]::KeyboardInput([uint16]$VK_CONTROL, 0, 0)
+        [MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, 0)
+        [MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, $KEYEVENTF_KEYUP)
+        [MDLiteTableNative]::KeyboardInput([uint16]$VK_CONTROL, 0, $KEYEVENTF_KEYUP)
+    )
+
+    $delivery = Send-KeyboardInputBatch $inputs; Exit-InputTarget $target
+    $delivery | Add-Member NoteProperty target_context $target
+    $delivery
 }
 
 function Send-KeyRepeat([IntPtr]$Editor, [int]$Key, [int]$Repeat) {
     $target = Enter-InputTarget $Editor; if (-not $target.can_send) { return [pscustomobject]@{ sent=0; expected=$Repeat*2; sendinput_called=$false; status='BLOCKED_FOREGROUND_NOT_ESTABLISHED'; target_context=$target } }
-    $inputs=[MDLiteTableNative+INPUT[]]::new($Repeat*2); for($index=0;$index -lt $Repeat;$index++){ $down=$index*2; $up=$down+1; $inputs[$down].type=1; $inputs[$down].U=[MDLiteTableNative+INPUT_UNION]::new(); $inputs[$down].U.ki.wVk=[uint16]$Key; $inputs[$up].type=1; $inputs[$up].U=[MDLiteTableNative+INPUT_UNION]::new(); $inputs[$up].U.ki.wVk=[uint16]$Key; $inputs[$up].U.ki.dwFlags=$KEYEVENTF_KEYUP }
-    $sent=[MDLiteTableNative]::SendInput($inputs.Length,$inputs,[Runtime.InteropServices.Marshal]::SizeOf($inputs[0])); $errorCode=if($sent -eq $inputs.Length){0}else{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}; Exit-InputTarget $target
-    [pscustomobject]@{ sent=$sent; expected=$inputs.Length; sendinput_called=$true; error=$errorCode; status=if($sent -eq $inputs.Length){'PASS'}else{'BLOCKED_SENDINPUT'}; target_context=$target }
+    $inputs=[MDLiteTableNative+INPUT[]]::new($Repeat*2)
+    for($index=0;$index -lt $Repeat;$index++){
+        $inputs[$index*2]=[MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, 0)
+        $inputs[$index*2+1]=[MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, $KEYEVENTF_KEYUP)
+    }
+
+    $delivery = Send-KeyboardInputBatch $inputs; Exit-InputTarget $target
+    $delivery | Add-Member NoteProperty target_context $target
+    $delivery
 }
 function Send-ShiftKey([IntPtr]$Editor, [int]$Key) {
     $target = Enter-InputTarget $Editor
@@ -503,21 +692,16 @@ function Send-ShiftKey([IntPtr]$Editor, [int]$Key) {
         return [pscustomobject]@{ sent = 0; expected = 4; sendinput_called = $false; status = 'BLOCKED_FOREGROUND_NOT_ESTABLISHED'; target_context = $target }
     }
     try {
-        $inputs = [MDLiteTableNative+INPUT[]]::new(4)
-        for ($index = 0; $index -lt $inputs.Length; $index++) {
-            $inputs[$index].type = 1
-            $inputs[$index].U = [MDLiteTableNative+INPUT_UNION]::new()
-        }
-        $inputs[0].U.ki.wVk = [uint16]$VK_SHIFT
-        $inputs[1].U.ki.wVk = [uint16]$Key
-        $inputs[2].U.ki.wVk = [uint16]$Key
-        $inputs[2].U.ki.dwFlags = 0x0002
-        $inputs[3].U.ki.wVk = [uint16]$VK_SHIFT
-        $inputs[3].U.ki.dwFlags = 0x0002
-        $sent = [MDLiteTableNative]::SendInput(4, $inputs, [Runtime.InteropServices.Marshal]::SizeOf($inputs[0]))
-        $errorCode = if ($sent -eq 4) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+        $inputs = [MDLiteTableNative+INPUT[]]@(
+            [MDLiteTableNative]::KeyboardInput([uint16]$VK_SHIFT, 0, 0)
+            [MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, 0)
+            [MDLiteTableNative]::KeyboardInput([uint16]$Key, 0, $KEYEVENTF_KEYUP)
+            [MDLiteTableNative]::KeyboardInput([uint16]$VK_SHIFT, 0, $KEYEVENTF_KEYUP)
+        )
+        $delivery = Send-KeyboardInputBatch $inputs
         Start-Sleep -Milliseconds 150
-        return [pscustomobject]@{ sent = $sent; expected = 4; sendinput_called = $true; error = $errorCode; status = if ($sent -eq 4) { 'PASS' } else { 'BLOCKED_SENDINPUT' }; target_context = $target }
+        $delivery | Add-Member NoteProperty target_context $target
+        return $delivery
     }
     finally {
         Exit-InputTarget $target
@@ -572,6 +756,10 @@ function Save-NativeTableFrame([IntPtr]$Window, [string]$Name) {
 }
 
 function Invoke-TableCase([string]$Name, [scriptblock]$Action) {
+    if ($script:inputCleanupUnconfirmed) {
+        $checks[$Name] = [pscustomobject]@{pass=$false;status='BLOCKED_KEY_UP_CLEANUP_UNCONFIRMED'}
+        return
+    }
     $workspace = Join-Path $runRoot $Name
     [IO.Directory]::CreateDirectory((Join-Path $workspace '.mdlite')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $workspace '.mdlite\settings.toml'),
@@ -873,17 +1061,20 @@ try {
     Invoke-TableCase 'shift_tab_previous_cell' {
         param($main, $editor, $path)
         Set-Selection $editor $two
+        $beforeSelection = Get-Selection $editor
+        if ($beforeSelection.start -ne $two -or $beforeSelection.end -ne $two) { throw 'Shift+Tab initial source selection did not match the second cell.' }
         $input = Send-ShiftKey $editor $VK_TAB
-        if ($input.status -ne 'PASS') {
+        if ($input.status -ne 'QUEUED_EFFECT_UNPROVEN') {
             return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $input; reason = 'OS Shift+Tab was not delivered to the target RichEdit.' }
         }
         $selection = Get-Selection $editor
         $saved = Save-Source $main $path
         $pass = $selection.start -eq $one -and $selection.end -eq $one -and $saved -eq $source
         if (-not $pass) {
-            return [pscustomobject]@{ pass = $false; status = 'FAIL'; reason = 'OS Shift+Tab was delivered, but the selection/source result did not match the previous cell'; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
+            $unchanged = $selection.start -eq $beforeSelection.start -and $selection.end -eq $beforeSelection.end -and $saved -eq $source
+            return [pscustomobject]@{ pass = $false; status = if ($unchanged) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' } else { 'FAIL_NAVIGATION_AFTER_OBSERVED_OS_INPUT' }; reason = 'Queued OS Shift+Tab did not produce the expected previous-cell source selection'; before_selection = $beforeSelection; delivery = $input; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
         }
-        [pscustomobject]@{ pass = $true; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
+        [pscustomobject]@{ pass = $true; status = 'PASS_OBSERVED_OS_SHIFT_TAB'; before_selection = $beforeSelection; delivery = $input; actual_start = $selection.start; actual_end = $selection.end; expected = $one; saved = $saved }
     }
     Invoke-TableCase 'arrow_right_boundary' {
         param($main, $editor, $path)
@@ -914,21 +1105,74 @@ try {
     Invoke-TableCase 'continuous_unicode_input_no_accumulation' {
         param($main, $editor, $path, $process)
         $payload = ('日本語' + [char]0xd83d + [char]0xde00 + 'e' + [char]0x0301) * 16
-        Set-Selection $editor $nativeView.Length
+        Set-Selection $editor $source.Length
+        $beforeSelection = Get-Selection $editor
+        if ($beforeSelection.start -ne $source.Length -or $beforeSelection.end -ne $source.Length) { throw 'Unicode append initial selection is not the exact source end.' }
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        try { $before = Get-TableInputObservation $main $editor $deadline }
+        catch {
+            $failure = Get-TableObservationFailure $_ $deadline
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED_UNICODE_BASELINE_OBSERVATION'; stage = 'baseline'; observation_failure = $failure; input_sent = $false; before_selection = $beforeSelection }
+        }
+        if (-not $before.consistent -or $before.source -cne $source -or ($before.readiness -band 7) -ne 7) {
+            return [pscustomobject]@{ pass = $false; status = 'FAIL_UNICODE_BASELINE_NOT_READY'; stage = 'baseline'; before = $before; input_sent = $false }
+        }
         $input = Send-UnicodeCharacters $editor $payload
-        if ($input.status -ne 'PASS') {
+        if ($input.status -ne 'QUEUED_EFFECT_UNPROVEN') {
             return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $input; reason = 'OS Unicode input was not delivered to the target RichEdit.' }
         }
-        Start-Sleep -Milliseconds 250
-        $saved = Save-Source $main $path
+        $expected = $source + $payload
+        $observations = [Collections.Generic.List[object]]::new()
+        $frames = [Collections.Generic.List[object]]::new()
+        $after = $null; $saved = $null; $ready = $false; $savedExact = $false; $timeoutReason = $null
+        $failure = $null; $stage = 'post_input_observation'
+        try {
+            do {
+                $after = Get-TableInputObservation $main $editor $deadline
+                $observations.Add($after)
+                if ($observations.Count -eq 1) {
+                    $frames.Add((Save-NativeTableFrame $main 'unicode-first-observation'))
+                }
+                $ready = Test-ExactUnicodeObservation $after $expected $deadline
+                if ($ready) { break }
+                Start-Sleep -Milliseconds ([Math]::Min(50, (Get-TableBudgetRemaining $deadline)))
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($ready) {
+                $frames.Add((Save-NativeTableFrame $main 'unicode-ready-before-save'))
+                # Save only the proven complete input, then observe its actual model/disk result.
+                $stage = 'save_dispatch'
+                [void](Read-TableScalar $main $WM_COMMAND $kFileSave 0 $deadline)
+                $stage = 'save_result_observation'
+                do {
+                    $saved = [IO.File]::ReadAllText($path)
+                    $savedExact = $saved -ceq $expected -and
+                        (Read-TableScalar $main 0x8045 0 0 $deadline) -eq 0 -and
+                        (Read-TableScalar $main 0x8045 6 0 $deadline) -eq $after.revision
+                    if ($savedExact) { break }
+                    Start-Sleep -Milliseconds ([Math]::Min(50, (Get-TableBudgetRemaining $deadline)))
+                } while ([DateTime]::UtcNow -lt $deadline)
+            }
+        } catch {
+            $failure = Get-TableObservationFailure $_ $deadline
+            $timeoutReason = $failure.message
+        }
+        $historyObserved = $null -ne $after -and $after.undo -gt $before.undo -and
+            $after.revision -gt $before.revision -and $after.redo -eq 0
+        $pixelsCaptured = $frames.Count -eq 2 -and @($frames | Where-Object status -ne 'CAPTURED_NATIVE_WINDOW').Count -eq 0
+        $pass = $ready -and $savedExact -and $historyObserved -and $pixelsCaptured -and
+            $null -eq $timeoutReason -and [DateTime]::UtcNow -lt $deadline
         [pscustomobject]@{
-            pass = $saved -eq ($source + $payload)
-            status = if ($saved -eq ($source + $payload)) { 'PASS_OS_INPUT_NO_IME' }
-                elseif ($saved -eq $source) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
-                else { 'FAIL_SOURCE_AFTER_OBSERVED_OS_INPUT' }
+            pass = $pass
+            status = if ($pass) { 'PASS_OBSERVED_OS_UNICODE_INPUT' }
+                elseif ($failure -and $failure.kind -in @('NATIVE_READ_TIMEOUT','NATIVE_READ_FAILURE')) { 'BLOCKED_UNICODE_NATIVE_OBSERVATION' }
+                else { 'FAIL_UNICODE_OBSERVATION_OR_SAVE' }
             delivery = $input
-            expected_length = ($source + $payload).Length
-            actual_length = $saved.Length
+            expected_length = $expected.Length; actual_length = if ($null -ne $saved) { $saved.Length } else { $null }
+            before_selection = $beforeSelection; after_selection = if ($after) { $after.selection } else { $null }; expected_caret = $expected.Length
+            budget_ms = 10000; deadline_utc = $deadline.ToString('o'); timeout_reason = $timeoutReason
+            before = $before; observations = $observations.ToArray(); frames = $frames.ToArray()
+            last_observed_state = $after; observation_failure = $failure; stage = $stage
+            exact_input_ready_before_save = $ready; history_observed = $historyObserved; saved_exact = $savedExact
         }
     }
     Invoke-TableCase 'ctrl_z_single_transaction' {
@@ -940,14 +1184,14 @@ try {
         Invoke-Command $main $kTableColumnAfter
         $afterTwo = Save-Source $main $path
         $firstInput = Send-ControlKey $editor $VK_Z
-        if ($firstInput.status -ne 'PASS') {
+        if ($firstInput.status -ne 'QUEUED_EFFECT_UNPROVEN') {
             return [pscustomobject]@{ pass = $false; status = $firstInput.status; delivery = $firstInput; reason = 'OS Ctrl+Z was not delivered to the target RichEdit.' }
         }
         Start-Sleep -Milliseconds 150
         $undoOne = Save-Source $main $path
         Start-Sleep -Milliseconds 100
         $secondInput = Send-ControlKey $editor $VK_Z
-        if ($secondInput.status -ne 'PASS') {
+        if ($secondInput.status -ne 'QUEUED_EFFECT_UNPROVEN') {
             return [pscustomobject]@{ pass = $false; status = $secondInput.status; delivery = $secondInput; reason = 'Second OS Ctrl+Z was not delivered to the target RichEdit.' }
         }
         Start-Sleep -Milliseconds 150
@@ -967,17 +1211,67 @@ try {
     Invoke-TableCase 'arrow_repeat_boundary' {
         param($main, $editor, $path, $process)
         Set-Selection $editor ($one + 3)
-        $input = Send-KeyRepeat $editor $VK_RIGHT 8
-        if ($input.status -ne 'PASS') {
-            return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $input; reason = 'OS arrow repeat was not delivered to the target RichEdit.' }
+        $beforeSelection = Get-Selection $editor
+        if ($beforeSelection.start -ne ($one + 3) -or $beforeSelection.end -ne $beforeSelection.start) { throw 'Arrow-repeat initial source selection did not match the first-cell boundary.' }
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        try { $before = Get-TableInputObservation $main $editor $deadline }
+        catch {
+            $failure = Get-TableObservationFailure $_ $deadline
+            return [pscustomobject]@{ pass = $false; status = 'BLOCKED_ARROW_BASELINE_OBSERVATION'; stage = 'baseline'; observation_failure = $failure; input_sent = $false; before_selection = $beforeSelection }
         }
-        Start-Sleep -Milliseconds 150
-        $selection = Get-Selection $editor
-        $saved = Save-Source $main $path
-        $pass = $saved -eq $source -and $selection.start -ge $two -and $selection.end -eq $selection.start -and $selection.start -lt $three
+        $steps = [Collections.Generic.List[object]]::new()
+        $deliveries = [Collections.Generic.List[object]]::new()
+        $after = $before; $saved = $null; $timeoutReason = $null; $failure = $null; $stage = 'per_key_observation'
+        $monotonic = $true; $sourceHistoryUnchanged = $true
+        try {
+            for ($press = 1; $press -le 8; $press++) {
+                $beforeStep = $after
+                $input = Send-KeyRepeat $editor $VK_RIGHT 1
+                $deliveries.Add($input)
+                if ($input.status -ne 'QUEUED_EFFECT_UNPROVEN') {
+                    return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $deliveries.ToArray(); steps = $steps.ToArray(); reason = 'OS arrow input was not queued for the target RichEdit.' }
+                }
+                $effectObserved = $false
+                do {
+                    $after = Get-TableInputObservation $main $editor $deadline
+                    $effectObserved = $after.native_selection.start -ne $beforeStep.native_selection.start -or
+                        $after.native_selection.end -ne $beforeStep.native_selection.end
+                    if ($effectObserved -and $after.consistent -and ($after.readiness -band 7) -eq 7) { break }
+                    Start-Sleep -Milliseconds ([Math]::Min(25, (Get-TableBudgetRemaining $deadline)))
+                } while ([DateTime]::UtcNow -lt $deadline)
+                $validStep = $after.consistent -and ($after.readiness -band 7) -eq 7 -and $effectObserved -and
+                    $after.selection.start -ge $beforeStep.selection.start -and $after.selection.start -ge 0 -and
+                    $after.selection.start -le $source.Length -and $after.selection.end -eq $after.selection.start
+                $monotonic = $monotonic -and $validStep
+                $sourceHistoryUnchanged = $sourceHistoryUnchanged -and $after.source -ceq $source -and
+                    $after.revision -eq $before.revision -and $after.undo -eq $before.undo -and
+                    $after.redo -eq $before.redo -and $after.dirty -eq $before.dirty
+                $steps.Add([pscustomobject]@{
+                    press = $press; before = $beforeStep; after = $after; native_effect_observed = $effectObserved
+                    supplemental_monotonic = $validStep; crossed_next_row = $beforeStep.selection.start -lt $three -and $after.selection.start -ge $three
+                })
+            }
+            $stage = 'save_dispatch'
+            [void](Read-TableScalar $main $WM_COMMAND $kFileSave 0 $deadline)
+            $saved = [IO.File]::ReadAllText($path)
+        } catch {
+            $failure = Get-TableObservationFailure $_ $deadline
+            $timeoutReason = $failure.message
+        }
+        $selection = $after.selection
+        # Preserve the documented same-row oracle pending Root's contract refinement.
+        # Monotonic per-key navigation is supplemental evidence, never a replacement PASS.
+        $sameRow = $selection.start -ge $two -and $selection.end -eq $selection.start -and $selection.start -lt $three
+        $supplemental = $steps.Count -eq 8 -and $monotonic -and $sourceHistoryUnchanged -and $saved -ceq $source -and
+            $null -eq $timeoutReason -and [DateTime]::UtcNow -lt $deadline
+        $pass = $sameRow -and $supplemental
         [pscustomobject]@{ pass = $pass; status = if ($pass) { 'PASS_OS_INPUT_BOUNDARY' }
+            elseif ($failure -and $failure.kind -in @('NATIVE_READ_TIMEOUT','NATIVE_READ_FAILURE')) { 'BLOCKED_ARROW_NATIVE_OBSERVATION' }
             elseif ($selection.start -eq ($one + 3) -and $selection.end -eq $selection.start -and $saved -eq $source) { 'BLOCKED_INPUT_DELIVERY_UNPROVEN' }
-            else { 'FAIL_BOUNDARY_AFTER_OBSERVED_OS_INPUT' }; delivery = $input; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved }
+            else { 'FAIL_BOUNDARY_AFTER_OBSERVED_OS_INPUT' }; delivery = $deliveries.ToArray(); before_selection = $beforeSelection; actual_start = $selection.start; actual_end = $selection.end; first_cell = $two; next_row = $three; saved = $saved
+            documented_same_row_criterion = $sameRow; supplemental_monotonic_source_navigation = $supplemental
+            steps = $steps.ToArray(); before = $before; budget_ms = 10000; timeout_reason = $timeoutReason
+            last_observed_state = $after; observation_failure = $failure; stage = $stage }
     }
     Invoke-TableCase 'table_paint_reentry' {
         param($main, $editor, $path, $process)

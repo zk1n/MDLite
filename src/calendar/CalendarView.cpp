@@ -46,6 +46,7 @@ struct CalendarViewWindowState {
       : interaction(initial_today) {}
 
   CalendarViewTheme theme;
+  HFONT font{};
   CalendarViewInteraction interaction;
   bool tracking_mouse{};
   bool suppress_mouse_leave_tracking_for_test{};
@@ -81,13 +82,13 @@ void InvalidateVisibleDate(HWND view, CalendarDate date) noexcept {
   const auto dates = GetCalendarViewMonthDates(*month);
   const auto found = std::ranges::find(dates, std::optional<CalendarDate>{date});
   if (found == dates.end()) return;
-  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
   const auto index = static_cast<std::size_t>(found - dates.begin());
   InvalidateRectWithoutErase(view, geometry.date_cells[index]);
 }
 
 void InvalidateMonthBody(HWND view) noexcept {
-  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
   InvalidateRectWithoutErase(view, geometry.header);
   InvalidateRectWithoutErase(view, geometry.weekdays);
   InvalidateRectWithoutErase(view, geometry.grid);
@@ -159,9 +160,9 @@ void NotifyDateSelected(HWND view, CalendarDate date) noexcept {
                reinterpret_cast<LPARAM>(&notification));
 }
 
-void DrawMarker(HDC dc, const RECT& cell, COLORREF color, int position, int count) noexcept {
-  constexpr int kMarkerSize = 3;
-  constexpr int kMarkerGap = 2;
+void DrawMarker(HDC dc, const RECT& cell, COLORREF color, int position, int count, UINT dpi) noexcept {
+  const int kMarkerSize = std::max(1, MulDiv(3, static_cast<int>(dpi), 96));
+  const int kMarkerGap = std::max(1, MulDiv(2, static_cast<int>(dpi), 96));
   const int total_width = count * kMarkerSize + std::max(0, count - 1) * kMarkerGap;
   const int left = (cell.left + cell.right - total_width) / 2 +
                    position * (kMarkerSize + kMarkerGap);
@@ -171,8 +172,12 @@ void DrawMarker(HDC dc, const RECT& cell, COLORREF color, int position, int coun
 
 void DrawView(HWND view, CalendarViewWindowState& state, const PAINTSTRUCT& paint) {
   HDC dc = paint.hdc;
+  const UINT dpi = GetDpiForWindow(view);
+  const auto dip = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
+  const int saved = SaveDC(dc);
+  SelectObject(dc, state.font ? state.font : GetStockObject(DEFAULT_GUI_FONT));
   const auto client = ClientRect(view);
-  const auto geometry = CalculateCalendarViewGeometry(client);
+  const auto geometry = CalculateCalendarViewGeometry(client, GetDpiForWindow(view));
   const auto month = state.interaction.displayed_month();
   const auto dates = GetCalendarViewMonthDates(month);
 
@@ -181,7 +186,10 @@ void DrawView(HWND view, CalendarViewWindowState& state, const PAINTSTRUCT& pain
   if (RectsIntersect(geometry.header, paint.rcPaint)) {
     const auto title = std::to_wstring(month.year) + L"年 " +
                        std::to_wstring(month.month) + L"月";
-    DrawCenteredText(dc, geometry.header, title, state.theme.heading_text);
+    RECT title_rect = geometry.header;
+    title_rect.left = geometry.previous_month_button.right;
+    title_rect.right = geometry.next_month_button.left;
+    DrawCenteredText(dc, title_rect, title, state.theme.heading_text);
     if (state.hovered_navigation < 0) {
       FillColor(dc, geometry.previous_month_button,
                 state.theme.navigation_hover_background);
@@ -247,9 +255,9 @@ void DrawView(HWND view, CalendarViewWindowState& state, const PAINTSTRUCT& pain
     DrawCenteredText(dc, geometry.date_cells[index], std::to_wstring(date.day), day_color);
     const int marker_count = static_cast<int>(is_holiday) + static_cast<int>(is_daily);
     if (is_holiday) DrawMarker(dc, geometry.date_cells[index], state.theme.holiday_marker,
-                               0, marker_count);
+                               0, marker_count, dpi);
     if (is_daily) DrawMarker(dc, geometry.date_cells[index], state.theme.daily_marker,
-                             is_holiday ? 1 : 0, marker_count);
+                             is_holiday ? 1 : 0, marker_count, dpi);
     if (is_hovered && is_selected) {
       FrameColor(dc, geometry.date_cells[index], state.theme.hover_background, 4);
     }
@@ -263,23 +271,24 @@ void DrawView(HWND view, CalendarViewWindowState& state, const PAINTSTRUCT& pain
       InflateRect(&hover, -4, -2);
       FillColor(dc, hover, state.theme.hover_background);
     }
-    const int icon_left = geometry.today_action.left + 12;
+    const int icon_left = geometry.today_action.left + dip(12);
     const int icon_top = geometry.today_action.top +
-                         ((geometry.today_action.bottom - geometry.today_action.top) - 12) / 2;
-    const RECT icon{icon_left, icon_top, icon_left + 12, icon_top + 12};
+                         ((geometry.today_action.bottom - geometry.today_action.top) - dip(12)) / 2;
+    const RECT icon{icon_left, icon_top, icon_left + dip(12), icon_top + dip(12)};
     FrameColor(dc, icon, state.theme.today_outline, 0);
-    FillColor(dc, {icon_left + 2, icon_top + 4, icon_left + 10, icon_top + 5},
+    FillColor(dc, {icon_left + dip(2), icon_top + dip(4), icon_left + dip(10), icon_top + dip(5)},
               state.theme.today_outline);
     const CalendarDate today = state.interaction.today();
     wchar_t label[48]{};
     swprintf_s(label, L"今日: %04d/%02d/%02d", today.year, today.month, today.day);
     SetTextColor(dc, state.theme.heading_text);
     SetBkMode(dc, TRANSPARENT);
-    RECT text_rect{icon_left + 22, geometry.today_action.top,
-                   geometry.today_action.right - 8, geometry.today_action.bottom};
+    RECT text_rect{icon_left + dip(22), geometry.today_action.top,
+                   geometry.today_action.right - dip(8), geometry.today_action.bottom};
     DrawTextW(dc, label, -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
   }
+  if (saved) RestoreDC(dc, saved);
 }
 
 void SetHoveredDate(HWND view, CalendarViewWindowState& state,
@@ -295,7 +304,7 @@ void SetHoveredDate(HWND view, CalendarViewWindowState& state,
 void SetHoveredNavigation(HWND view, CalendarViewWindowState& state, int navigation) noexcept {
   navigation = std::clamp(navigation, -1, 1);
   if (state.hovered_navigation == navigation) return;
-  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+  const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
   if (state.hovered_navigation < 0) {
     InvalidateRectWithoutErase(view, geometry.previous_month_button);
   } else if (state.hovered_navigation > 0) {
@@ -329,7 +338,7 @@ void SelectToday(HWND view, CalendarViewWindowState& state) noexcept {
     InvalidateVisibleDate(view, today);
   }
   if (old_selection != std::optional<CalendarDate>{today}) NotifyDateSelected(view, today);
-  InvalidateRectWithoutErase(view, CalculateCalendarViewGeometry(ClientRect(view)).today_action);
+  InvalidateRectWithoutErase(view, CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view)).today_action);
 }
 
 LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
@@ -378,7 +387,7 @@ LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
         state->tracking_mouse = TrackMouseEvent(&tracking) != FALSE;
       }
       const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-      const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+      const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
       const bool hovering_today = PtInRect(&geometry.today_action, point) != FALSE;
       if (state->hovered_today_action != hovering_today) {
         state->hovered_today_action = hovering_today;
@@ -401,7 +410,7 @@ LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
         if (state->hovered_today_action) {
           state->hovered_today_action = false;
           InvalidateRectWithoutErase(view,
-                                    CalculateCalendarViewGeometry(ClientRect(view)).today_action);
+                                    CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view)).today_action);
         }
         SetHoveredDate(view, *state, std::nullopt);
         SetHoveredNavigation(view, *state, 0);
@@ -415,7 +424,7 @@ LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
       if (!state) break;
       if (GetCapture() == view) ReleaseCapture();
       const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-      const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+      const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
       if (PtInRect(&geometry.today_action, point)) {
         SelectToday(view, *state);
         return 0;
@@ -452,6 +461,14 @@ LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
       }
       return 0;
     }
+    case WM_SETFONT:
+      if (state) {
+        state->font = reinterpret_cast<HFONT>(wparam);
+        if (lparam) InvalidateRect(view, nullptr, FALSE);
+      }
+      return 0;
+    case WM_GETFONT:
+      return state ? reinterpret_cast<LRESULT>(state->font) : 0;
     case WM_SETFOCUS:
       if (state) {
         const auto date = state->interaction.focused_date();
@@ -516,19 +533,20 @@ LRESULT CALLBACK CalendarViewWindowProc(HWND view, UINT message, WPARAM wparam,
 
 }  // namespace
 
-CalendarViewGeometry CalculateCalendarViewGeometry(RECT client) noexcept {
+CalendarViewGeometry CalculateCalendarViewGeometry(RECT client, UINT dpi) noexcept {
+  const auto dip = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi ? dpi : 96), 96); };
   CalendarViewGeometry geometry{};
   const int width = std::max(0, static_cast<int>(client.right - client.left));
   const int height = std::max(0, static_cast<int>(client.bottom - client.top));
-  const int header_height = std::min(height, std::max(24, std::min(36, height / 5)));
+  const int header_height = std::min(height, std::max(dip(24), std::min(dip(36), height / 5)));
   const int header_bottom = client.top + header_height;
   const int weekday_height = std::min(height - header_height,
-                                      std::max(20, std::min(24, (height - header_height) / 8)));
+                                      std::max(dip(20), std::min(dip(24), (height - header_height) / 8)));
   const int grid_top = header_bottom + weekday_height;
   const int footer_height = std::min(std::max(0, height - grid_top),
-                                    std::max(24, std::min(32, height / 9)));
+                                    std::max(dip(24), std::min(dip(32), height / 9)));
   const int grid_bottom = std::max(grid_top, static_cast<int>(client.bottom) - footer_height);
-  const int nav_width = std::min(44, width / 3);
+  const int nav_width = std::min(dip(44), width / 5);
   geometry.header = {client.left, client.top, client.right, header_bottom};
   geometry.previous_month_button = {client.left, client.top, client.left + nav_width,
                                     header_bottom};
@@ -773,7 +791,7 @@ bool CalendarView_SetToday(HWND view, CalendarDate today) noexcept {
     InvalidateVisibleDate(view, old_today);
     InvalidateVisibleDate(view, today);
     InvalidateRectWithoutErase(view,
-                               CalculateCalendarViewGeometry(ClientRect(view)).today_action);
+                               CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view)).today_action);
     return true;
   }
   return false;
@@ -820,7 +838,7 @@ bool CalendarView_SetMarkers(HWND view,
                              std::span<const CalendarViewDateMarker> markers) noexcept {
   if (auto* state = State(view)) {
     const auto month_dates = GetCalendarViewMonthDates(state->interaction.displayed_month());
-    const auto geometry = CalculateCalendarViewGeometry(ClientRect(view));
+    const auto geometry = CalculateCalendarViewGeometry(ClientRect(view), GetDpiForWindow(view));
     std::array<CalendarViewMarkerFlags, kCalendarViewCellCount> old_flags{};
     for (std::size_t index = 0; index < month_dates.size(); ++index) {
       if (month_dates[index]) old_flags[index] = state->interaction.MarkersForDate(*month_dates[index]);

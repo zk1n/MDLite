@@ -194,6 +194,9 @@ class Application {
   static LRESULT CALLBACK TabStripSubclass(HWND window, UINT message, WPARAM wparam,
                                             LPARAM lparam, UINT_PTR subclass_id,
                                             DWORD_PTR reference);
+  static LRESULT CALLBACK StatusBarSubclass(HWND window, UINT message, WPARAM wparam,
+                                             LPARAM lparam, UINT_PTR subclass_id,
+                                             DWORD_PTR reference);
   static LRESULT CALLBACK CalendarDetailsSubclass(HWND window, UINT message, WPARAM wparam,
                                                    LPARAM lparam, UINT_PTR subclass_id,
                                                    DWORD_PTR reference);
@@ -201,6 +204,8 @@ class Application {
 
   void CreateControls();
   void LayoutControls();
+  int MeasurePanelTextHeight(HWND item, int width) const;
+  int MinimumCalendarPanelHeight(int width) const;
   void LoadPanelLayout();
   void SavePanelLayout();
   void MovePanelToSlot(PanelId id, PanelSlot slot);
@@ -386,7 +391,7 @@ class Application {
   HWND command_search_{};
   HWND tab_new_{};
   HWND tab_close_{};
-  std::array<HWND, 3> window_buttons_{};
+  HWND chrome_tooltip_{};
   std::array<HWND, 5> activity_buttons_{};
   HWND workspace_tree_{};
   HWND tabs_{};
@@ -419,6 +424,10 @@ class Application {
   HWND git_commit_{};
   HWND git_trust_{};
   HWND calendar_details_{};
+  HWND calendar_summary_{};
+  HWND calendar_daily_{};
+  HWND calendar_details_toggle_{};
+  bool calendar_details_expanded_{};
   std::vector<CalendarDetailTarget> calendar_detail_targets_;
   std::array<HWND, 4> panel_headers_{};
   std::filesystem::path workspace_;
@@ -449,6 +458,7 @@ class Application {
   bool save_dialog_active_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};
   bool suppress_editor_change_{};
+  bool table_tab_keydown_handled_{};
   bool editor_projection_repair_message_posted_{};
   ULONGLONG editor_projection_repair_retry_due_{};
   bool external_operation_active_{};
@@ -475,6 +485,7 @@ class Application {
   HANDLE workspace_mutex_{};
   HACCEL accelerator_table_{};
   HFONT editor_font_{};
+  HFONT ui_font_{};
   HBRUSH background_brush_{};
   HBRUSH surface_brush_{};
   HBRUSH input_brush_{};
@@ -489,11 +500,14 @@ class Application {
   COLORREF theme_muted_{RGB(92, 104, 120)};
   COLORREF theme_accent_{RGB(56, 112, 194)};
   bool dark_theme_{};
+  bool high_contrast_{};
+  COLORREF theme_selected_text_{RGB(255, 255, 255)};
   std::vector<std::unique_ptr<std::wstring>> menu_labels_;
   std::wstring status_text_;
   std::array<std::wstring, 4> status_segments_{};
   PanelLayout panel_layout_ = PanelLayout::Default();
   PanelId focused_panel_{PanelId::Explorer};
+  int active_activity_{};
   EffectiveSettings settings_;
   GitPanelStatus git_panel_status_;
   std::wstring calendar_tooltip_text_;

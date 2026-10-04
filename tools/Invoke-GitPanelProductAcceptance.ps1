@@ -134,6 +134,7 @@ public static class MDLiteGitProductNative {
     [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)] private static extern IntPtr SendMessageGetText(IntPtr window, uint message, IntPtr wparam, StringBuilder value);
     [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageSetText(IntPtr window, uint message, IntPtr wparam, string text);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", EntryPoint = "SendMessageW")] public static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
@@ -177,6 +178,7 @@ public static class MDLiteGitProductNative {
     public static string WindowText(IntPtr window) { return TextOf(window); }
     public static string WindowClass(IntPtr window) { return ClassOf(window); }
     public static int ControlId(IntPtr window) { return GetDlgCtrlID(window); }
+    public static int WindowStyle(IntPtr window) { return GetWindowLong(window, -16); }
 
     public static IntPtr FindMainWindow(int processId) {
         IntPtr found = IntPtr.Zero;
@@ -424,14 +426,55 @@ function Find-ChildByText([IntPtr]$Parent, [string]$ClassName, [string]$Text) {
     return [MDLiteGitProductNative]::FindChildByText($Parent, $ClassName, $Text)
 }
 
-function Wait-WindowTitle([int]$ProcessId, [string]$Title, [int]$TimeoutMs = 10000) {
+function Wait-WindowTitle([int]$ProcessId, [string]$Title, [int]$TimeoutMs = 10000,
+    [int[]]$RequiredButtonIds = @(), [string]$RequiredBody = '', [switch]$TrustAcknowledgement) {
+    if ($TrustAcknowledgement -and ($Title -cne 'Workspace Trust' -or -not $RequiredBody -or $RequiredButtonIds.Count -gt 0)) {
+        throw 'Trust acknowledgement requires an exact receipt body and cannot use Yes/No button requirements.'
+    }
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastWindow = [IntPtr]::Zero
+    $lastEvidence = $null
     do {
         $window = [MDLiteGitProductNative]::FindTopLevelWindow($ProcessId, $Title)
-        if ($window -ne [IntPtr]::Zero) { return $window }
+        $lastWindow = $window
+        if ($window -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($window)) {
+            $ready = $true
+            if ($Title -ceq 'MDLite コマンドパレット') {
+                $ready = [MDLiteGitProductNative]::WindowClass($window) -ceq 'MDLite.NativePickerWindow'
+                $filter = Find-Child $window 100 'Edit'
+                $list = Find-Child $window 101 'ListBox'
+                foreach ($control in @($filter, $list)) {
+                    if ($control -eq [IntPtr]::Zero -or -not [MDLiteGitProductNative]::IsWindowVisible($control) -or
+                        -not [MDLiteGitProductNative]::IsWindowEnabled($control)) { $ready = $false }
+                }
+                if ($ready) { $ready = [MDLiteGitProductNative]::SendMessage($list, 0x018B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -gt 0 }
+            }
+            if ($RequiredButtonIds.Count -gt 0 -or $RequiredBody) {
+                $lastEvidence = Get-DialogControlsEvidence $window
+                if ($TrustAcknowledgement) {
+                    if ($null -eq (Select-TrustAcknowledgement $lastEvidence $RequiredBody)) { $ready = $false }
+                } elseif ($lastEvidence.dialog_class -cne '#32770' -or -not $lastEvidence.static_body_wm_gettext.Contains($RequiredBody)) { $ready = $false }
+                foreach ($id in $RequiredButtonIds) {
+                    $buttons = @($lastEvidence.buttons | Where-Object { $_.control_id -eq $id -and $_.visible -and $_.enabled })
+                    if ($buttons.Count -ne 1) { $ready = $false }
+                }
+            }
+            if ($ready) { return $window }
+        }
         Start-Sleep -Milliseconds 35
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Native dialog did not appear: $Title"
+    throw "Native dialog readiness timed out: title='$Title', owner_pid=$ProcessId, hwnd=$($lastWindow.ToInt64()), configured_timeout_ms=$TimeoutMs, elapsed_ms=$($watch.ElapsedMilliseconds), evidence=$($lastEvidence | ConvertTo-Json -Depth 5 -Compress)"
+}
+
+function Select-TrustAcknowledgement([System.Collections.IDictionary]$Evidence, [string]$ExpectedBody) {
+    if ($Evidence.dialog_class -cne '#32770' -or $Evidence.dialog_caption -cne 'Workspace Trust' -or
+        -not $Evidence.dialog_visible -or $Evidence.static_body_wm_gettext -cne $ExpectedBody) { return $null }
+    $buttons = @($Evidence.buttons)
+    if ($buttons.Count -ne 1 -or $buttons[0].class_name -cne 'Button' -or
+        $buttons[0].wm_gettext -cne 'OK' -or $buttons[0].control_id -notin @(1, 2) -or
+        -not $buttons[0].visible -or -not $buttons[0].enabled) { return $null }
+    return $buttons[0]
 }
 
 function Get-DialogChildText([IntPtr]$Window) {
@@ -453,20 +496,23 @@ function Get-DialogControlsEvidence([IntPtr]$Window) {
         }
     }
     $items = @($controls)
-    $staticText = @($items | Where-Object { $_.class_name -eq 'Static' -and $_.wm_gettext })
+    $staticText = @($items | Where-Object { $_.class_name -eq 'Static' -and $_.visible -and $_.wm_gettext })
     $buttons = @($items | Where-Object { $_.class_name -eq 'Button' })
     return [ordered]@{
         dialog_hwnd = $Window.ToInt64(); dialog_class = [MDLiteGitProductNative]::WindowClass($Window)
         dialog_caption = [MDLiteGitProductNative]::WindowText($Window)
+        dialog_visible = [MDLiteGitProductNative]::IsWindowVisible($Window)
         static_body_wm_gettext = @($staticText | ForEach-Object { $_.wm_gettext }) -join "`n"
         buttons = $buttons; controls = $items
     }
 }
 
-function Wait-WindowGone([int]$ProcessId, [string]$Title, [int]$TimeoutMs = 5000) {
+function Wait-WindowGone([int]$ProcessId, [string]$Title, [int]$TimeoutMs = 5000, [IntPtr]$WindowHandle = [IntPtr]::Zero) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     do {
-        if ([MDLiteGitProductNative]::FindTopLevelWindow($ProcessId, $Title) -eq [IntPtr]::Zero) { return $true }
+        if ($WindowHandle -ne [IntPtr]::Zero) {
+            if (-not [MDLiteGitProductNative]::IsWindow($WindowHandle)) { return $true }
+        } elseif ([MDLiteGitProductNative]::FindTopLevelWindow($ProcessId, $Title) -eq [IntPtr]::Zero) { return $true }
         Start-Sleep -Milliseconds 35
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
@@ -475,12 +521,8 @@ function Wait-WindowGone([int]$ProcessId, [string]$Title, [int]$TimeoutMs = 5000
 function Wait-GitSummary([IntPtr]$Window, [string]$Needle, [int]$TimeoutMs = 10000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     do {
-        foreach ($child in [MDLiteGitProductNative]::Children($Window)) {
-            if ([MDLiteGitProductNative]::WindowClass($child) -ne 'Static') { continue }
-            if (-not [MDLiteGitProductNative]::IsWindowVisible($child)) { continue }
-            $text = [MDLiteGitProductNative]::WindowText($child)
-            if ($text.StartsWith('Git') -and $text.Contains($Needle)) { return $text }
-        }
+        $text = Get-GitSummary $Window
+        if ($text -and $text.Contains($Needle)) { return $text }
         Start-Sleep -Milliseconds 40
     } while ([DateTime]::UtcNow -lt $deadline)
     return ''
@@ -488,10 +530,16 @@ function Wait-GitSummary([IntPtr]$Window, [string]$Needle, [int]$TimeoutMs = 100
 
 function Get-GitSummary([IntPtr]$Window) {
     foreach ($child in [MDLiteGitProductNative]::Children($Window)) {
-        if ([MDLiteGitProductNative]::WindowClass($child) -ne 'Static') { continue }
+        # git_panel_ currently has ID 0: require its readonly/multiline/tabstop styles and exact state line.
+        # The diff EDIT has no WS_TABSTOP, and Calendar details starts with its selected date.
+        if ([MDLiteGitProductNative]::WindowClass($child) -ne 'Edit' -or
+            [MDLiteGitProductNative]::ControlId($child) -ne 0 -or
+            ([MDLiteGitProductNative]::WindowStyle($child) -band 0x10804) -ne 0x10804) { continue }
         if (-not [MDLiteGitProductNative]::IsWindowVisible($child)) { continue }
         $text = [MDLiteGitProductNative]::WindowText($child)
-        if ($text.StartsWith('Git')) { return $text }
+        $stateLine = ($text -split '[\r\n]', 2)[0]
+        if (@('Workspace未選択', 'Workspaceは未信頼です', 'Git未導入', 'repositoryなし',
+              '準備完了', 'remoteなし', '操作中', 'エラー', '不明') -ccontains $stateLine) { return $text }
     }
     return ''
 }
@@ -545,6 +593,16 @@ function Get-SourceSelection([IntPtr]$Window) {
     $anchor = [MDLiteGitProductNative]::SendMessage($Window, 0x8033, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
     $active = [MDLiteGitProductNative]::SendMessage($Window, 0x8034, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
     return [pscustomobject]@{ anchor = $anchor; active = $active }
+}
+
+function Get-DocumentSource([IntPtr]$Window) {
+    $length = [MDLiteGitProductNative]::SendMessage($Window, 0x8045, [IntPtr]4, [IntPtr]::Zero).ToInt32()
+    if ($length -lt 0) { throw 'Main fixture source inspection hook is unavailable.' }
+    $text = [Text.StringBuilder]::new($length)
+    for ($index = 0; $index -lt $length; $index++) {
+        [void]$text.Append([char][MDLiteGitProductNative]::SendMessage($Window, 0x8045, [IntPtr]5, [IntPtr]$index).ToInt32())
+    }
+    return $text.ToString()
 }
 
 function Invoke-ProductCommandFromPalette([IntPtr]$Window, [Diagnostics.Process]$Target, [string]$Query) {
@@ -624,12 +682,17 @@ function Invoke-PaletteEscapeFromFocus([IntPtr]$Window, [Diagnostics.Process]$Ta
         $escapeSent -and $closed -and $record.main_reenabled -and $record.source_unchanged -and $record.selection_preserved -and $record.disk_bytes_unchanged) $record
 }
 
-function Find-ProductButton([IntPtr]$Window, [string]$Text) {
+function Find-ProductButton([IntPtr]$Window, [string]$Text, [int]$ControlId = -1) {
+    if ($ControlId -ge 0) {
+        $button = Find-Child $Window $ControlId 'Button'
+        if ($button -eq [IntPtr]::Zero -or [MDLiteGitProductNative]::WindowText($button) -cne $Text) { return [IntPtr]::Zero }
+        return $button
+    }
     return Find-ChildByText $Window 'Button' $Text
 }
 
-function Get-ButtonEvidence([IntPtr]$Window, [string]$Text) {
-    $button = Find-ProductButton $Window $Text
+function Get-ButtonEvidence([IntPtr]$Window, [string]$Text, [int]$ControlId = -1) {
+    $button = Find-ProductButton $Window $Text $ControlId
     if ($button -eq [IntPtr]::Zero) {
         return [ordered]@{ exists = $false; hwnd = 0L; control_id = -1; name = $Text; enabled = $false; visible = $false }
     }
@@ -642,7 +705,7 @@ function Get-ButtonEvidence([IntPtr]$Window, [string]$Text) {
 }
 
 function Invoke-WorkspaceTrustPrompt([IntPtr]$Window, [Diagnostics.Process]$Target) {
-    $control = Get-ButtonEvidence $Window '信頼する'
+    $control = Get-ButtonEvidence $Window '信頼を確認...' 1032 # kWorkspaceTrust
     if ($control.exists -and $control.enabled -and $control.visible) {
         Click-ProductButton ([IntPtr]$control.hwnd) 'Workspace Trust confirmation'
         return [ordered]@{ route = 'Git panel Trust button BM_CLICK via PostMessage'; control = $control; palette = $null }
@@ -675,11 +738,11 @@ function Get-DialogButton([IntPtr]$Dialog, [int]$ControlId) {
     return $button
 }
 
-function Complete-TrustPrompt([int]$ProcessId, [bool]$Allow) {
-    $dialog = Wait-WindowTitle $ProcessId 'Workspace Trust'
+function Complete-TrustPrompt([int]$ProcessId, [bool]$Allow, [string]$EvidenceLabel = '') {
+    $dialog = Wait-WindowTitle $ProcessId 'Workspace Trust' -RequiredButtonIds @(6, 7) -RequiredBody '信頼しますか'
     $dialogEvidence = Get-DialogControlsEvidence $dialog
     $promptKind = if ($Allow) { 'accept' } else { 'deny' }
-    $dialogEvidence['screenshot'] = Save-WindowFrame $dialog (Join-Path $evidenceRoot "trust-prompt-$promptKind-$runId.png")
+    $dialogEvidence['screenshot'] = Save-WindowFrame $dialog (Join-Path $evidenceRoot "trust-prompt-$promptKind-$EvidenceLabel-$runId.png")
     $script:trustDialogFrames.Add($dialogEvidence.screenshot)
     $body = $dialogEvidence.static_body_wm_gettext
     if (-not $body.Contains('信頼しますか')) {
@@ -691,7 +754,7 @@ function Complete-TrustPrompt([int]$ProcessId, [bool]$Allow) {
     $captionMatchesDecision = if ($Allow) { $decisionCaption -match '^(はい|Yes)' } else { $decisionCaption -match '^(いいえ|No)' }
     if (-not $captionMatchesDecision) { throw "Workspace Trust button id $decisionId has unexpected caption '$decisionCaption'." }
     Click-ProductButton $decisionButton 'Workspace Trust decision'
-    if (-not (Wait-WindowGone $ProcessId 'Workspace Trust')) { throw 'Workspace Trust confirmation stayed open.' }
+    if (-not (Wait-WindowGone $ProcessId 'Workspace Trust' -WindowHandle $dialog)) { throw 'Workspace Trust confirmation stayed open.' }
     if (-not $Allow) {
         return [pscustomobject]@{
             decision = 'NO'; decision_button_id = $decisionId; decision_button = $decisionCaption
@@ -699,35 +762,35 @@ function Complete-TrustPrompt([int]$ProcessId, [bool]$Allow) {
         }
     }
 
-    $receipt = Wait-WindowTitle $ProcessId 'Workspace Trust'
+    $receipt = Wait-WindowTitle $ProcessId 'Workspace Trust' -RequiredBody 'このWorkspaceを信頼しました。' -TrustAcknowledgement
     $receiptEvidence = Get-DialogControlsEvidence $receipt
-    $receiptEvidence['screenshot'] = Save-WindowFrame $receipt (Join-Path $evidenceRoot "trust-result-accept-$runId.png")
+    $receiptEvidence['screenshot'] = Save-WindowFrame $receipt (Join-Path $evidenceRoot "trust-result-accept-$EvidenceLabel-$runId.png")
     $script:trustDialogFrames.Add($receiptEvidence.screenshot)
     $receiptText = $receiptEvidence.static_body_wm_gettext
-    $ackButton = Get-DialogButton $receipt 1
-    $ackCaption = [MDLiteGitProductNative]::WindowText($ackButton)
-    Click-ProductButton $ackButton 'Workspace Trust acknowledgement'
-    if (-not (Wait-WindowGone $ProcessId 'Workspace Trust')) { throw 'Workspace Trust result dialog stayed open.' }
+    $ack = Select-TrustAcknowledgement $receiptEvidence 'このWorkspaceを信頼しました。'
+    if ($null -eq $ack) { throw 'Workspace Trust success receipt lost its exact semantic OK contract.' }
+    Click-ProductButton ([IntPtr]$ack.hwnd) 'Workspace Trust acknowledgement'
+    if (-not (Wait-WindowGone $ProcessId 'Workspace Trust' -WindowHandle $receipt)) { throw 'Workspace Trust result dialog stayed open.' }
     return [pscustomobject]@{
         decision = 'YES'; decision_button_id = $decisionId; decision_button = $decisionCaption
         confirmation = $body; confirmation_controls = $dialogEvidence
         result = $receiptText; result_contains_trusted_message = $receiptText.Contains('信頼しました')
-        result_controls = $receiptEvidence; acknowledgement_button_id = 1; acknowledgement_button = $ackCaption
+        result_controls = $receiptEvidence; acknowledgement_button_id = $ack.control_id; acknowledgement_button = $ack.wm_gettext; acknowledgement_semantic_ok = $true
     }
 }
 
 function Complete-TrustRevocation([IntPtr]$Window, [Diagnostics.Process]$Target) {
     $command = Invoke-ProductCommandFromPalette $Window $Target 'Workspace: 信頼を解除'
-    $dialog = Wait-WindowTitle $Target.Id 'Workspace Trust'
+    $dialog = Wait-WindowTitle $Target.Id 'Workspace Trust' -RequiredBody 'Workspaceの信頼を解除しました。' -TrustAcknowledgement
     $dialogEvidence = Get-DialogControlsEvidence $dialog
     $body = $dialogEvidence.static_body_wm_gettext
-    $ackButton = Get-DialogButton $dialog 1
-    $ackCaption = [MDLiteGitProductNative]::WindowText($ackButton)
-    Click-ProductButton $ackButton 'Workspace Trust revocation acknowledgement'
-    if (-not (Wait-WindowGone $Target.Id 'Workspace Trust')) { throw 'Workspace Trust revoke result stayed open.' }
+    $ack = Select-TrustAcknowledgement $dialogEvidence 'Workspaceの信頼を解除しました。'
+    if ($null -eq $ack) { throw 'Workspace Trust revoke receipt lost its exact semantic OK contract.' }
+    Click-ProductButton ([IntPtr]$ack.hwnd) 'Workspace Trust revocation acknowledgement'
+    if (-not (Wait-WindowGone $Target.Id 'Workspace Trust' -WindowHandle $dialog)) { throw 'Workspace Trust revoke result stayed open.' }
     return [pscustomobject]@{
         command = $command; result = $body; result_contains_revoked_message = $body.Contains('信頼を解除しました')
-        result_controls = $dialogEvidence; acknowledgement_button_id = 1; acknowledgement_button = $ackCaption
+        result_controls = $dialogEvidence; acknowledgement_button_id = $ack.control_id; acknowledgement_button = $ack.wm_gettext; acknowledgement_semantic_ok = $true
     }
 }
 
@@ -785,14 +848,16 @@ function New-WorkspaceFixture([string]$Workspace) {
     [IO.File]::WriteAllText((Join-Path $Workspace 'records\created-day.md'), "# Calendar rename fixture $runId`n", [Text.UTF8Encoding]::new($false))
 }
 
-function Start-MDLite([string]$DocumentPath, [bool]$WithoutGit) {
+function Start-MDLite([string]$DocumentPath, [bool]$WithoutGit, [bool]$Silent = $true) {
     $oldPath = $env:PATH
     $oldHttpProxy = $env:HTTP_PROXY
     $oldHttpsProxy = $env:HTTPS_PROXY
     $oldAllProxy = $env:ALL_PROXY
     $oldNoProxy = $env:NO_PROXY
     $oldGitCeiling = $env:GIT_CEILING_DIRECTORIES
+    $oldSilent = $env:MDLITE_TEST_SILENT
     try {
+        $env:MDLITE_TEST_SILENT = if ($Silent) { '1' } else { '0' }
         if ($WithoutGit) { $env:PATH = $emptyPath }
         $env:HTTP_PROXY = ''
         $env:HTTPS_PROXY = ''
@@ -801,6 +866,7 @@ function Start-MDLite([string]$DocumentPath, [bool]$WithoutGit) {
         $env:GIT_CEILING_DIRECTORIES = $runRoot
         return Start-Process -FilePath $executable -ArgumentList @($DocumentPath) -WorkingDirectory $repoRoot -PassThru
     } finally {
+        if ($null -eq $oldSilent) { Remove-Item Env:MDLITE_TEST_SILENT -ErrorAction SilentlyContinue } else { $env:MDLITE_TEST_SILENT = $oldSilent }
         $env:PATH = $oldPath
         if ($null -eq $oldHttpProxy) { Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue } else { $env:HTTP_PROXY = $oldHttpProxy }
         if ($null -eq $oldHttpsProxy) { Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue } else { $env:HTTPS_PROXY = $oldHttpsProxy }
@@ -846,27 +912,287 @@ function Save-WindowFrame([IntPtr]$Window, [string]$Path) {
 }
 
 function Ensure-GitPanelVisible([IntPtr]$Window, [Diagnostics.Process]$Target,
-                                [string]$ExpectedSummary, [bool]$RequireList = $false) {
-    $summary = Get-GitSummary $Window
-    if (-not $summary) {
-        [void](Invoke-ProductCommandFromPalette $Window $Target '表示: Gitを表示/非表示')
-        $summary = Wait-GitSummary $Window $ExpectedSummary 5000
-    } elseif (-not $summary.Contains($ExpectedSummary)) {
-        $summary = Wait-GitSummary $Window $ExpectedSummary 3000
-    }
-    if (-not $summary -or -not $summary.Contains($ExpectedSummary)) {
-        throw "Visible Git panel summary did not match '$ExpectedSummary': $summary"
-    }
-    $list = Get-GitList $Window
-    if ($RequireList -and $list -eq [IntPtr]::Zero) {
-        throw "Git panel ListView is absent in required ready state '$ExpectedSummary'."
-    }
-    return $list
+                                [string]$ExpectedSummary, [bool]$RequireList = $false, [int]$TimeoutMs = 5000) {
+    # Activity activation shows/expands/focuses; a visibility toggle can hide an
+    # already open panel during transient status publication or child layout.
+    $activity = Find-ProductButton $Window 'Git（ソース管理）' 125
+    Click-ProductButton $activity 'Git activity activation'
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        $summary = Get-GitSummary $Window
+        $list = Get-GitList $Window
+        $listReady = -not $RequireList
+        if ($RequireList -and $list -ne [IntPtr]::Zero) {
+            $bounds = New-Object MDLiteGitProductNative+RECT
+            $listReady = [MDLiteGitProductNative]::GetWindowRect($list, [ref]$bounds) -and
+                $bounds.Right -gt $bounds.Left -and $bounds.Bottom -gt $bounds.Top
+        }
+        if ($summary -and $summary.Contains($ExpectedSummary) -and $listReady) { return $list }
+        Start-Sleep -Milliseconds 40
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $children = @([MDLiteGitProductNative]::Children($Window) | ForEach-Object {
+        [pscustomobject]@{ id = [MDLiteGitProductNative]::ControlId($_)
+            class = [MDLiteGitProductNative]::WindowClass($_)
+            visible = [MDLiteGitProductNative]::IsWindowVisible($_) }
+    })
+    throw "Git panel readiness timed out for '$ExpectedSummary', require_list=$RequireList, summary='$summary', pid=$($Target.Id), children=$($children | ConvertTo-Json -Compress)."
+}
+
+function Wait-FreshFetchStartup([Diagnostics.Process]$Target, [string]$DocumentPath, [DateTime]$StartedUtc,
+    [System.Collections.IDictionary]$Trace) {
+    $mainDeadline = $StartedUtc.AddMilliseconds(10000)
+    $deadline = $StartedUtc.AddMilliseconds(15000)
+    $expectedCaption = 'MDLite — ' + [IO.Path]::GetFileName($DocumentPath) + ' — ' + [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($DocumentPath))
+    $Trace.process_started_utc = $StartedUtc.ToString('o'); $Trace.total_budget_ms = 15000
+    $Trace.expected_caption = $expectedCaption; $Trace.initial = $null; $Trace.first_visible_utc = $null; $Trace.ready_utc = $null; $Trace.last_controls = @()
+    do {
+        $Target.Refresh()
+        if ($Target.HasExited) { throw "Fresh Fetch process exited before startup readiness (exit=$($Target.ExitCode))." }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        $window = [MDLiteGitProductNative]::FindMainWindow($Target.Id)
+        $visible = $window -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($window)
+        if ($null -eq $Trace.initial) { $Trace.initial = [ordered]@{ utc = [DateTime]::UtcNow.ToString('o'); hwnd = $window.ToInt64(); visible = $visible } }
+        if ($visible) {
+            if ($null -eq $Trace.first_visible_utc) { $Trace.first_visible_utc = [DateTime]::UtcNow.ToString('o') }
+            $activity = Get-ButtonEvidence $window 'Git（ソース管理）' 125
+            $editor = Find-Child $window 102 'RICHEDIT50W'
+            $editorVisible = $editor -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($editor)
+            $editorEnabled = $editor -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowEnabled($editor)
+            $caption = [MDLiteGitProductNative]::WindowText($window)
+            $Trace.last_controls = @($activity, [ordered]@{ hwnd = $editor.ToInt64(); control_id = 102; class_name = 'RICHEDIT50W'; visible = $editorVisible; enabled = $editorEnabled })
+            $Trace.last_caption = $caption
+            if ($caption -ceq $expectedCaption -and $activity.exists -and $activity.visible -and $activity.enabled -and
+                $editorVisible -and $editorEnabled -and [MDLiteGitProductNative]::IsWindowEnabled($window) -and [DateTime]::UtcNow -lt $deadline) {
+                $Trace.ready_utc = [DateTime]::UtcNow.ToString('o')
+                $Trace.ready_elapsed_ms = [Math]::Round(([DateTime]::UtcNow - $StartedUtc).TotalMilliseconds)
+                return $window
+            }
+        } elseif ([DateTime]::UtcNow -ge $mainDeadline) {
+            throw "Fresh Fetch main window was not visible within its existing 10000 ms budget (pid=$($Target.Id))."
+        }
+        Start-Sleep -Milliseconds 35
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $Trace.timeout_utc = [DateTime]::UtcNow.ToString('o')
+    throw "Fresh Fetch requested-document/activity/editor readiness exhausted the shared 15000 ms startup budget (pid=$($Target.Id), trace=$($Trace | ConvertTo-Json -Depth 4 -Compress))."
 }
 
 function Update-GitStatus([IntPtr]$Window) {
     $refresh = Find-ProductButton $Window '更新'
     Click-ProductButton $refresh 'Git status refresh'
+}
+
+function Get-RealTrustInventory([string]$Workspace) {
+    $root = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MDLite\trust\v1'
+    $identityPath = [IO.Path]::GetFullPath($Workspace).ToLowerInvariant()
+    $magic = "MDLITE_TRUST_V1`n"
+    $files = @(if (Test-Path -LiteralPath $root -PathType Container) {
+        foreach ($file in (Get-ChildItem -LiteralPath $root -File | Sort-Object Name)) {
+            $bytes = [IO.File]::ReadAllBytes($file.FullName)
+            $matchesFixture = $false
+            if ($bytes.Length -gt $magic.Length -and [Text.Encoding]::ASCII.GetString($bytes, 0, $magic.Length) -ceq $magic) {
+                $identity = [Text.Encoding]::Unicode.GetString($bytes, $magic.Length, $bytes.Length - $magic.Length)
+                $matchesFixture = ($identity -split "`n", 2)[0] -ceq $identityPath
+            }
+            [pscustomobject]@{ name = $file.Name; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant(); matches_fixture = $matchesFixture }
+        }
+    })
+    return [pscustomobject]@{ files = $files; fixture_entries = @($files | Where-Object matches_fixture).Count }
+}
+
+function Test-OtherTrustEntriesUnchanged($Before, $After) {
+    $left = @($Before.files | Where-Object { -not $_.matches_fixture } | Sort-Object name | ForEach-Object { $_.name + ':' + $_.sha256 }) -join "`n"
+    $right = @($After.files | Where-Object { -not $_.matches_fixture } | Sort-Object name | ForEach-Object { $_.name + ':' + $_.sha256 }) -join "`n"
+    return $left -ceq $right
+}
+
+function Get-FetchFixtureState([string]$Workspace, [IntPtr]$Editor) {
+    $head = Get-GitOutput $Workspace @('rev-parse', 'HEAD')
+    $status = Get-GitOutput $Workspace @('status', '--short')
+    $refs = Get-GitOutput $Workspace @('for-each-ref', '--sort=refname', '--format=%(refname) %(objectname)')
+    $objects = Get-GitOutput $Workspace @('cat-file', '--batch-all-objects', '--batch-check=%(objectname)')
+    if ($head.exit_code -ne 0 -or $status.exit_code -ne 0 -or $refs.exit_code -ne 0 -or $objects.exit_code -ne 0) { throw 'Could not read isolated Fetch fixture Git state.' }
+    $files = @('README.md', 'tracked.md', 'other.md', '.gitignore', 'records\created-day.md') | ForEach-Object {
+        $_ + ':' + (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Workspace $_)).Hash.ToLowerInvariant()
+    }
+    $objectFiles = @(Get-ChildItem -LiteralPath (Join-Path $Workspace '.git\objects') -File -Recurse | Sort-Object FullName | ForEach-Object {
+        $_.FullName.Substring($Workspace.Length) + ':' + (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+    }) -join "`n"
+    $fetchHeadPath = Join-Path $Workspace '.git\FETCH_HEAD'
+    $fetchHead = if (Test-Path -LiteralPath $fetchHeadPath -PathType Leaf) {
+        [ordered]@{ exists = $true; length = [IO.FileInfo]::new($fetchHeadPath).Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $fetchHeadPath).Hash.ToLowerInvariant() }
+    } else { [ordered]@{ exists = $false; length = 0; sha256 = $null } }
+    return [ordered]@{ head = $head.output; status = $status.output; index_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Workspace '.git\index')).Hash.ToLowerInvariant(); worktree = $files -join "`n"; editor_text = [MDLiteGitProductNative]::WindowText($Editor); refs = $refs.output; object_ids = @($objects.output -split "`n" | Where-Object { $_ } | Sort-Object) -join "`n"; object_files = $objectFiles; fetch_head = $fetchHead }
+}
+
+function Test-FetchCancellationState([System.Collections.IDictionary]$Before, [System.Collections.IDictionary]$After,
+    [string]$ResultBody, [bool]$LoopbackConnected) {
+    # Git opens/truncates FETCH_HEAD before contacting the remote; empty metadata is not a fetched ref.
+    $emptyFetchHead = -not $Before.fetch_head.exists -and (-not $After.fetch_head.exists -or
+        ($After.fetch_head.length -eq 0 -and $After.fetch_head.sha256 -ceq 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'))
+    return $LoopbackConnected -and $ResultBody -match '(?m)^終了コード: 1223\r?$' -and
+        $ResultBody.Contains('(ユーザーがキャンセルしました)') -and $emptyFetchHead -and
+        $Before.head -ceq $After.head -and $Before.index_sha256 -ceq $After.index_sha256 -and
+        $Before.worktree -ceq $After.worktree -and $Before.status -ceq $After.status -and $Before.editor_text -ceq $After.editor_text -and
+        $Before.refs -ceq $After.refs -and $Before.object_ids -ceq $After.object_ids -and $Before.object_files -ceq $After.object_files
+}
+
+function Select-FetchTaskCancel([System.Collections.IDictionary]$Evidence) {
+    if ($Evidence.dialog_class -cne '#32770' -or $Evidence.dialog_caption -cne 'Fetch' -or -not $Evidence.dialog_visible) { return $null }
+    $directUi = @($Evidence.controls | Where-Object { $_.class_name -ceq 'DirectUIHWND' -and $_.visible })
+    $cancel = @($Evidence.buttons | Where-Object { $_.class_name -ceq 'Button' -and $_.wm_gettext -cmatch '^(Cancel|キャンセル)$' -and $_.visible -and $_.enabled })
+    $done = @($Evidence.buttons | Where-Object { $_.class_name -ceq 'Button' -and $_.wm_gettext -ceq '完了' -and $_.visible -and -not $_.enabled })
+    if ($directUi.Count -eq 0 -or $cancel.Count -ne 1 -or $done.Count -ne 1) { return $null }
+    # DirectUI native HWND IDs can be 0; virtual TaskDialog IDCANCEL is not a native child-control ID.
+    return $cancel[0]
+}
+
+function Wait-FetchTaskCancel([int]$ProcessId, [int]$TimeoutMs = 10000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $lastEvidence = $null
+    do {
+        $dialog = [MDLiteGitProductNative]::FindTopLevelWindow($ProcessId, 'Fetch')
+        if ($dialog -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($dialog)) {
+            $lastEvidence = Get-DialogControlsEvidence $dialog
+            $cancel = Select-FetchTaskCancel $lastEvidence
+            if ($null -ne $cancel) { return [pscustomobject]@{ dialog = $dialog; cancel = $cancel; evidence = $lastEvidence } }
+        }
+        Start-Sleep -Milliseconds 35
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Running Fetch TaskDialog semantic Cancel was not ready within $TimeoutMs ms: $($lastEvidence | ConvertTo-Json -Depth 5 -Compress)"
+}
+
+function Complete-FetchResult([int]$ProcessId, [string]$Workspace) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(10000)
+    do {
+        $dialog = [MDLiteGitProductNative]::FindTopLevelWindow($ProcessId, 'Fetch')
+        if ($dialog -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($dialog)) {
+            $evidence = Get-DialogControlsEvidence $dialog
+            $body = $evidence.static_body_wm_gettext
+            $buttons = @($evidence.buttons)
+            if ($evidence.dialog_class -ceq '#32770' -and $body.Contains('作業ディレクトリ: ' + $Workspace) -and
+                $body.Contains('コマンド: git fetch --prune') -and $body.Contains('(ユーザーがキャンセルしました)') -and
+                $buttons.Count -eq 1 -and $buttons[0].wm_gettext -ceq 'OK' -and $buttons[0].control_id -in @(1, 2) -and
+                $buttons[0].visible -and $buttons[0].enabled) {
+                Click-ProductButton ([IntPtr]$buttons[0].hwnd) 'Fetch cancelled-result acknowledgement'
+                if (-not (Wait-WindowGone $ProcessId 'Fetch' -WindowHandle $dialog)) { throw 'Fetch result acknowledgement did not close.' }
+                return $evidence
+            }
+        }
+        Start-Sleep -Milliseconds 35
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Exact cancelled Fetch result and sole semantic OK were not ready within 10000 ms.'
+}
+
+function Invoke-FreshLoopbackFetch {
+    $workspace = Join-Path $runRoot 'fetch-fresh-workspace'
+    $target = $null; $window = [IntPtr]::Zero; $server = $null
+    $evidence = [ordered]@{ fixture = $workspace; silent = $false; test_hooks_used = $false; stage = 'preparing_fixture'; grant_created = $false; cleanup_status = 'NOT_STARTED' }
+    $beforeTrust = $null; $pass = $false; $grantAttempted = $false; $revocationConfirmed = $false
+    try {
+        if (Test-Path -LiteralPath $workspace) { throw 'Fresh Fetch fixture already exists; no draft workspace will be restarted.' }
+        New-WorkspaceFixture $workspace
+        [IO.File]::WriteAllText((Join-Path $workspace '.gitignore'), ".mdlite/`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $workspace 'tracked.md'), 'baseline', [Text.UTF8Encoding]::new($false))
+        foreach ($setupArguments in @(@('init', '--initial-branch=main'), @('config', '--local', 'user.name', 'MDLite acceptance'),
+            @('config', '--local', 'user.email', 'mdlite-acceptance@example.invalid'), @('add', '-A'), @('commit', '-m', 'fresh Fetch fixture'))) {
+            $setup = Get-GitOutput $workspace $setupArguments
+            if ($setup.exit_code -ne 0) { throw 'Fresh Fetch fixture Git setup failed.' }
+        }
+        [IO.File]::WriteAllText((Join-Path $workspace 'tracked.md'), 'staged', [Text.UTF8Encoding]::new($false))
+        $setup = Get-GitOutput $workspace @('add', '--', 'tracked.md')
+        if ($setup.exit_code -ne 0) { throw 'Fresh Fetch staged fixture setup failed.' }
+        [IO.File]::WriteAllText((Join-Path $workspace 'tracked.md'), 'unstaged', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $workspace 'other.md'), 'untracked', [Text.UTF8Encoding]::new($false))
+        $server = [MDLiteLocalStallServer]::new(); $server.Start()
+        $url = "http://127.0.0.1:$($server.Port)/fixture.git"
+        $setup = Get-GitOutput $workspace @('remote', 'add', 'origin', $url)
+        if ($setup.exit_code -ne 0) { throw 'Fresh Fetch loopback remote setup failed.' }
+        $beforeTrust = Get-RealTrustInventory $workspace
+        if ($beforeTrust.fixture_entries -ne 0 -or (Test-Path -LiteralPath (Join-Path $workspace '.mdlite\.state\recovery'))) { throw 'Fresh Fetch fixture already has Trust or recovery data.' }
+        $evidence.stage = 'starting_non_silent'
+        $document = Join-Path $workspace 'README.md'
+        $target = Start-MDLite $document $false $false
+        $startedUtc = $target.StartTime.ToUniversalTime()
+        $evidence.process_id = $target.Id; $evidence.startup = [ordered]@{}
+        $evidence.stage = 'waiting_startup'
+        $window = Wait-FreshFetchStartup $target $document $startedUtc $evidence.startup
+        $remainingMs = [Math]::Min(5000, [int][Math]::Floor(($startedUtc.AddMilliseconds(15000) - [DateTime]::UtcNow).TotalMilliseconds))
+        if ($remainingMs -le 0) { throw 'Fresh Fetch startup budget exhausted before Git activity activation.' }
+        $evidence.stage = 'showing_untrusted_git'
+        [void](Ensure-GitPanelVisible $window $target 'Workspaceは未信頼です' $false $remainingMs)
+        $evidence.startup.panel_ready_utc = [DateTime]::UtcNow.ToString('o')
+        if ([DateTime]::UtcNow -ge $startedUtc.AddMilliseconds(15000)) { throw 'Fresh Fetch shared startup budget expired before Git panel readiness.' }
+        $evidence.stage = 'granting_trust'
+        $grantAttempted = $true
+        $evidence.trust_route = Invoke-WorkspaceTrustPrompt $window $target
+        $evidence.trust_grant = Complete-TrustPrompt $target.Id $true 'fetch-fresh'
+        $granted = Get-RealTrustInventory $workspace
+        $evidence.grant_created = $granted.fixture_entries -gt 0
+        $evidence.trust_before = $beforeTrust; $evidence.trust_granted = $granted
+        if ($granted.fixture_entries -ne 1 -or -not (Test-OtherTrustEntriesUnchanged $beforeTrust $granted)) { throw 'Ordinary Trust grant did not affect only the fresh Fetch fixture.' }
+        $evidence.stage = 'waiting_trusted_git'
+        [void](Ensure-GitPanelVisible $window $target 'unstaged 1' $true)
+        $editor = Find-Child $window 102 'RICHEDIT50W'
+        if ($editor -eq [IntPtr]::Zero -or -not [MDLiteGitProductNative]::IsWindowVisible($editor)) { throw 'Fresh Fetch editor is not visible.' }
+        $before = Get-FetchFixtureState $workspace $editor
+        $fetchHead = Join-Path $workspace '.git\FETCH_HEAD'
+        if (Test-Path -LiteralPath $fetchHead) { throw 'Fresh Fetch fixture unexpectedly has FETCH_HEAD.' }
+        $evidence.stage = 'fetch_confirmation'
+        $evidence.palette = Invoke-ProductCommandFromPalette $window $target 'Git: Fetch'
+        $confirmation = Wait-WindowTitle $target.Id 'Git 明示操作' -RequiredButtonIds @(6, 7) -RequiredBody 'コマンド: git fetch --prune'
+        $question = Get-DialogChildText $confirmation
+        $yes = Get-DialogButton $confirmation 6; $no = Get-DialogButton $confirmation 7
+        if (-not $question.Contains('Fetchを実行しますか？') -or -not $question.Contains('作業ディレクトリ: ' + $workspace) -or
+            [MDLiteGitProductNative]::WindowText($yes) -notmatch '^(はい|Yes)' -or [MDLiteGitProductNative]::WindowText($no) -notmatch '^(いいえ|No)') { throw 'Fetch confirmation did not match the isolated command/workspace and Yes/No contract.' }
+        $evidence.confirmation = Get-DialogControlsEvidence $confirmation
+        Click-ProductButton $yes 'Fetch explicit Yes'
+        if (-not (Wait-WindowGone $target.Id 'Git 明示操作' -WindowHandle $confirmation)) { throw 'Fetch confirmation did not close.' }
+        $evidence.stage = 'fetch_running'
+        $taskReady = Wait-FetchTaskCancel $target.Id
+        $task = $taskReady.dialog
+        $cancel = [IntPtr]$taskReady.cancel.hwnd
+        $connected = $server.WaitForConnection(2500)
+        $evidence.task_dialog = $taskReady.evidence
+        $evidence.cancel_dispatch = [ordered]@{ native_hwnd = $cancel.ToInt64(); native_control_id = $taskReady.cancel.control_id; caption = $taskReady.cancel.wm_gettext; method = 'Captured native Button HWND BM_CLICK via PostMessage; no WM_COMMAND with native ID0' }
+        Click-ProductButton $cancel 'Fetch cancellation'
+        if (-not (Wait-WindowGone $target.Id 'Fetch' 10000 -WindowHandle $task)) { throw 'Fetch TaskDialog did not close after Cancel.' }
+        $evidence.stage = 'fetch_result'
+        $evidence.result = Complete-FetchResult $target.Id $workspace
+        $evidence.stage = 'verifying_baseline'
+        $after = Get-FetchFixtureState $workspace $editor
+        $evidence.before = $before; $evidence.after = $after; $evidence.loopback_connection_accepted = $connected; $evidence.fetch_head_created = Test-Path -LiteralPath $fetchHead
+        $pass = Test-FetchCancellationState $before $after $evidence.result.static_body_wm_gettext $connected
+    } catch { $evidence.error = $_.Exception.Message; $evidence.failed_stage = $evidence.stage }
+    finally {
+        if ($beforeTrust) {
+            try {
+                $current = Get-RealTrustInventory $workspace
+                if ($grantAttempted -and $current.fixture_entries -gt 0) {
+                    $evidence.grant_created = $true
+                    if (-not $target -or $target.HasExited) { throw 'Fresh Fetch process is unavailable for ordinary Trust revocation.' }
+                    $pending = [MDLiteGitProductNative]::FindTopLevelWindow($target.Id, 'Workspace Trust')
+                    if ($pending -ne [IntPtr]::Zero) {
+                        $ack = Select-TrustAcknowledgement (Get-DialogControlsEvidence $pending) 'このWorkspaceを信頼しました。'
+                        if ($null -eq $ack) { throw 'Unexpected modal prevents safe ordinary Trust cleanup.' }
+                        Click-ProductButton ([IntPtr]$ack.hwnd) 'Pending fresh Trust acknowledgement'
+                        if (-not (Wait-WindowGone $target.Id 'Workspace Trust' -WindowHandle $pending)) { throw 'Pending Trust acknowledgement did not close.' }
+                    }
+                    if (-not [MDLiteGitProductNative]::IsWindowEnabled($window)) { throw 'A remaining modal prevents safe ordinary Trust cleanup.' }
+                    $evidence.trust_revoke = Complete-TrustRevocation $window $target
+                    if (-not (Get-GitSummary $window).Contains('Workspaceは未信頼です')) { throw 'Fresh fixture UI did not return to untrusted after revocation.' }
+                    $revocationConfirmed = $true
+                }
+                $finalTrust = Get-RealTrustInventory $workspace
+                $evidence.trust_after = $finalTrust
+                $cleanupOk = $finalTrust.fixture_entries -eq 0 -and (Test-OtherTrustEntriesUnchanged $beforeTrust $finalTrust) -and (-not $grantAttempted -or $revocationConfirmed)
+                $evidence.cleanup_status = if (-not $cleanupOk) { 'UNKNOWN_PRESERVED_STORE' } elseif (-not $grantAttempted) { 'NO_GRANT_CREATED_OTHER_ENTRIES_UNCHANGED' } else { 'CONFIRMED_FIXTURE_REVOKED_OTHER_ENTRIES_UNCHANGED' }
+                $pass = $pass -and $cleanupOk
+            } catch { $evidence.cleanup_status = 'UNKNOWN_PRESERVED_STORE'; $evidence.cleanup_error = $_.Exception.Message; $pass = $false }
+        }
+        try { if ($target) { Stop-MDLite $target $window } }
+        finally { if ($server) { $server.Dispose() } }
+    }
+    return [pscustomobject]@{ pass = $pass; evidence = $evidence }
 }
 
 try {
@@ -900,12 +1226,12 @@ try {
         $trustUiEvidence.stage = 'mode1_store_selection'
         $trustStoreHook = [MDLiteGitProductNative]::SendMessage($noGitMain, 0x8043, [IntPtr]1, [IntPtr]::Zero).ToInt32()
         $trustInventoryBefore = Get-TestTrustInventory $noGitWorkspace
-        $initialTrustButton = Get-ButtonEvidence $noGitMain '信頼する'
+        $initialTrustButton = Get-ButtonEvidence $noGitMain '信頼を確認...' 1032
         $initialTrustSummary = Get-GitSummary $noGitMain
         $initialTrustList = Get-GitList $noGitMain
         $trustUiEvidence.details.mode1_store_selection = [ordered]@{
             hook_wparam = 1; hook_result = $trustStoreHook; trust_store_inventory = $trustInventoryBefore
-            current_rendered_trust_state = if ($initialTrustSummary -match 'Workspace未信頼') { 'UNTRUSTED' } elseif ($initialTrustButton.visible) { 'UNTRUSTED' } else { 'NOT_OBSERVED' }
+            current_rendered_trust_state = if ($initialTrustSummary -match 'Workspaceは未信頼です') { 'UNTRUSTED' } elseif ($initialTrustButton.visible) { 'UNTRUSTED' } else { 'NOT_OBSERVED' }
             visible_summary = $initialTrustSummary; trust_button = $initialTrustButton
             git_listview_present = ($initialTrustList -ne [IntPtr]::Zero)
             listview_absence_expected_while_untrusted = $true
@@ -930,7 +1256,7 @@ try {
             confirmation_controls = $trustDenied.confirmation_controls
             visible_summary = $afterDeny; trust_store_inventory = $trustInventoryAfterDeny
             trust_store_unchanged_by_deny = $trustStoreUnchangedByDeny
-            trust_button = Get-ButtonEvidence $noGitMain '信頼する'
+            trust_button = Get-ButtonEvidence $noGitMain '信頼を確認...' 1032
             git_listview_present = (Get-GitList $noGitMain) -ne [IntPtr]::Zero
         }
         $noGitPanelSnapshots.Add([pscustomobject]@{ phase = 'after_ui_deny'; text = $afterDeny })
@@ -952,13 +1278,13 @@ try {
             result_controls = $trustAccepted.result_controls; visible_summary = $noGitText
             trust_store_inventory = $trustInventoryAfterAccept
             panel_visibility_error = $noGitPanelEnsureError
-            trust_button = Get-ButtonEvidence $noGitMain '信頼する'
+            trust_button = Get-ButtonEvidence $noGitMain '信頼を確認...' 1032
             git_listview_present = (Get-GitList $noGitMain) -ne [IntPtr]::Zero
             listview_required_for_no_git_state = $false
         }
         $noGitPanelSnapshots.Add([pscustomobject]@{ phase = 'after_ui_accept'; text = $noGitText })
         Add-Check 'trust_ui_accept_writes_only_fixture_store' (
-            $trustAccepted.decision -eq 'YES' -and $trustAccepted.acknowledgement_button_id -eq 1 -and
+            $trustAccepted.decision -eq 'YES' -and $trustAccepted.acknowledgement_semantic_ok -and $trustAccepted.result_contains_trusted_message -and
             $trustInventoryAfterAccept.files_matching_current_workspace_path -ge 1
         ) $trustUiEvidence.details.accept
         $noGitStateStatus = if ($noGitText -match 'Git未導入') { 'PASS' } else { 'BLOCKED' }
@@ -973,12 +1299,12 @@ try {
         $trustUiEvidence.details.revoke = [ordered]@{
             command = $trustRevoked.command; result = $trustRevoked.result; result_contains_revoked_message = $trustRevoked.result_contains_revoked_message
             result_controls = $trustRevoked.result_controls; visible_summary = $afterRevoke
-            trust_store_inventory = $trustInventoryAfterRevoke; trust_button = Get-ButtonEvidence $noGitMain '信頼する'
+            trust_store_inventory = $trustInventoryAfterRevoke; trust_button = Get-ButtonEvidence $noGitMain '信頼を確認...' 1032
             git_listview_present = (Get-GitList $noGitMain) -ne [IntPtr]::Zero
         }
         $noGitPanelSnapshots.Add([pscustomobject]@{ phase = 'after_ui_revoke'; text = $afterRevoke })
         Add-Check 'trust_ui_revoke_removes_fixture_grant' (
-            $trustRevoked.acknowledgement_button_id -eq 1 -and $trustInventoryAfterRevoke.files_matching_current_workspace_path -eq 0
+            $trustRevoked.acknowledgement_semantic_ok -and $trustRevoked.result_contains_revoked_message -and $trustInventoryAfterRevoke.files_matching_current_workspace_path -eq 0
         ) $trustUiEvidence.details.revoke
         $trustUiEvidence.status = 'PASS'
         $trustUiEvidence.stage = 'complete'
@@ -1206,6 +1532,8 @@ try {
     }
 
     $commitMessage = "product-route-$runId"
+    $headBeforeCommit = Get-GitOutput $gitWorkspace @('rev-parse', 'HEAD')
+    if ($headBeforeCommit.exit_code -ne 0) { throw 'Could not read fixture HEAD before product Commit.' }
     $cachedBeforeCommit = Get-GitOutput $gitWorkspace @('diff', '--cached', '--name-only')
     $cachedPathsBeforeCommit = @($cachedBeforeCommit.output -split "`n" | Where-Object { $_ })
     $pendingStagedAtCommit = @($cachedPathsBeforeCommit | Where-Object { $_ -ceq 'pending.md' }).Count -gt 0
@@ -1245,38 +1573,57 @@ try {
     $commitTextSetResult = [MDLiteGitProductNative]::SendMessageSetText($commitEdit, 0x000C, [IntPtr]::Zero, $commitMessage).ToInt32()
     $commitTextReadback = [MDLiteGitProductNative]::WindowText($commitEdit)
     if ($commitTextSetResult -eq 0 -or $commitTextReadback -cne $commitMessage) { throw 'Commit message field did not accept the fixture text.' }
+        $commitDocumentBefore = Get-DocumentState $main
+        $commitSourceBefore = Get-DocumentSource $main
         Click-ProductButton (Find-ProductButton $main 'Commit') 'Git Commit'
-        $commitTaskDialog = Wait-WindowTitle $process.Id 'ステージ済み変更をコミット'
-        $commitProgressEvidence = Get-DialogControlsEvidence $commitTaskDialog
+        $commitTaskDialog = [IntPtr]::Zero
+        $commitProgressEvidence = $null
+        $commitHead = $null
+        $commitSubject = $null
         $commitWaitDeadline = [DateTime]::UtcNow.AddSeconds(15)
-        while ([MDLiteGitProductNative]::IsWindow($commitTaskDialog) -and [DateTime]::UtcNow -lt $commitWaitDeadline) { Start-Sleep -Milliseconds 40 }
-        if ([MDLiteGitProductNative]::IsWindow($commitTaskDialog)) { throw 'Commit progress dialog did not close within 15 seconds.' }
-        if ($env:MDLITE_TEST_SILENT -eq '1') {
-            $commitResultText = 'RunProcessWithCancel dialog closed; the subsequent MessageBoxW result is intentionally suppressed in MDLITE_TEST_SILENT mode.'
-        } else {
-            $commitResultDialog = Wait-WindowTitle $process.Id 'ステージ済み変更をコミット'
-            $commitResultText = Get-DialogChildText $commitResultDialog
-            [void][MDLiteGitProductNative]::PostMessage($commitResultDialog, 0x0111, [IntPtr]1, [IntPtr]::Zero)
-            if (-not (Wait-WindowGone $process.Id 'ステージ済み変更をコミット')) { throw 'Commit result message did not close.' }
-        }
+        do {
+            $progress = [MDLiteGitProductNative]::FindTopLevelWindow($process.Id, 'ステージ済み変更をコミット')
+            if ($progress -ne [IntPtr]::Zero -and [MDLiteGitProductNative]::IsWindowVisible($progress)) {
+                $commitTaskDialog = $progress
+                if (-not $commitProgressEvidence) { $commitProgressEvidence = Get-DialogControlsEvidence $progress }
+            }
+            $commitHead = Get-GitOutput $gitWorkspace @('rev-parse', 'HEAD')
+            $commitSubject = Get-GitOutput $gitWorkspace @('log', '-1', '--format=%s')
+            $commitBusy = [MDLiteGitProductNative]::SendMessage($main, 0x8044, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+            if ($commitHead.exit_code -eq 0 -and $commitHead.output -cne $headBeforeCommit.output -and
+                $commitSubject.exit_code -eq 0 -and $commitSubject.output -ceq $commitMessage -and
+                $commitBusy -eq 0 -and [MDLiteGitProductNative]::IsWindowEnabled($main)) { break }
+            Start-Sleep -Milliseconds 40
+        } while ([DateTime]::UtcNow -lt $commitWaitDeadline)
+        $commitParent = Get-GitOutput $gitWorkspace @('rev-parse', 'HEAD^')
+        $commitResultText = 'Commit completion observed through changed HEAD, exact subject, cleared busy state and re-enabled main window; silent result popup is not required.'
     $committedTracked = Get-GitOutput $gitWorkspace @('show', 'HEAD:tracked.md')
     $workingTracked = [IO.File]::ReadAllText($trackedPath)
     $headFiles = Get-GitOutput $gitWorkspace @('ls-tree', '--name-only', 'HEAD')
     $headPaths = @($headFiles.output -split "`n" | Where-Object { $_ })
     $statusAfterCommit = Get-GitOutput $gitWorkspace @('status', '--short')
+    $commitDocumentAfter = Get-DocumentState $main
+    $commitSourceAfter = Get-DocumentSource $main
     $documentStates.disk_hash_after_commit = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitDocument).Hash.ToLowerInvariant()
     $headContainsPendingAsStaged = @($headPaths | Where-Object { $_ -ceq 'pending.md' }).Count -gt 0
     $pendingRemainsInWorktreeStatus = $statusAfterCommit.output -match '(?m)^\?\? pending\.md$'
     $allCachedPathsCommitted = @($cachedPathsBeforeCommit | Where-Object { $_ -notin $headPaths }).Count -eq 0
-    Add-Check 'product_commit_consumes_index_without_worktree_pathspec' ($committedTracked.exit_code -eq 0 -and
+    Add-Check 'product_commit_consumes_index_without_worktree_pathspec' ($commitHead.exit_code -eq 0 -and $commitHead.output -cne $headBeforeCommit.output -and
+        $commitSubject.exit_code -eq 0 -and $commitSubject.output -ceq $commitMessage -and
+        $commitParent.exit_code -eq 0 -and $commitParent.output -ceq $headBeforeCommit.output -and $commitBusy -eq 0 -and
+        [MDLiteGitProductNative]::IsWindowEnabled($main) -and $committedTracked.exit_code -eq 0 -and
         $committedTracked.output -eq 'staged-version' -and $workingTracked -eq 'unstaged-version' -and
         $headFiles.output -match '(?m)^tracked\.md$' -and $headContainsPendingAsStaged -eq $pendingStagedAtCommit -and
         $allCachedPathsCommitted -and
+        $commitDocumentBefore.dirty -and $commitDocumentAfter.dirty -and $commitSourceBefore -ceq $commitSourceAfter -and
+        ($commitDocumentBefore | ConvertTo-Json -Compress) -ceq ($commitDocumentAfter | ConvertTo-Json -Compress) -and
         $headFiles.output -notmatch '(?m)^other\.md$' -and $statusAfterCommit.exit_code -eq 0 -and
         $documentStates.disk_hash_after_commit -ceq $diskHashBefore -and
         $statusAfterCommit.output.Contains('tracked.md') -and $statusAfterCommit.output.Contains('other.md') -and
         $pendingRemainsInWorktreeStatus -eq (-not $pendingStagedAtCommit)) ([ordered]@{
         commit_message = $commitMessage; commit_result = $commitResultText; committed_tracked_version = $committedTracked.output
+        head_before = $headBeforeCommit.output; head_after = $commitHead.output; parent_after = $commitParent.output; actual_subject = $commitSubject.output; busy_after = $commitBusy
+        source_before = $commitSourceBefore; source_after = $commitSourceAfter; document_before = $commitDocumentBefore; document_after = $commitDocumentAfter
         commit_input_set_lresult = $commitTextSetResult; commit_input_readback = $commitTextReadback
         cached_paths_before_product_commit = $cachedPathsBeforeCommit; pending_staged_at_commit = $pendingStagedAtCommit
         readiness_summary = $commitReadySummary; expected_summary_token = $expectedCommitSummary
@@ -1378,69 +1725,10 @@ try {
         }
     }
 
-    # Fetch is a distinct lane. In silent mode its non-Trust YES/NO confirmation is IDNO, so record that guard rather than waiting for a dialog that cannot appear.
-    try {
-        $stall = [MDLiteLocalStallServer]::new()
-        $stall.Start()
-        $remoteUrl = "http://127.0.0.1:$($stall.Port)/fixture.git"
-        $remoteAdd = Get-GitOutput $gitWorkspace @('remote', 'add', 'origin', $remoteUrl)
-        if ($remoteAdd.exit_code -ne 0) { throw "Could not configure fixture loopback remote: $($remoteAdd.output)" }
-        Update-GitStatus $main
-        $remotePanel = Wait-GitSummary $main 'unstaged 1'
-        $remoteReady = [bool]$remotePanel -and -not $remotePanel.Contains('remoteなし')
-        $fetchPaletteRoute = Invoke-ProductCommandFromPalette $main $process 'Git: Fetch'
-        $fetchHead = Join-Path $gitWorkspace '.git\FETCH_HEAD'
-        if ($env:MDLITE_TEST_SILENT -eq '1') {
-            Start-Sleep -Milliseconds 250
-            $fetchConfirmation = [MDLiteGitProductNative]::FindTopLevelWindow($process.Id, 'Git 明示操作')
-            $fetchTaskDialog = [MDLiteGitProductNative]::FindTopLevelWindow($process.Id, 'Fetch')
-            $loopbackConnected = $stall.WaitForConnection(750)
-            $statusAfterFetchCancel = Get-GitOutput $gitWorkspace @('status', '--short')
-            $checks['loopback_fetch_cancel_uses_product_taskdialog_and_preserves_index'] = [ordered]@{
-                status = 'BLOCKED'
-                details = [ordered]@{
-                    reason = 'MDLITE_TEST_SILENT maps non-Workspace-Trust MB_YESNO confirmations to IDNO; Fetch never reaches RunProcessWithCancel.'
-                    palette_route = $fetchPaletteRoute; confirmation_dialog_hwnd = $fetchConfirmation.ToInt64()
-                    fetch_taskdialog_hwnd = $fetchTaskDialog.ToInt64(); loopback_connection_accepted = $loopbackConnected
-                    url = $remoteUrl; panel = $remotePanel; remote_ready = $remoteReady
-                    status_before = $statusAfterCommit.output; status_after = $statusAfterFetchCancel.output
-                    fetch_head_created = (Test-Path -LiteralPath $fetchHead)
-                }
-            }
-        } else {
-            $confirmation = Wait-WindowTitle $process.Id 'Git 明示操作'
-            $fetchQuestion = Get-DialogChildText $confirmation
-            [void][MDLiteGitProductNative]::PostMessage($confirmation, 0x0111, [IntPtr]6, [IntPtr]::Zero)
-            if (-not (Wait-WindowGone $process.Id 'Git 明示操作')) { throw 'Fetch confirmation stayed open.' }
-            $taskDialog = Wait-WindowTitle $process.Id 'Fetch'
-            $cancelButton = [IntPtr]::Zero
-            foreach ($candidate in [MDLiteGitProductNative]::Children($taskDialog)) {
-                if ([MDLiteGitProductNative]::WindowClass($candidate) -ne 'Button') { continue }
-                $caption = [MDLiteGitProductNative]::WindowText($candidate)
-                if ($caption -match '^(Cancel|キャンセル)$') { $cancelButton = $candidate; break }
-            }
-            $cancelCaption = if ($cancelButton -ne [IntPtr]::Zero) { [MDLiteGitProductNative]::WindowText($cancelButton) } else { '' }
-            if ($cancelButton -eq [IntPtr]::Zero) { throw 'The actual Fetch TaskDialog Cancel button was not found.' }
-            $loopbackConnected = $stall.WaitForConnection(2500)
-            Click-ProductButton $cancelButton 'Fetch cancellation'
-            if (-not (Wait-WindowGone $process.Id 'Fetch' 10000)) { throw 'Cancellable Fetch TaskDialog did not close.' }
-            $fetchResult = Wait-WindowTitle $process.Id 'Fetch'
-            $fetchResultText = Get-DialogChildText $fetchResult
-            [void][MDLiteGitProductNative]::PostMessage($fetchResult, 0x0111, [IntPtr]1, [IntPtr]::Zero)
-            if (-not (Wait-WindowGone $process.Id 'Fetch')) { throw 'Fetch result message did not close.' }
-            $statusAfterFetchCancel = Get-GitOutput $gitWorkspace @('status', '--short')
-            Add-Check 'loopback_fetch_cancel_uses_product_taskdialog_and_preserves_index' ($remoteReady -and $fetchQuestion.Contains('fetch --prune') -and
-                $loopbackConnected -and [bool]$cancelCaption -and $fetchResultText.Contains('キャンセル') -and $statusAfterFetchCancel.exit_code -eq 0 -and
-                $statusAfterFetchCancel.output -ceq $statusAfterCommit.output -and -not (Test-Path -LiteralPath $fetchHead)) ([ordered]@{
-                url = $remoteUrl; panel = $remotePanel; loopback_connection_accepted = $loopbackConnected
-                confirmation = $fetchQuestion; cancel_button = $cancelCaption; result = $fetchResultText
-                status_before = $statusAfterCommit.output; status_after = $statusAfterFetchCancel.output; fetch_head_created = (Test-Path -LiteralPath $fetchHead)
-            })
-        }
-    } catch {
-        $checks['loopback_fetch_cancel_uses_product_taskdialog_and_preserves_index'] = [ordered]@{
-            status = 'BLOCKED'; details = [ordered]@{ error = $_.Exception.Message; process_id = $process.Id; main_window_hwnd = $main.ToInt64() }
-        }
+    # Fetch uses a separate fresh non-silent process; main fixture scalar/isolation hooks stay enabled.
+    $freshFetch = Invoke-FreshLoopbackFetch
+    $checks['loopback_fetch_cancel_uses_product_taskdialog_and_preserves_index'] = [ordered]@{
+        status = if ($freshFetch.pass) { 'PASS' } else { 'BLOCKED' }; details = $freshFetch.evidence
     }
     $status = 'PASS_PRODUCT_UI_SYNTHETIC_NATIVE_ROUTE'
 } catch {
@@ -1509,7 +1797,7 @@ $result = [ordered]@{
     evidence_boundary = $evidenceBoundary
     screenshots = @($mixedPanelScreenshot, $paletteScreenshot, $headerScreenshot)
     local_http_fetch_fixture = '127.0.0.1 ephemeral TcpListener accepts one connection and sends no response; no external network or credentials.'
-    trust_fixture_route = 'noGit fixture uses WM_APP+67 wParam=1 to select only its .mdlite/.state/test-trust store, then real native Workspace Trust dialogs for deny, accept, and revoke; main Git fixture uses explicitly labeled wParam=0 direct fixture grant for product Git checks.'
+    trust_fixture_route = 'noGit uses fixture-store mode1 and main Git uses isolated mode0; fresh non-silent Fetch uses ordinary Trust grant/revoke with real-store inventory comparison and no test hooks.'
     error = $errorMessage
     timestamp_utc = [DateTime]::UtcNow.ToString('o')
 }

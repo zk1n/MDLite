@@ -48,6 +48,7 @@ public static class MDLiteCalendarNative {
   [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hwnd, StringBuilder text, int capacity);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
@@ -74,6 +75,22 @@ public static class MDLiteCalendarNative {
   }
 }
 '@
+
+function Get-CalendarGridGeometry([int]$Width, [int]$Height, [uint32]$Dpi = 96) {
+    # Match CalculateCalendarViewGeometry: positive MulDiv rounds halves upward.
+    if ($Dpi -eq 0) { $Dpi = 96 }
+    $width = [Math]::Max(0, $Width)
+    $height = [Math]::Max(0, $Height)
+    $dip = { param([int]$Value) [int][Math]::Floor(($Value * [long]$Dpi + 48) / 96.0) }
+    $header = [Math]::Min($height, [Math]::Max((& $dip 24), [Math]::Min((& $dip 36), [int][Math]::Floor($height / 5))))
+    $weekday = [Math]::Min($height - $header,
+        [Math]::Max((& $dip 20), [Math]::Min((& $dip 24), [int][Math]::Floor(($height - $header) / 8))))
+    $gridTop = $header + $weekday
+    $footer = [Math]::Min([Math]::Max(0, $height - $gridTop),
+        [Math]::Max((& $dip 24), [Math]::Min((& $dip 32), [int][Math]::Floor($height / 9))))
+    $gridBottom = [Math]::Max($gridTop, $height - $footer)
+    return [pscustomobject]@{ width = $width; height = $height; dpi = $Dpi; header = $header; gridTop = $gridTop; gridBottom = $gridBottom; navWidth = [Math]::Min((& $dip 44), [int][Math]::Floor($width / 5)) }
+}
 
 function Get-DailyFileCount([string]$Root) {
     $daily = Join-Path $Root 'Dairy'
@@ -195,15 +212,12 @@ try {
         left = $calendarRect.left; top = $calendarRect.top
         right = $calendarRect.right; bottom = $calendarRect.bottom
         width = $calendarClient.right; height = $calendarClient.bottom
+        dpi = [MDLiteCalendarNative]::GetDpiForWindow($calendar)
     }
     $height = $calendarClient.bottom
-    $header = [Math]::Min($height, [Math]::Max(24, [Math]::Min(36, [Math]::Floor($height / 5))))
-    $weekday = [Math]::Min($height - $header,
-        [Math]::Max(20, [Math]::Min(24, [Math]::Floor(($height - $header) / 8))))
-    $gridTop = [int]($header + $weekday)
-    $footer = [Math]::Min([Math]::Max(0, $height - $gridTop),
-        [Math]::Max(24, [Math]::Min(32, [Math]::Floor($height / 9))))
-    $gridBottom = [Math]::Max($gridTop, $height - $footer)
+    $geometry = Get-CalendarGridGeometry $calendarClient.right $height $calendarBounds.dpi
+    $gridTop = $geometry.gridTop
+    $gridBottom = $geometry.gridBottom
     $gridHeight = $gridBottom - $gridTop
     $gridWidth = $calendarClient.right
     $today = [DateTime]::Today

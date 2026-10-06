@@ -2,6 +2,7 @@
 #include "app/PanelLayout.h"
 
 #include "calendar/CalendarView.h"
+#include "calendar/CalendarDayIndex.h"
 #include "core/Document.h"
 #include "editor/EditorAdapter.h"
 #include "editor/RichEditTableAdapter.h"
@@ -99,6 +100,7 @@ class Application {
     SourceSelection suspended_selection{};
     std::size_t suspended_first_visible_source{};
     std::optional<std::size_t> suspended_horizontal_left_edge_source;
+    std::optional<int> suspended_legacy_first_visible_line;
     bool suspended_view_state_valid{};
     MarkdownParseResult parse;
     EditorSnapshot editor_snapshot;
@@ -233,11 +235,12 @@ class Application {
   void NewUntitledDocument();
   void QuickOpen();
   void OpenWorkspace(const std::filesystem::path& path);
-  void PopulateWorkspaceTree();
+  void PopulateWorkspaceTree(bool refresh_calendar_index = true);
   void RefreshCalendarAfterWorkspaceMutation();
   void AddTreeDirectory(HTREEITEM parent, const std::filesystem::path& directory, int depth);
-  void OpenDocument(const std::filesystem::path& path);
-  void OpenDocumentView(Document document, std::wstring tab_name);
+  void OpenDocument(const std::filesystem::path& path, bool activate = true);
+  void OpenDocumentView(Document document, std::wstring tab_name, bool activate = true);
+  void SeedSessionViewState(DocumentView& view, const SessionDocument& item);
   void OpenRecoverySnapshot(const std::filesystem::path& path);
   void ActivateDocument(std::size_t index);
   bool EnsureEditor(DocumentView& view);
@@ -327,6 +330,11 @@ class Application {
   bool OpenCalendarDetailAtOffset(std::size_t offset);
   void UpdateCalendarDetails(const SYSTEMTIME& date);
   void UpdateCalendarDetails(CalendarDate date);
+  void StartCalendarIndexWorker();
+  void StopCalendarIndexWorker();
+  void CompleteCalendarIndex(void* raw_payload);
+  void CompleteCalendarIndexDeliveryFailure();
+  void RefreshCalendarForSelection(CalendarDate date);
   void UpdateCalendarViewTheme();
   void UpdateCalendarViewMarkers();
   void CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date);
@@ -429,6 +437,12 @@ class Application {
   HWND calendar_details_toggle_{};
   bool calendar_details_expanded_{};
   std::vector<CalendarDetailTarget> calendar_detail_targets_;
+  std::jthread calendar_index_worker_;
+  std::uint64_t calendar_index_generation_{};
+  std::filesystem::path calendar_index_workspace_;
+  std::optional<CalendarDayFileIndex> calendar_workspace_index_;
+  bool calendar_index_active_{};
+  std::atomic_bool calendar_index_delivery_failed_{};
   std::array<HWND, 4> panel_headers_{};
   std::filesystem::path workspace_;
   std::vector<std::filesystem::path> copied_files_;

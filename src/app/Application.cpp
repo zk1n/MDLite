@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <array>
@@ -43,6 +44,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <new>
 #include <thread>
 
@@ -101,6 +103,7 @@ constexpr UINT kTestRefreshWorkspaceTreeMessage = WM_APP + 66;
 constexpr UINT kTestTrustWorkspaceForGitMessage = WM_APP + 67;
 constexpr UINT kTestGetGitActionActiveMessage = WM_APP + 68;
 constexpr UINT kTestGetDocumentStateMessage = WM_APP + 69;
+constexpr UINT kCalendarIndexCompleteMessage = WM_APP + 70;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticWrite = 1U << 0U;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticRestore = 1U << 1U;
 constexpr std::uint32_t kNativeProjectionFaultIncrementalWrite = 1U << 2U;
@@ -210,6 +213,90 @@ bool TestAutomationSilent() {
   return GetEnvironmentVariableW(L"MDLITE_TEST_SILENT", enabled, 2) == 1 && enabled[0] == L'1';
 }
 
+// Test-only startup timings; no path/content/query values are recorded.
+enum class TestStartupPhaseId {
+  InitialPath, Workspace, Tree, TreeEnumerate, TreeSort, TreeEntries,
+  DocumentLoad, DocumentView, Snapshot, EnsureEditor, Activate, CalendarIndex, CalendarPublish
+};
+
+int FormatTestStartupRecord(char* buffer, std::size_t capacity,
+                           TestStartupPhaseId phase, int event, double elapsed,
+                           std::uint64_t count, std::uint64_t other_count,
+                           double work_ms, double other_ms) noexcept {
+  constexpr const char* names[]{"initial_path", "workspace", "tree", "tree_enumerate",
+      "tree_sort", "tree_entries", "document_load", "document_view", "snapshot",
+      "ensure_editor", "activate", "calendar_index", "calendar_publish"};
+  constexpr const char* events[]{"begin", "end", "progress"};
+  const auto index = static_cast<std::size_t>(phase);
+  if (index >= std::size(names) || event < 0 || event >= static_cast<int>(std::size(events))) return 0;
+  const int length = _snprintf_s(buffer, capacity, _TRUNCATE,
+      "{\"phase\":\"%s\",\"event\":\"%s\",\"pid\":%lu,\"tid\":%lu,"
+      "\"elapsed_ms\":%.3f,\"count\":%llu,\"other_count\":%llu,\"work_ms\":%.3f,\"other_ms\":%.3f}\n",
+      names[index], events[event], GetCurrentProcessId(), GetCurrentThreadId(), elapsed,
+      static_cast<unsigned long long>(count), static_cast<unsigned long long>(other_count), work_ms, other_ms);
+  return length > 0 ? length : 0;
+}
+
+struct TestStartupTraceFile {
+  HANDLE file{INVALID_HANDLE_VALUE};
+  TestStartupTraceFile() noexcept {
+    if (!TestAutomationSilent()) return;
+    try {
+      wchar_t value[32768]{};
+      const DWORD size = GetEnvironmentVariableW(L"MDLITE_TEST_STARTUP_TRACE_PATH", value, static_cast<DWORD>(std::size(value)));
+      if (size == 0 || size >= std::size(value)) return;
+      const std::filesystem::path path(value);
+      if (!path.is_absolute() || path.filename() != L"startup-phases.ndjson") return;
+      const DWORD parent = GetFileAttributesW(path.parent_path().c_str());
+      const DWORD target = GetFileAttributesW(path.c_str());
+      if (parent == INVALID_FILE_ATTRIBUTES || !(parent & FILE_ATTRIBUTE_DIRECTORY) ||
+          (parent & FILE_ATTRIBUTE_REPARSE_POINT) || target == INVALID_FILE_ATTRIBUTES ||
+          (target & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
+      std::ifstream marker(path.parent_path() / L".mdlite-startup-trace-owned", std::ios::binary);
+      std::array<char, 32> magic{};
+      marker.read(magic.data(), magic.size());
+      if (std::string_view(magic.data(), static_cast<std::size_t>(marker.gcount())) !=
+          "MDLite startup phase trace v1\n") return;
+      file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    } catch (...) { file = INVALID_HANDLE_VALUE; }
+  }
+  ~TestStartupTraceFile() { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
+};
+
+struct TestStartupPhase {
+  TestStartupPhaseId phase;
+  HANDLE file;
+  std::chrono::steady_clock::time_point start{};
+  std::uint64_t count{}, other_count{};
+  double work_ms{}, other_ms{};
+  bool ended{};
+  explicit TestStartupPhase(TestStartupPhaseId value) noexcept : phase(value) {
+    static TestStartupTraceFile trace;
+    file = trace.file;
+    if (file != INVALID_HANDLE_VALUE) { start = std::chrono::steady_clock::now(); Emit(0); }
+  }
+  bool Enabled() const noexcept { return file != INVALID_HANDLE_VALUE; }
+  double Elapsed() const noexcept {
+    return Enabled() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() : 0;
+  }
+  void Emit(int event) noexcept {
+    if (!Enabled()) return;
+    char buffer[384]{};
+    const int length = FormatTestStartupRecord(buffer, sizeof(buffer), phase, event, Elapsed(),
+                                               count, other_count, work_ms, other_ms);
+    DWORD written{};
+    // Calendar indexing can now trace alongside the UI thread's tree spans.
+    static std::mutex append_mutex;
+    const std::lock_guard lock(append_mutex);
+    if (length == 0 || !WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr) ||
+        written != static_cast<DWORD>(length)) file = INVALID_HANDLE_VALUE;
+  }
+  void Finish() noexcept { if (!ended) { Emit(1); ended = true; } }
+  ~TestStartupPhase() { Finish(); }
+};
+
+
 DWORD TestGitActionDelay() {
   if (!TestAutomationSilent()) return 0;
   wchar_t value[16]{};
@@ -281,6 +368,12 @@ struct GitStatusCompleteMessage {
   std::uint64_t generation{};
   std::filesystem::path workspace;
   GitPanelStatus status;
+};
+
+struct CalendarIndexCompleteMessage {
+  std::uint64_t generation{};
+  std::filesystem::path workspace;
+  CalendarDayFileIndex index;
 };
 
 struct GitActionCompleteMessage {
@@ -1373,6 +1466,7 @@ void PlaceOnVisibleMonitor(HWND window, int x, int y, int width, int height) {
 Application::Application(HINSTANCE instance) : instance_(instance) {}
 
 Application::~Application() {
+  StopCalendarIndexWorker();
   if (menu_ && IsMenu(menu_)) DestroyMenu(menu_);
   menu_ = nullptr;
   StopGitActionWorker();
@@ -1458,6 +1552,7 @@ int Application::Run() {
 }
 
 void Application::OpenInitialPath(const std::filesystem::path& path) {
+  TestStartupPhase startup_trace(TestStartupPhaseId::InitialPath);
   std::error_code error;
   const auto absolute = std::filesystem::weakly_canonical(path, error);
   if (error) return;
@@ -2608,10 +2703,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       if (wparam == kAutosaveTimer) {
         CompleteGitActionDeliveryFailure();
         CompleteGitStatusDeliveryFailure();
+        CompleteCalendarIndexDeliveryFailure();
         if (external_operation_active_) return 0;
         const ULONGLONG now = GetTickCount64();
-        bool pending = git_status_worker_.joinable();
-        bool fast_poll = git_status_worker_.joinable();
+        bool pending = git_status_worker_.joinable() || calendar_index_active_;
+        bool fast_poll = pending;
         ULONGLONG next_asset_check = std::numeric_limits<ULONGLONG>::max();
         if (editor_projection_repair_retry_due_ != 0) {
           pending = true;
@@ -2974,6 +3070,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     case kWorkspaceSearchCompleteMessage:
       CompleteWorkspaceSearch(reinterpret_cast<void*>(lparam));
+      return 0;
+    case kCalendarIndexCompleteMessage:
+      CompleteCalendarIndex(reinterpret_cast<void*>(lparam));
       return 0;
     case kGitActionCompleteMessage:
       CompleteGitAction(reinterpret_cast<void*>(lparam));
@@ -3516,7 +3615,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
                                               : std::nullopt);
       } else if (header->hwndFrom == calendar_ && header->code == CVN_DATE_SELECTED) {
         const auto* selection = reinterpret_cast<const CalendarViewDateSelectedNotification*>(lparam);
-        UpdateCalendarDetails(selection->date);
+        RefreshCalendarForSelection(selection->date);
       } else if (header->hwndFrom == calendar_ && header->code == CVN_MONTH_CHANGED) {
         UpdateCalendarViewMarkers();
       } else if (header->hwndFrom == find_results_ &&
@@ -3544,6 +3643,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     case WM_CLOSE: {
       if (SaveAllForExit(true) == SaveAllResult::Cancelled) return 0;
+      StopCalendarIndexWorker();
       if (workspace_search_worker_.joinable()) {
         workspace_search_worker_.request_stop();
         workspace_search_worker_.join();
@@ -3607,6 +3707,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       return reinterpret_cast<LRESULT>(brush ? brush : GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_DESTROY:
+      StopCalendarIndexWorker();
       if (menu_ && IsMenu(menu_)) {
         SetMenu(window_, nullptr);
         DestroyMenu(menu_);
@@ -4530,7 +4631,7 @@ void Application::GoToCalendarToday() {
   CalendarView_SetToday(calendar_, today);
   CalendarView_SetDisplayedMonth(calendar_, today);
   CalendarView_SetSelection(calendar_, today);
-  UpdateCalendarDetails(today);
+  RefreshCalendarForSelection(today);
 }
 int Application::MeasurePanelTextHeight(HWND item, int width) const {
   if (!item) return ScaleDip(window_, 40);
@@ -5054,6 +5155,7 @@ void Application::QuickOpen() {
 }
 
 void Application::OpenWorkspace(const std::filesystem::path& path) {
+  TestStartupPhase startup_trace(TestStartupPhaseId::Workspace);
   if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
   ++workspace_search_generation_;
   workspace_search_due_ = 0;
@@ -5083,7 +5185,7 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
   workspace_ = absolute;
   git_panel_status_ = {};
   git_status_workspace_ = workspace_;
-  std::optional<SessionDocument> active_session_view_to_restore;
+  SessionState session;
   workspace_store_ = std::make_shared<WorkspaceStore>(workspace_);
   if (!std::filesystem::exists(workspace_ / L".mdlite")) {
     if (MessageBoxW(window_, L"このWorkspace用の設定・復旧領域 .mdlite を作成しますか？\n"
@@ -5097,133 +5199,137 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
     if (!workspace_store_->Initialize(initialize_error)) {
       MessageBoxW(window_, initialize_error.c_str(), L"Workspace設定", MB_ICONWARNING);
       workspace_store_.reset();
-    } else {
-      const auto recoveries = workspace_store_->RecoveryFiles();
-      if (!recoveries.empty()) {
-        const int recover = TestAutomationSilent() ? IDYES : MessageBoxW(window_,
-            L"前回の復旧スナップショットがあります。\n"
-            L"元文書への未保存編集として開きますか？",
-            L"MDLite 復旧", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON1);
-        if (recover == IDYES) {
-          for (const auto& recovery : recoveries) OpenRecoverySnapshot(recovery);
-        } else if (MessageBoxW(window_,
-                   L"復旧スナップショットを明示的に破棄しますか？\n"
-                   L"「いいえ」なら次回起動のために保持します。",
-                   L"MDLite 復旧", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) == IDYES) {
-          for (const auto& recovery : recoveries) {
-            std::wstring discard_error;
-            if (!workspace_store_->DiscardRecoverySnapshot(recovery, discard_error))
-              MessageBoxW(window_, discard_error.c_str(), L"復旧スナップショット", MB_ICONWARNING);
-          }
-        }
-      }
-      SessionState session;
-      if (!workspace_store_->ReadSessionState(session, initialize_error)) {
-        MessageBoxW(window_, initialize_error.c_str(), L"セッション復元", MB_ICONWARNING);
-      } else {
-        recent_documents_ = session.recent_documents;
-        PlaceOnVisibleMonitor(window_, session.main_x, session.main_y,
-                              session.main_width, session.main_height);
-        for (const auto& item : session.documents) OpenDocument(item.path);
-        for (const auto& item : session.documents) {
-          const auto found = std::ranges::find_if(documents_, [&](const auto& view) {
-            return view->document.path() == item.path;
-          });
-          if (found == documents_.end()) continue;
-          const auto index = static_cast<std::size_t>(std::distance(documents_.begin(), found));
-          ActivateDocument(index);
-          std::optional<POINT> source_anchor_scroll;
-          if (item.first_visible_source_offset) {
-            const auto viewport_source_anchor = item.horizontal_left_edge_source_offset
-                .value_or(*item.first_visible_source_offset);
-            source_anchor_scroll = SourceAnchoredScrollPosition(
-                (*found)->editor, (*found)->editor_snapshot, viewport_source_anchor);
-          }
-          RestoreSourceSelection((*found)->editor, (*found)->editor_snapshot,
-                                 SourceSelection{item.selection_begin, item.selection_end});
-          if (item.first_visible_source_offset) {
-            const auto source_anchor = std::min(*item.first_visible_source_offset,
-                                                (*found)->document.text().size());
-            const auto native_anchor = static_cast<LONG>(
-                (*found)->editor_snapshot.SourceToNative(source_anchor));
-            const LRESULT target_line =
-                SendMessageW((*found)->editor, EM_LINEFROMCHAR, native_anchor, 0);
-            const LRESULT current_first_line =
-                SendMessageW((*found)->editor, EM_GETFIRSTVISIBLELINE, 0, 0);
-            if (target_line >= 0 && current_first_line >= 0)
-              SendMessageW((*found)->editor, EM_LINESCROLL, 0,
-                           target_line - current_first_line);
-          } else {
-            // Legacy session files store a line count rather than a source anchor.
-            const LRESULT current_first_line =
-                SendMessageW((*found)->editor, EM_GETFIRSTVISIBLELINE, 0, 0);
-            if (current_first_line >= 0)
-              SendMessageW((*found)->editor, EM_LINESCROLL, 0,
-                           item.first_visible_line - current_first_line);
-          }
-          if (source_anchor_scroll)
-            SendMessageW((*found)->editor, EM_SETSCROLLPOS, 0,
-                         reinterpret_cast<LPARAM>(&*source_anchor_scroll));
-          CaptureEditorViewState(**found);
-          if (item.compact) {
-            ToggleCompactWindow();
-            if ((*found)->compact_window)
-              PlaceOnVisibleMonitor((*found)->compact_window, item.x, item.y, item.width, item.height);
-          }
-        }
-        if (!documents_.empty()) {
-          ActivateDocument(std::min(session.active_index, documents_.size() - 1));
-          if (active_document_ < documents_.size()) {
-            const auto active_path = documents_[active_document_]->document.path();
-            const auto saved_active_view = std::ranges::find_if(
-                session.documents, [&](const SessionDocument& item) {
-                  return item.path == active_path;
-                });
-            if (saved_active_view != session.documents.end())
-              active_session_view_to_restore = *saved_active_view;
-          }
-        }
-      }
     }
   }
+  // Editors must be created against the final settings and panel geometry.
+  // Applying these after rehydration would restyle the active table again.
   LoadAndApplySettings();
   LoadPanelLayout();
-  SetWindowTextW(window_, (L"MDLite — " + workspace_.filename().wstring()).c_str());
-  PopulateWorkspaceTree();
-  UpdateStatus();
-  LayoutControls();
-  // Settings and panel restoration above can resize RichEdit after the session
-  // was initially rehydrated. Reapply the active document's source viewport
-  // once against the final formatting rectangle and table projection.
-  if (active_session_view_to_restore && active_document_ < documents_.size()) {
-    auto& view = *documents_[active_document_];
-    if (view.document.path() == active_session_view_to_restore->path &&
-        view.editor && IsWindow(view.editor)) {
-      view.suspended_selection = {active_session_view_to_restore->selection_begin,
-                                  active_session_view_to_restore->selection_end};
-      if (active_session_view_to_restore->first_visible_source_offset)
-        view.suspended_first_visible_source = std::min(
-            *active_session_view_to_restore->first_visible_source_offset,
-            view.document.text().size());
-      view.suspended_horizontal_left_edge_source =
-          active_session_view_to_restore->horizontal_left_edge_source_offset;
-      view.suspended_view_state_valid = true;
-      RestoreEditorViewState(view);
-      CaptureEditorViewState(view);
-      view.suspended_view_state_valid = false;
+  if (workspace_store_) {
+    std::wstring initialize_error;
+    const auto recoveries = workspace_store_->RecoveryFiles();
+    if (!recoveries.empty()) {
+      const int recover = TestAutomationSilent() ? IDYES : MessageBoxW(window_,
+          L"前回の復旧スナップショットがあります。\n"
+          L"元文書への未保存編集として開きますか？",
+          L"MDLite 復旧", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON1);
+      if (recover == IDYES) {
+        for (const auto& recovery : recoveries) OpenRecoverySnapshot(recovery);
+      } else if (MessageBoxW(window_,
+                 L"復旧スナップショットを明示的に破棄しますか？\n"
+                 L"「いいえ」なら次回起動のために保持します。",
+                 L"MDLite 復旧", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) == IDYES) {
+        for (const auto& recovery : recoveries) {
+          std::wstring discard_error;
+          if (!workspace_store_->DiscardRecoverySnapshot(recovery, discard_error))
+            MessageBoxW(window_, discard_error.c_str(), L"復旧スナップショット", MB_ICONWARNING);
+        }
+      }
+    }
+    if (!workspace_store_->ReadSessionState(session, initialize_error)) {
+      MessageBoxW(window_, initialize_error.c_str(), L"セッション復元", MB_ICONWARNING);
+      session = {};
+    } else {
+      recent_documents_ = session.recent_documents;
+      PlaceOnVisibleMonitor(window_, session.main_x, session.main_y,
+                            session.main_width, session.main_height);
     }
   }
+  SetWindowTextW(window_, (L"MDLite — " + workspace_.filename().wstring()).c_str());
+  // Building the initial tree changes no files. Reuse the scan started by
+  // settings restoration instead of cancelling it and scanning twice.
+  PopulateWorkspaceTree(false);
+  LayoutControls();
+  for (const auto& item : session.documents) {
+    const auto existing = std::ranges::find_if(documents_, [&](const auto& view) {
+      return view->document.path() == item.path;
+    });
+    // Recovery bodies and compact views retain eager opening. Clean regular
+    // saved tabs need only Documents/snapshots until actually selected.
+    const bool eager = item.compact ||
+        (existing != documents_.end() && (*existing)->document.dirty());
+    OpenDocument(item.path, eager);
+    const auto found = std::ranges::find_if(documents_, [&](const auto& view) {
+      return view->document.path() == item.path;
+    });
+    if (found == documents_.end()) continue;
+    SeedSessionViewState(**found, item);
+    if ((*found)->editor && !(*found)->editor_projection_invalid) {
+      const auto index = static_cast<std::size_t>(found - documents_.begin());
+      if (item.compact && active_document_ == index) {
+        if (!(*found)->compact_window) ToggleCompactWindow();
+        if ((*found)->compact_window)
+          PlaceOnVisibleMonitor((*found)->compact_window, item.x, item.y, item.width, item.height);
+      }
+      RestoreEditorViewState(**found);
+      CaptureEditorViewState(**found);
+      (*found)->suspended_view_state_valid = false;
+    }
+  }
+  if (!documents_.empty()) {
+    std::size_t selected = std::min(session.active_index, documents_.size() - 1);
+    if (session.active_index < session.documents.size()) {
+      const auto found = std::ranges::find_if(documents_, [&](const auto& view) {
+        return view->document.path() == session.documents[session.active_index].path;
+      });
+      if (found != documents_.end()) selected = static_cast<std::size_t>(found - documents_.begin());
+    }
+    ActivateDocument(selected);
+  }
+  UpdateStatus();
+  // Settings were resolved before recovery hydration. Schedule those newly
+  // dirty Documents now without reapplying styling or activating their views.
+  const ULONGLONG restored_autosave_now = GetTickCount64();
+  bool restored_autosave_pending = false;
+  for (auto& view : documents_) {
+    if (!view->document.dirty()) continue;
+    view->autosave_due = settings_.auto_save
+        ? restored_autosave_now + settings_.auto_save_delay_ms : 0;
+    restored_autosave_pending |= settings_.auto_save;
+  }
+  if (restored_autosave_pending) SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
   RunGitStatus();
 }
 
-void Application::PopulateWorkspaceTree() {
-  TreeView_DeleteAllItems(workspace_tree_);
-  tree_paths_.clear();
-  AddTreeDirectory(TVI_ROOT, workspace_, 0);
-  RefreshCalendarAfterWorkspaceMutation();
+void Application::PopulateWorkspaceTree(bool refresh_calendar_index) {
+  TestStartupPhase startup_trace(TestStartupPhaseId::Tree);
+  // Bulk inserts otherwise repeat native layout/scroll-width work per item.
+  // Preserve the child's own visibility bit, including a hidden ancestor.
+  struct TreeRedrawScope {
+    HWND tree;
+    bool was_visible;
+    explicit TreeRedrawScope(HWND value) noexcept
+        : tree(value), was_visible((GetWindowLongPtrW(value, GWL_STYLE) & WS_VISIBLE) != 0) {
+      SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+    }
+    ~TreeRedrawScope() noexcept {
+      if (!IsWindow(tree)) return;
+      SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+      if (!was_visible)
+        SetWindowLongPtrW(tree, GWL_STYLE,
+                         GetWindowLongPtrW(tree, GWL_STYLE) & ~static_cast<LONG_PTR>(WS_VISIBLE));
+      RedrawWindow(tree, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+  };
+  {
+    const TreeRedrawScope redraw(workspace_tree_);
+    TreeView_DeleteAllItems(workspace_tree_);
+    tree_paths_.clear();
+    AddTreeDirectory(TVI_ROOT, workspace_, 0);
+  }
+  if (refresh_calendar_index) {
+    RefreshCalendarAfterWorkspaceMutation();
+  } else {
+    UpdateCalendarViewMarkers();
+    if (const auto selected = CalendarView_GetSelection(calendar_))
+      UpdateCalendarDetails(*selected);
+  }
 }
 
 void Application::RefreshCalendarAfterWorkspaceMutation() {
+  StopCalendarIndexWorker();
+  calendar_workspace_index_.reset();
+  calendar_index_workspace_.clear();
   UpdateCalendarViewMarkers();
   if (const auto selected = CalendarView_GetSelection(calendar_))
     UpdateCalendarDetails(*selected);
@@ -5231,10 +5337,14 @@ void Application::RefreshCalendarAfterWorkspaceMutation() {
 
 void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path& directory, int depth) {
   if (depth > 32) return;
+  TestStartupPhase enumerate_trace(TestStartupPhaseId::TreeEnumerate);
   std::vector<std::filesystem::directory_entry> entries;
   std::error_code error;
   for (std::filesystem::directory_iterator iterator(directory, std::filesystem::directory_options::skip_permission_denied, error), end;
        iterator != end && !error; iterator.increment(error)) entries.push_back(*iterator);
+  enumerate_trace.count = entries.size();
+  enumerate_trace.Finish();
+  TestStartupPhase sort_trace(TestStartupPhaseId::TreeSort);
   std::ranges::sort(entries, [](const auto& a, const auto& b) {
     const bool a_directory = a.is_directory();
     const bool b_directory = b.is_directory();
@@ -5245,6 +5355,9 @@ void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path
     if (insensitive != CSTR_EQUAL && insensitive != 0) return insensitive == CSTR_LESS_THAN;
     return a_name < b_name;
   });
+  sort_trace.count = entries.size();
+  sort_trace.Finish();
+  TestStartupPhase entries_trace(TestStartupPhaseId::TreeEntries);
   for (const auto& entry : entries) {
     const auto name = entry.path().filename().wstring();
     if (name == L".git" || name == L"build" || name == L"out" ||
@@ -5252,6 +5365,7 @@ void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path
         (name == L".state" && entry.path().parent_path().filename() == L".mdlite")) continue;
     if (!entry.is_directory() && !IsTextFile(entry.path())) continue;
     tree_paths_.push_back(std::make_unique<std::filesystem::path>(entry.path()));
+    const auto icon_started = entries_trace.Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const DWORD attributes = entry.is_directory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
     SHFILEINFOW image_info{};
     const bool has_image = SHGetFileInfoW(entry.path().c_str(), attributes, &image_info,
@@ -5263,6 +5377,8 @@ void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path
                          SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_OPENICON) != 0)
         selected_image = open_image.iIcon;
     }
+    if (entries_trace.Enabled()) entries_trace.work_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - icon_started).count();
+    const auto insert_started = entries_trace.Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     TVINSERTSTRUCTW insert{};
     insert.hParent = parent;
     // The directory entries above are already ordered. TVI_SORT re-sorts the
@@ -5285,11 +5401,16 @@ void Application::AddTreeDirectory(HTREEITEM parent, const std::filesystem::path
       placeholder.item.pszText = const_cast<wchar_t*>(L"");
       placeholder.item.lParam = 0;
       TreeView_InsertItem(workspace_tree_, &placeholder);
+      ++entries_trace.other_count;
     }
+    ++entries_trace.count;
+    ++entries_trace.other_count;
+    if (entries_trace.Enabled()) entries_trace.other_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - insert_started).count();
+    if (entries_trace.count % 128 == 0) entries_trace.Emit(2);
   }
 }
 
-void Application::OpenDocument(const std::filesystem::path& path) {
+void Application::OpenDocument(const std::filesystem::path& path, bool activate) {
   std::error_code error;
   const auto absolute = std::filesystem::weakly_canonical(path, error);
   if (error || !IsTextFile(absolute)) return;
@@ -5306,35 +5427,55 @@ void Application::OpenDocument(const std::filesystem::path& path) {
   if (recent_documents_.size() > 20) recent_documents_.resize(20);
   for (std::size_t i = 0; i < documents_.size(); ++i) {
     if (documents_[i]->document.path() == absolute) {
-      ActivateDocument(i);
+      if (activate) ActivateDocument(i);
       return;
     }
   }
   std::wstring load_error;
   Document document;
+  TestStartupPhase load_trace(TestStartupPhaseId::DocumentLoad);
   if (!document.Load(absolute, load_error)) {
     MessageBoxW(window_, load_error.c_str(), L"ファイルを開けません", MB_ICONERROR);
     return;
   }
-  OpenDocumentView(std::move(document), absolute.filename().wstring());
+  load_trace.count = document.text().size();
+  load_trace.Finish();
+  OpenDocumentView(std::move(document), absolute.filename().wstring(), activate);
 }
 
-void Application::OpenDocumentView(Document document, std::wstring tab_name) {
+void Application::OpenDocumentView(Document document, std::wstring tab_name, bool activate) {
+  TestStartupPhase startup_trace(TestStartupPhaseId::DocumentView);
   auto view = std::make_unique<DocumentView>();
   view->workspace_store = workspace_store_;
   view->document = std::move(document);
+  TestStartupPhase snapshot_trace(TestStartupPhaseId::Snapshot);
+  snapshot_trace.count = view->document.text().size();
   view->editor_snapshot = SnapshotFor(view->document);
-  if (!EnsureEditor(*view)) {
-    SetStatusText(L"文書エディターを作成できなかったため、文書を開けませんでした。");
-    return;
+  snapshot_trace.Finish();
+  if (activate) {
+    TestStartupPhase ensure_trace(TestStartupPhaseId::EnsureEditor);
+    if (!EnsureEditor(*view)) {
+      SetStatusText(L"文書エディターを作成できなかったため、文書を開けませんでした。");
+      return;
+    }
   }
-
   TCITEMW tab{};
   tab.mask = TCIF_TEXT;
   tab.pszText = tab_name.data();
   TabCtrl_InsertItem(tabs_, static_cast<int>(documents_.size()), &tab);
   documents_.push_back(std::move(view));
-  ActivateDocument(documents_.size() - 1);
+  if (activate) ActivateDocument(documents_.size() - 1);
+}
+
+void Application::SeedSessionViewState(DocumentView& view, const SessionDocument& item) {
+  const auto size = view.document.text().size();
+  view.suspended_selection = {std::min(item.selection_begin, size), std::min(item.selection_end, size)};
+  view.suspended_first_visible_source = std::min(item.first_visible_source_offset.value_or(0), size);
+  view.suspended_horizontal_left_edge_source = item.horizontal_left_edge_source_offset
+      ? std::optional<std::size_t>(std::min(*item.horizontal_left_edge_source_offset, size)) : std::nullopt;
+  view.suspended_legacy_first_visible_line = item.first_visible_source_offset
+      ? std::nullopt : std::optional<int>(std::max(0, item.first_visible_line));
+  view.suspended_view_state_valid = true;
 }
 
 void Application::OpenRecoverySnapshot(const std::filesystem::path& path) {
@@ -5391,6 +5532,7 @@ void Application::OpenRecoverySnapshot(const std::filesystem::path& path) {
 }
 
 void Application::ActivateDocument(std::size_t index) {
+  TestStartupPhase activate_trace(TestStartupPhaseId::Activate);
   if (index >= documents_.size()) return;
   auto& target = *documents_[index];
   if (active_document_ < documents_.size() && active_document_ != index &&
@@ -5540,6 +5682,7 @@ void Application::CaptureEditorViewState(DocumentView& view) {
   const LRESULT first_visible_native = SendMessageW(
       view.editor, EM_LINEINDEX, static_cast<WPARAM>(std::max<LRESULT>(0, first_visible_line)), 0);
   if (first_visible_native >= 0) {
+    view.suspended_legacy_first_visible_line.reset();
     view.suspended_first_visible_source = view.editor_snapshot.NativeToSource(
         static_cast<std::size_t>(first_visible_native));
     view.suspended_first_visible_source = std::min(
@@ -5553,7 +5696,17 @@ void Application::CaptureEditorViewState(DocumentView& view) {
 }
 
 void Application::RestoreEditorViewState(DocumentView& view) {
-  if (!view.editor || !IsWindow(view.editor) || !view.suspended_view_state_valid) return;
+  if (view.editor_projection_invalid || !view.editor || !IsWindow(view.editor) || !view.suspended_view_state_valid) return;
+  if (view.suspended_legacy_first_visible_line) {
+    RestoreSourceSelection(view.editor, view.editor_snapshot, view.suspended_selection);
+    const LRESULT current = SendMessageW(view.editor, EM_GETFIRSTVISIBLELINE, 0, 0);
+    if (current >= 0) {
+      SendMessageW(view.editor, EM_LINESCROLL, 0, *view.suspended_legacy_first_visible_line - current);
+      view.suspended_legacy_first_visible_line.reset();
+      CaptureEditorViewState(view);
+    }
+    return;
+  }
   const auto horizontal_source_anchor = view.suspended_horizontal_left_edge_source
       .value_or(view.suspended_first_visible_source);
   const auto source_anchor_scroll = SourceAnchoredScrollPosition(
@@ -8803,6 +8956,12 @@ void Application::SaveSession() {
     if (view->editor && IsWindow(view->editor)) {
       item.first_visible_line = static_cast<int>(
           SendMessageW(view->editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    } else if (view->suspended_legacy_first_visible_line) {
+      // An inactive legacy tab has not yet had a native projection from which
+      // to derive a source anchor. Keep its line-only contract until selected.
+      item.first_visible_line = *view->suspended_legacy_first_visible_line;
+      item.first_visible_source_offset.reset();
+      item.horizontal_left_edge_source_offset.reset();
     } else {
       const auto anchor = std::min(view->suspended_first_visible_source,
                                    view->document.text().size());
@@ -11166,6 +11325,113 @@ bool Application::OpenCalendarDetailAtOffset(std::size_t offset) {
   return true;
 }
 
+void Application::StopCalendarIndexWorker() {
+  ++calendar_index_generation_;
+  if (calendar_index_worker_.joinable()) {
+    calendar_index_worker_.request_stop();
+    calendar_index_worker_.join();
+  }
+  calendar_index_active_ = false;
+  calendar_index_delivery_failed_.store(false, std::memory_order_release);
+  // Stop and join before draining: a completed worker may already have queued
+  // its result. No worker can post into a destroyed/reused owner HWND.
+  if (window_ && IsWindow(window_)) {
+    MSG pending{};
+    while (PeekMessageW(&pending, window_, kCalendarIndexCompleteMessage,
+                        kCalendarIndexCompleteMessage, PM_REMOVE))
+      delete reinterpret_cast<CalendarIndexCompleteMessage*>(pending.lParam);
+  }
+}
+
+void Application::StartCalendarIndexWorker() {
+  if (calendar_index_workspace_ == workspace_ &&
+      (calendar_index_active_ || calendar_workspace_index_)) return;
+  StopCalendarIndexWorker();
+  calendar_workspace_index_.reset();
+  calendar_index_workspace_ = workspace_;
+  const auto root = workspace_;
+  const auto generation = calendar_index_generation_;
+  const HWND owner = window_;
+  if (SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr) == 0) {
+    calendar_workspace_index_.emplace();
+    calendar_workspace_index_->state = CalendarIndexState::Error;
+    calendar_workspace_index_->error = L"カレンダー一覧の読み取りを監視するtimerを開始できません。";
+    return;
+  }
+  auto* delivery_failed = &calendar_index_delivery_failed_;
+  calendar_index_active_ = true;
+  try {
+    auto payload = std::make_unique<CalendarIndexCompleteMessage>(
+        CalendarIndexCompleteMessage{generation, root, {}});
+    calendar_index_worker_ = std::jthread(
+        [root, owner, delivery_failed, payload = std::move(payload)](std::stop_token stop) mutable {
+      TestStartupPhase trace(TestStartupPhaseId::CalendarIndex);
+      CalendarDayFileIndex index;
+      try {
+        index = BuildCalendarDayFileIndex(root, {}, [&] { return stop.stop_requested(); });
+      } catch (...) {
+        index.state = CalendarIndexState::Error;
+        index.error = L"カレンダー一覧を読み取れません。";
+      }
+      trace.count = index.files.size();
+      trace.Finish();
+      if (stop.stop_requested() || index.state == CalendarIndexState::Reading) return;
+      payload->index = std::move(index);
+      if (PostMessageW(owner, kCalendarIndexCompleteMessage, 0,
+                       reinterpret_cast<LPARAM>(payload.get()))) {
+        payload.release();
+      } else {
+        delivery_failed->store(true, std::memory_order_release);
+      }
+    });
+  } catch (...) {
+    calendar_index_active_ = false;
+    calendar_workspace_index_.emplace();
+    calendar_workspace_index_->state = CalendarIndexState::Error;
+    calendar_workspace_index_->error = L"カレンダー一覧の読み取りを開始できません。";
+  }
+}
+
+void Application::CompleteCalendarIndexDeliveryFailure() {
+  if (!calendar_index_delivery_failed_.exchange(false, std::memory_order_acq_rel)) return;
+  if (calendar_index_worker_.joinable()) calendar_index_worker_.join();
+  calendar_index_active_ = false;
+  if (calendar_index_workspace_ != workspace_) return;
+  calendar_workspace_index_.emplace();
+  calendar_workspace_index_->state = CalendarIndexState::Error;
+  calendar_workspace_index_->error = L"カレンダー一覧の結果を画面へ通知できませんでした。日付を選び直して再試行してください。";
+  if (const auto selected = CalendarView_GetSelection(calendar_))
+    UpdateCalendarDetails(*selected);
+}
+
+void Application::RefreshCalendarForSelection(CalendarDate date) {
+  // Explicit user selection must see external create/delete/rename changes.
+  // Reuse only an ongoing scan; never turn a completed snapshot into a cache.
+  if (!calendar_index_active_) calendar_workspace_index_.reset();
+  UpdateCalendarDetails(date);
+}
+
+void Application::CompleteCalendarIndex(void* raw_payload) {
+  std::unique_ptr<CalendarIndexCompleteMessage> payload(
+      static_cast<CalendarIndexCompleteMessage*>(raw_payload));
+  if (!payload || payload->generation != calendar_index_generation_ ||
+      payload->workspace != workspace_ || !calendar_index_active_ ||
+      payload->index.state == CalendarIndexState::Reading) return;
+  calendar_workspace_index_ = std::move(payload->index);
+  calendar_index_active_ = false;
+  // The scan is date/profile-independent. Filter for the *current* selection
+  // and resolve the current Daily profile on the UI thread, never the old date.
+  if (const auto selected = CalendarView_GetSelection(calendar_)) {
+    TestStartupPhase publish_trace(TestStartupPhaseId::CalendarPublish);
+    // A failed partial scan must never look like a successful full index in
+    // timing evidence. The native summary retains the explicit error state.
+    if (calendar_workspace_index_->state == CalendarIndexState::Ready)
+      publish_trace.count = calendar_workspace_index_->files.size();
+    UpdateCalendarDetails(*selected);
+    publish_trace.other_count = calendar_detail_targets_.size();
+  }
+}
+
 void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
   if (!calendar_details_) return;
   calendar_detail_targets_.clear();
@@ -11210,22 +11476,27 @@ void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
     return;
   }
 
-  const auto details = BuildCalendarDayDetails(workspace_, selected, daily);
-  switch (details.index.state) {
+  StartCalendarIndexWorker();
+  const auto reading = MakeCalendarDayFileIndexReading();
+  const auto& workspace_index = calendar_workspace_index_ ? *calendar_workspace_index_ : reading;
+  const auto index = FilterCalendarDayFileIndexForDate(workspace_index, selected);
+  std::wstring daily_path_error;
+  const auto daily_path = ResolveCalendarDailyPath(workspace_, selected, daily, daily_path_error);
+  switch (index.state) {
     case CalendarIndexState::Zero: count = L"文書数: 0件"; break;
     case CalendarIndexState::Reading: count = L"文書数: 取得中"; break;
     case CalendarIndexState::Error: count = L"文書数: 読み取りエラー"; break;
-    case CalendarIndexState::Ready: count = L"文書数: " + std::to_wstring(details.index.files.size()) + L"件"; break;
+    case CalendarIndexState::Ready: count = L"文書数: " + std::to_wstring(index.files.size()) + L"件"; break;
   }
-  switch (details.index.state) {
+  switch (index.state) {
     case CalendarIndexState::Zero: output += L"\n作成ファイル: 0件"; break;
     case CalendarIndexState::Reading: output += L"\n作成ファイル: 取得中"; break;
     case CalendarIndexState::Error: output += L"\n作成ファイル: 読み取りエラー"; break;
     case CalendarIndexState::Ready:
-      output += L"\n作成ファイル: " + std::to_wstring(details.index.files.size()) + L"件";
+      output += L"\n作成ファイル: " + std::to_wstring(index.files.size()) + L"件";
       break;
   }
-  for (const auto& file : details.index.files) {
+  for (const auto& file : index.files) {
     const auto begin = output.size() + 1;
     output += L"\n・" + file.name + L" [" + std::wstring(CalendarFileTypeName(file.type)) + L"] " +
               file.relative_path.generic_wstring();
@@ -11245,13 +11516,13 @@ void Application::UpdateCalendarDetails(const SYSTEMTIME& date) {
   }
   if (!calendar_detail_targets_.empty())
     output += L"\n行を選択してEnter、またはダブルクリックで開けます。";
-  if (details.configured_daily_path) {
+  if (daily_path) {
     std::error_code path_error;
-    const auto relative = std::filesystem::relative(*details.configured_daily_path,
+    const auto relative = std::filesystem::relative(*daily_path,
                                                     workspace_, path_error);
     if (!path_error) output += L"\nDaily path: " + relative.generic_wstring();
   }
-  if (!details.workspace_index.error.empty()) output += L"\n" + details.workspace_index.error;
+  if (!workspace_index.error.empty()) output += L"\n" + workspace_index.error;
   publish();
 }
 
@@ -11271,7 +11542,7 @@ void Application::OpenCalendarDate(CalendarDate date) {
   value.wDay = static_cast<WORD>(date.day);
   CreateProfileForDate(BuiltInProfile::Daily, value);
   UpdateCalendarViewMarkers();
-  UpdateCalendarDetails(value);
+  RefreshCalendarForSelection(date);
 }
 
 void Application::OpenSelectedCalendarDate() {

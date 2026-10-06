@@ -256,6 +256,38 @@ void TestNavigationAndEditing() {
         "column deletion leaves rows missing the selected column untouched");
 }
 
+void TestColumnInsertionPreservesPadding() {
+  const std::wstring table =
+      L"before\r\n\r\n| A | B | C |\r\n| :--- | :---: | ---: |\r\n"
+      L"| one |  | 日本語 |\r\n| three | four | five |\r\n\r\nafter\r\n";
+  const auto middle = mdlite::InsertTableColumn(table, table.find(L"one"), true);
+  Check(middle.changed && middle.text ==
+      L"before\r\n\r\n| A |  | B | C |\r\n| :--- | --- | :---: | ---: |\r\n"
+      L"| one |  |  | 日本語 |\r\n| three |  | four | five |\r\n\r\nafter\r\n",
+      "inserting before an empty cell preserves its padding, CRLF and surrounding source");
+  const std::wstring last = L"| A | B |\n| --- | --- |\n| one |  |";
+  const auto appended = mdlite::InsertTableColumn(last, last.size() - 1, true);
+  Check(appended.changed && appended.text.ends_with(L"| one |  |  |"),
+      "appending after an empty last cell keeps both empty cells' padding");
+  const std::wstring padded = L"| A | B |\n| --- | --- |\n| one |  two  |";
+  const auto spaced = mdlite::InsertTableColumn(padded, padded.find(L"one"), true);
+  Check(spaced.changed && spaced.text.ends_with(L"| one |  |  two  |"),
+      "a new column does not move a pre-existing nonempty cell's whitespace");
+  const std::wstring tabs = L"| A | B |\n| --- | --- |\n| one | \t |";
+  const auto tabbed = mdlite::InsertTableColumn(tabs, tabs.find(L"one"), true);
+  Check(tabbed.changed && tabbed.text.ends_with(L"| one |  | \t |"),
+      "a pre-existing empty cell retains its literal tab padding");
+  const auto first = mdlite::InsertTableColumn(last, last.find(L"one"), false);
+  Check(first.changed && first.text.ends_with(L"|  | one |  |"),
+      "inserting before the first column preserves all existing cell ranges");
+  const std::wstring unframed = L"A | B\n--- | ---\none | two";
+  const auto outerless = mdlite::InsertTableColumn(unframed, unframed.find(L"two"), true);
+  const auto parsed = mdlite::ParseGfmTableAt(outerless.text, outerless.selection);
+  Check(outerless.changed && parsed && parsed->alignments.size() == 3 &&
+      outerless.text.ends_with(L"one | two|  |"),
+      "unframed rows remain valid while existing last-cell bytes stay intact");
+}
+
 void TestMissingTableCellInsertion() {
   const std::wstring outer_pipe_table =
       L"| A | B | C | D |\r\n"
@@ -431,6 +463,7 @@ int main() {
   TestCachedTableCaretNavigation();
   TestMalformedFallback();
   TestNavigationAndEditing();
+  TestColumnInsertionPreservesPadding();
   TestMissingTableCellInsertion();
   TestHeaderAnchoredNavigation();
   if (failures != 0) return 1;

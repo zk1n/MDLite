@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -67,7 +68,8 @@ struct CalendarDayFileIndex {
 CalendarDayFileIndex MakeCalendarDayFileIndexReading() noexcept;
 CalendarDayFileIndex BuildCalendarDayFileIndex(
     const std::filesystem::path& workspace,
-    const CalendarIndexOptions& options = {});
+    const CalendarIndexOptions& options = {},
+    const std::function<bool()>& cancelled = {});
 CalendarDayFileIndex FilterCalendarDayFileIndexForDate(
     const CalendarDayFileIndex& source, CalendarDate date);
 
@@ -88,6 +90,7 @@ std::optional<std::filesystem::path> ResolveCalendarDailyPath(
 CalendarDayDetails BuildCalendarDayDetails(
     const std::filesystem::path& workspace, CalendarDate date,
     const ProfileDefinition& daily_profile,
-    const CalendarIndexOptions& options = {});
+    const CalendarIndexOptions& options = {},
+    const std::function<bool()>& cancelled = {});
 
 }  // namespace mdlite

@@ -401,7 +401,8 @@ std::wstring RenderRow(std::size_t columns) {
 }
 
 std::wstring InsertedColumnText(std::wstring_view value, bool before_existing_cell) {
-  return before_existing_cell ? std::wstring(value) + L" | " : L" | " + std::wstring(value);
+  return before_existing_cell ? L" " + std::wstring(value) + L" |"
+                              : L"| " + std::wstring(value) + L" ";
 }
 
 std::wstring ApplyRowChanges(std::wstring_view source, std::vector<RowChange> changes) {
@@ -755,10 +756,14 @@ TableEditResult InsertTableColumn(std::wstring_view source, std::size_t caret, b
     const std::size_t insertion_cell = std::min(target, cells.size());
     const bool before_existing_cell = insertion_cell < cells.size();
     const std::size_t insertion = before_existing_cell
-        ? row.cells[insertion_cell].begin : row.cells.back().end;
+        ? row.cells[insertion_cell].raw_begin : row.cells.back().raw_end;
     const std::wstring value = IsDelimiter(row, source) ? L"---" : L"";
-    changes.push_back({insertion, insertion,
-                       InsertedColumnText(value, before_existing_cell)});
+    auto inserted = InsertedColumnText(value, before_existing_cell);
+    // An empty final column needs a closing separator in an unframed row;
+    // otherwise GFM interprets the new separator as the old row's trailing pipe.
+    if (!before_existing_cell && (insertion >= source.size() || source[insertion] != L'|'))
+      inserted.push_back(L'|');
+    changes.push_back({insertion, insertion, std::move(inserted)});
   }
   const std::wstring result = ApplyRowChanges(source, changes);
   return {result, RowCaretAfterChanges(result, *block, target, changes), true};

@@ -567,6 +567,113 @@ function Wait-SaveAsControlsReady([Diagnostics.Process]$Target, [int]$TimeoutMs 
     throw "Visible Save As filename host and semantic Save button were not ready within $TimeoutMs ms."
 }
 
+function Wait-SaveRetrySettled($Fixture, [IntPtr]$Dialog, [string]$Path, [string]$ExpectedText,
+    [int]$TimeoutMs = 5000) {
+    $started = [DateTime]::UtcNow
+    $deadline = $started.AddMilliseconds($TimeoutMs)
+    $expectedBytes = [Text.UTF8Encoding]::new($false).GetBytes($ExpectedText)
+    $expectedCaption = 'MDLite — ' + [IO.Path]::GetFileName($Path) + ' — ' + [IO.Path]::GetFileName($Fixture.Directory)
+    $samples = [Collections.Generic.List[object]]::new()
+    $stable = 0
+    $script:lastSaveRetrySettlement = [ordered]@{ pass = $false; samples = $samples }
+    do {
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        $Fixture.Process.Refresh()
+        if ($Fixture.Process.HasExited) { throw 'Save retry process exited before exact bytes and clean state settled.' }
+        $owner = [uint32]0
+        [void][MDLiteNative]::GetWindowThreadProcessId($Fixture.Main, [ref]$owner)
+        $class = [Text.StringBuilder]::new(64)
+        [void][MDLiteNative]::GetClassName($Fixture.Main, $class, $class.Capacity)
+        if ($owner -ne $Fixture.Process.Id -or $class.ToString() -cne 'MDLite.MainWindow') {
+            throw 'Save retry observation requires the owned top-level MDLite window.'
+        }
+        $dialogClosed = -not [MDLiteNative]::IsWindow($Dialog)
+        $exists = $dialogClosed -and (Test-Path -LiteralPath $Path -PathType Leaf)
+        $bytesMatch = $false
+        if ($exists) {
+            $actualBytes = [IO.File]::ReadAllBytes($Path)
+            $bytesMatch = $actualBytes.Length -eq $expectedBytes.Length -and
+                [Convert]::ToBase64String($actualBytes) -ceq [Convert]::ToBase64String($expectedBytes)
+        }
+        $caption = [Text.StringBuilder]::new([Math]::Max(1024, $expectedCaption.Length + 2))
+        [void][MDLiteNative]::GetWindowText($Fixture.Main, $caption, $caption.Capacity)
+        $captionMatches = $caption.ToString() -ceq $expectedCaption
+        $state = [ordered]@{}
+        if ($bytesMatch -and $captionMatches -and [MDLiteNative]::IsWindowEnabled($Fixture.Main)) {
+            foreach ($probe in @(@('dirty', 0), @('revision', 3), @('source_length', 4), @('saved_revision', 6))) {
+                $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                if ($remaining -le 0) { break }
+                $value = [IntPtr]::Zero
+                $api = [MDLiteNative]::SendMessageTimeoutW($Fixture.Main, 0x8045, [IntPtr]$probe[1],
+                    [IntPtr]::Zero, 2, [uint32][Math]::Min(250, $remaining), [ref]$value)
+                if ($api -eq [IntPtr]::Zero) { break }
+                $state[$probe[0]] = $value.ToInt64()
+            }
+        }
+        $clean = $state.Count -eq 4 -and $state.dirty -eq 0 -and $state.revision -eq $state.saved_revision -and
+            $state.source_length -eq $ExpectedText.Length
+        $observed = [DateTime]::UtcNow
+        if ($samples.Count -lt 64) { $samples.Add([ordered]@{
+            elapsed_ms = [Math]::Round(($observed - $started).TotalMilliseconds, 3)
+            dialog_closed = $dialogClosed; requested_path_exists = $exists; exact_bytes = $bytesMatch
+            caption_matches = $captionMatches; observed_caption = $caption.ToString(); clean_state = $clean; scalar_state = $state
+            within_deadline = $observed -lt $deadline
+        }) }
+        if ($dialogClosed -and $bytesMatch -and $captionMatches -and $clean) { $stable++ } else { $stable = 0 }
+        if ($stable -ge 2 -and [DateTime]::UtcNow -lt $deadline) {
+            $script:lastSaveRetrySettlement.pass = $true
+            $script:lastSaveRetrySettlement['elapsed_ms'] = [Math]::Round(($observed - $started).TotalMilliseconds, 3)
+            return $script:lastSaveRetrySettlement
+        }
+        Start-Sleep -Milliseconds 40
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Save retry did not settle exact requested-path bytes and clean document state within its existing post-click budget.'
+}
+
+function Wait-LegacySessionViewport([IntPtr]$Main, [IntPtr]$Editor, $Target, [int]$Selection, [DateTime]$Deadline) {
+    $samples = [Collections.Generic.List[object]]::new()
+    $script:lastLegacySessionViewport = [ordered]@{ pass = $false; expected_line = 12; expected_selection = $Selection; samples = $samples }
+    $stable = 0
+    do {
+        if ([DateTime]::UtcNow -ge $Deadline) { break }
+        $owner = [uint32]0
+        [void][MDLiteNative]::GetWindowThreadProcessId($Main, [ref]$owner)
+        $class = [Text.StringBuilder]::new(64)
+        [void][MDLiteNative]::GetClassName($Main, $class, $class.Capacity)
+        if ($owner -ne $Target.Id -or $class.ToString() -cne 'MDLite.MainWindow') { throw 'Legacy viewport owner/class mismatch.' }
+        $editorOwner = [uint32]0
+        [void][MDLiteNative]::GetWindowThreadProcessId($Editor, [ref]$editorOwner)
+        $editorClass = [Text.StringBuilder]::new(64)
+        [void][MDLiteNative]::GetClassName($Editor, $editorClass, $editorClass.Capacity)
+        if ($editorOwner -ne $Target.Id -or $editorClass.ToString() -cne 'RICHEDIT50W' -or
+            [MDLiteNative]::GetDlgCtrlID($Editor) -ne 102 -or -not [MDLiteNative]::IsWindowVisible($Editor) -or
+            -not [MDLiteNative]::IsWindowEnabled($Editor)) { throw 'Legacy viewport requires the current owned visible editor.' }
+        $values = [ordered]@{}
+        foreach ($probe in @(@('first_line', 0x00CE), @('anchor', 0x8033), @('active', 0x8034))) {
+            $remaining = [int][Math]::Floor(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remaining -le 0) { break }
+            $reply = [IntPtr]::Zero
+            $receiver = if ($probe[0] -eq 'first_line') { $Editor } else { $Main }
+            $api = [MDLiteNative]::SendMessageTimeoutW($receiver, [uint32]$probe[1], [IntPtr]::Zero,
+                [IntPtr]::Zero, 2, [uint32][Math]::Min(250, $remaining), [ref]$reply)
+            if ($api -eq [IntPtr]::Zero) { break }
+            $values[$probe[0]] = $reply.ToInt64()
+        }
+        $observed = [DateTime]::UtcNow
+        if ($samples.Count -lt 256) { $samples.Add([ordered]@{ values = $values; within_deadline = $observed -lt $Deadline }) }
+        if ($values.Count -eq 3 -and $values.first_line -eq 12 -and $values.anchor -eq $Selection -and $values.active -eq $Selection) {
+            $stable++
+        } else { $stable = 0 }
+        if ($stable -ge 2 -and [DateTime]::UtcNow -lt $Deadline) {
+            $script:lastLegacySessionViewport.pass = $true
+            $script:lastLegacySessionViewport['successful_values'] = $values
+            return $script:lastLegacySessionViewport
+        }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $Deadline)
+    throw 'Legacy line12/selection viewport did not settle within the existing shared readiness deadline.'
+}
+
 function Get-CurrentVisibleEditors([IntPtr]$Main, [int]$OwnerPid) {
     $script:quickOpenEditors=[Collections.Generic.List[IntPtr]]::new()
     $callback=[MDLiteNative+EnumWindowsProc]{
@@ -909,6 +1016,8 @@ function Invoke-SuspendedEditorLifecycle([string]$Directory) {
 }
 
 function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
+    $script:workspaceSessionStageEvidence = [ordered]@{ new_format_complete = $false; legacy_viewport = $null }
+    $script:lastLegacySessionViewport = $null
     $readinessTraceStart = $script:workspaceDocumentReadinessTraces.Count
     [IO.Directory]::CreateDirectory((Join-Path $Directory '.mdlite')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $Directory '.mdlite\settings.toml'),
@@ -1172,6 +1281,14 @@ function Invoke-WorkspaceSessionViewRestore([string]$Directory) {
     [void][MDLiteNative]::PostMessage($main, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
     if (-not $child.WaitForExit(10000)) { throw 'Restored workspace fixture did not close cleanly.' }
 
+    $script:workspaceSessionStageEvidence.new_format_complete = $true
+    $script:workspaceSessionStageEvidence['new_format'] = [ordered]@{
+        saved_active_index = $sessionActiveIndex; restored_active_index = $restoredActiveIndex
+        long_horizontal_expected = $sessionLongHorizontalOffset; long_horizontal_actual = $restoredLongLeftEdgeOffset
+        table_vertical_expected = $sessionTableVerticalOffset; table_vertical_actual = $restoredTableVerticalOffset
+        table_horizontal_expected = $sessionTableHorizontalOffset; table_horizontal_actual = $restoredTableLeftEdgeOffset
+        source_files_unchanged = $true; long_source_restored = $longEditorSourceRestored; table_body_restored = $tableEditorContentRestored
+    }
     # Selection restore can scroll RichEdit to a later caret before applying
     # the saved line-only viewport from a legacy session.
     $legacyDirectory = Join-Path (Split-Path -Parent $Directory) 'legacy-session-scroll'
@@ -1210,8 +1327,11 @@ height = 520
     $script:readbackProcesses.Add($legacyChild)
     $legacyMain = Wait-ProcessWindow $legacyChild
     $legacyTabControl = Wait-Control $legacyMain 101 'SysTabControl32'
+    $legacyDeadline = [DateTime]::UtcNow.AddMilliseconds(10000)
     try {
-        $legacyEditor = Wait-VisibleControl $legacyMain 102 'RICHEDIT50W' 10000 'legacy-session-startup'
+        $remaining = [int][Math]::Floor(($legacyDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0) { throw 'Legacy startup exhausted its existing readiness budget.' }
+        $legacyEditor = Wait-WorkspaceDocumentReady $legacyMain $legacyChild 'legacy-scroll.md' $legacyDirectory $remaining
     } catch {
         $legacyChild.Refresh()
         $legacyTabCount = [MDLiteNative]::SendMessage(
@@ -1222,8 +1342,11 @@ height = 520
         }).Count
         throw "Legacy session editor not visible: exited=$($legacyChild.HasExited), exit_code=$(if ($legacyChild.HasExited) { $legacyChild.ExitCode } else { 'running' }), tabs=$legacyTabCount, rich_edit_controls=$($legacyEditors.Count), visible_rich_edit_controls=$legacyVisibleEditorCount, main_title='$(Get-WindowText $legacyMain)', detail=$($_.Exception.Message)."
     }
-    $legacyRestoredFirstLine = Get-FirstVisibleLine $legacyEditor
-    $legacyRestoredSelection = Get-SourceSelectionByMessage $legacyMain
+    try { $script:workspaceSessionStageEvidence.legacy_viewport = Wait-LegacySessionViewport $legacyMain $legacyEditor $legacyChild $legacySelection $legacyDeadline }
+    finally { $script:workspaceSessionStageEvidence.legacy_viewport = $script:lastLegacySessionViewport }
+    $lastLegacy = $script:lastLegacySessionViewport.successful_values
+    $legacyRestoredFirstLine = $lastLegacy.first_line
+    $legacyRestoredSelection = [pscustomobject]@{ anchor = $lastLegacy.anchor; active = $lastLegacy.active }
     $legacyRestorePass = $legacyRestoredFirstLine -eq 12 -and
         $legacyRestoredSelection.anchor -eq $legacySelection -and
         $legacyRestoredSelection.active -eq $legacySelection
@@ -1327,6 +1450,7 @@ function Stop-ReadbackFixture($Fixture) {
 }
 
 function Invoke-UntitledLifecycleAcceptance() {
+    $script:lastSaveRetrySettlement = $null
     $fixture = Start-ReadbackFixture 'e01-multiple-untitled-save-as' ''
     $checks = [ordered]@{
         multiple_untitled_tabs_created = $false
@@ -1472,7 +1596,7 @@ function Invoke-UntitledLifecycleAcceptance() {
         $details.save_as_host_visible = [MDLiteNative]::IsWindowVisible($retryDialog)
         if ($setName -eq 0 -or $readName -cne $requestedPath) { throw 'Save retry filename host did not accept/read back the exact absolute fixture path.' }
         [void][MDLiteNative]::SendMessage($saveButton, $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
-        Wait-ProcessClassWindowGone $fixture.Process '#32770' 5000
+        $details.save_retry_settlement = Wait-SaveRetrySettled $fixture $retryDialog $target $expectedSavedText 5000
         $details.save_dialog_closed_after_click = -not [MDLiteNative]::IsWindow($retryDialog)
         $checks.save_as_retry_writes_exact_pending_buffer =
             $retryDialog -ne [IntPtr]::Zero -and $fileNameEdit -ne [IntPtr]::Zero -and
@@ -1502,6 +1626,7 @@ function Invoke-UntitledLifecycleAcceptance() {
             [ordered]@{ path = $_.path; contains_first_draft = $_.content.Contains($firstDraft); contains_second_draft = $_.content.Contains($secondDraft) }
         })
     } catch {
+        if ($script:lastSaveRetrySettlement) { $details.save_retry_settlement = $script:lastSaveRetrySettlement }
         $details.error = $_.Exception.Message
     } finally {
         Stop-ReadbackFixture $fixture

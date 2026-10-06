@@ -169,7 +169,10 @@ CalendarDayFileIndex MakeCalendarDayFileIndexReading() noexcept {
 }
 
 CalendarDayFileIndex BuildCalendarDayFileIndex(const std::filesystem::path& workspace,
-                                               const CalendarIndexOptions& options) {
+                                               const CalendarIndexOptions& options,
+                                               const std::function<bool()>& cancelled) {
+  const auto stopped = [&] { return cancelled && cancelled(); };
+  if (stopped()) return MakeCalendarDayFileIndexReading();
   CalendarDayFileIndex result = MakeCalendarDayFileIndexReading();
   std::wstring root_error;
   if (!IsValidWorkspaceRoot(workspace, root_error)) {
@@ -190,6 +193,7 @@ CalendarDayFileIndex BuildCalendarDayFileIndex(const std::filesystem::path& work
     return result;
   }
   for (; iterator != end; iterator.increment(iterator_error)) {
+    if (stopped()) return MakeCalendarDayFileIndexReading();
     if (iterator_error) {
       result.error = FileEnumerationError(root, iterator_error);
       break;
@@ -228,6 +232,7 @@ CalendarDayFileIndex BuildCalendarDayFileIndex(const std::filesystem::path& work
       continue;
     }
     if (binary) continue;
+    if (stopped()) return MakeCalendarDayFileIndexReading();
 
     CalendarFileDetails details;
     details.relative_path = entry.path().lexically_relative(root);
@@ -242,9 +247,14 @@ CalendarDayFileIndex BuildCalendarDayFileIndex(const std::filesystem::path& work
     result.files.push_back(std::move(details));
   }
 
+  if (stopped()) return MakeCalendarDayFileIndexReading();
+  // An increment failure may also move the iterator to end, skipping the
+  // next loop body. Preserve that error rather than publishing partial Ready.
+  if (iterator_error) result.error = FileEnumerationError(root, iterator_error);
   std::ranges::sort(result.files, [](const auto& left, const auto& right) {
     return _wcsicmp(left.relative_path.c_str(), right.relative_path.c_str()) < 0;
   });
+  if (stopped()) return MakeCalendarDayFileIndexReading();
   if (!result.error.empty()) {
     result.state = CalendarIndexState::Error;
   } else if (result.files.empty()) {
@@ -300,11 +310,17 @@ std::optional<std::filesystem::path> ResolveCalendarDailyPath(
 CalendarDayDetails BuildCalendarDayDetails(const std::filesystem::path& workspace,
                                            CalendarDate date,
                                            const ProfileDefinition& daily_profile,
-                                           const CalendarIndexOptions& options) {
+                                           const CalendarIndexOptions& options,
+                                           const std::function<bool()>& cancelled) {
   CalendarDayDetails result;
   result.date = date;
-  result.workspace_index = BuildCalendarDayFileIndex(workspace, options);
+  result.workspace_index = BuildCalendarDayFileIndex(workspace, options, cancelled);
   result.index = FilterCalendarDayFileIndexForDate(result.workspace_index, date);
+  if (cancelled && cancelled()) {
+    result.workspace_index = MakeCalendarDayFileIndexReading();
+    result.index = MakeCalendarDayFileIndexReading();
+  }
+  if (result.workspace_index.state == CalendarIndexState::Reading) return result;
   result.configured_daily_path = ResolveCalendarDailyPath(
       workspace, date, daily_profile, result.daily_path_error);
   return result;

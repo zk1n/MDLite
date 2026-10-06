@@ -3,7 +3,11 @@
 param(
     [ValidateSet('debug','release')]
     [string]$Preset = 'release',
-    [string]$OutputPath
+    [string]$OutputPath,
+    [ValidateScript({ [void][regex]::new($_); $true })]
+    [string]$CaseFilter = '.*',
+    [ValidateRange(0,30)]
+    [int]$RootOsFocusPauseSeconds = 0
 )
 
 Set-StrictMode -Version Latest
@@ -619,6 +623,26 @@ function Test-ExactUnicodeObservation($Observation, [string]$Expected, [DateTime
         $Observation.selection.end -eq $Expected.Length
 }
 
+function Get-TableUnicodeCandidate([IntPtr]$Main, [DateTime]$Deadline) {
+    $started = [DateTime]::UtcNow
+    $revision = Read-TableScalar $Main 0x8045 3 0 $Deadline
+    $length = Read-TableScalar $Main 0x8045 4 0 $Deadline
+    $anchor = Read-TableScalar $Main $kTestGetSourceAnchorMessage 0 0 $Deadline
+    $active = Read-TableScalar $Main $kTestGetSourceActiveMessage 0 0 $Deadline
+    $readiness = Read-TableScalar $Main $kTestGetEditorReadinessMessage 0 0 $Deadline
+    $lastRevision = Read-TableScalar $Main 0x8045 3 0 $Deadline
+    $finished = [DateTime]::UtcNow
+    return [pscustomobject]@{ utc=$finished.ToString('o'); duration_ms=($finished-$started).TotalMilliseconds
+        source_length=$length; revision=$revision; selection=[pscustomobject]@{start=$anchor;end=$active}
+        readiness=$readiness; consistent=$revision -eq $lastRevision; rpc_count=6 }
+}
+function Test-SettledUnicodeCandidate($Candidate, [int]$ExpectedLength, [DateTime]$Deadline) {
+    return [DateTime]::UtcNow -lt $Deadline -and $Candidate.consistent -and
+        $Candidate.source_length -eq $ExpectedLength -and $Candidate.selection.start -eq $ExpectedLength -and
+        $Candidate.selection.end -eq $ExpectedLength -and ($Candidate.readiness -band 7) -eq 7 -and
+        ($Candidate.readiness -band 248) -eq 0
+}
+
 $script:inputCleanupUnconfirmed = $false
 function Send-KeyboardInputBatch([MDLiteTableNative+INPUT[]]$Inputs) {
     # Do not release a key that was already held before this harness batch.
@@ -715,6 +739,8 @@ $runRoot = Join-Path ([IO.Path]::GetTempPath()) ("mdlite-table-acceptance-" + [g
 $captureDirectory = Join-Path $repoRoot "build\verification\native-table-frames-$Preset-$runId"
 $captureRows = [Collections.Generic.List[object]]::new()
 $checks = [ordered]@{}
+$skippedTableCases = [Collections.Generic.List[string]]::new()
+$rootOsFocusPauses = [Collections.Generic.List[object]]::new()
 $nativeFindOffsets = [ordered]@{}
 $processes = [Collections.Generic.List[Diagnostics.Process]]::new()
 $firstNativeEditorText = $null
@@ -755,7 +781,31 @@ function Save-NativeTableFrame([IntPtr]$Window, [string]$Name) {
     }
 }
 
+function Wait-RootOsFocusPause([string]$Name, $Process, [IntPtr]$Main, [IntPtr]$Editor, [int]$ProjectionState) {
+    if ($RootOsFocusPauseSeconds -eq 0 -or $Name -notin @('shift_tab_previous_cell',
+        'continuous_unicode_input_no_accumulation','ctrl_z_single_transaction','arrow_repeat_boundary')) { return }
+    $mainOwner = [uint32]0; $editorOwner = [uint32]0
+    [void][MDLiteTableNative]::GetWindowThreadProcessId($Main, [ref]$mainOwner)
+    [void][MDLiteTableNative]::GetWindowThreadProcessId($Editor, [ref]$editorOwner)
+    $mainClass = [Text.StringBuilder]::new(128); $editorClass = [Text.StringBuilder]::new(128)
+    [void][MDLiteTableNative]::GetClassName($Main, $mainClass, $mainClass.Capacity)
+    [void][MDLiteTableNative]::GetClassName($Editor, $editorClass, $editorClass.Capacity)
+    if ($Process.HasExited -or $mainOwner -ne $Process.Id -or $editorOwner -ne $Process.Id -or
+        $mainClass.ToString() -cne 'MDLite.MainWindow' -or $editorClass.ToString() -cne 'RICHEDIT50W' -or
+        [MDLiteTableNative]::GetDlgCtrlID($Editor) -ne $kEditor -or (Get-MainWindow $Editor) -ne $Main -or
+        -not [MDLiteTableNative]::IsWindowVisible($Editor) -or ($ProjectionState -band 7) -ne 7) {
+        throw 'Root OS focus pause requires the owned main/editor and ready projection.'
+    }
+    $pause = [ordered]@{ case=$Name; pid=$Process.Id; main_hwnd=$Main.ToInt64(); editor_hwnd=$Editor.ToInt64();
+        pause_seconds=$RootOsFocusPauseSeconds; started_utc=[DateTime]::UtcNow.ToString('o'); focus='UNPROVEN_RECHECK_REQUIRED' }
+    $rootOsFocusPauses.Add($pause)
+    Write-Host ('ROOT_OS_FOCUS_READY ' + ([pscustomobject]$pause | ConvertTo-Json -Compress))
+    Start-Sleep -Seconds $RootOsFocusPauseSeconds
+    $pause['completed_utc']=[DateTime]::UtcNow.ToString('o')
+}
+
 function Invoke-TableCase([string]$Name, [scriptblock]$Action) {
+    if ($Name -notmatch $CaseFilter) { $skippedTableCases.Add($Name); return }
     if ($script:inputCleanupUnconfirmed) {
         $checks[$Name] = [pscustomobject]@{pass=$false;status='BLOCKED_KEY_UP_CLEANUP_UNCONFIRMED'}
         return
@@ -807,6 +857,7 @@ function Invoke-TableCase([string]$Name, [scriptblock]$Action) {
                                    'ragged_virtual_cell_tab_edit_undo_redo','table_paint_reentry')
         if ($captureCase) { $script:captureRows.Add((Save-NativeTableFrame $main ($Name + '-before'))) }
         Set-Selection $editor 0 0
+        Wait-RootOsFocusPause $Name $process $main $editor $projectionState
         $value = & $Action $main $editor $path $process
         if ($null -eq $value) { throw "Case $Name returned no result" }
         $checks[$Name] = $value
@@ -1109,6 +1160,7 @@ try {
         $beforeSelection = Get-Selection $editor
         if ($beforeSelection.start -ne $source.Length -or $beforeSelection.end -ne $source.Length) { throw 'Unicode append initial selection is not the exact source end.' }
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        $baselineStarted = [DateTime]::UtcNow
         try { $before = Get-TableInputObservation $main $editor $deadline }
         catch {
             $failure = Get-TableObservationFailure $_ $deadline
@@ -1117,24 +1169,51 @@ try {
         if (-not $before.consistent -or $before.source -cne $source -or ($before.readiness -band 7) -ne 7) {
             return [pscustomobject]@{ pass = $false; status = 'FAIL_UNICODE_BASELINE_NOT_READY'; stage = 'baseline'; before = $before; input_sent = $false }
         }
+        $baselineDurationMs = ([DateTime]::UtcNow-$baselineStarted).TotalMilliseconds
+        $inputStarted = [DateTime]::UtcNow
         $input = Send-UnicodeCharacters $editor $payload
+        $inputDurationMs = ([DateTime]::UtcNow-$inputStarted).TotalMilliseconds
         if ($input.status -ne 'QUEUED_EFFECT_UNPROVEN') {
             return [pscustomobject]@{ pass = $false; status = $input.status; delivery = $input; reason = 'OS Unicode input was not delivered to the target RichEdit.' }
         }
         $expected = $source + $payload
         $observations = [Collections.Generic.List[object]]::new()
+        $coarseObservations = [Collections.Generic.List[object]]::new()
+        $fullScanTimings = [Collections.Generic.List[object]]::new()
+        $coarseAttempts = 0; $coarseRpcCount = 0; $fullScanAttempts = 0; $candidateStable = 0; $candidateRevision = -1
         $frames = [Collections.Generic.List[object]]::new()
         $after = $null; $saved = $null; $ready = $false; $savedExact = $false; $timeoutReason = $null
         $failure = $null; $stage = 'post_input_observation'
         try {
             do {
-                $after = Get-TableInputObservation $main $editor $deadline
+                $coarseAttempts++
+                $candidate = Get-TableUnicodeCandidate $main $deadline
+                $coarseRpcCount += $candidate.rpc_count
+                $coarseObservations.Add($candidate)
+                if (Test-SettledUnicodeCandidate $candidate $expected.Length $deadline) {
+                    if ($candidate.revision -eq $candidateRevision) { $candidateStable++ } else { $candidateStable=1; $candidateRevision=$candidate.revision }
+                } else { $candidateStable=0 }
+                if ($candidateStable -lt 2) {
+                    Start-Sleep -Milliseconds ([Math]::Min(100, (Get-TableBudgetRemaining $deadline)))
+                    continue
+                }
+                $fullScanAttempts++
+                $scanStarted = [DateTime]::UtcNow
+                $scanCompleted = $false
+                try { $after = Get-TableInputObservation $main $editor $deadline; $scanCompleted = $true }
+                finally {
+                    $fullScanTimings.Add([pscustomobject]@{started_utc=$scanStarted.ToString('o');duration_ms=([DateTime]::UtcNow-$scanStarted).TotalMilliseconds;
+                        completed=$scanCompleted; rpc_count=if($scanCompleted -and $after.source.Length -eq $after.source_length){$after.source_length+14}else{$null};
+                        rpc_attempt_upper_bound=if($scanCompleted){$after.source_length+14}else{$null};
+                        expected_rpc_count=$expected.Length+14; consistent=if($scanCompleted){$after.consistent}else{$null}})
+                }
                 $observations.Add($after)
                 if ($observations.Count -eq 1) {
                     $frames.Add((Save-NativeTableFrame $main 'unicode-first-observation'))
                 }
                 $ready = Test-ExactUnicodeObservation $after $expected $deadline
                 if ($ready) { break }
+                $candidateStable=0
                 Start-Sleep -Milliseconds ([Math]::Min(50, (Get-TableBudgetRemaining $deadline)))
             } while ([DateTime]::UtcNow -lt $deadline)
             if ($ready) {
@@ -1171,6 +1250,11 @@ try {
             before_selection = $beforeSelection; after_selection = if ($after) { $after.selection } else { $null }; expected_caret = $expected.Length
             budget_ms = 10000; deadline_utc = $deadline.ToString('o'); timeout_reason = $timeoutReason
             before = $before; observations = $observations.ToArray(); frames = $frames.ToArray()
+            observer_method = 'Coarse six-scalar candidates while input is active; full exact text only after two settled candidates'
+            baseline_duration_ms = $baselineDurationMs; baseline_rpc_count = $before.source_length + 14; input_queue_duration_ms = $inputDurationMs
+            coarse_observations = $coarseObservations.ToArray(); coarse_scan_attempts = $coarseAttempts
+            coarse_completed_rpc_count = $coarseRpcCount; coarse_rpc_attempt_upper_bound = $coarseAttempts * 6
+            full_scan_attempts = $fullScanAttempts; full_scan_timings = $fullScanTimings.ToArray()
             last_observed_state = $after; observation_failure = $failure; stage = $stage
             exact_input_ready_before_save = $ready; history_observed = $historyObserved; saved_exact = $savedExact
         }
@@ -1300,6 +1384,14 @@ try {
     }
     $result = [ordered]@{
         preset = $Preset
+        coverage = [ordered]@{
+            scope = if ($skippedTableCases.Count) { 'FOCUSED_FILTER_NOT_FULL_MATRIX' } else { 'FULL_HARNESS_MATRIX' }
+            case_filter = $CaseFilter; executed_cases = @($checks.Keys); skipped_cases = $skippedTableCases.ToArray()
+            executed_count = $checks.Count; discovered_count = $checks.Count + $skippedTableCases.Count
+            full_matrix_executed = $skippedTableCases.Count -eq 0 -and $checks.Count -gt 0
+            mappings_apply_only_to_executed_cases = $true
+        }
+        root_os_focus_pauses = $rootOsFocusPauses.ToArray()
         executable_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
         source = $source
         native_editor_text_before_first_action = $firstNativeEditorText
@@ -1349,8 +1441,9 @@ try {
             }
         }
         evidence_boundary = 'Harness checks use synthetic native Win32/RichEdit routes. Semantic check groups are harness-local, not current-task E01-E25 IDs. The current-task crosswalk is conservative and partial; UNKNOWN and NOT_COVERED conditions remain open.'
-        all_cases_pass = $failed.Count -eq 0 -and $blocked.Count -eq 0 -and $resultShapeErrors.Count -eq 0
-        automated_product_checks_pass = $failed.Count -eq 0 -and $resultShapeErrors.Count -eq 0
+        all_cases_pass = $checks.Count -gt 0 -and $failed.Count -eq 0 -and $blocked.Count -eq 0 -and $resultShapeErrors.Count -eq 0
+        full_matrix_pass = $skippedTableCases.Count -eq 0 -and $checks.Count -gt 0 -and $failed.Count -eq 0 -and $blocked.Count -eq 0 -and $resultShapeErrors.Count -eq 0
+        automated_product_checks_pass = $checks.Count -gt 0 -and $failed.Count -eq 0 -and $resultShapeErrors.Count -eq 0
         blocked_cases = @($blocked | ForEach-Object { $_.Key })
         failed_cases = @($failed | ForEach-Object { $_.Key })
         invalid_result_shape_cases = @($resultShapeErrors)

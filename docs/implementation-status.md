@@ -1,10 +1,16 @@
 # MDLite 表示・UI再構築 実装・受入状況
 
-更新日: 2026-10-05
+更新日: 2026-10-06
 
-以下の2026-10-05 Current Statusが最新のsource 5968状況である。Build/CTest/CoreのPASSは製品全体の受入PASSを意味しない。f01、f5、76ab、99d5、CDF、過去snapshotは各source laneの歴史記録として分離し、source 5968へ引き継いだPASSとは扱わない。受入の権威はcurrent Task、latest HANDOFF、current implementation、latest user instructions。Drive資料や過去のintegrated-spec copyは、これらと矛盾する場合はreference-onlyであり、新しい要求や機能の根拠にしない。
+最新のsource c269状況は冒頭のCurrent Statusと[承認UI検証記録](verification-approved-ui-20261004.md)に記載する。以下の5968以前の節は当時の記録であり、現在の結果へ読み替えない。履歴内のmutable receiptリンクは現在版へ更新され得るため、各記録のsource／EXE hashと対応artifactを優先する。Build/CTest/CoreのPASSは製品全体の受入PASSを意味しない。f01、f5、76ab、99d5、CDF、過去snapshotは各source laneの歴史記録として分離し、source 5968へ引き継いだPASSとは扱わない。受入の権威はcurrent Task、latest HANDOFF、current implementation、latest user instructions。Drive資料や過去のintegrated-spec copyは、これらと矛盾する場合はreference-onlyであり、新しい要求や機能の根拠にしない。
 
-## Current Status — 2026-10-05 (source 5968)
+## Current Status — 2026-10-06 (source c269)
+
+Overall acceptance remains INCOMPLETE / NOT PASS. Source `c2694697ee91768644a40562ff4b5018bd2c8a44a20405f5342e869ea6b27433` preserves table-cell source padding, batches Explorer redraw, applies cancellable full Calendar indexing by workspace/generation, and hydrates clean saved tabs before a single final activation. Dirty recovered documents retain resolved autosave scheduling. Source is preserved by presentation changes.
+
+Fresh Debug/Release build and CTest pass 7/7 each (core 397). Current Release broad GUI passes all 236 Boolean conditions, and current Save/profile/settings passes 9/9 in each configuration with stable identities. The focused session/Save retry cases pass their original observation bounds; their separate forced synthetic cleanup is not normal-close acceptance. Current-source remaining runtime, human launch version, Git and HANDOFF results are recorded in [approved UI verification](verification-approved-ui-20261004.md). Older source-specific PASS, FAIL and BLOCKED records remain historical. Develop integration requires whole-task acceptance; no main/release/force/Inbox cleanup is authorized.
+
+## Historical Status — 2026-10-05 (source 5968)
 
 **Overall acceptance: INCOMPLETE / NOT PASS. Verification checkpoint before Git/HANDOFF delivery.** Actual delivery is recorded separately in the final HANDOFF. Current source is `5968e404fb1410c1c2be49ffafbc2c7bd363f53ea77a5448870958e9c538baee`. The post-f01 delta changes only `RenderGitPanel` display line breaks to CRLF for native readonly EDIT. Fresh [Debug](../build/verification/build-receipt-debug.json) and [Release](../build/verification/build-receipt-release.json) builds/CTest pass 7/7, with 397 core checks. Debug EXE: `b1b55e6b3a8ed6c26d0ef241bf0b601b1dc60f8c3575a896d4029e55928ffd88`; Release EXE: `6fc5e932519d3987b53caf467b8ac0f68767c38dfebd3dbacf061034dc40b0b5`.
 

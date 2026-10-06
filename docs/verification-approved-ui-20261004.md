@@ -127,3 +127,58 @@ Final broad GUI and edit regressions currently retain failed and blocked raw res
 Each final artifact must identify source/executable, fixture, input method, expected/observed result, and PASS/FAIL/BLOCKED/NOT_RUN. Prior source results remain historical. Physical long-press, subjective visual checks, unexecuted DPI/monitor conditions, and real IME evidence are not promoted by synthetic tests. Additional unrelated defects become follow-up issues rather than extending this case set.
 
 This feature-only verification checkpoint records the completed evidence above, before Git/HANDOFF delivery. Whole-task acceptance is NOT PASS and the develop-integration condition is unmet. Actual delivery results belong to the final HANDOFF. Historical failures, blocked routes and the original finite criteria remain preserved.
+
+## Resumed prototype checkpoint — 2026-10-06, source 0d9f
+
+All pending/in-progress labels in this historical section describe the checkpoint time. This section adds a source-qualified prototype cycle; it does not rewrite the historical 5968, f01, or f5 results above. The build artifacts identify source fingerprint 0d9f4cb4444b5bd18d80034f1338ae663809e2c615f70fcd27feceafd98f2aa0 (50 source inputs). Debug and Release build/CTest both PASS, 7/7 suites. Debug build run 0d851e80827f4cf18243f724f439bb57 produced EXE SHA-256 7a322ac88fe861503c26a78f1f6cb2eae9388749c58d21ed7be1230123803abc; Release build run 20fc3337df33480abdb7cd3b072fa193 produced EXE SHA-256 db8d3fc60ce3c03a2efb66c86a1a77301250d06cfd92eefd094b160791b8e8df.
+
+| 0d9f lane | Current result | Boundary / next step |
+|---|---|---|
+| Debug and Release build/CTest | PASS, 7/7 each | Receipts and EXE hashes above bind both configurations to source 0d9f. Any source change requires fresh receipts. |
+| P2 one-document startup-only | FAIL / STARTUP_TIMEOUT at the 60,000 ms bound | Root's latest trace records Calendar index 43,969 ms, Tree 24,050 ms, total Workspace 73,498 ms. These are trace phase spans, not totals to add. High is investigating the causal slice; this is not a performance PASS. |
+| Controlled clipboard comparison | Partial: fixture text exact; cross-process WM_PASTE left source unchanged after 5 s; OS Ctrl+V injected 4/4, then BLOCKED with SOURCE_PRESENTATION_NOT_READY at the helper's 250 ms presentation observation | The OS result is unknown, not PASS or FAIL. Root confirmed restoration of the captured actual clipboard baseline. The earlier pre-730 original value remains UNKNOWN and is not retroactively established by the 373 capture. Publisher/readback review remains pending; do not repeat the broad clipboard/cut harness. |
+| Human preview | PASS for a scoped visual preview only | PreviewInfo binds source 0d9f, Release build run 20fc3337df33480abdb7cd3b072fa193, EXE SHA-256 db8d3fc60ce3c03a2efb66c86a1a77301250d06cfd92eefd094b160791b8e8df, and commit ab3762702056f8fb8d2e58e1bf343aa49b31f50f with a dirty worktree. Root observed readable pixels, native caption, Activity, table/Git text, Calendar's five-file count, and Calendar Details/creation information. The owned process exited after normal WM_CLOSE. No editor, Trust, or IME settings were changed. |
+| Full GUI, Save, Native Table, Edit History | NOT RUN on source 0d9f after these receipts | Run the finite suites once after High's fix is integrated and both receipts match the final source. Keep clipboard cases filtered and gated on the publisher review. |
+| Full Release P0–P5 | NOT RUN for the final source | Reconsider one full 100-iteration run only after the focused P2 result and regressions justify it. |
+
+The preview used the same fix branch at commit ab376 with source 0d9f in a dirty worktree. It is an engineering prototype observation, separate from user configuration changes and whole-product acceptance. The final post-commit source/build and any source-changed human preview remain pending. Overall acceptance remains NOT PASS.
+
+## Historical engineering candidate — source b768
+
+All current-source and pending/in-progress labels in this historical section describe the b768 checkpoint time. Source `b76827b8087c3b1d2390a6865faa98333d6a3ccb4e33757551e362ec54a3b4b7` includes raw table-cell padding preservation, batched Explorer redraw, and cancellable Calendar indexing. The Calendar result is applied on the UI thread only for the current workspace/generation; explicit date actions refresh completed indexes. Iterator and delivery errors keep partial results out of the ready state. The separate reviewer found no remaining concrete code blocker after three Calendar corrections.
+
+| Current-source verification | Result | Scope |
+|---|---|---|
+| Debug / Release build and CTest | PASS, 7/7 each | Debug EXE `988ec553b53e64731f0c083e57426c9ade65559eb1e35ea8f7c5675ed1c4f202`; Release EXE `e27c2e866de847e3368c32ff3a0912ad970ed84d85d6554fabe74181994e9f36` |
+| Save / Profile / Settings | PASS, 9/9 each configuration | Source and executable identity match before and after the native runs |
+| Real clipboard, WM_PASTE and OS Ctrl+V | Exact effect PASS in separate fake fixtures | Source, Dirty, one undo transaction, collapsed caret and clipboard generation verified; OS batch accepted 4/4. Captured current baselines restored. WM fixture cleanup required a separately recorded normal-close follow-up; OS fixture completed normal cleanup. The earlier test-helper 730 original clipboard state remains UNKNOWN |
+| P2 startup and Calendar publication | PASS within the original 60 seconds | Editor ready at 24,454.763 ms; accepted full 10,000-file Calendar index observed at 52,920.208 ms. Normal owned-process exit and build identity verified; full P0–P5 remains in progress |
+| Broad GUI | 233/236 Boolean conditions true; overall incomplete | Two underlying paths remain in the retained raw result: legacy viewport observation and Save retry observation. Corrected bounded observers await focused runtime confirmation |
+| Native Table | Automated product checks PASS; four OS cases BLOCKED | Shift+Tab, continuous Unicode input, Ctrl+Z and arrow repeat lack foreground execution evidence in this run |
+| Filtered nonclipboard Edit History | 31 PASS, 0 FAIL, 3 BLOCKED | Outline drag/notification delivery blocked with Win32 1460/5. Initialization still reads the clipboard; no selected case published or restored it |
+
+Final ATOK, F5, caption/pixel checks, focused GUI reconciliation, final version and Git/HANDOFF delivery remain pending. Physical input, disabled Microsoft IME, other display configurations and Human review remain distinct. Whole-product acceptance is NOT PASS.
+
+## Current engineering candidate — source c269
+
+Source fingerprint: `c2694697ee91768644a40562ff4b5018bd2c8a44a20405f5342e869ea6b27433`, 50 inputs. In addition to the b768 changes, clean saved tabs hydrate without repeatedly activating the editor. Layout and settings resolve first; source/history and inactive viewport anchors remain preserved. The saved active document activates once. Dirty recovered documents retain the resolved autosave scheduling. The separate correctness/safety reviewer found no remaining concrete code blocker in this delta; 21 extracted-method checks passed.
+
+| Current-source verification | Result | Boundary |
+|---|---|---|
+| Debug / Release build and CTest | PASS, 7/7 each; core 397 | Debug EXE `27365df1ed38b676afcf519c76b607e1182cf23f4021ba8cff000eb6e234af63`; Release EXE `0800da84c4c93cb72d5a572bb34dc55c1d778d6e510b3fccbda3f52759315794` |
+| Broad GUI | PASS, all 236 Boolean conditions | Current Release executable; native harness results do not establish physical input or every display configuration |
+| Save / Profile / Settings | PASS, 9/9 in each configuration | Matching source/executable identities before and after both native runs |
+| Focused session viewport and Save retry | PASS, both cases | Original 10/5-second observer bounds retained. The separate focused fixture needed guarded forced cleanup of its own synthetic process, which is not normal-close acceptance |
+| Release full P0–P5 | PASS for the measured profile | Current-source full run: zero scenario failures; P5 100 iterations, zero failures, private bytes +69,632 (68 KiB). Search settlement is a 750ms no-count-change heuristic, not completion-generation proof |
+| Real ATOK | PASS, four finite cases | Current Debug: inspected actual preedit/reconversion pixels; exact commit/cancel/source/history and OS Undo/Redo. No IME configuration changes; owned process normal-close verified |
+| Native caption buttons | PASS, maximize and restore | Actual screenshot-directed OS button clicks and window-state readback; source/Dirty/history/revision/selection unchanged. Other gestures and physical/DPI conditions remain separate |
+| Actual OS table input | Shift+Tab and Ctrl+Z PASS; Unicode and arrow finite conditions remain FAIL | Current-source owned input and source/history readback. Shift+Tab follows a separately retained initial foreground BLOCKED run. Arrow59→70 preserves source but fails the original row criterion (ZK1-12). Unicode224/224 is accepted, but the original shared10s exact197/save condition remains incomplete; Jev third-round defer preserves the failure |
+| Current clipboard comparison | BLOCKED | WM setup/focus prevented publication; OS-only exact fake readback refused at OpenClipboard before paste. The OS probe restored its eagerly captured current baseline and normal-closed its owned fixture. No current clipboard effect PASS; preceding b768 WM/OS results remain historical |
+| Current F5 | BLOCKED before F5 input | Owned IDE appeared, but Root could not attest the selected configuration within the separate60s setup interval. No F5 sent, no fresh debugger proof. Owned Code window normal-closed; launch/tasks/security unchanged |
+| Other broad Native Table / filtered Edit observations | Historical b768 coverage only | Unchanged routes were not rerun merely to change the source label; current CTest, broad GUI/table topology and focused OS/ATOK/save evidence cover the changed claims. Outline notification routes remain blocked in the earlier artifact |
+
+Whole-task acceptance remains NOT PASS. Human physical input, subjective review, disabled Microsoft IME, and untested display configurations remain separate. The original test-helper 730 clipboard state remains UNKNOWN; successful later snapshot restoration does not recover that earlier state. Git/develop/HANDOFF status will be recorded from actual delivery results.
+
+Current measured P1 one/six-document working-set peaks are 48,447,488 / 44,421,120 bytes; document readiness is 9,272.714 / 13,090.265 ms. P2 document readiness is 29,384.493 / 38,853.935 ms; search-settled heuristic is 295,927.944 / 278,914.064 ms. P3 20/100MiB input p95 is 352.426 / 2,056.898 ms, with working-set peaks 270,876,672 / 1,158,942,720 bytes. Profile PASS does not imply low latency for large documents or all performance goals.
+
+Unicode diagnostic detail: baseline exact read took110.713ms/99RPCs; the input-queue phase took4,267.683ms. Six-scalar polling completed198RPCs, with0full197 scans because a settled candidate was not reached before10s. The latest partial source length181 is not a final-length or permanent-loss result. The preceding observer produced torn117/137 snapshots with at least530RPCs. The original FAILs remain retained; no deadline, source, caret, disk or history condition was relaxed. Further diagnosis is deferred within the existing editing issue, and overall acceptance stays NOT PASS.

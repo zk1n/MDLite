@@ -9,6 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <future>
 
 namespace {
 
@@ -166,6 +168,95 @@ void TestStatesAndConfiguredDailyPath(const std::filesystem::path& root) {
   Check(!invalid.has_value() && !error.empty(), "invalid selected date is rejected");
 }
 
+void TestCancellation(const std::filesystem::path& root) {
+  const auto workspace = root / L"cancel-workspace";
+  for (int i = 0; i < 8; ++i)
+    WriteText(workspace / (L"note-" + std::to_wstring(i) + L".md"), "synthetic note\n");
+  WriteText(workspace / L"nul.md", std::string("a\0b", 3));
+  const auto before = mdlite::BuildCalendarDayFileIndex(workspace);
+  const auto early = mdlite::BuildCalendarDayFileIndex(root / L"missing", {}, [] { return true; });
+  Check(early.state == mdlite::CalendarIndexState::Reading && early.files.empty() && early.error.empty(),
+        "cancelled request does not validate or publish a missing root");
+  int checkpoints{};
+  const auto partial = mdlite::BuildCalendarDayFileIndex(workspace, {}, [&] {
+    return ++checkpoints >= 6;
+  });
+  Check(checkpoints == 6 && partial.state == mdlite::CalendarIndexState::Reading &&
+            partial.files.empty() && partial.error.empty(),
+        "mid-scan cancellation discards every partial file and error");
+  const auto selected = mdlite::FilterCalendarDayFileIndexForDate(partial, {2026, 10, 6});
+  Check(selected.state == mdlite::CalendarIndexState::Reading && selected.files.empty(),
+        "cancelled partial scan cannot become a zero or ready selected-date result");
+  auto failed_partial = before;
+  failed_partial.state = mdlite::CalendarIndexState::Error;
+  failed_partial.error = L"synthetic enumeration failure";
+  const auto rejected = mdlite::FilterCalendarDayFileIndexForDate(failed_partial, {2026, 10, 6});
+  Check(rejected.state == mdlite::CalendarIndexState::Error && rejected.files.empty() &&
+            rejected.error == failed_partial.error,
+        "enumeration error suppresses every partial file in selected-date publication");
+  const auto after = mdlite::BuildCalendarDayFileIndex(workspace);
+  Check(after.files.size() == 8 && !HasRelative(after, L"nul.md"),
+        "fresh scan after cancellation preserves all eligible files and binary filtering");
+  Check(before.files.size() == after.files.size() &&
+            std::ranges::equal(before.files, after.files, [](const auto& a, const auto& b) {
+              return a.relative_path == b.relative_path && a.creation_time_utc == b.creation_time_utc &&
+                     a.creation_date_local == b.creation_date_local &&
+                     a.creation_time_provenance == b.creation_time_provenance;
+            }), "cancellation does not write or change creation provenance");
+  std::promise<void> reached;
+  auto ready = reached.get_future();
+  mdlite::CalendarDayFileIndex stopped;
+  std::jthread worker([&](std::stop_token stop) {
+    bool announced{};
+    stopped = mdlite::BuildCalendarDayFileIndex(workspace, {}, [&] {
+      if (!announced) {
+        announced = true;
+        reached.set_value();
+        while (!stop.stop_requested()) std::this_thread::yield();
+      }
+      return stop.stop_requested();
+    });
+  });
+  ready.wait();
+  worker.request_stop();
+  worker.join();
+  Check(stopped.state == mdlite::CalendarIndexState::Reading && stopped.files.empty(),
+        "owned jthread stop/join returns without publishing a cancelled result");
+  mdlite::ProfileDefinition daily{L"daily", L"Daily", L"journal", L"{{date:yyyyMMdd}}.md",
+      L"templates/daily.md", mdlite::ProfileCollision::OpenExisting};
+  const auto details = mdlite::BuildCalendarDayDetails(workspace, {2026, 10, 6}, daily, {},
+                                                       [] { return true; });
+  Check(details.index.state == mdlite::CalendarIndexState::Reading &&
+            details.workspace_index.state == mdlite::CalendarIndexState::Reading &&
+            details.index.files.empty() && details.workspace_index.files.empty() &&
+            !details.configured_daily_path,
+        "cancelled details expose neither a partial list nor a resolved ready Daily result");
+}
+
+void TestExternalFreshness(const std::filesystem::path& root) {
+  const auto workspace = root / L"external-workspace";
+  WriteText(workspace / L"first.md", "first synthetic note\n");
+  const auto initial = mdlite::BuildCalendarDayFileIndex(workspace);
+  WriteText(workspace / L"created.md", "external synthetic note\n");
+  Check(initial.files.size() == 1 && !HasRelative(initial, L"created.md"),
+        "completed snapshot does not silently acquire external files");
+  const auto created = mdlite::BuildCalendarDayFileIndex(workspace);
+  Check(created.files.size() == 2 && HasRelative(created, L"created.md"),
+        "fresh request observes external creation");
+  std::filesystem::remove(workspace / L"first.md");
+  std::filesystem::rename(workspace / L"created.md", workspace / L"renamed.md");
+  const auto renamed = mdlite::BuildCalendarDayFileIndex(workspace);
+  Check(renamed.files.size() == 1 && HasRelative(renamed, L"renamed.md") &&
+            !HasRelative(renamed, L"created.md") && !HasRelative(renamed, L"first.md"),
+        "fresh request observes external deletion and rename");
+  const auto original = std::ranges::find_if(created.files, [](const auto& file) {
+    return file.relative_path == L"created.md";
+  });
+  Check(original != created.files.end() &&
+            original->creation_time_utc == renamed.files.front().creation_time_utc,
+        "external rename retains filesystem creation provenance");
+}
+
 }  // namespace
 
 int wmain() {
@@ -177,6 +268,8 @@ int wmain() {
   TestIndex(root / L"workspace");
   TestSelectedDateFilter(root);
   TestStatesAndConfiguredDailyPath(root);
+  TestCancellation(root);
+  TestExternalFreshness(root);
   std::filesystem::remove_all(root, error);
   if (failures == 0) std::cout << "All " << checks << " MDLite calendar index checks passed.\n";
   return failures == 0 ? 0 : 1;

@@ -4,12 +4,51 @@ param(
     [ValidateSet('release','debug')][string]$Preset = 'release',
     [ValidateSet('full','quick')][string]$Profile = 'full',
     [ValidateRange(1, 1000)][int]$P5Iterations = 100,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$ScenarioFilter = '.*'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$full = $Profile -eq 'full'
+$p3Sizes = if ($full) { @(20MB, 100MB) } else { @(5MB, 10MB) }
+
+function Get-ScenarioSelection([string[]]$ScenarioNames, [string]$Pattern) {
+    try {
+        $regex = [Text.RegularExpressions.Regex]::new(
+            $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    } catch {
+        throw "Invalid scenario regex '$Pattern': $($_.Exception.Message)"
+    }
+
+    $selected = @($ScenarioNames | Where-Object { $regex.IsMatch($_) })
+    $notRun = @($ScenarioNames | Where-Object { -not $regex.IsMatch($_) })
+    return [pscustomobject]@{
+        filter_regex = $Pattern
+        selected_scenarios = $selected
+        not_run_scenarios = $notRun
+        focused = $notRun.Count -gt 0
+    }
+}
+
+$plannedScenarioNames = [Collections.Generic.List[string]]::new()
+$plannedScenarioNames.Add('P0-first-run-approximation')
+$plannedScenarioNames.Add('P0-warm')
+$plannedScenarioNames.Add('P1-one-document')
+$plannedScenarioNames.Add('P1-six-documents')
+$plannedScenarioNames.Add('P2-one-document-search')
+$plannedScenarioNames.Add('P2-six-documents-search')
+foreach ($size in $p3Sizes) { $plannedScenarioNames.Add("P3-{0}MiB" -f [int]($size / 1MB)) }
+$plannedScenarioNames.Add('P4-images-and-compacts')
+for ($iteration = 1; $iteration -le $P5Iterations; $iteration++) {
+    $plannedScenarioNames.Add("P5-{0:D3}" -f $iteration)
+}
+$scenarioPlan = Get-ScenarioSelection -ScenarioNames $plannedScenarioNames.ToArray() -Pattern $ScenarioFilter
+if ($scenarioPlan.selected_scenarios.Count -eq 0) {
+    throw "Scenario filter '$ScenarioFilter' selected no scenarios."
+}
+$script:scenarioPlan = $scenarioPlan
 
 function Get-SourceFingerprint([string]$Root) {
     $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
@@ -34,8 +73,11 @@ function Get-SourceFingerprint([string]$Root) {
 
 $executable = Join-Path $repoRoot "build\$Preset\MDLite.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Build first: $executable" }
-if (-not $OutputPath) { $OutputPath = Join-Path $repoRoot "build\verification\performance-$Preset-$Profile.json" }
 $measurementRunId = [guid]::NewGuid().ToString('N')
+if (-not $OutputPath) {
+    $focusedSuffix = if ($scenarioPlan.focused) { "-focused-$($measurementRunId.Substring(0, 8))" } else { '' }
+    $OutputPath = Join-Path $repoRoot "build\verification\performance-$Preset-$Profile$focusedSuffix.json"
+}
 $executableSha256AtStart = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash.ToLowerInvariant()
 $buildReceiptPath = Join-Path $repoRoot "build\verification\build-receipt-$Preset.json"
 if (-not (Test-Path -LiteralPath $buildReceiptPath -PathType Leaf)) {
@@ -202,9 +244,22 @@ function Write-RepeatedFile([string]$Path, [long]$Bytes, [Text.Encoding]$Encodin
     try {
         $take = [Math]::Min([long]$header.Length, $Bytes)
         $stream.Write($header, 0, [int]$take)
-        while ($stream.Length -lt $Bytes) {
-            $take = [Math]::Min([long]$block.Length, $Bytes - $stream.Length)
-            $stream.Write($block, 0, [int]$take)
+        $remaining = $Bytes - $stream.Length
+        if ($remaining -gt 0) {
+            $maxRepeats = [Math]::Max(1, [Math]::Floor(64KB / $block.Length))
+            $repeatCount = [int][Math]::Min($maxRepeats, [Math]::Ceiling($remaining / [double]$block.Length))
+            $tailBlock = [byte[]]::new($block.Length * $repeatCount)
+            [Buffer]::BlockCopy($block, 0, $tailBlock, 0, $block.Length)
+            $filled = $block.Length
+            while ($filled -lt $tailBlock.Length) {
+                $copyLength = [Math]::Min($filled, $tailBlock.Length - $filled)
+                [Buffer]::BlockCopy($tailBlock, 0, $tailBlock, $filled, $copyLength)
+                $filled += $copyLength
+            }
+            while ($stream.Length -lt $Bytes) {
+                $take = [Math]::Min([long]$tailBlock.Length, $Bytes - $stream.Length)
+                $stream.Write($tailBlock, 0, [int]$take)
+            }
         }
     } finally { $stream.Dispose() }
 }
@@ -889,6 +944,7 @@ function Measure-Scenario([string]$Name, [string[]]$Targets, [bool]$MeasureInput
 }
 
 function Add-ScenarioResult([string]$Name, [scriptblock]$Measurement) {
+    if ($script:scenarioPlan.selected_scenarios -notcontains $Name) { return }
     $script:activePerformanceScenario = $Name
     $startedUtc = [DateTime]::UtcNow
     try {
@@ -920,7 +976,6 @@ $scenarios = New-Object Collections.Generic.List[object]
 $p5Rows = New-Object Collections.Generic.List[object]
 $p5Failures = 0
 try {
-    $full = $Profile -eq 'full'
     $p1 = New-Workspace $runRoot 'P1'
     $p1Bytes = if ($full) { 20MB } else { 2MB }
     $p1Count = if ($full) { 2000 } else { 200 }
@@ -950,7 +1005,6 @@ try {
     } | Measure-Object -Sum).Sum)
 
     $p3 = New-Workspace $runRoot 'P3'
-    $p3Sizes = if ($full) { @(20MB, 100MB) } else { @(5MB, 10MB) }
     $p3Targets = @()
     foreach ($size in $p3Sizes) {
         $path = Join-Path $p3 ("large-{0}MiB.md" -f [int]($size / 1MB))
@@ -1014,10 +1068,12 @@ try {
     Add-ScenarioResult 'P4-images-and-compacts' { Measure-Scenario -Name 'P4-images-and-compacts' -Targets $p4Docs -MeasureInput $true -MeasureSearch $false -StableMs 2500 -CompactCount 3 -MeasureSettledInput $true }
 
     for ($iteration = 1; $iteration -le $P5Iterations; $iteration++) {
+        $scenarioName = "P5-{0:D3}" -f $iteration
+        if ($scenarioPlan.selected_scenarios -notcontains $scenarioName) { continue }
         try {
             [IO.File]::WriteAllText($p5Doc, $p5Seed, [Text.UTF8Encoding]::new($false))
             $theme = if ($iteration % 2 -eq 0) { 'light' } else { 'dark' }
-            $row = Measure-Scenario ("P5-{0:D3}" -f $iteration) @($p5Doc) $true $true 0 $false 0 $theme
+            $row = Measure-Scenario $scenarioName @($p5Doc) $true $true 0 $false 0 $theme
             $p5Rows.Add([pscustomobject]@{
                 iteration=$iteration
                 input_editor_length_before=$row.input_editor_length_before
@@ -1117,15 +1173,30 @@ try {
     $sourceUnchangedDuringRun = $sourceAtMeasurementStart.sha256 -eq $sourceAtMeasurementEnd.sha256
     $buildReceiptSha256AtEnd = (Get-FileHash -Algorithm SHA256 -LiteralPath $buildReceiptPath).Hash.ToLowerInvariant()
     $buildReceiptUnchangedDuringRun = $buildReceiptSha256 -eq $buildReceiptSha256AtEnd
+    $measurementPassed = $scenarioFailureCount -eq 0 -and $p5Failures -eq 0 -and
+        $executableUnchangedDuringRun -and $sourceUnchangedDuringRun -and
+        $buildReceiptUnchangedDuringRun
+    $measurementStatus = if (-not $measurementPassed) { 'FAILED_OR_INCOMPLETE' }
+        elseif ($scenarioPlan.focused) { 'FOCUSED_PASS' }
+        else { 'PASS' }
+    $measurementScope = if ($scenarioPlan.focused) { 'FOCUSED_SUBSET_ONLY_NOT_FULL_P0_P5_ACCEPTANCE' }
+        elseif ($Profile -eq 'full' -and $P5Iterations -eq 100) { 'FULL_P0_P5_PROFILE' }
+        else { 'QUICK_OR_REDUCED_PROFILE_NOT_FULL_P0_P5_ACCEPTANCE' }
     $result = [pscustomobject]@{
         schema = 'mdlite-performance-v5'
         run_id = $measurementRunId
         timestamp_utc = [DateTime]::UtcNow.ToString('o')
-        measurement_status = if ($scenarioFailureCount -eq 0 -and $p5Failures -eq 0 -and
-            $executableUnchangedDuringRun -and $sourceUnchangedDuringRun -and
-            $buildReceiptUnchangedDuringRun) { 'PASS' } else { 'FAILED_OR_INCOMPLETE' }
+        measurement_status = $measurementStatus
+        measurement_scope = $measurementScope
+        scenario_selection = [pscustomobject]@{
+            filter_regex = $scenarioPlan.filter_regex
+            selected_scenarios = $scenarioPlan.selected_scenarios
+            not_run_scenarios = $scenarioPlan.not_run_scenarios
+            focused = $scenarioPlan.focused
+        }
         profile = $Profile
         preset = $Preset
+        output_path = [IO.Path]::GetFullPath($OutputPath)
         executable_sha256 = $executableSha256AtStart
         source_sha256_at_start = $sourceAtMeasurementStart.sha256
         source_sha256_at_end = $sourceAtMeasurementEnd.sha256
@@ -1181,6 +1252,8 @@ try {
         scenario_failures = $scenarioFailureCount
         p5 = [pscustomobject]@{
             iterations = $P5Iterations
+            selected_iterations = $p5Rows.Count
+            not_run_iterations = @($scenarioPlan.not_run_scenarios | Where-Object { $_ -like 'P5-*' }).Count
             failures = $p5Failures
             private_bytes_first = if ($p5Rows.Count) { $p5Rows[0].peak_private_bytes } else { $null }
             private_bytes_last = if ($p5Rows.Count) { $p5Rows[$p5Rows.Count - 1].peak_private_bytes } else { $null }

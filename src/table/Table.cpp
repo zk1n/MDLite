@@ -632,10 +632,16 @@ std::optional<TableCellIntent> MoveTableCaretTargetAtBoundary(
 
   switch (direction) {
     case TableCaretDirection::Left:
-      if (current_cell.column == 0) return std::nullopt;
+      if (current_cell.column == 0) {
+        const auto previous = PreviousVisibleRow(block->current_row);
+        return previous ? IntentAtColumn(*block, *previous, block->alignments.size() - 1) : std::nullopt;
+      }
       return IntentAtColumn(*block, block->current_row, current_cell.column - 1);
     case TableCaretDirection::Right:
-      if (current_cell.column + 1 >= block->alignments.size()) return std::nullopt;
+      if (current_cell.column + 1 >= block->alignments.size()) {
+        const auto next = NextVisibleRow(*block, block->current_row);
+        return next ? IntentAtColumn(*block, *next, 0) : std::nullopt;
+      }
       return IntentAtColumn(*block, block->current_row, current_cell.column + 1);
     case TableCaretDirection::Up: {
       const auto previous_row = PreviousVisibleRow(block->current_row);
@@ -664,10 +670,16 @@ std::optional<TableCellIntent> MoveTableCaretTargetAtBoundary(
 
   switch (direction) {
     case TableCaretDirection::Left:
-      if (current_cell.column == 0) return std::nullopt;
+      if (current_cell.column == 0) {
+        const auto previous = PreviousVisibleRow(row_index);
+        return previous ? GfmIntentAtColumn(table, source, *previous, table.alignments.size() - 1) : std::nullopt;
+      }
       return GfmIntentAtColumn(table, source, row_index, current_cell.column - 1);
     case TableCaretDirection::Right:
-      if (current_cell.column + 1 >= table.alignments.size()) return std::nullopt;
+      if (current_cell.column + 1 >= table.alignments.size()) {
+        const auto next = NextVisibleRow(table, row_index);
+        return next ? GfmIntentAtColumn(table, source, *next, 0) : std::nullopt;
+      }
       return GfmIntentAtColumn(table, source, row_index, current_cell.column + 1);
     case TableCaretDirection::Up: {
       const auto previous = PreviousVisibleRow(row_index);
@@ -708,9 +720,15 @@ TableEditResult InsertTableRow(std::wstring_view source, std::size_t caret, bool
   if (!block) return NoTableEdit(source, caret);
   const auto& row = block->row_ranges[block->current_row];
   if (IsDelimiter(row, source)) return NoTableEdit(source, caret);
-  const std::wstring new_row = RenderRow(row.cells.size());
+  const std::wstring new_row = RenderRow(block->alignments.size());
   const std::wstring line_break(PreferredLineBreak(source, row.begin));
   std::wstring result(source);
+  if (block->current_row == 0) {
+    const auto insertion = NextLineStart(source, block->row_ranges[1].end);
+    const bool eof = insertion == block->row_ranges[1].end;
+    result.insert(insertion, eof ? line_break + new_row : new_row + line_break);
+    return {std::move(result), insertion + (eof ? line_break.size() : 0) + 2, true};
+  }
   if (!after) {
     result.insert(row.begin, new_row + line_break);
     return {std::move(result), row.begin + 2, true};
@@ -728,7 +746,8 @@ TableEditResult DeleteTableRow(std::wstring_view source, std::size_t caret) {
   const auto block = BlockAt(source, caret);
   if (!block) return NoTableEdit(source, caret);
   const auto& row = block->row_ranges[block->current_row];
-  if (IsDelimiter(row, source)) return NoTableEdit(source, caret);
+  if (block->current_row < 2 || block->row_ranges.size() <= 3)
+    return NoTableEdit(source, caret);
   std::size_t erase_begin = row.begin;
   std::size_t erase_end = row.end;
   const auto next = NextLineStart(source, row.end);
@@ -773,7 +792,7 @@ TableEditResult DeleteTableColumn(std::wstring_view source, std::size_t caret) {
   const auto block = BlockAt(source, caret);
   if (!block) return NoTableEdit(source, caret);
   const auto& current = block->row_ranges[block->current_row];
-  if (current.cells.size() <= 1) return NoTableEdit(source, caret);
+  if (block->alignments.size() <= 1) return NoTableEdit(source, caret);
   const std::size_t target = CellAt(current, caret);
   std::vector<RowChange> changes;
   changes.reserve(block->row_ranges.size());
@@ -786,6 +805,168 @@ TableEditResult DeleteTableColumn(std::wstring_view source, std::size_t caret) {
   const std::wstring result = ApplyRowChanges(source, changes);
   const std::size_t selected_column = target == 0 ? 0 : target - 1;
   return {result, RowCaretAfterChanges(result, *block, selected_column, changes), true};
+}
+
+std::optional<TableVisualCell> TableCellContentRange(std::wstring_view source,
+                                                   const TableCellIntent& cell) {
+  const auto table = ParseGfmTableAt(source, cell.row_begin);
+  if (!table) return std::nullopt;
+  const auto row = std::ranges::find(table->rows, cell.row_begin, &TableVisualRow::begin);
+  if (row == table->rows.end() || cell.column >= row->cells.size()) return std::nullopt;
+  const auto [begin, end] = TrimCell(source, row->cells[cell.column].begin,
+                                    row->cells[cell.column].end);
+  return TableVisualCell{begin, end};
+}
+
+TableEditResult MoveTableCellCommand(std::wstring_view source, const TableCellIntent& cell,
+                                    bool backwards, bool vertical) {
+  if (!vertical) {
+    auto edit = MoveToAdjacentTableCell(source, cell, backwards);
+    if (!edit.target_cell && backwards) {
+      if (const auto table = ParseGfmTableAt(source, cell.row_begin))
+        edit.selection = table->begin > 0 ? table->begin - 1 : cell.source_position;
+    }
+    return edit;
+  }
+  const auto block = BlockAt(source, cell.row_begin);
+  if (!block || block->current_row == 1) return NoTableEdit(source, cell.source_position);
+  const auto row = backwards ? PreviousVisibleRow(block->current_row)
+                            : NextVisibleRow(*block, block->current_row);
+  if (row) {
+    const auto target = IntentAtColumn(*block, *row, cell.column);
+    return {std::wstring(source), target ? target->source_position : cell.source_position,
+            false, target};
+  }
+  if (backwards) return {std::wstring(source), block->begin > 0 ? block->begin - 1
+                                                               : cell.source_position, false};
+  auto edit = InsertTableRow(source, cell.source_position, true);
+  if (edit.changed) {
+    if (const auto updated = BlockAt(edit.text, edit.selection)) {
+      edit.target_cell = IntentAtColumn(*updated, updated->current_row, cell.column);
+      if (edit.target_cell) edit.selection = edit.target_cell->source_position;
+    }
+  }
+  return edit;
+}
+
+TableEditResult LeaveTable(std::wstring_view source, std::size_t caret) {
+  const auto table = ParseGfmTableAt(source, caret);
+  if (!table) return NoTableEdit(source, caret);
+  if (table->end == source.size()) {
+    std::wstring result(source);
+    result.append(PreferredLineBreak(source, table->begin));
+    result.append(PreferredLineBreak(source, table->begin));
+    const auto position = result.size();
+    return {std::move(result), position, true};
+  }
+  auto position = NextLineStart(source, table->end);
+  if (position < source.size() && (source[position] == L'\r' || source[position] == L'\n'))
+    position = NextLineStart(source, position);
+  return {std::wstring(source), position, false};
+}
+
+TableEditResult SetTableColumnAlignment(std::wstring_view source, std::size_t caret,
+                                       TableAlignment alignment) {
+  const auto block = BlockAt(source, caret);
+  if (!block) return NoTableEdit(source, caret);
+  const auto column = CellAt(block->row_ranges[block->current_row], caret);
+  if (column >= block->alignments.size()) return NoTableEdit(source, caret);
+  const auto& cell = block->row_ranges[1].cells[column];
+  const std::wstring marker = alignment == TableAlignment::Center ? L":---:"
+      : alignment == TableAlignment::Right ? L"---:" : L":---";
+  std::wstring result(source);
+  result.replace(cell.begin, cell.end - cell.begin, marker);
+  return {std::move(result), caret, block->alignments[column] != alignment};
+}
+
+std::wstring CopyTableRectangle(std::wstring_view source, const TableCellIntent& first,
+                                const TableCellIntent& last) {
+  const auto table = ParseGfmTableAt(source, first.row_begin);
+  if (!table || last.row_begin < table->begin || last.row_begin > table->end) return {};
+  std::wstring text;
+  bool first_row = true;
+  for (std::size_t i{}; i < table->rows.size(); ++i) {
+    const auto& row = table->rows[i];
+    if (i == 1 || row.begin < std::min(first.row_begin, last.row_begin) ||
+        row.begin > std::max(first.row_begin, last.row_begin)) continue;
+    if (!first_row) text += L'\n';
+    first_row = false;
+    for (auto column = std::min(first.column, last.column);
+         column <= std::max(first.column, last.column); ++column) {
+      if (column != std::min(first.column, last.column)) text += L'\t';
+      if (column >= row.cells.size()) continue;
+      const auto [begin, end] = TrimCell(source, row.cells[column].begin, row.cells[column].end);
+      text.append(source.substr(begin, end - begin));
+    }
+  }
+  return text;
+}
+
+TableEditResult ReplaceTableRectangle(std::wstring_view source, const TableCellIntent& first,
+                                      const TableCellIntent& last, std::wstring_view tsv) {
+  const auto table = ParseGfmTableAt(source, first.row_begin);
+  if (!table || last.row_begin < table->begin || last.row_begin > table->end)
+    return NoTableEdit(source, first.source_position);
+  std::vector<std::vector<std::wstring>> values(1);
+  values.back().emplace_back();
+  for (std::size_t i{}; i < tsv.size(); ++i) {
+    const auto ch = tsv[i];
+    if (ch == L'\r' || ch == L'\n') {
+      if (ch == L'\r' && i + 1 < tsv.size() && tsv[i + 1] == L'\n') ++i;
+      if (i + 1 < tsv.size()) { values.emplace_back(); values.back().emplace_back(); }
+    } else if (ch == L'\t') values.back().emplace_back();
+    else {
+      if (ch == L'|' && !IsEscaped(tsv, i)) values.back().back() += L'\\';
+      values.back().back() += ch;
+    }
+  }
+  const auto top = std::min(first.row_begin, last.row_begin);
+  const auto bottom = std::max(first.row_begin, last.row_begin);
+  const auto left = std::min(first.column, last.column);
+  const auto right = std::max(first.column, last.column);
+  const bool clear = tsv.empty();
+  if (!clear) {
+    const auto width = values.front().size();
+    if (left + width > table->alignments.size() ||
+        std::ranges::any_of(values, [&](const auto& row) { return row.size() != width; }))
+      return NoTableEdit(source, first.source_position);
+    std::size_t targets{};
+    for (std::size_t i{}; i < table->rows.size() && targets < values.size(); ++i) {
+      const auto& row = table->rows[i];
+      if (i == 1 || row.begin < top) continue;
+      if (row.cells.size() < left + width) return NoTableEdit(source, first.source_position);
+      ++targets;
+    }
+    if (targets != values.size()) return NoTableEdit(source, first.source_position);
+  }
+  std::vector<RowChange> changes;
+  std::size_t value_row{};
+  std::size_t selection = first.source_position;
+  for (std::size_t i{}; i < table->rows.size(); ++i) {
+    const auto& row = table->rows[i];
+    if (i == 1 || row.begin < top || (clear && row.begin > bottom) ||
+        (!clear && value_row >= values.size())) continue;
+    const auto last_column = clear ? right : left + values[value_row].size() - 1;
+    for (auto column = left; column <= last_column && column < table->alignments.size(); ++column) {
+      if (column >= row.cells.size()) continue;
+      const auto [begin, end] = TrimCell(source, row.cells[column].begin, row.cells[column].end);
+      const auto value = clear ? std::wstring{} : values[value_row][column - left];
+      if (changes.empty()) selection = begin;
+      changes.push_back({begin, end, value});
+    }
+    ++value_row;
+  }
+  auto result = ApplyRowChanges(source, changes);
+  const bool changed = result != source;
+  if (!clear && !changes.empty()) {
+    const auto& last_change = changes.back();
+    selection = last_change.begin + last_change.replacement.size();
+    for (std::size_t i{}; i + 1 < changes.size(); ++i) {
+      selection += changes[i].replacement.size();
+      selection -= changes[i].end - changes[i].begin;
+    }
+  }
+  return {std::move(result), selection, changed};
 }
 
 }  // namespace mdlite

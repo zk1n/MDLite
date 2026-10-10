@@ -17,8 +17,9 @@ Workspaceファイル操作、画像asset取込み、明示Trust付きGit／stor
 
 対象CommonMark/GFM構文、設定GUI、変更を伴うGit補助、compact window、画像resize／可視animationまで接続済みです。
 IME／ATOK、DPI、主観的な画像・animation品質、各GUI操作、CommonMark/GFM公式conformance corpusなど、
-Human実操作が必要な受入条件があります。P0〜P5と100回反復の自動測定結果・大容量時の制約は
+Human実操作が必要な受入条件があります。過去のP0〜P5・100回反復の測定結果と大容量時の制約は
 [実装・受入状況](docs/implementation-status.md)を参照してください。
+編集・検索の操作と保護境界は[編集・検索ガイド](docs/editing-search.md)を参照してください。通常の確認では、小さなWorkspaceで起動・編集・検索・保存を確認します。過去の反復測定を毎回の標準手順にはしません。
 固定版の第三者部品と配布条件は[依存関係台帳](docs/dependencies.md)に記録しています。
 
 開発は`develop`を起点とした作業ブランチで行います。
@@ -32,10 +33,9 @@ Visual Studio Build ToolsのMSVC x64、Windows SDK、CMake、Ninjaを使用し�
 ```powershell
 .\tools\Invoke-Build.ps1 -Preset debug -Test
 .\tools\Invoke-Build.ps1 -Preset release -Test
-.\tools\Measure-Performance.ps1 -Preset release
 ```
 
-VS Codeでは「CMake: debug build」を実行後、F5で`build/debug/MDLite.exe`を起動します。
+VS Codeで「MDLite Debug」を選びF5を押すと、サンプルWorkspaceの準備とDebugビルド・テストを順に実行し、`build/debug/MDLite.exe`をデバッグ起動します。
 Workspaceをコマンドライン引数へ渡すこともできます。
 
 ## ライセンス

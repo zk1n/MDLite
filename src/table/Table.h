@@ -44,6 +44,20 @@ struct GfmTable {
   std::vector<TableVisualRow> rows;
 };
 
+std::optional<TableVisualCell> TableCellContentRange(std::wstring_view source,
+                                                   const TableCellIntent& cell);
+TableEditResult MoveTableCellCommand(std::wstring_view source, const TableCellIntent& cell,
+                                    bool backwards, bool vertical);
+TableEditResult LeaveTable(std::wstring_view source, std::size_t caret);
+TableEditResult SetTableColumnAlignment(std::wstring_view source, std::size_t caret,
+                                       TableAlignment alignment);
+// These content operations preserve every structural separator and untouched
+// cell's original padding. The endpoints identify a rectangle of visible cells.
+std::wstring CopyTableRectangle(std::wstring_view source, const TableCellIntent& first,
+                                const TableCellIntent& last);
+TableEditResult ReplaceTableRectangle(std::wstring_view source, const TableCellIntent& first,
+                                      const TableCellIntent& last, std::wstring_view tsv);
+
 // Parses the GFM table containing position, if any. The result includes raw
 // source ranges for every row and cell and the delimiter's per-column alignment.
 // It recognizes the same fenced-code, delimiter, and ragged-body rules used by

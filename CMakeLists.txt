@@ -39,6 +39,23 @@ FetchContent_Declare(libwebp
 )
 FetchContent_MakeAvailable(libwebp)
 
+# Bound regex work with engine match/depth/heap limits and cancellation callouts.
+# Only the UTF-16 static library is shipped; no helper executables or JIT.
+set(PCRE2_BUILD_PCRE2_8 OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_PCRE2_16 ON CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_PCRE2_32 OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(PCRE2_SUPPORT_JIT OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(pcre2
+  URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz
+  URL_HASH SHA256=929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(pcre2)
+
 add_library(mdlite_core
   src/app/PanelLayout.cpp
   src/app/PanelLayout.h
@@ -85,7 +102,7 @@ target_include_directories(mdlite_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(mdlite_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mdlite_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
 target_link_libraries(mdlite_core PUBLIC shell32 ole32 windowscodecs xmllite webp webpdemux
-  d2d1 d3d11 dxgi)
+  d2d1 d3d11 dxgi pcre2-16-static)
 
 add_executable(MDLite WIN32
   src/app/MDLite.manifest
@@ -94,6 +111,8 @@ add_executable(MDLite WIN32
   src/app/Application.h
   src/app/UiIcons.cpp
   src/app/UiIcons.h
+  src/app/SlimScrollbars.cpp
+  src/app/SlimScrollbars.h
   src/app/DiagnosticsView.cpp
   src/app/DiagnosticsView.h
 )
@@ -109,6 +128,17 @@ target_link_libraries(MDLite PRIVATE mdlite_core comctl32 comdlg32 shell32 shlwa
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(mdlite_search_quality_tests tests/SearchQualityTests.cpp)
+  target_compile_definitions(mdlite_search_quality_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_search_quality_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_search_quality_tests PRIVATE mdlite_core)
+  add_test(NAME mdlite_search_quality_tests COMMAND mdlite_search_quality_tests)
+  add_executable(mdlite_slim_scrollbar_tests tests/SlimScrollbarTests.cpp src/app/SlimScrollbars.cpp)
+  target_include_directories(mdlite_slim_scrollbar_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_definitions(mdlite_slim_scrollbar_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(mdlite_slim_scrollbar_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  target_link_libraries(mdlite_slim_scrollbar_tests PRIVATE comctl32)
+  add_test(NAME mdlite_slim_scrollbar_tests COMMAND mdlite_slim_scrollbar_tests)
   add_executable(mdlite_core_tests tests/CoreTests.cpp)
   target_compile_definitions(mdlite_core_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(mdlite_core_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)

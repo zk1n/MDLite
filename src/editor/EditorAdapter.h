@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mdlite {
@@ -102,6 +103,7 @@ struct EditorSnapshot {
   std::vector<NativeDiscontinuity> view_discontinuities;
   std::vector<NativeDiscontinuity> native_discontinuities;
   bool native_coordinates{};
+  std::optional<TableVisualCell> viewport_source_range;
 
   [[nodiscard]] std::size_t SourceToView(std::size_t position) const noexcept;
   [[nodiscard]] std::size_t ViewToSource(std::size_t position) const noexcept;
@@ -145,6 +147,7 @@ EditorSnapshot BuildEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildMarkdownEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildNativeEditorSnapshot(std::wstring_view source);
 EditorSnapshot BuildNativeTextEditorSnapshot(std::wstring_view source);
+EditorSnapshot BuildNativeTableViewportSnapshot(std::wstring_view source, const GfmTable& table);
 // RichEdit's native coordinate space uses one CR per paragraph. Some control
 // builds/export flags can still return CRLF (or a lone LF), so callers reading
 // the control normalize through this boundary before diffing or mapping.
@@ -162,6 +165,10 @@ SourceSelection NativeSelectionToView(const EditorSnapshot& snapshot,
                                       bool start_active) noexcept;
 SourceSelection SourceSelectionToNative(const EditorSnapshot& snapshot,
                                         SourceSelection selection) noexcept;
+// Content-command endpoints for native table selections. RichEdit can expand
+// a range to row markers; those markers must not select an adjacent source cell.
+std::optional<std::pair<TableCellIntent, TableCellIntent>> IntersectingNativeTableCells(
+    const EditorTableMapping& table, std::size_t begin, std::size_t end) noexcept;
 // Replace one projected table's TOM character coordinates after native table
 // insertion. Cell ranges are in the same flattened visible-row order as table.cells.
 // On success, native discontinuities are rebuilt for all tables.

@@ -444,6 +444,9 @@ std::size_t EditorSnapshot::SourceToView(std::size_t position) const noexcept {
 }
 
 std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
+  if (viewport_source_range) return std::clamp(
+      CoordinateToSource(position, source_size, view_discontinuities, tables, false),
+      viewport_source_range->begin, viewport_source_range->end);
   if (!view_discontinuities.empty())
     return CoordinateToSource(position, source_size, view_discontinuities, tables, false);
   if (native_coordinates) return NativeToSource(position);
@@ -461,11 +464,15 @@ std::size_t EditorSnapshot::ViewToSource(std::size_t position) const noexcept {
 }
 
 std::size_t EditorSnapshot::SourceToNative(std::size_t position) const noexcept {
+  if (viewport_source_range)
+    position = std::clamp(position, viewport_source_range->begin, viewport_source_range->end);
   return SourceToCoordinate(position, source_size, native_discontinuities, tables, true);
 }
 
 std::size_t EditorSnapshot::NativeToSource(std::size_t position) const noexcept {
-  return CoordinateToSource(position, source_size, native_discontinuities, tables, true);
+  const auto source = CoordinateToSource(position, source_size, native_discontinuities, tables, true);
+  return viewport_source_range ? std::clamp(source, viewport_source_range->begin, viewport_source_range->end)
+                               : source;
 }
 
 std::size_t EditorSnapshot::NativeToView(std::size_t position) const noexcept {
@@ -533,7 +540,9 @@ namespace {
 
 void AppendNativeSourceRange(std::wstring_view source, std::size_t begin, std::size_t end,
                             const std::vector<ImageReference>& images,
-                            std::size_t& image_index, EditorSnapshot& result) {
+                            std::size_t& image_index, EditorSnapshot& result,
+                            std::vector<CollapsedRange>* cell_escapes = nullptr,
+                            const std::vector<StyleSpan>* spans = nullptr) {
   for (std::size_t position = begin; position < end;) {
     while (image_index < images.size() && images[image_index].begin < position) ++image_index;
     if (image_index < images.size() && images[image_index].begin == position &&
@@ -543,6 +552,14 @@ void AppendNativeSourceRange(std::wstring_view source, std::size_t begin, std::s
       result.collapsed.push_back({image.begin, image.end, result.view.size()});
       result.view.push_back(0xFFFC);
       position = image.end;
+    } else if (cell_escapes && source[position] == L'\\' && position + 1 < end &&
+               (source[position + 1] == L'|' || source[position + 1] == L'\\') &&
+               (!spans || !std::ranges::any_of(*spans,
+                 [&](const StyleSpan& span) { return span.kind == SpanKind::Code &&
+                     position >= span.begin && position < span.end; }))) {
+      cell_escapes->push_back({position, position + 2, result.view.size()});
+      result.view.push_back(source[position + 1]);
+      position += 2;
     } else if (source[position] == L'\r' && position + 1 < end &&
                source[position + 1] == L'\n') {
       result.view.push_back(L'\r');
@@ -650,8 +667,10 @@ EditorSnapshot BuildNativeEditorSnapshot(std::wstring_view source) {
         table.gaps.push_back(gap);
       }
       for (std::size_t cell_index{}; cell_index < row.cells.size(); ++cell_index) {
-        const auto& source_cell = row.cells[cell_index];
+        auto source_cell = row.cells[cell_index];
         if (source_cell.begin > source_cell.end || source_cell.end > source.size()) continue;
+        while (source_cell.begin < source_cell.end && iswspace(source[source_cell.begin])) ++source_cell.begin;
+        while (source_cell.end > source_cell.begin && iswspace(source[source_cell.end - 1])) --source_cell.end;
         if (cell_index > 0 && !table.cells.empty()) {
           const auto left_index = table.cells.size() - 1;
           EditorTableGapMapping gap{table.cells[left_index].source_end, source_cell.begin,
@@ -662,13 +681,16 @@ EditorSnapshot BuildNativeEditorSnapshot(std::wstring_view source) {
         }
         const std::size_t view_begin = result.view.size();
         const auto collapsed_begin = result.collapsed.size();
+        std::vector<CollapsedRange> cell_escapes;
         AppendNativeSourceRange(source, source_cell.begin, source_cell.end, images,
-                                image_index, result);
+                                image_index, result, &cell_escapes, &parsed.spans);
         const std::size_t view_end = result.view.size();
         EditorTableCellMapping mapped_cell{source_cell.begin, source_cell.end,
                                            view_begin, view_end, view_begin, view_end};
         for (std::size_t collapsed = collapsed_begin; collapsed < result.collapsed.size(); ++collapsed)
           mapped_cell.collapsed.push_back(result.collapsed[collapsed]);
+        mapped_cell.collapsed.insert(mapped_cell.collapsed.end(), cell_escapes.begin(), cell_escapes.end());
+        std::ranges::sort(mapped_cell.collapsed, {}, &CollapsedRange::source_begin);
         visual_row.cells.push_back({source_cell.begin, source_cell.end,
                                     view_begin, view_end, view_begin, view_end, false});
         table.cells.push_back(std::move(mapped_cell));
@@ -708,6 +730,36 @@ EditorSnapshot BuildNativeTextEditorSnapshot(std::wstring_view source) {
   return result;
 }
 
+EditorSnapshot BuildNativeTableViewportSnapshot(std::wstring_view source, const GfmTable& table) {
+  if (table.begin > table.end || table.end > source.size()) return {};
+  auto snapshot = BuildNativeEditorSnapshot(source.substr(table.begin, table.end - table.begin));
+  snapshot.source_size = source.size();
+  snapshot.viewport_source_range = TableVisualCell{table.begin, table.end};
+  const auto shift_range = [&](auto& range) { range.source_begin += table.begin; range.source_end += table.begin; };
+  for (auto& range : snapshot.collapsed) shift_range(range);
+  for (auto& range : snapshot.view_discontinuities) shift_range(range);
+  for (auto& range : snapshot.native_discontinuities) shift_range(range);
+  for (auto& mapping : snapshot.tables) {
+    shift_range(mapping);
+    for (auto& cell : mapping.cells) {
+      shift_range(cell);
+      for (auto& range : cell.collapsed) shift_range(range);
+    }
+    for (auto& gap : mapping.gaps) shift_range(gap);
+    for (auto& row : mapping.visual_rows) {
+      shift_range(row);
+      for (auto& cell : row.cells) shift_range(cell);
+    }
+  }
+  const auto add_boundaries = [&](auto& ranges) {
+    if (table.begin != 0) ranges.insert(ranges.begin(), {0, table.begin, 0, 0});
+    if (table.end < source.size()) ranges.push_back({table.end, source.size(), snapshot.view.size(), snapshot.view.size()});
+  };
+  add_boundaries(snapshot.view_discontinuities);
+  add_boundaries(snapshot.native_discontinuities);
+  return snapshot;
+}
+
 SourceSelection NativeSelectionToSource(const EditorSnapshot& snapshot,
                                         std::size_t native_start,
                                         std::size_t native_end,
@@ -736,6 +788,27 @@ SourceSelection SourceSelectionToNative(const EditorSnapshot& snapshot,
                                         SourceSelection selection) noexcept {
   return {snapshot.SourceToNative(selection.anchor),
           snapshot.SourceToNative(selection.active)};
+}
+
+std::optional<std::pair<TableCellIntent, TableCellIntent>> IntersectingNativeTableCells(
+    const EditorTableMapping& table, std::size_t begin, std::size_t end) noexcept {
+  if (!table.native_coordinates_set || begin >= end || begin < table.native_begin ||
+      end > table.native_end) return std::nullopt;
+  std::optional<TableCellIntent> first;
+  TableCellIntent last;
+  for (const auto& row : table.visual_rows) {
+    for (std::size_t column{}; column < row.cells.size(); ++column) {
+      const auto& cell = row.cells[column];
+      const bool intersects = cell.native_begin == cell.native_end
+          ? begin <= cell.native_begin && cell.native_begin < end
+          : cell.native_begin < end && cell.native_end > begin;
+      if (!intersects) continue;
+      last = {row.source_begin, column, cell.source_begin, cell.virtual_cell};
+      if (!first) first = last;
+    }
+  }
+  if (!first) return std::nullopt;
+  return std::pair{*first, last};
 }
 
 bool ReplaceNativeTableCoordinates(EditorSnapshot& snapshot, std::size_t table_index,
@@ -852,6 +925,59 @@ SourceTransaction ApplyEditorText(const EditorSnapshot& before, std::wstring_vie
   result.source = source;
   result.source.replace(result.begin, result.old_end - result.begin, *replacement);
   result.new_end = result.begin + replacement->size();
+  // The view contains cell content, never structural separators. Encode pipes
+  // for every native entry route (typing, IME, deletion of a code delimiter),
+  // while leaving a literal pipe inside a still-valid code span untouched.
+  for (const auto& table : before.tables) {
+    const auto cell = std::ranges::find_if(table.cells, [&](const EditorTableCellMapping& candidate) {
+      return result.begin >= candidate.source_begin && result.old_end <= candidate.source_end;
+    });
+    if (cell == table.cells.end()) continue;
+    auto new_length = cell->source_end - cell->source_begin - (result.old_end - result.begin) + replacement->size();
+    auto parsed = ParseMarkdown(std::wstring_view(result.source).substr(cell->source_begin, new_length));
+    std::wstring inserted;
+    for (std::size_t i{}; i < replacement->size(); ++i) {
+      const auto local_position = result.begin - cell->source_begin + i;
+      const bool literal_code_or_image = std::ranges::any_of(parsed.spans, [&](const StyleSpan& span) {
+        return span.kind == SpanKind::Code && local_position >= span.begin && local_position < span.end;
+      }) || std::ranges::any_of(parsed.images, [&](const ImageReference& image) {
+        return local_position >= image.begin && local_position < image.end;
+      });
+      if ((*replacement)[i] == L'\\' && !literal_code_or_image) inserted += L'\\';
+      inserted += (*replacement)[i];
+    }
+    const bool inserted_escapes = inserted != *replacement;
+    if (inserted_escapes) {
+      result.source.replace(result.begin, replacement->size(), inserted);
+      new_length += inserted.size() - replacement->size();
+      parsed = ParseMarkdown(std::wstring_view(result.source).substr(cell->source_begin, new_length));
+    }
+    const auto content = std::wstring_view(result.source).substr(cell->source_begin, new_length);
+    std::wstring encoded;
+    std::size_t backslashes{};
+    for (std::size_t i{}; i < content.size(); ++i) {
+      const auto character = content[i];
+      const bool code = std::ranges::any_of(parsed.spans, [&](const StyleSpan& span) {
+        return span.kind == SpanKind::Code && i >= span.begin && i < span.end;
+      });
+      if (character == L'|' && backslashes % 2 == 0 && !code) encoded += L'\\';
+      encoded += character;
+      backslashes = character == L'\\' ? backslashes + 1 : 0;
+    }
+    const bool pipe_escapes = encoded != content;
+    if (pipe_escapes) result.source.replace(cell->source_begin, new_length, encoded);
+    if (inserted_escapes || pipe_escapes) {
+      std::size_t begin{};
+      while (begin < source.size() && begin < result.source.size() && source[begin] == result.source[begin]) ++begin;
+      auto old_end = source.size();
+      auto new_end = result.source.size();
+      while (old_end > begin && new_end > begin && source[old_end - 1] == result.source[new_end - 1]) {
+        --old_end; --new_end;
+      }
+      result.begin = begin; result.old_end = old_end; result.new_end = new_end;
+    }
+    break;
+  }
   result.changed = true;
   return result;
 }

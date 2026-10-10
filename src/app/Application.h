@@ -42,6 +42,8 @@ class Application {
   void OpenInitialPath(const std::filesystem::path& path);
 
  private:
+  enum class SearchScope : std::uint8_t { CurrentFile, Workspace };
+
   enum class EditorProjectionRebuildResult {
     Failed,
     Native,
@@ -92,6 +94,35 @@ class Application {
       unsigned frame_count{};
       bool animated{};
       bool inserted{};
+    };
+
+    struct TableViewport {
+      HWND editor{};
+      std::size_t source_begin{};
+      std::size_t source_end{};
+      EditorSnapshot snapshot;
+      std::uint64_t revision{std::numeric_limits<std::uint64_t>::max()};
+      bool native_tables_ready{};
+      std::uint64_t presentation_revision{std::numeric_limits<std::uint64_t>::max()};
+      int active_line{-1};
+      std::size_t active_source_line_begin{std::numeric_limits<std::size_t>::max()};
+      std::uint64_t derived_image_revision{std::numeric_limits<std::uint64_t>::max()};
+      std::vector<RenderedImage> rendered_images;
+      std::map<std::size_t, AnimatedImageState> animated_image_frames;
+      std::wstring rendered_image_source;
+      std::vector<LONG> row_heights_twips;
+      UINT dpi{};
+      unsigned font_size_pt{};
+      std::wstring font_face;
+      LONG available_width{};
+      LONG natural_width_twips{};
+      std::array<HWND, 10> operation_buttons{};
+      std::optional<TableCellIntent> hovered_cell;
+      bool hover_visible{};
+      bool button_press_armed{};
+      bool pointer_down{};
+      bool pointer_dragged{};
+      POINT pointer_origin{};
     };
 
     Document document;
@@ -149,6 +180,54 @@ class Application {
     std::vector<SourceEdit> source_undo;
     std::vector<SourceEdit> source_redo;
     bool painting_table_grid{};
+    bool table_source_mode{};
+    bool table_source_revealed_for_search{};
+    bool table_return_key_handled{};
+    std::vector<std::unique_ptr<TableViewport>> table_viewports;
+    TableViewport* active_table_viewport{};
+    HWND table_parent_editor{};
+    bool refreshing_table_viewports{};
+    std::optional<SourceSelection> table_exit_selection;
+  };
+
+  class TableViewportContext {
+   public:
+    TableViewportContext(Application& app, DocumentView& view, DocumentView::TableViewport& viewport);
+    ~TableViewportContext();
+   private:
+    void SwapProjection();
+    Application& app_;
+    DocumentView& view_;
+    DocumentView::TableViewport& viewport_;
+    HWND parent_editor_{};
+    std::uint64_t revision_{};
+    bool source_mode_{};
+  };
+
+  struct RetiredSearchWorker {
+    std::jthread worker;
+    std::shared_ptr<std::atomic_bool> finished;
+  };
+
+  struct SearchFormatSpan {
+    LONG begin{};
+    LONG end{};
+    COLORREF background{};
+    bool automatic_background{};
+  };
+
+  struct SearchHighlightRange {
+    LONG begin{};
+    LONG end{};
+    bool current{};
+    friend bool operator==(const SearchHighlightRange&, const SearchHighlightRange&) = default;
+  };
+
+  struct SearchHighlightState {
+    std::filesystem::path path;
+    std::uint64_t revision{};
+    std::vector<SearchFormatSpan> original_backgrounds;
+    std::vector<SearchHighlightRange> ranges;
   };
 
   struct TableGridRow {
@@ -185,11 +264,18 @@ class Application {
   static LRESULT CALLBACK CompactWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   static LRESULT CALLBACK EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                           UINT_PTR subclass_id, DWORD_PTR reference);
+  static LRESULT CALLBACK TableViewportSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                                UINT_PTR subclass_id, DWORD_PTR reference);
+  static LRESULT CALLBACK TableOperationButtonSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+                                                       UINT_PTR subclass_id, DWORD_PTR reference);
   static LRESULT CALLBACK TreeDragSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                             UINT_PTR subclass_id, DWORD_PTR reference);
   static LRESULT CALLBACK PanelHeaderSubclass(HWND window, UINT message, WPARAM wparam,
                                                LPARAM lparam, UINT_PTR subclass_id,
                                                DWORD_PTR reference);
+  static LRESULT CALLBACK SearchControlSubclass(HWND window, UINT message, WPARAM wparam,
+                                                LPARAM lparam, UINT_PTR subclass_id,
+                                                DWORD_PTR reference);
   static LRESULT CALLBACK ChromeBarSubclass(HWND window, UINT message, WPARAM wparam,
                                              LPARAM lparam, UINT_PTR subclass_id,
                                              DWORD_PTR reference);
@@ -217,6 +303,10 @@ class Application {
   void UpdatePanelHeaders();
   void DrawChromeButton(const DRAWITEMSTRUCT& draw) const;
   void DrawTabItem(const DRAWITEMSTRUCT& draw) const;
+  void DrawSearchScopeItem(const DRAWITEMSTRUCT& draw) const;
+  void DrawSearchScopeArrow(HWND combo, HDC dc) const;
+  void DrawSearchScopeFrame(HWND combo, HDC dc) const;
+  void DrawSearchCheckbox(HWND checkbox) const;
   void ActivatePanel(PanelId id);
   void GoToCalendarToday();
   void SetStatusSegments(std::array<std::wstring, 4> segments);
@@ -269,6 +359,18 @@ class Application {
   bool ApplySourceHistory(DocumentView& view, bool redo);
   bool PrepareTableProjectionForNativeMutation(DocumentView& view, UINT message,
                                                WPARAM wparam);
+  bool HandleTableCommandInput(DocumentView& view, UINT message, WPARAM wparam, LPARAM lparam);
+  void ToggleTableSource(DocumentView& view, bool search_reveal = false);
+  void ReleaseSearchTableSource(DocumentView& view);
+  EditorSnapshot NativeSnapshotForView(DocumentView& view, std::wstring_view text) const;
+  void RefreshTableViewports(DocumentView& view);
+  void LayoutTableViewports(DocumentView& view);
+  bool SelectTableSourceRange(DocumentView& view, SourceSelection selection, bool focus = true);
+  void ApplyTableSearchHighlights(DocumentView& view);
+  void ShowTableHoverControls(DocumentView& view, DocumentView::TableViewport& viewport, bool show);
+  void UpdateTableHoverTarget(DocumentView& view, DocumentView::TableViewport& viewport, POINT point);
+  void ExecuteTableHoverCommand(DocumentView& view, DocumentView::TableViewport& viewport, unsigned command);
+  void DrawTableOperationButton(const DRAWITEMSTRUCT& draw) const;
   void UpdatePendingVirtualTableCellFromCaret(DocumentView& view,
                                               const POINT* click_point = nullptr);
   bool InsertTextIntoPendingVirtualTableCell(DocumentView& view,
@@ -312,7 +414,21 @@ class Application {
   bool EditorText(HWND editor, EditorSnapshot& snapshot, std::wstring& text,
                   std::wstring* raw_native_text = nullptr) const;
   void UpdateStatus();
-  void ShowFindBar();
+  void ShowFindBar(SearchScope scope = SearchScope::Workspace);
+  void CloseSearchPanel();
+  void SetSearchScope(SearchScope scope);
+  void ScheduleSearch();
+  void SearchNow();
+  void PruneSearchWorkers();
+  void NavigateSearchMatch(int direction);
+  void UpdateCurrentSearchMatchForCaret(DocumentView& view);
+  std::uint64_t SearchContentHash(const DocumentView& view);
+  void ClearSearchResults();
+  void UpdateSearchPanelLabels();
+  void ApplyDocumentSearchHighlights(DocumentView& view, bool formatting_reset = false);
+  void OpenSearchResult(std::size_t index, bool focus_editor = false);
+  void ReplaceSelectedWorkspace(bool all_matches);
+  void ReplaceWorkspaceFile(const SearchMatch& match, bool all_matches);
   SearchQuery SearchQueryFromFindBar() const;
   void FindNext(bool restart_from_beginning = false);
   void ReplaceCurrentDocument(bool all);
@@ -322,6 +438,7 @@ class Application {
   void CompleteWorkspaceSearch(void* payload);
   void OpenWorkspaceSearchResult(std::size_t index);
   void ReplaceWorkspaceFromFindBar();
+  void RollbackClosedWorkspaceReplace();
   bool CloseDocument(std::size_t index);
   void CreateProfile(BuiltInProfile profile);
   void CreateProfileForDate(BuiltInProfile profile, const SYSTEMTIME& date);
@@ -338,7 +455,7 @@ class Application {
   void UpdateCalendarViewTheme();
   void UpdateCalendarViewMarkers();
   void CreateProfileById(std::wstring id, const SYSTEMTIME* requested_date);
-  void ApplyTableAction(TableAction action);
+  void ApplyTableAction(TableAction action, std::optional<std::size_t> target_source = std::nullopt);
   void MoveOutlineSection(std::size_t source_begin, std::size_t target_begin);
   bool SaveRecovery(DocumentView& view, bool interactive = false);
   void SaveSession();
@@ -411,6 +528,7 @@ class Application {
   HWND replace_edit_{};
   HWND find_workspace_{};
   HWND replace_workspace_{};
+  HWND rollback_workspace_replace_{};
   HWND find_case_{};
   HWND find_regex_{};
   HWND find_word_{};
@@ -419,6 +537,15 @@ class Application {
   HWND replace_one_{};
   HWND replace_document_{};
   HWND find_results_{};
+  HWND search_scope_{};
+  HWND search_target_{};
+  HWND search_previous_{};
+  HWND search_replace_toggle_{};
+  HWND search_details_toggle_{};
+  HWND search_count_{};
+  HWND search_status_{};
+  HWND search_ignore_{};
+  HWND search_hidden_{};
   HWND calendar_{};
   HWND calendar_tooltip_{};
   HWND git_panel_{};
@@ -445,14 +572,26 @@ class Application {
   std::atomic_bool calendar_index_delivery_failed_{};
   std::array<HWND, 4> panel_headers_{};
   std::filesystem::path workspace_;
+  std::filesystem::path latest_closed_replace_journal_;
   std::vector<std::filesystem::path> copied_files_;
   std::vector<std::unique_ptr<std::filesystem::path>> tree_paths_;
   std::vector<std::unique_ptr<DocumentView>> documents_;
   std::vector<std::filesystem::path> recent_documents_;
   std::vector<std::wstring> recent_diagnostic_summaries_;
   std::vector<SearchMatch> workspace_search_results_;
-  std::size_t workspace_search_issue_count_{};
+  std::vector<SearchMatch> document_search_results_;
+  std::vector<HTREEITEM> search_result_items_;
+  std::map<std::filesystem::path, HTREEITEM> search_file_nodes_;
+  std::map<std::filesystem::path, std::size_t> search_file_first_result_;
+  std::map<std::filesystem::path, std::size_t> search_file_match_counts_;
+  std::map<HWND, SearchHighlightState> search_highlight_states_;
+  std::map<std::filesystem::path, std::pair<std::uint64_t, std::uint64_t>> search_content_hash_cache_;
+  std::size_t workspace_search_error_count_{};
+  std::size_t workspace_search_excluded_count_{};
+  bool workspace_search_failed_{};
   std::jthread workspace_search_worker_;
+  std::shared_ptr<std::atomic_bool> workspace_search_worker_finished_;
+  std::vector<RetiredSearchWorker> retired_search_workers_;
   std::jthread git_status_worker_;
   std::jthread git_action_worker_;
   std::uint64_t workspace_search_generation_{};
@@ -468,6 +607,16 @@ class Application {
   bool git_action_active_{};
   ULONGLONG workspace_search_due_{};
   bool workspace_search_started_{};
+  SearchScope search_scope_state_{SearchScope::Workspace};
+  bool search_replace_expanded_{};
+  bool search_details_expanded_{};
+  bool search_ime_composing_{};
+  bool search_tree_selection_update_{};
+  int pending_search_navigation_{};
+  std::filesystem::path document_search_path_;
+  std::uint64_t document_search_revision_{};
+  std::size_t current_search_match_index_{static_cast<std::size_t>(-1)};
+  std::size_t current_workspace_match_index_{static_cast<std::size_t>(-1)};
   bool holiday_cache_loaded_{};
   bool save_dialog_active_{};
   std::size_t active_document_{static_cast<std::size_t>(-1)};

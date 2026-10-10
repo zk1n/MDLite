@@ -1,4 +1,5 @@
 #include "editor/RichEditTableAdapter.h"
+#include "markdown/Markdown.h"
 
 #include <richedit.h>
 #include <richole.h>
@@ -152,7 +153,7 @@ const char* AlignmentTag(TableAlignment alignment) {
   return "\\ql";
 }
 
-bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
+bool BuildRtfTable(HWND editor, const EditorSnapshot& snapshot, std::size_t table_index,
                    const RichEditTableStyle& style, std::string& rtf) {
   if (table_index >= snapshot.tables.size()) return false;
   const auto& table = snapshot.tables[table_index];
@@ -162,24 +163,24 @@ bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
     column_count = std::max(column_count, row.cells.size());
   if (column_count == 0 || column_count > MAX_TAB_STOPS + 16) return false;
 
-  const LONG available = std::max<LONG>(1, style.available_width_twips);
-  const LONG minimum = std::max<LONG>(1, style.minimum_cell_width_twips);
-  const LONG total_width = std::max(available,
-      minimum > LONG_MAX / static_cast<LONG>(column_count)
-          ? LONG_MAX : minimum * static_cast<LONG>(column_count));
-  const LONG width = std::max<LONG>(1, total_width / static_cast<LONG>(column_count));
+  auto widths = MeasureRichEditTableColumns(editor, snapshot, table_index, style);
+  if (widths.size() != column_count) return false;
+  LONG total_width{};
+  for (const auto width : widths) total_width += width;
+  if (style.layout_footprint && total_width > style.available_width_twips) {
+    for (auto& width : widths) width = std::max<LONG>(1, MulDiv(width, style.available_width_twips, total_width));
+  }
   std::vector<LONG> cell_edges(column_count);
   LONG cumulative{};
   for (std::size_t column{}; column < column_count; ++column) {
-    const LONG increment = column + 1 == column_count
-        ? total_width - cumulative : width;
+    const LONG increment = widths[column];
     if (increment <= 0 || cumulative > LONG_MAX - increment) return false;
     cumulative += increment;
     cell_edges[column] = cumulative;
   }
 
   rtf = "{\\rtf1\\ansi\\ansicpg1252\\deff0\\viewkind4\\uc1";
-  rtf += "{\\fonttbl{\\f0\\fnil Segoe UI;}}{\\colortbl;";
+  rtf += "{\\fonttbl{\\f0\\fnil " + EscapeRtf(style.font_face) + ";}}{\\colortbl;";
   AppendRtfColor(rtf, style.border_color);
   AppendRtfColor(rtf, style.header_background);
   AppendRtfColor(rtf, style.body_background);
@@ -189,12 +190,21 @@ bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
     if (row.cells.size() > column_count) return false;
     rtf += "\\trowd\\trgaph" + std::to_string(std::max<LONG>(0, style.cell_margin_twips));
     rtf += "\\trleft0";
+    LONG height = style.font_size_half_points * 18;
+    const auto measured_heights = style.row_heights_twips.find(table.source_begin);
+    if (measured_heights != style.row_heights_twips.end() && row_index < measured_heights->second.size())
+      height = measured_heights->second[row_index];
+    rtf += "\\trrh" + std::to_string(style.layout_footprint ? -height : height);
     for (std::size_t column{}; column < column_count; ++column) {
       rtf += "\\clvertalt\\clbrdrl\\brdrs\\brdrw6\\brdrcf1"
              "\\clbrdrr\\brdrs\\brdrw6\\brdrcf1"
              "\\clbrdrt\\brdrs\\brdrw6\\brdrcf1"
              "\\clbrdrb\\brdrs\\brdrw6\\brdrcf1";
       rtf += row_index == 0 ? "\\clcbpat2" : "\\clcbpat3";
+      rtf += "\\clpadl" + std::to_string(style.cell_margin_twips) + "\\clpadfl3";
+      rtf += "\\clpadr" + std::to_string(style.cell_margin_twips) + "\\clpadfr3";
+      rtf += "\\clpadt" + std::to_string(style.row_padding_twips) + "\\clpadft3";
+      rtf += "\\clpadb" + std::to_string(style.row_padding_twips) + "\\clpadfb3";
       rtf += "\\cellx" + std::to_string(cell_edges[column]);
     }
     for (std::size_t column{}; column < column_count; ++column) {
@@ -202,7 +212,9 @@ bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
              std::to_string(std::max<LONG>(2, style.font_size_half_points));
       rtf += AlignmentTag(column < table.alignments.size()
                               ? table.alignments[column] : TableAlignment::Left);
+      rtf += "\\sl" + std::to_string(style.font_size_half_points * 16) + "\\slmult0";
       rtf.push_back(' ');
+      if (style.layout_footprint) rtf += "\\v ";
       const auto& cell = row.cells[column];
       if (cell.view_begin > cell.view_end || cell.view_end > snapshot.view.size()) return false;
       if (!cell.virtual_cell) {
@@ -219,8 +231,72 @@ bool BuildRtfTable(const EditorSnapshot& snapshot, std::size_t table_index,
 
 }  // namespace
 
+std::vector<LONG> MeasureRichEditTableColumns(HWND editor, const EditorSnapshot& snapshot,
+                                             std::size_t table_index,
+                                             const RichEditTableStyle& style) {
+  if (table_index >= snapshot.tables.size()) return {};
+  const auto& table = snapshot.tables[table_index];
+  std::size_t columns{};
+  for (const auto& row : table.visual_rows) columns = std::max(columns, row.cells.size());
+  std::vector<LONG> widths(columns, std::max<LONG>(1, style.minimum_cell_width_twips));
+  HDC dc = GetDC(editor);
+  if (!dc) return {};
+  const int dpi = std::max(1, GetDeviceCaps(dc, LOGPIXELSX));
+  std::array<HFONT, 8> fonts{};
+  for (std::size_t i{}; i < fonts.size(); ++i) {
+    fonts[i] = CreateFontW(-MulDiv(style.font_size_half_points, dpi, 144), 0, 0, 0,
+        (i & 1) ? FW_BOLD : FW_NORMAL, (i & 2) != 0, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+        (i & 4) ? L"Cascadia Mono" : style.font_face.c_str());
+  }
+  const auto original_font = GetCurrentObject(dc, OBJ_FONT);
+  for (const auto& row : table.visual_rows) {
+    for (std::size_t column{}; column < row.cells.size(); ++column) {
+      const auto& cell = row.cells[column];
+      if (cell.virtual_cell || cell.view_end > snapshot.view.size()) continue;
+      const auto text = std::wstring_view(snapshot.view).substr(cell.view_begin,
+                                                               cell.view_end - cell.view_begin);
+      const auto inline_parse = ParseMarkdown(text);
+      LONG measured{};
+      for (std::size_t begin{}; begin < text.size();) {
+        unsigned font_style{};
+        bool hidden{};
+        std::size_t end = text.size();
+        for (const auto& span : inline_parse.spans) {
+          if (span.begin > begin) end = std::min(end, span.begin);
+          if (begin >= span.begin && begin < span.end) {
+            end = std::min(end, span.end);
+            hidden |= span.kind == SpanKind::EmphasisMarker;
+            if (span.kind == SpanKind::Strong) font_style |= 1;
+            if (span.kind == SpanKind::Emphasis) font_style |= 2;
+            if (span.kind == SpanKind::Code) font_style |= 4;
+          }
+        }
+        end = std::max(begin + 1, end);
+        if (!hidden) {
+          if (fonts[font_style]) SelectObject(dc, fonts[font_style]);
+          SIZE extent{};
+          if (GetTextExtentPoint32W(dc, text.data() + begin, static_cast<int>(end - begin), &extent))
+            measured += extent.cx;
+        }
+        begin = end;
+      }
+      const LONG text_twips = MulDiv(measured, 1440, dpi);
+      // Reference textWidth + 16 CSS px; px is a DPI-independent logical unit.
+      const LONG candidate = std::clamp(text_twips + 240, style.minimum_cell_width_twips,
+          std::max(style.minimum_cell_width_twips, style.maximum_cell_width_twips));
+      widths[column] = std::max(widths[column], candidate);
+    }
+  }
+  SelectObject(dc, original_font);
+  for (const auto font : fonts) if (font) DeleteObject(font);
+  ReleaseDC(editor, dc);
+  return widths;
+}
+
 bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
-                             COLORREF header_background, COLORREF body_background) {
+                             COLORREF header_background, COLORREF body_background,
+                             bool hide_content) {
   if (snapshot.tables.empty()) return true;
   IRichEditOle* rich_edit{};
   if (!SendMessageW(editor, EM_GETOLEINTERFACE, 0,
@@ -230,8 +306,7 @@ bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
                                                     reinterpret_cast<void**>(&document));
   rich_edit->Release();
   if (FAILED(queried) || !document) return false;
-  BSTR face = SysAllocString(L"Cascadia Mono");
-  bool formatted = face != nullptr;
+  bool formatted = true;
   for (const auto& table : snapshot.tables) {
     for (std::size_t row_index{}; formatted && row_index < table.visual_rows.size(); ++row_index) {
       for (const auto& cell : table.visual_rows[row_index].cells) {
@@ -242,7 +317,7 @@ bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
         formatted = SUCCEEDED(document->Range(static_cast<LONG>(cell.native_begin),
                                               static_cast<LONG>(cell.native_end), &range)) && range &&
                     SUCCEEDED(range->GetFont(&font)) && font &&
-                    SUCCEEDED(font->SetName(face)) &&
+                    (!hide_content || SUCCEEDED(font->SetHidden(tomTrue))) &&
                     SUCCEEDED(font->SetBackColor(static_cast<LONG>(
                         row_index == 0 ? header_background : body_background)));
         if (font) font->Release();
@@ -252,7 +327,6 @@ bool FormatRichEditTableCells(HWND editor, const EditorSnapshot& snapshot,
     }
     if (!formatted) break;
   }
-  SysFreeString(face);
   document->Release();
   return formatted;
 }
@@ -309,7 +383,7 @@ bool RebuildRichEditTables(HWND editor, EditorSnapshot& snapshot,
     if (table.native_coordinates_set || table.view_begin > table.view_end ||
         table.view_end > snapshot.view.size() || table.view_end > LONG_MAX) return false;
     std::string rtf;
-    if (!BuildRtfTable(snapshot, reverse - 1, style, rtf)) return false;
+    if (!BuildRtfTable(editor, snapshot, reverse - 1, style, rtf)) return false;
     CHARRANGE range{static_cast<LONG>(table.view_begin), static_cast<LONG>(table.view_end)};
     SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
     RtfInput input{&rtf, 0};

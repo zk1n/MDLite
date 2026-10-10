@@ -9,6 +9,14 @@
 - ビルド: CMake `FetchContent` が固定URLとhashを照合する。encoder/mux libraryは自動テストfixture生成だけにリンクし、製品runtimeへは含めない。
 - 配布境界: 静的リンクのため、実行先にStore版WebP Image Extensionsや任意WIC codecを要求しない。正式package時は `THIRD_PARTY_NOTICES.md` を同梱する。
 
+## PCRE2 10.49
+
+- 用途: UTF-16正規表現検索と置換。match/depth/heap制限とcalloutによるキャンセルを使用し、入力由来の長時間バックトラックを制限する。
+- 公式入手先: `https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz`
+- SHA-256: `929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae`
+- ビルド: 固定URL/hashのCMake FetchContent。16bit静的libraryだけをリンクし、JIT・共有DLL・grep・library testsは含めない。
+- ライセンス: BSD-3-Clause。第三者noticeに収録する。通常実行時に入手先へ通信しない。
+
 ## Windows SDK / OS components
 
 - WIC: PNG/JPEG/GIFの復号と描画用PNG stream生成。
@@ -20,6 +28,6 @@
 ## 手動更新と保守
 
 - アプリ更新元／更新feedは未設定。通常起動・診断表示・診断更新でrelease情報を確認したり、packageを取得したりしない。診断画面は「更新元未設定」と表示する。配布先が決まるまでは、アプリ更新の自動確認・ダウンロード・インストールを行わない。
-- 依存libraryは一括最新版化しない。libwebpを更新するときは、承認した正確なversionのarchive URLとSHA-256を `CMakeLists.txt` とこの台帳の両方で更新し、`THIRD_PARTY_NOTICES.md` のlicense／patent noticeを再確認する。
-- 更新後はDebug/Releaseのconfigure・build・CTestと、画像形式・画像安全性・package依存表示の回帰を確認する。archiveを取得できないoffline環境ではconfigureを失敗として扱い、別版へfallbackしない。MDLite本体の通常実行は依存取得元へ通信しない。
-- 本台帳の現行libwebp版、固定URL、hashがdependency updateの保守基準である。Diagnosticsの依存version表示は実際にlinkedされたdecoderから取得し、sourceやhash未設定をinstalled versionから推測しない。
+- 依存libraryは一括最新版化しない。libwebp／PCRE2を更新するときは、承認した正確なversionのarchive URLとSHA-256を `CMakeLists.txt` とこの台帳の両方で更新し、`THIRD_PARTY_NOTICES.md` のlicense／patent noticeを再確認する。
+- 更新後はDebug/Releaseのconfigure・build・CTestと、画像形式・画像安全性・検索／置換・package依存表示の関連する回帰を確認する。archiveを取得できないoffline環境ではconfigureを失敗として扱い、別版へfallbackしない。MDLite本体の通常実行は依存取得元へ通信しない。
+- 本台帳の現行libwebp／PCRE2版、固定URL、hashがdependency updateの保守基準である。Diagnosticsの依存version表示は実際にlinkedされたlibraryから取得し、sourceやhash未設定をinstalled versionから推測しない。

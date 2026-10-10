@@ -226,7 +226,7 @@ void TestNativeWrappingAndMapping() {
     POINT second_row_start{};
     Check(PositionOf(editor, static_cast<LONG>(raw_cell), first_start),
           "raw cell offsets match RichEdit native positions");
-    Check(PositionOf(editor, static_cast<LONG>(raw_cell + 30), wrapped_mid),
+    Check(PositionOf(editor, static_cast<LONG>(raw_cell + 80), wrapped_mid),
           "wrapped cell midpoint has a native screen position");
     Check(PositionOf(editor, static_cast<LONG>(raw_right), right_start),
           "adjacent cell has a native screen position");
@@ -430,11 +430,157 @@ void TestNativeWrappingAndMapping() {
   FreeLibrary(rich_edit_module);
 }
 
+void TestMeasuredWidths() {
+  HMODULE module = LoadLibraryW(L"Msftedit.dll");
+  const HWND host = CreateWindowExW(0, L"STATIC", L"local table viewport", WS_POPUP,
+                                    0, 0, 400, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  const HWND editor = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_CHILD | ES_MULTILINE,
+                                      0, 0, 360, 360, host, nullptr, GetModuleHandleW(nullptr), nullptr);
+  const std::wstring source = L"before\n| A | Longer heading |\n| --- | --- |\n| x | 日本語 long content |\n\nafter";
+  auto snapshot = mdlite::BuildNativeEditorSnapshot(source);
+  SetWindowTextW(editor, snapshot.view.c_str());
+  mdlite::RichEditTableStyle style;
+  style.minimum_cell_width_twips = 950;
+  style.maximum_cell_width_twips = 6400;
+  const auto widths = mdlite::MeasureRichEditTableColumns(editor, snapshot, 0, style);
+  Check(widths.size() == 2 && widths[0] == 950 && widths[1] > widths[0] && widths[1] <= 6400,
+        "measured widths compact short cells and grow Japanese long column within bounds");
+  const bool built = mdlite::RebuildRichEditTables(editor, snapshot, style);
+  Check(built, "measured table projection builds");
+  const auto table = mdlite::ParseGfmTableAt(source, source.find(L"Longer"));
+  if (table) {
+    auto viewport = mdlite::BuildNativeTableViewportSnapshot(source, *table);
+    SetWindowTextW(editor, viewport.view.c_str());
+    const bool projected = mdlite::RebuildRichEditTables(editor, viewport, style);
+    std::wstring raw, flattened;
+    const bool observed = mdlite::ReadRichEditNativeText(editor, raw) &&
+        mdlite::FlattenRichEditTableText(viewport, raw, flattened);
+    std::cout << "viewport lengths old=" << viewport.view.size() << " flat=" << flattened.size() << '\n';
+    Check(projected && observed && flattened == viewport.view,
+          "table-only viewport round trips without paragraph/source additions");
+    Check(viewport.NativeToSource(viewport.SourceToNative(source.find(L"日本語"))) == source.find(L"日本語"),
+          "table-only native positions map to canonical document source offsets");
+    const auto unchanged = mdlite::ApplyEditorText(viewport, source, flattened);
+    Check(!unchanged.changed && unchanged.source == source,
+          "derived viewport presentation leaves the entire canonical source unchanged");
+  }
+  DestroyWindow(host);
+  if (module) FreeLibrary(module);
+}
+
+void TestProtectedContentPipes() {
+  const std::wstring source = L"before\r\n| H | V |\r\n| --- | --- |\r\n| A\\|B | `C|D` |\r\nafter";
+  const auto snapshot = mdlite::BuildNativeEditorSnapshot(source);
+  Check(snapshot.view.find(L"A|B") != std::wstring::npos && snapshot.view.find(L"A\\|B") == std::wstring::npos,
+        "escaped content pipe projects as one visible character");
+  const auto unchanged = mdlite::ApplyEditorText(snapshot, source, snapshot.view);
+  Check(!unchanged.changed && unchanged.source == source,
+        "pipe projection leaves escape padding and CRLF source unchanged");
+  auto deleted_view = snapshot.view;
+  deleted_view.erase(deleted_view.find(L"A|B") + 1, 1);
+  const auto deleted = mdlite::ApplyEditorText(snapshot, source, deleted_view);
+  Check(deleted.source.find(L"| AB | `C|D` |") != std::wstring::npos,
+        "deleting the one visible pipe deletes its whole source escape atom, not a separator");
+  auto typed_view = snapshot.view;
+  typed_view.insert(typed_view.find(L"A|B") + 3, L"|");
+  const auto typed = mdlite::ApplyEditorText(snapshot, source, typed_view);
+  Check(typed.source.find(L"| A\\|B\\| |") != std::wstring::npos,
+        "native text/IME pipe insertion is encoded in one canonical cell transaction");
+  auto slash_view = snapshot.view;
+  slash_view.insert(slash_view.find(L"A|B") + 1, L"\\");
+  const auto slash = mdlite::ApplyEditorText(snapshot, source, slash_view);
+  const auto slash_snapshot = mdlite::BuildNativeEditorSnapshot(slash.source);
+  Check(slash.source.find(L"A\\\\\\|B") != std::wstring::npos && slash_snapshot.view == slash_view,
+        "typing a literal backslash before a pipe keeps the same visible text and escaped source");
+  auto code_view = snapshot.view;
+  code_view.insert(code_view.find(L"C|D") + 1, L"|");
+  const auto code = mdlite::ApplyEditorText(snapshot, source, code_view);
+  Check(code.source.find(L"`C||D`") != std::wstring::npos,
+        "literal code-span pipes keep code content unchanged");
+  const std::wstring mixed = L"![before](safe.png)\n| H | V |\n| --- | --- |\n| one | two |\n![after](safe.png)";
+  const auto table = mdlite::ParseGfmTableAt(mixed, mixed.find(L"one"));
+  const auto parent = mdlite::BuildNativeEditorSnapshot(mixed);
+  const auto child = table ? mdlite::BuildNativeTableViewportSnapshot(mixed, *table) : mdlite::EditorSnapshot{};
+  Check(parent.collapsed.size() == 2 && child.collapsed.empty() &&
+        !mdlite::ApplyEditorText(child, mixed, child.view).changed,
+        "outside-table image objects belong only to the main projection and cannot be injected into a child");
+}
+
+void TestNativeRectangleContentEndpoints() {
+  const auto module = LoadLibraryW(L"Msftedit.dll");
+  const auto host = CreateWindowExW(0, L"STATIC", L"rectangle content test", WS_POPUP,
+      0, 0, 600, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  const auto editor = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_CHILD | ES_MULTILINE,
+      0, 0, 600, 400, host, nullptr, GetModuleHandleW(nullptr), nullptr);
+  for (const bool crlf : {false, true}) {
+    const std::wstring nl = crlf ? L"\r\n" : L"\n";
+    const std::wstring source = L"before" + nl + L"| Head A | Head B |" + nl +
+        L"| :--- | ---: |" + nl + L"| one | two |" + nl + L"| three | four |" + nl + L"after";
+    const auto parsed = mdlite::ParseGfmTableAt(source, source.find(L"one"));
+    auto snapshot = mdlite::BuildNativeTableViewportSnapshot(source, *parsed);
+    SetWindowTextW(editor, snapshot.view.c_str());
+    Check(mdlite::RebuildRichEditTables(editor, snapshot, {}), "rectangle fixture builds");
+    const auto& table = snapshot.tables.front();
+    CHARRANGE requested{static_cast<LONG>(table.visual_rows[1].cells[0].native_begin),
+        static_cast<LONG>(table.visual_rows[2].cells[1].native_end)};
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&requested));
+    CHARRANGE actual{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&actual));
+    Check(requested.cpMin == 20 && requested.cpMax == 42 && actual.cpMin == 18 && actual.cpMax == 45,
+          "native row selection reproduces expansion from 20..42 to 18..45");
+    const auto cells = mdlite::IntersectingNativeTableCells(table, actual.cpMin, actual.cpMax);
+    Check(cells && cells->first.row_begin == parsed->rows[2].begin && cells->first.column == 0 &&
+        cells->second.row_begin == parsed->rows[3].begin && cells->second.column == 1,
+        "row marker endpoints resolve the four body cells without the adjacent header");
+    if (cells) {
+      Check(mdlite::CopyTableRectangle(source, cells->first, cells->second) == L"one\ttwo\nthree\tfour",
+            "native rectangle endpoints copy exact two-by-two TSV");
+      const auto cleared = mdlite::ReplaceTableRectangle(source, cells->first, cells->second, L"");
+      const auto expected = L"before" + nl + L"| Head A | Head B |" + nl + L"| :--- | ---: |" + nl +
+          L"|  |  |" + nl + L"|  |  |" + nl + L"after";
+      Check(cleared.changed && cleared.text == expected,
+            "rectangle clear preserves header delimiter padding line endings and outside source");
+    }
+    Check(!mdlite::IntersectingNativeTableCells(table, table.visual_rows[1].native_begin,
+        table.visual_rows[1].cells[0].native_begin), "native row markers alone contain no content cell");
+    const auto partial = mdlite::IntersectingNativeTableCells(table, requested.cpMin + 1, requested.cpMin + 2);
+    Check(partial && partial->first.row_begin == partial->second.row_begin &&
+        partial->first.column == partial->second.column, "partial in-cell selection remains one cell");
+    const auto whole = mdlite::IntersectingNativeTableCells(table, table.native_begin, table.native_end);
+    Check(whole && whole->first.row_begin == parsed->rows.front().begin && whole->first.column == 0,
+          "explicit whole table still includes its header content");
+  }
+  const std::wstring source = L"before\r\n| H | V | C |\r\n| --- | --- | --- |\r\n"
+      L"| 😀 | `a|b` |\r\n|  | below | last |\r\nafter";
+  const auto parsed = mdlite::ParseGfmTableAt(source, source.find(L"😀"));
+  auto snapshot = mdlite::BuildNativeTableViewportSnapshot(source, *parsed);
+  SetWindowTextW(editor, snapshot.view.c_str());
+  Check(mdlite::RebuildRichEditTables(editor, snapshot, {}), "ragged Unicode rectangle fixture builds");
+  const auto& table = snapshot.tables.front();
+  const auto cells = mdlite::IntersectingNativeTableCells(table, table.visual_rows[1].native_begin,
+      table.visual_rows[2].native_end);
+  Check(cells && mdlite::CopyTableRectangle(source, cells->first, cells->second) == L"😀\t`a|b`\t\n\tbelow\tlast",
+        "native rectangle includes empty and missing cells without changing Unicode or code pipes");
+  const auto missing = mdlite::IntersectingNativeTableCells(table, table.visual_rows[1].native_begin,
+      table.visual_rows[1].native_end);
+  Check(missing && missing->second.virtual_cell && missing->second.column == 2,
+        "selected missing-cell slot keeps its row and column identity");
+  const auto empty = mdlite::IntersectingNativeTableCells(table, table.visual_rows[2].native_begin,
+      table.visual_rows[2].cells[1].native_begin);
+  Check(empty && empty->first.column == 0 && empty->second.column == 0,
+        "selected zero-length content slot remains the empty first cell");
+  DestroyWindow(host);
+  FreeLibrary(module);
+}
+
 }  // namespace
 
 int main() {
   TestNativeCollapsedImageRanges();
   TestNativeWrappingAndMapping();
+  TestMeasuredWidths();
+  TestProtectedContentPipes();
+  TestNativeRectangleContentEndpoints();
   if (failures != 0) return 1;
   std::cout << "NativeRichEditTableTests PASS\n";
   return 0;

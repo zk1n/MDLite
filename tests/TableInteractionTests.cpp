@@ -454,6 +454,54 @@ void TestHeaderAnchoredNavigation() {
         "Tab creates a header-width row only after the final row's declared slots and preserves overflow source");
 }
 
+void TestReferenceCommands() {
+  const std::wstring source = L"before\r\n| H1 | H2 |\r\n| --- | ---: |\r\n| one | two |\r\n| three | four |";
+  const auto one = mdlite::ResolveTableCellIntent(source, source.find(L"one"));
+  const auto four = mdlite::ResolveTableCellIntent(source, source.find(L"four"));
+  Check(one && four, "reference command fixtures resolve cells");
+  if (!one || !four) return;
+  const auto vertical = mdlite::MoveTableCellCommand(source, *one, false, true);
+  Check(!vertical.changed && vertical.selection == source.find(L"three"),
+        "Enter moves one row down in the same column without editing");
+  const auto left_wrap = mdlite::MoveTableCaretTargetAtBoundary(source, *one, mdlite::TableCaretDirection::Left);
+  const auto right_wrap = left_wrap ? mdlite::MoveTableCaretTargetAtBoundary(source, *left_wrap,
+        mdlite::TableCaretDirection::Right) : std::nullopt;
+  Check(left_wrap && left_wrap->source_position == source.find(L"H2") && right_wrap &&
+        right_wrap->source_position == source.find(L"one"),
+        "horizontal arrows wrap across visible rows and skip the structural delimiter row");
+  const auto appended = mdlite::MoveTableCellCommand(source, *four, false, true);
+  Check(appended.changed && appended.target_cell && appended.target_cell->column == 1 &&
+        appended.text.ends_with(L"\r\n|  |  |"), "Enter appends CRLF row in same column");
+  const auto exited = mdlite::LeaveTable(source, one->source_position);
+  Check(exited.changed && exited.text == source + L"\r\n\r\n" && exited.selection == exited.text.size(),
+        "explicit EOF exit appends paragraph with source line endings");
+  Check(!mdlite::DeleteTableRow(source, source.find(L"H1")).changed,
+        "table header deletion is protected");
+  const auto deleted = mdlite::DeleteTableRow(source, one->source_position);
+  Check(deleted.changed && !mdlite::DeleteTableRow(deleted.text, deleted.text.find(L"three")).changed,
+        "last body row deletion is protected");
+  Check(mdlite::CopyTableRectangle(source, *one, *four) == L"one\ttwo\nthree\tfour",
+        "rectangle copy has TSV content without pipes");
+  const auto cleared = mdlite::ReplaceTableRectangle(source, *one, *four, L"");
+  Check(cleared.text == L"before\r\n| H1 | H2 |\r\n| --- | ---: |\r\n|  |  |\r\n|  |  |",
+        "rectangle deletion keeps padding pipes and CRLF");
+  const auto pasted = mdlite::ReplaceTableRectangle(source, *one, *one, L"東京\tA|B\r\nthree\tfour");
+  Check(pasted.text.find(L"| 東京 | A\\|B |") != std::wstring::npos &&
+        pasted.text.ends_with(L"| three | four |"), "TSV paste escapes content pipe and preserves untouched rows");
+  Check(pasted.selection == pasted.text.find(L"four") + 4,
+        "TSV paste caret follows the final pasted cell content");
+  Check(!mdlite::ReplaceTableRectangle(source, *four, *four, L"A\tB").changed &&
+        !mdlite::ReplaceTableRectangle(source, *one, *one, L"A\tB\nC").changed &&
+        !mdlite::ReplaceTableRectangle(source, *four, *four, L"A\nB").changed,
+        "oversized or uneven TSV matrices leave the entire source unchanged");
+  const auto slashes = mdlite::ReplaceTableRectangle(source, *one, *one, L"A\\\\|B");
+  Check(slashes.text.find(L"A\\\\\\|B") != std::wstring::npos,
+        "TSV pipe escaping checks backslash parity rather than only the previous character");
+  const auto aligned = mdlite::SetTableColumnAlignment(source, four->source_position, mdlite::TableAlignment::Center);
+  Check(aligned.changed && aligned.text.find(L"| --- | :---: |") != std::wstring::npos,
+        "column alignment changes only delimiter content");
+}
+
 }  // namespace
 
 int main() {
@@ -466,6 +514,7 @@ int main() {
   TestColumnInsertionPreservesPadding();
   TestMissingTableCellInsertion();
   TestHeaderAnchoredNavigation();
+  TestReferenceCommands();
   if (failures != 0) return 1;
   std::cout << "TableInteractionTests PASS\n";
   return 0;

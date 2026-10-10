@@ -43,12 +43,12 @@
     {
       "name": "debug",
       "configurePreset": "debug",
-      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_richedit_table_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests", "mdlite_calendar_view_tests"]
+      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_richedit_table_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests", "mdlite_calendar_view_tests", "mdlite_slim_scrollbar_tests", "mdlite_search_quality_tests"]
     },
     {
       "name": "release",
       "configurePreset": "release",
-      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_richedit_table_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests", "mdlite_calendar_view_tests"]
+      "targets": ["MDLite", "mdlite_core_tests", "mdlite_panel_layout_tests", "mdlite_table_interaction_tests", "mdlite_richedit_table_tests", "mdlite_calendar_day_index_tests", "mdlite_git_panel_tests", "mdlite_calendar_view_tests", "mdlite_slim_scrollbar_tests", "mdlite_search_quality_tests"]
     }
   ],
   "testPresets": [

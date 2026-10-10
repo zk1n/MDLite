@@ -1329,15 +1329,18 @@ void TestEditorAdapter() {
       L"| left | right |\n| --- | --- |\n| a || c |\n| x | y |\nafter";
   const auto native_table = mdlite::BuildNativeEditorSnapshot(native_table_source);
   const std::wstring expected_table_view =
-      L"before\r A \t B \r alpha\\|beta \t `x|y` \rmiddle\r left \t right \t"
-      L"\r a \t\t c \r x \t y \t\rafter";
+      L"before\rA\tB\ralpha|beta\t`x|y`\rmiddle\rleft\tright\t"
+      L"\ra\t\tc\rx\ty\t\rafter";
   Check(native_table.tables.size() == 2 && native_table.view == expected_table_view,
         "native GFM projection keeps adjacent text and emits visible cells with tab and CR separators");
+  const auto unchanged_table = mdlite::ApplyEditorText(native_table, native_table_source, native_table.view);
+  Check(!unchanged_table.changed && unchanged_table.source == native_table_source,
+        "native cell padding is visual only and preserves exact source whitespace and line endings");
   Check(native_table.tables[0].cells.size() == 4 && native_table.tables[1].cells.size() == 7 &&
             native_table.tables[1].gaps.size() > native_table.tables[0].gaps.size(),
         "native table mappings cover multiple tables, escaped/code-span pipes, empty and ragged cells");
   const std::size_t escaped_source = native_table_source.find(L"alpha\\|beta");
-  const std::size_t escaped_view = native_table.view.find(L"alpha\\|beta");
+  const std::size_t escaped_view = native_table.view.find(L"alpha|beta");
   const std::size_t middle_source = native_table_source.find(L"middle");
   const std::size_t middle_view = native_table.view.find(L"middle");
   Check(native_table.SourceToView(escaped_source + 3) == escaped_view + 3 &&
@@ -1346,7 +1349,7 @@ void TestEditorAdapter() {
             native_table.NativeToSource(middle_view) == middle_source,
         "table cell and adjacent-text source/view/native coordinates round-trip across mixed line endings");
   auto edited_table_view = native_table.view;
-  edited_table_view.replace(escaped_view, std::wstring_view(L"alpha\\|beta").size(), L"updated");
+  edited_table_view.replace(escaped_view, std::wstring_view(L"alpha|beta").size(), L"updated");
   const auto edited_table = mdlite::ApplyEditorText(
       native_table, native_table_source, edited_table_view);
   std::wstring expected_table_source = native_table_source;
@@ -1978,8 +1981,10 @@ void TestTableEditing() {
             literal_delete.text == L"|  A  | `C|D` |\r\n| :--- | :---: |\n| left  | right |" &&
             literal_delete.selection == literal_delete.text.find(L"left"),
         "column deletion changes only the selected separator range and keeps caret in the row");
-  const auto deleted = mdlite::DeleteTableRow(table, table.find(L"1"));
-  Check(deleted.changed && deleted.text.find(L"| 1 | 2 |") == std::wstring::npos,
+  const std::wstring deletable_table = table + L"\n| 3 | 4 |";
+  const auto deleted = mdlite::DeleteTableRow(deletable_table, deletable_table.find(L"1"));
+  Check(deleted.changed && deleted.text.find(L"| 1 | 2 |") == std::wstring::npos &&
+        deleted.text.ends_with(L"| 3 | 4 |"),
         "table row deletion removes only the selected row");
   const auto right_inside = mdlite::MoveTableCaretAtBoundary(
       table, table.find(L"1"), mdlite::TableCaretDirection::Right);
@@ -2000,10 +2005,11 @@ void TestTableEditing() {
   Check(crlf_insert.changed && crlf_insert.text.find(L"|  |  |\r\n| 1 | 2 |") != std::wstring::npos,
         "table row insertion preserves the surrounding CRLF convention");
   const auto crlf_after = mdlite::InsertTableRow(crlf_table, crlf_table.find(L"A"), true);
-  Check(crlf_after.changed && crlf_after.text.find(L"| A | B |\r\n|  |  |\r\n| ---") != std::wstring::npos,
+  Check(crlf_after.changed && crlf_after.text == L"| A | B |\r\n| --- | --- |\r\n|  |  |\r\n| 1 | 2 |",
         "table row insertion after a CRLF row does not split or duplicate the line ending");
-  const auto crlf_delete = mdlite::DeleteTableRow(crlf_table, crlf_table.find(L"1"));
-  Check(crlf_delete.changed && crlf_delete.text.ends_with(L"| --- | --- |") &&
+  const std::wstring crlf_deletable = crlf_table + L"\r\n| 3 | 4 |";
+  const auto crlf_delete = mdlite::DeleteTableRow(crlf_deletable, crlf_deletable.find(L"3"));
+  Check(crlf_delete.changed && crlf_delete.text == crlf_table &&
             crlf_delete.text.find(L"\n\n") == std::wstring::npos,
         "table row deletion consumes the complete CRLF line ending");
   const std::wstring escaped = L"| `a|b` | c\\|d | e |\n| --- | --- | --- |";

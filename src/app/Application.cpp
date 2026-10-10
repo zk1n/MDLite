@@ -4,6 +4,7 @@
 #include "assets/StorageAdapter.h"
 #include "app/DiagnosticsView.h"
 #include "app/UiIcons.h"
+#include "app/SlimScrollbars.h"
 #include <windowsx.h>
 #include "editor/RichEditTableAdapter.h"
 #include "calendar/JapaneseHolidays.h"
@@ -30,6 +31,8 @@
 #include <uxtheme.h>
 #include <wincodec.h>
 #include <webp/decode.h>
+#define PCRE2_CODE_UNIT_WIDTH 16
+#include <pcre2.h>
 
 #include <algorithm>
 #include <atomic>
@@ -54,6 +57,7 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"MDLite.MainWindow";
 constexpr wchar_t kCompactWindowClass[] = L"MDLite.CompactWindow";
 bool test_trust_ui_enabled{};
+bool test_replace_confirmation_ui_enabled{};
 constexpr UINT_PTR kAutosaveTimer = 1;
 constexpr UINT kTimerPollMs = 50;
 constexpr ULONGLONG kEditorSyncDelayMs = 500;
@@ -68,6 +72,8 @@ constexpr int kEditorHorizontalInset = 24;
 constexpr int kEditorVerticalInset = 16;
 constexpr int kTableCellPadding = 12;
 constexpr int kTableMinimumCellEmCount = 14;
+constexpr int kTableOperationBandDip = 18;
+constexpr int kTableOperationButtonId = 0x7200;
 constexpr int kFindHeight = 96;
 constexpr int kFindResultsHeight = 170;
 constexpr int kMinimumEditorWidth = 360;
@@ -104,6 +110,7 @@ constexpr UINT kTestTrustWorkspaceForGitMessage = WM_APP + 67;
 constexpr UINT kTestGetGitActionActiveMessage = WM_APP + 68;
 constexpr UINT kTestGetDocumentStateMessage = WM_APP + 69;
 constexpr UINT kCalendarIndexCompleteMessage = WM_APP + 70;
+constexpr UINT kTestSetReplaceConfirmationUiMessage = WM_APP + 71;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticWrite = 1U << 0U;
 constexpr std::uint32_t kNativeProjectionFaultProgrammaticRestore = 1U << 1U;
 constexpr std::uint32_t kNativeProjectionFaultIncrementalWrite = 1U << 2U;
@@ -296,7 +303,6 @@ struct TestStartupPhase {
   ~TestStartupPhase() { Finish(); }
 };
 
-
 DWORD TestGitActionDelay() {
   if (!TestAutomationSilent()) return 0;
   wchar_t value[16]{};
@@ -331,6 +337,12 @@ int TestAwareMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
   if (!TestAutomationSilent()) return ::MessageBoxW(owner, text, caption, type);
   if (test_trust_ui_enabled && caption && wcscmp(caption, L"Workspace Trust") == 0)
     return ::MessageBoxW(owner, text, caption, type);
+  const bool replace_review = test_replace_confirmation_ui_enabled && caption &&
+      ((type & MB_TYPEMASK) == MB_OKCANCEL || (type & MB_TYPEMASK) == MB_YESNO) &&
+      (wcscmp(caption, L"置換対象の確認") == 0 ||
+       wcscmp(caption, L"Workspace置換") == 0 ||
+       wcscmp(caption, L"閉じたファイルの置換を戻す") == 0);
+  if (replace_review) return ::MessageBoxW(owner, text, caption, type);
 
   // Other silent acceptance routes never surface a modal dialog or play the
   // Windows message-box sound.  Expected affirmative choices are handled at
@@ -354,15 +366,40 @@ int TestAwareMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type) {
 
 struct WorkspaceSearchBatchMessage {
   std::uint64_t generation{};
+  bool current_document{};
+  std::filesystem::path workspace;
+  std::filesystem::path document;
+  std::uint64_t document_revision{};
   std::vector<SearchMatch> matches;
   std::vector<SearchIssue> issues;
 };
 
 struct WorkspaceSearchCompleteMessage {
   std::uint64_t generation{};
+  bool current_document{};
+  std::filesystem::path workspace;
+  std::filesystem::path document;
+  std::uint64_t document_revision{};
   bool completed{};
+  bool truncated{};
   std::wstring error;
 };
+
+struct SearchWorkerFinishedGuard {
+  std::shared_ptr<std::atomic_bool> finished;
+  ~SearchWorkerFinishedGuard() {
+    if (finished) finished->store(true, std::memory_order_release);
+  }
+};
+
+void PostWorkspaceSearchFailure(
+    HWND owner, std::unique_ptr<WorkspaceSearchCompleteMessage> failure) noexcept {
+  if (!failure) return;
+  auto* payload = failure.release();
+  if (!PostMessageW(owner, kWorkspaceSearchCompleteMessage, 0,
+                    reinterpret_cast<LPARAM>(payload)))
+    delete payload;
+}
 
 struct GitStatusCompleteMessage {
   std::uint64_t generation{};
@@ -527,6 +564,17 @@ enum ControlId : int {
   kTabClose,
   kGitCommitEdit,
   kCalendarDetailsToggle = 134,
+  kSearchScope,
+  kSearchPrevious,
+  kSearchReplaceToggle,
+  kSearchDetailsToggle,
+  kSearchIgnore,
+  kSearchHidden,
+  kSearchClose,
+  kSearchTarget,
+  kSearchCount,
+  kSearchStatus,
+  kRollbackWorkspaceReplace,
   kFileOpenWorkspace = 1000,
   kFileNew,
   kFileOpen,
@@ -633,6 +681,9 @@ enum ControlId : int {
   // Keep diagnostics after existing IDs; acceptance harnesses send the other
   // command IDs directly.
   kViewDiagnostics,
+  // New commands stay at the enum tail to preserve legacy command IDs.
+  kEditFindPrevious,
+  kEditRollbackWorkspaceReplace,
 };
 
 int PanelIndex(PanelId id) {
@@ -1367,7 +1418,7 @@ std::vector<std::wstring> SplitGlobList(std::wstring_view value) {
   std::vector<std::wstring> globs;
   std::size_t begin{};
   while (begin <= value.size()) {
-    const auto end = value.find_first_of(L";\r\n", begin);
+    const auto end = value.find_first_of(L",;\r\n", begin);
     auto token = value.substr(begin, end == std::wstring_view::npos ? value.size() - begin
                                                                    : end - begin);
     while (!token.empty() && iswspace(token.front())) token.remove_prefix(1);
@@ -1381,6 +1432,348 @@ std::vector<std::wstring> SplitGlobList(std::wstring_view value) {
     begin = end + 1;
   }
   return globs;
+}
+
+std::filesystem::path SearchPathKey(const std::filesystem::path& value) {
+  std::error_code error;
+  auto absolute = std::filesystem::absolute(value, error);
+  if (error) absolute = value;
+  std::wstring key = absolute.lexically_normal().wstring();
+  std::ranges::transform(key, key.begin(), towlower);
+  return std::filesystem::path(key);
+}
+
+bool SameSearchPath(const std::filesystem::path& left, const std::filesystem::path& right) {
+  return SearchPathKey(left) == SearchPathKey(right);
+}
+
+bool ContainsSearchMatch(const SearchMatch& expected, std::wstring_view source,
+                         const SearchQuery& query, std::wstring& error) {
+  error.clear();
+  std::vector<SearchMatch> matches;
+  if (!SearchDocumentText(expected.path, source, query, matches, error)) return false;
+  return std::ranges::any_of(matches, [&](const SearchMatch& match) {
+    return match.begin == expected.begin && match.end == expected.end &&
+        match.snapshot_hash == expected.snapshot_hash;
+  });
+}
+
+std::wstring ReplaceDiffPreview(std::wstring_view before, std::wstring_view after) {
+  std::size_t prefix = 0;
+  while (prefix < before.size() && prefix < after.size() && before[prefix] == after[prefix]) ++prefix;
+  const std::size_t start = prefix > 24 ? prefix - 24 : 0;
+  const std::size_t before_end = std::min(before.size(), prefix + 96);
+  const std::size_t after_end = std::min(after.size(), prefix + 96);
+  auto excerpt = [&](std::wstring_view value, std::size_t end) {
+    std::wstring text(value.substr(start, end - start));
+    std::ranges::replace(text, L'\r', L' ');
+    std::ranges::replace(text, L'\n', L' ');
+    if (start != 0) text.insert(0, L"…");
+    if (end < value.size()) text += L"…";
+    return text;
+  };
+  return L"変更前: [" + excerpt(before, before_end) + L"]\n変更後: [" +
+      excerpt(after, after_end) + L"]";
+}
+
+struct ReplaceReviewFile {
+  const std::filesystem::path* path{};
+  std::wstring_view before;
+  std::wstring_view after;
+  std::size_t replacement_count{};
+};
+
+struct ReplaceReviewDialogContext {
+  HWND list{};
+  HWND path{};
+  HWND before_label{};
+  HWND after_label{};
+  HWND before{};
+  HWND after{};
+  const std::filesystem::path* workspace{};
+  const std::vector<ReplaceReviewFile>* files{};
+  COLORREF surface{};
+  COLORREF editor{};
+  COLORREF foreground{};
+  COLORREF border{};
+  bool high_contrast{};
+  bool accepted{};
+  HBRUSH surface_brush{};
+  HBRUSH editor_brush{};
+};
+
+constexpr wchar_t kReplaceReviewWindowClass[] = L"MDLite.ReplaceReviewDialog";
+constexpr int kReplaceReviewListId = 4101;
+constexpr int kReplaceReviewPathId = 4102;
+constexpr int kReplaceReviewBeforeId = 4103;
+constexpr int kReplaceReviewAfterId = 4104;
+constexpr int kReplaceReviewBeforeLabelId = 4105;
+constexpr int kReplaceReviewAfterLabelId = 4106;
+
+void UpdateReplaceReviewSelection(HWND window, ReplaceReviewDialogContext& context) {
+  const LRESULT selected = SendMessageW(context.list, LB_GETCURSEL, 0, 0);
+  if (selected < 0 || static_cast<std::size_t>(selected) >= context.files->size()) return;
+  const auto& file = (*context.files)[static_cast<std::size_t>(selected)];
+  std::error_code relative_error;
+  const auto relative = std::filesystem::relative(*file.path, *context.workspace, relative_error);
+  std::wstring label = L"対象 " + std::to_wstring(selected + 1) + L" / " +
+      std::to_wstring(context.files->size()) + L" — " +
+      (relative_error ? file.path->wstring() : relative.wstring());
+  if (file.replacement_count > 0)
+    label += L" (" + std::to_wstring(file.replacement_count) + L"箇所)";
+  SetWindowTextW(context.path, label.c_str());
+  SetWindowTextW(context.before, file.before.data());
+  SetWindowTextW(context.after, file.after.data());
+  SendMessageW(context.before, EM_SETSEL, 0, 0);
+  SendMessageW(context.after, EM_SETSEL, 0, 0);
+  (void)window;
+}
+
+LRESULT CALLBACK ReplaceReviewWindowProc(HWND window, UINT message, WPARAM wparam,
+                                         LPARAM lparam) {
+  auto* context = reinterpret_cast<ReplaceReviewDialogContext*>(
+      GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+    context = static_cast<ReplaceReviewDialogContext*>(create->lpCreateParams);
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
+  }
+  if (!context) return DefWindowProcW(window, message, wparam, lparam);
+  switch (message) {
+    case WM_CREATE: {
+      HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+      context->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewListId)),
+          GetModuleHandleW(nullptr), nullptr);
+      context->path = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewPathId)),
+          GetModuleHandleW(nullptr), nullptr);
+      context->before_label = CreateWindowExW(0, L"STATIC", L"変更前", WS_CHILD | WS_VISIBLE,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewBeforeLabelId)),
+          GetModuleHandleW(nullptr), nullptr);
+      context->after_label = CreateWindowExW(0, L"STATIC", L"変更後", WS_CHILD | WS_VISIBLE,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewAfterLabelId)),
+          GetModuleHandleW(nullptr), nullptr);
+      const DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_MULTILINE |
+          ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL | WS_VSCROLL;
+      context->before = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", edit_style,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewBeforeId)),
+          GetModuleHandleW(nullptr), nullptr);
+      context->after = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", edit_style,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kReplaceReviewAfterId)),
+          GetModuleHandleW(nullptr), nullptr);
+      HWND accept = CreateWindowExW(0, L"BUTTON", L"確認して続行",
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), GetModuleHandleW(nullptr), nullptr);
+      HWND cancel = CreateWindowExW(0, L"BUTTON", L"キャンセル",
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+          0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), GetModuleHandleW(nullptr), nullptr);
+      for (HWND control : {context->list, context->path, context->before_label, context->after_label,
+                           context->before, context->after,
+                           accept, cancel}) {
+        if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+      }
+      if (context->list)
+        ThemeSlimScrollbars(context->list, context->editor, context->border, context->high_contrast);
+      if (context->before)
+        ThemeSlimScrollbars(context->before, context->editor, context->border, context->high_contrast);
+      if (context->after)
+        ThemeSlimScrollbars(context->after, context->editor, context->border, context->high_contrast);
+      if (context->before) SendMessageW(context->before, EM_SETLIMITTEXT, 0x7ffffffe, 0);
+      if (context->after) SendMessageW(context->after, EM_SETLIMITTEXT, 0x7ffffffe, 0);
+      for (const auto& file : *context->files) {
+        std::error_code relative_error;
+        const auto relative = std::filesystem::relative(*file.path, *context->workspace, relative_error);
+        std::wstring label = relative_error ? file.path->wstring() : relative.wstring();
+        if (file.replacement_count > 0)
+          label += L" (" + std::to_wstring(file.replacement_count) + L"箇所)";
+        SendMessageW(context->list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+      }
+      SendMessageW(context->list, LB_SETCURSEL, 0, 0);
+      UpdateReplaceReviewSelection(window, *context);
+      return 0;
+    }
+    case WM_SIZE: {
+      const int width = LOWORD(lparam);
+      const int height = HIWORD(lparam);
+      const int dpi = static_cast<int>(GetDpiForWindow(window));
+      const auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+      const int padding = scale(12);
+      const int gap = scale(8);
+      const int list_height = scale(112);
+      const int label_height = scale(22);
+      const int button_height = scale(30);
+      const int button_width = scale(120);
+      const int path_top = padding + list_height + gap;
+      const int diff_label_top = path_top + label_height + gap;
+      const int content_top = diff_label_top + label_height;
+      const int buttons_top = std::max(content_top, height - padding - button_height);
+      const int column_gap = scale(10);
+      const int column_width = std::max(0, (width - padding * 2 - column_gap) / 2);
+      MoveWindow(context->list, padding, padding, std::max(0, width - padding * 2), list_height, TRUE);
+      MoveWindow(context->path, padding, path_top,
+                 std::max(0, width - padding * 2), label_height, TRUE);
+      if (context->before_label) MoveWindow(context->before_label, padding, diff_label_top,
+                                            column_width, label_height, TRUE);
+      if (context->after_label) MoveWindow(context->after_label, padding + column_width + column_gap,
+                                           diff_label_top, column_width, label_height, TRUE);
+      if (context->before) MoveWindow(context->before, padding, content_top,
+                                      column_width, std::max(0, buttons_top - content_top - gap), TRUE);
+      if (context->after) MoveWindow(context->after, padding + column_width + column_gap, content_top,
+                                     column_width, std::max(0, buttons_top - content_top - gap), TRUE);
+      HWND accept = GetDlgItem(window, IDOK);
+      HWND cancel = GetDlgItem(window, IDCANCEL);
+      if (accept) MoveWindow(accept, width - padding * 2 - button_width * 2 - gap,
+                             buttons_top, button_width, button_height, TRUE);
+      if (cancel) MoveWindow(cancel, width - padding - button_width, buttons_top,
+                             button_width, button_height, TRUE);
+      return 0;
+    }
+    case WM_COMMAND:
+      if (LOWORD(wparam) == kReplaceReviewListId && HIWORD(wparam) == LBN_SELCHANGE) {
+        UpdateReplaceReviewSelection(window, *context);
+        return 0;
+      }
+      if (LOWORD(wparam) == IDOK) {
+        context->accepted = true;
+        DestroyWindow(window);
+        return 0;
+      }
+      if (LOWORD(wparam) == IDCANCEL) {
+        DestroyWindow(window);
+        return 0;
+      }
+      break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+      HDC dc = reinterpret_cast<HDC>(wparam);
+      const HWND control = reinterpret_cast<HWND>(lparam);
+      const bool edit = control == context->before || control == context->after || control == context->list;
+      SetTextColor(dc, context->foreground);
+      SetBkColor(dc, edit ? context->editor : context->surface);
+      return reinterpret_cast<LRESULT>(edit ? context->editor_brush : context->surface_brush);
+    }
+    case WM_ERASEBKGND:
+      if (context->surface_brush) {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wparam), &client, context->surface_brush);
+        return 1;
+      }
+      break;
+    case WM_CLOSE:
+      DestroyWindow(window);
+      return 0;
+    case WM_NCDESTROY:
+      SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+      break;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool ReviewReplaceFiles(HWND owner, const std::filesystem::path& workspace,
+                        const std::vector<ReplaceReviewFile>& files,
+                        COLORREF surface, COLORREF editor, COLORREF foreground,
+                        COLORREF border, bool high_contrast) {
+  if (files.empty()) return false;
+  static bool class_registered{};
+  HINSTANCE instance = GetModuleHandleW(nullptr);
+  if (!class_registered) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.lpfnWndProc = ReplaceReviewWindowProc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kReplaceReviewWindowClass;
+    if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+    class_registered = true;
+  }
+  ReplaceReviewDialogContext context;
+  context.workspace = &workspace;
+  context.files = &files;
+  context.surface = surface;
+  context.editor = editor;
+  context.foreground = foreground;
+  context.border = border;
+  context.high_contrast = high_contrast;
+  context.surface_brush = CreateSolidBrush(surface);
+  context.editor_brush = CreateSolidBrush(editor);
+  RECT owner_rect{};
+  GetWindowRect(owner, &owner_rect);
+  MONITORINFO monitor{sizeof(monitor)};
+  GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
+  const int dpi = static_cast<int>(GetDpiForWindow(owner));
+  const int width = std::min(MulDiv(1080, dpi, 96), static_cast<int>(monitor.rcWork.right - monitor.rcWork.left));
+  const int height = std::min(MulDiv(720, dpi, 96), static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top));
+  const int x = std::clamp<int>(static_cast<int>(owner_rect.left +
+      (owner_rect.right - owner_rect.left - width) / 2),
+      static_cast<int>(monitor.rcWork.left), static_cast<int>(monitor.rcWork.right) - width);
+  const int y = std::clamp<int>(static_cast<int>(owner_rect.top +
+      (owner_rect.bottom - owner_rect.top - height) / 2),
+      static_cast<int>(monitor.rcWork.top), static_cast<int>(monitor.rcWork.bottom) - height);
+  HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+      kReplaceReviewWindowClass, L"置換対象の確認", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+      WS_THICKFRAME | WS_CLIPCHILDREN, x, y, width, height, owner, nullptr, instance, &context);
+  if (!dialog) {
+    if (context.surface_brush) DeleteObject(context.surface_brush);
+    if (context.editor_brush) DeleteObject(context.editor_brush);
+    return false;
+  }
+  if (!context.list || !context.path || !context.before_label || !context.after_label ||
+      !context.before || !context.after) {
+    DestroyWindow(dialog);
+    if (context.surface_brush) DeleteObject(context.surface_brush);
+    if (context.editor_brush) DeleteObject(context.editor_brush);
+    return false;
+  }
+  EnableWindow(owner, FALSE);
+  ShowWindow(dialog, SW_SHOW);
+  UpdateWindow(dialog);
+  SetFocus(context.list);
+  MSG message{};
+  while (IsWindow(dialog)) {
+    const BOOL received = GetMessageW(&message, nullptr, 0, 0);
+    if (received <= 0) {
+      if (received == 0) PostQuitMessage(static_cast<int>(message.wParam));
+      break;
+    }
+    if (!IsDialogMessageW(dialog, &message)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  if (IsWindow(dialog)) DestroyWindow(dialog);
+  EnableWindow(owner, TRUE);
+  SetActiveWindow(owner);
+  if (context.surface_brush) DeleteObject(context.surface_brush);
+  if (context.editor_brush) DeleteObject(context.editor_brush);
+  return context.accepted;
+}
+
+std::wstring SearchExcludedIssuesSummary(const std::filesystem::path& workspace,
+                                         const std::vector<SearchIssue>& issues) {
+  const std::size_t excluded_count = static_cast<std::size_t>(std::ranges::count_if(
+      issues, [](const SearchIssue& issue) { return issue.kind == SearchIssueKind::Excluded; }));
+  if (excluded_count == 0) return {};
+  std::wstring summary = L"\n\n対象外として変更しない項目: " +
+      std::to_wstring(excluded_count) + L"件";
+  constexpr std::size_t preview_limit = 4;
+  std::size_t shown{};
+  for (const auto& issue : issues) {
+    if (issue.kind != SearchIssueKind::Excluded) continue;
+    std::error_code relative_error;
+    const auto relative = std::filesystem::relative(issue.path, workspace, relative_error);
+    std::wstring message = issue.message;
+    std::ranges::replace(message, L'\r', L' ');
+    std::ranges::replace(message, L'\n', L' ');
+    summary += L"\n- " + (relative_error ? issue.path.wstring() : relative.wstring()) +
+        L": " + message;
+    if (++shown == preview_limit) break;
+  }
+  if (excluded_count > shown)
+    summary += L"\n- ほか " + std::to_wstring(excluded_count - shown) + L"件";
+  return summary;
 }
 
 std::filesystem::path ResolveGitExecutable() {
@@ -1425,6 +1818,42 @@ std::optional<std::filesystem::path> PickFolder(HWND owner, std::wstring_view ti
   dialog->GetOptions(&options);
   dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
   dialog->SetTitle(title.data());
+  IShellItem* initial_item{};
+  if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr, IID_PPV_ARGS(&initial_item)))) {
+    dialog->SetFolder(initial_item);
+    initial_item->Release();
+  }
+  std::optional<std::filesystem::path> result;
+  if (SUCCEEDED(dialog->Show(owner))) {
+    IShellItem* item{};
+    if (SUCCEEDED(dialog->GetResult(&item))) {
+      PWSTR path{};
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        result = std::filesystem::path(path);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dialog->Release();
+  return result;
+}
+
+std::optional<std::filesystem::path> PickReplaceJournal(
+    HWND owner, const std::filesystem::path& workspace) {
+  IFileDialog* dialog{};
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog)))) return std::nullopt;
+  const COMDLG_FILTERSPEC filter{L"MDLite置換journal (*.journal)", L"*.journal"};
+  dialog->SetFileTypes(1, &filter);
+  dialog->SetDefaultExtension(L"journal");
+  dialog->SetTitle(L"戻す置換journalを選択");
+  DWORD options{};
+  dialog->GetOptions(&options);
+  dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+  std::error_code folder_error;
+  auto initial = workspace / L".mdlite" / L".state" / L"replace";
+  if (!std::filesystem::is_directory(initial, folder_error)) initial = workspace;
   IShellItem* initial_item{};
   if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr, IID_PPV_ARGS(&initial_item)))) {
     dialog->SetFolder(initial_item);
@@ -1539,9 +1968,7 @@ int Application::Run() {
         if (!handled) TranslateMessage(&message);
         continue;
       }
-      const bool editor_focused = std::ranges::any_of(documents_, [](const auto& view) {
-        return view->editor == GetFocus();
-      });
+      const bool editor_focused = FindDocumentView(GetFocus()) != nullptr;
       if (message.message == WM_KEYDOWN && message.wParam == VK_TAB && !editor_focused &&
           IsDialogMessageW(window_, &message)) continue;
       TranslateMessage(&message);
@@ -1645,10 +2072,185 @@ LRESULT CALLBACK Application::CompactWindowProc(HWND window, UINT message, WPARA
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+void Application::TableViewportContext::SwapProjection() {
+  std::swap(view_.editor_snapshot, viewport_.snapshot);
+  std::swap(view_.native_tables_ready, viewport_.native_tables_ready);
+  std::swap(view_.presentation_revision, viewport_.presentation_revision);
+  std::swap(view_.active_line, viewport_.active_line);
+  std::swap(view_.active_source_line_begin, viewport_.active_source_line_begin);
+  std::swap(view_.derived_image_revision, viewport_.derived_image_revision);
+  std::swap(view_.rendered_images, viewport_.rendered_images);
+  std::swap(view_.animated_image_frames, viewport_.animated_image_frames);
+  std::swap(view_.rendered_image_source, viewport_.rendered_image_source);
+}
+
+Application::TableViewportContext::TableViewportContext(
+    Application& app, DocumentView& view, DocumentView::TableViewport& viewport)
+    : app_(app), view_(view), viewport_(viewport), parent_editor_(view.editor),
+      revision_(view.document.revision()), source_mode_(view.table_source_mode) {
+  SwapProjection();
+  view_.editor = viewport_.editor;
+  view_.table_parent_editor = parent_editor_;
+  view_.active_table_viewport = &viewport_;
+}
+
+Application::TableViewportContext::~TableViewportContext() {
+  if (!view_.ime_composing && (view_.native_edit_pending || view_.sync_due != 0) &&
+      !view_.native_readback_failed) app_.SyncDocumentFromEditor(view_);
+  const bool focused = GetFocus() == viewport_.editor;
+  const auto selection = app_.CaptureSourceSelection(view_.editor, view_.editor_snapshot);
+  SwapProjection();
+  view_.editor = parent_editor_;
+  view_.active_table_viewport = nullptr;
+  view_.table_parent_editor = nullptr;
+  if (view_.refreshing_table_viewports) return;
+  if (revision_ != view_.document.revision() || source_mode_ != view_.table_source_mode) {
+    app_.RebuildEditorProjection(view_, app_.NativeSnapshotForView(view_, view_.document.text()), selection);
+    app_.ApplyMarkdownPresentation(view_, true, selection);
+    app_.RefreshTableViewports(view_);
+  } else if (focused && IsWindow(parent_editor_)) {
+    ScopedEditorChangeSuppression suppression(app_.suppress_editor_change_);
+    POINT scroll{};
+    SendMessageW(parent_editor_, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    app_.RestoreSourceSelection(parent_editor_, view_.editor_snapshot, selection);
+    SendMessageW(parent_editor_, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  }
+  if (view_.table_exit_selection) {
+    const auto target = *view_.table_exit_selection;
+    view_.table_exit_selection.reset();
+    app_.RestoreSourceSelection(parent_editor_, view_.editor_snapshot, target);
+    SetFocus(parent_editor_);
+    SendMessageW(parent_editor_, EM_SCROLLCARET, 0, 0);
+  }
+}
+
+LRESULT CALLBACK Application::TableViewportSubclass(HWND window, UINT message, WPARAM wparam,
+                                                    LPARAM lparam, UINT_PTR id, DWORD_PTR reference) {
+  auto& app = *reinterpret_cast<Application*>(reference);
+  if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(window, TableViewportSubclass, id);
+    if (auto* owner = app.FindDocumentView(window)) {
+      for (auto& item : owner->table_viewports) if (item->editor == window) item->editor = nullptr;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+  }
+  auto* view = app.FindDocumentView(window);
+  if (!view) return DefSubclassProc(window, message, wparam, lparam);
+  auto viewport = std::ranges::find_if(view->table_viewports,
+      [&](const auto& item) { return item->editor == window; });
+  if (viewport != view->table_viewports.end()) {
+    auto& table = **viewport;
+    const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    if (message == WM_LBUTTONDOWN) {
+      table.pointer_down = true; table.pointer_dragged = false;
+      table.pointer_origin = point; table.button_press_armed = false;
+    } else if (message == WM_MOUSEMOVE) {
+      if (!table.pointer_down && (wparam & MK_LBUTTON) == 0) table.pointer_dragged = false;
+      if (table.pointer_down && (std::abs(point.x - table.pointer_origin.x) > GetSystemMetrics(SM_CXDRAG) ||
+          std::abs(point.y - table.pointer_origin.y) > GetSystemMetrics(SM_CYDRAG))) table.pointer_dragged = true;
+      if (table.pointer_dragged) app.ShowTableHoverControls(*view, table, false);
+      else app.UpdateTableHoverTarget(*view, table, point);
+      TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0}; TrackMouseEvent(&track);
+    } else if (message == WM_MOUSELEAVE) {
+      POINT cursor{}; GetCursorPos(&cursor);
+      bool in_buttons{};
+      for (const auto button : table.operation_buttons) {
+        RECT bounds{}; GetWindowRect(button, &bounds);
+        in_buttons |= PtInRect(&bounds, cursor) || GetFocus() == button;
+      }
+      if (!in_buttons) app.ShowTableHoverControls(*view, table, false);
+    } else if (message == WM_LBUTTONUP) {
+      table.pointer_down = false;
+      if (table.pointer_dragged) app.ShowTableHoverControls(*view, table, false);
+    }
+  }
+  if (view->editor == window) return EditorSubclass(window, message, wparam, lparam, id, reference);
+  // A derived viewport enters source/history context only for input and
+  // selection. In particular EM_GETRECT/WM_PAINT/scroll are native geometry
+  // operations: mirroring their selection would scroll the parent, whose
+  // layout queries this child again and recursively re-enters the mirror.
+  const bool source_event = message == WM_SETFOCUS || message == WM_KILLFOCUS ||
+      message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN ||
+      message == WM_SYSCHAR || message == WM_CHAR || message == WM_LBUTTONDOWN ||
+      message == WM_LBUTTONUP || (message == WM_MOUSEMOVE && (wparam & MK_LBUTTON) != 0) ||
+      message == WM_IME_STARTCOMPOSITION || message == WM_IME_COMPOSITION ||
+      message == WM_IME_ENDCOMPOSITION || message == WM_COPY || message == WM_CUT ||
+      message == WM_CLEAR || message == WM_PASTE || message == WM_UNDO || message == EM_REDO ||
+      message == EM_REPLACESEL || message == EM_SETSEL || message == EM_EXSETSEL ||
+      message == WM_CONTEXTMENU;
+  if (!source_event) return DefSubclassProc(window, message, wparam, lparam);
+  if (viewport == view->table_viewports.end()) return DefSubclassProc(window, message, wparam, lparam);
+  TableViewportContext context(app, *view, **viewport);
+  return EditorSubclass(window, message, wparam, lparam, id, reference);
+}
+
+LRESULT CALLBACK Application::TableOperationButtonSubclass(HWND window, UINT message, WPARAM wparam,
+                                                           LPARAM lparam, UINT_PTR id, DWORD_PTR reference) {
+  auto& app = *reinterpret_cast<Application*>(reference);
+  if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(window, TableOperationButtonSubclass, id);
+    for (auto& document : app.documents_) {
+      for (auto& viewport : document->table_viewports) {
+        for (auto& button : viewport->operation_buttons) if (button == window) button = nullptr;
+      }
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+  }
+  if (auto* view = app.FindDocumentView(GetParent(window))) {
+    for (auto& viewport : view->table_viewports) {
+      if (std::ranges::find(viewport->operation_buttons, window) == viewport->operation_buttons.end()) continue;
+      if (message == WM_LBUTTONDOWN || (message == WM_KEYDOWN && (wparam == VK_SPACE || wparam == VK_RETURN)))
+        viewport->button_press_armed = true;
+      if (message == WM_SETFOCUS) app.ShowTableHoverControls(*view, *viewport, true);
+      if (message == WM_MOUSEMOVE) {
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0}; TrackMouseEvent(&track);
+      }
+      if (message == WM_MOUSELEAVE || message == WM_KILLFOCUS) {
+        POINT cursor{}; GetCursorPos(&cursor); RECT bounds{};
+        GetWindowRect(viewport->editor, &bounds);
+        bool keep = PtInRect(&bounds, cursor) != FALSE;
+        for (const auto button : viewport->operation_buttons) {
+          GetWindowRect(button, &bounds);
+          keep |= PtInRect(&bounds, cursor) != FALSE ||
+              (message == WM_KILLFOCUS ? reinterpret_cast<HWND>(wparam) == button : GetFocus() == button);
+        }
+        if (!keep) app.ShowTableHoverControls(*view, *viewport, false);
+      }
+      break;
+    }
+  }
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
 LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                                UINT_PTR, DWORD_PTR reference) {
   auto* app = reinterpret_cast<Application*>(reference);
   auto* view = app->FindDocumentView(window);
+  if (view && message == WM_DRAWITEM) {
+    const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+    if (draw && draw->CtlID >= kTableOperationButtonId && draw->CtlID < kTableOperationButtonId + 10) {
+      app->DrawTableOperationButton(*draw); return TRUE;
+    }
+  }
+  if (view && message == WM_COMMAND && HIWORD(wparam) == BN_CLICKED &&
+      LOWORD(wparam) >= kTableOperationButtonId && LOWORD(wparam) < kTableOperationButtonId + 10) {
+    const auto button = reinterpret_cast<HWND>(lparam);
+    for (auto& viewport : view->table_viewports) {
+      if (std::ranges::find(viewport->operation_buttons, button) == viewport->operation_buttons.end()) continue;
+      if (viewport->button_press_armed && GetCapture() != viewport->editor) {
+        viewport->button_press_armed = false;
+        app->ExecuteTableHoverCommand(*view, *viewport, LOWORD(wparam) - kTableOperationButtonId);
+      }
+      return 0;
+    }
+  }
+  if (view && !view->table_viewports.empty() &&
+      (message == WM_COMMAND || message == WM_NOTIFY)) {
+    const HWND sender = message == WM_COMMAND ? reinterpret_cast<HWND>(lparam)
+        : reinterpret_cast<const NMHDR*>(lparam)->hwndFrom;
+    if (sender != window && app->FindDocumentView(sender) == view)
+      return SendMessageW(app->window_, message, wparam, lparam);
+  }
   std::optional<std::wstring> body_scalar;
   if (view && (view->editor_projection_invalid || view->native_readback_failed ||
       message == WM_KILLFOCUS || (message == WM_KEYDOWN && wparam != VK_PACKET) || message == WM_SYSKEYDOWN ||
@@ -1722,6 +2324,8 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     }
   }
   if (message == WM_SETFOCUS) app->SelectDocumentForEditor(window);
+  if (view && !view->ime_composing && !view->native_readback_failed &&
+      app->HandleTableCommandInput(*view, message, wparam, lparam)) return 0;
   if (view && view->pending_virtual_table_cell && message == WM_KEYDOWN &&
       (wparam == VK_BACK || wparam == VK_DELETE)) {
     view->pending_virtual_table_cell.reset();
@@ -1884,44 +2488,8 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
     app->ApplySourceHistory(*view, redo);
     return TRUE;
   }
-  if (message == WM_KEYDOWN && wparam == VK_TAB && view && !view->ime_composing &&
-      IsMarkdownFile(view->document.path())) {
-    view->pending_table_high_surrogate = 0;
-    if (!app->SyncDocumentFromEditor(*view)) {
-      app->table_tab_keydown_handled_ = true;
-      app->SetStatusText(L"入力内容を読み取れなかったため表の移動を中止しました。再試行してください。");
-      return 0;
-    }
-    CHARRANGE selection{};
-    SendMessageW(window, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const auto source_caret = view->editor_snapshot.NativeToSource(selection.cpMin);
-    const auto current_cell = view->pending_virtual_table_cell
-        ? view->pending_virtual_table_cell
-        : ResolveTableCellIntent(view->document.text(), source_caret);
-    const auto edit = current_cell
-        ? MoveToAdjacentTableCell(view->document.text(), *current_cell,
-                                  (GetKeyState(VK_SHIFT) & 0x8000) != 0)
-        : TableEditResult{view->document.text(), source_caret, false};
-    if (edit.changed) {
-      if (!app->ApplySourceTextWithUndo(*view, edit.text, true,
-                                        SourceSelection{edit.selection, edit.selection})) {
-        app->table_tab_keydown_handled_ = true;
-        view->pending_virtual_table_cell.reset();
-        app->SetStatusText(L"本文が同期中のため表の移動を中止しました。再試行してください。");
-        return 0;
-      }
-    }
-    if (edit.target_cell) {
-      if (edit.target_cell->virtual_cell) view->pending_virtual_table_cell = edit.target_cell;
-      else view->pending_virtual_table_cell.reset();
-      const auto view_caret = view->editor_snapshot.SourceToNative(
-          edit.target_cell->source_position);
-      SendMessageW(window, EM_SETSEL, view_caret, view_caret);
-      app->table_tab_keydown_handled_ = true;
-      return 0;
-    }
-  }
   if (message == WM_KEYDOWN && view && !view->ime_composing &&
+      !view->table_source_mode &&
       (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN) &&
       (GetKeyState(VK_SHIFT) & 0x8000) == 0 && (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
       (GetKeyState(VK_MENU) & 0x8000) == 0 && IsMarkdownFile(view->document.path())) {
@@ -1980,8 +2548,22 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
           if (destination) {
             if (destination->virtual_cell) view->pending_virtual_table_cell = destination;
             else view->pending_virtual_table_cell.reset();
-            const auto view_caret = view->editor_snapshot.SourceToNative(
-                destination->source_position);
+            auto target_source = destination->source_position;
+            if (const auto content = TableCellContentRange(view->document.text(), *destination)) {
+              if (direction == TableCaretDirection::Left) target_source = content->end;
+              else if (direction == TableCaretDirection::Up || direction == TableCaretDirection::Down) {
+                POINT current_point{}, target_point{};
+                SendMessageW(window, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&current_point), selection.cpMin);
+                SendMessageW(window, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&target_point),
+                    view->editor_snapshot.SourceToNative(direction == TableCaretDirection::Up
+                        ? content->end : content->begin));
+                target_point.x = current_point.x;
+                const auto hit = SendMessageW(window, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&target_point));
+                target_source = std::clamp(view->editor_snapshot.NativeToSource(
+                    static_cast<std::size_t>(std::max<LRESULT>(0, hit))), content->begin, content->end);
+              }
+            }
+            const auto view_caret = view->editor_snapshot.SourceToNative(target_source);
             SendMessageW(window, EM_SETSEL, view_caret, view_caret);
             return 0;
           }
@@ -2185,13 +2767,587 @@ LRESULT CALLBACK Application::EditorSubclass(HWND window, UINT message, WPARAM w
       ReleaseDC(window, paint_dc);
     }
   }
+  if (view && !view->active_table_viewport &&
+      (message == WM_PAINT || message == WM_SIZE || message == WM_VSCROLL ||
+       message == WM_HSCROLL || message == WM_MOUSEWHEEL || message == EM_SETSCROLLPOS))
+    app->LayoutTableViewports(*view);
+  if (view && !view->active_table_viewport && message == WM_SIZE)
+    app->RefreshTableViewports(*view);
+  if (view && !view->active_table_viewport && !view->table_source_mode && !view->ime_composing &&
+      (message == WM_KEYDOWN || message == WM_LBUTTONUP) && GetFocus() == window) {
+    const auto selection = app->CaptureSourceSelection(window, view->editor_snapshot);
+    app->SelectTableSourceRange(*view, selection);
+  }
   return result;
+}
+
+void Application::ToggleTableSource(DocumentView& view, bool search_reveal) {
+  if (search_reveal && view.table_source_mode) return;
+  if (!SyncDocumentFromEditor(view)) return;
+  const auto selection = CaptureSourceSelection(view.editor, view.editor_snapshot);
+  if (!view.table_source_mode && !ParseGfmTableAt(view.document.text(), selection.active)) return;
+  view.table_source_mode = !view.table_source_mode;
+  view.table_source_revealed_for_search = search_reveal && view.table_source_mode;
+  view.pending_virtual_table_cell.reset();
+  view.pending_table_high_surrogate = 0;
+  const auto result = RebuildEditorProjection(view,
+      view.table_source_mode ? BuildNativeTextEditorSnapshot(view.document.text())
+                             : NativeSnapshotFor(view.document), selection);
+  if (result != EditorProjectionRebuildResult::Failed && !view.table_source_mode)
+    ApplyMarkdownPresentation(view, true, selection);
+  if (!view.active_table_viewport) RefreshTableViewports(view);
+}
+
+void Application::ReleaseSearchTableSource(DocumentView& view) {
+  if (!view.table_source_revealed_for_search) return;
+  if (view.table_source_mode) ToggleTableSource(view);
+  else view.table_source_revealed_for_search = false;
+}
+
+EditorSnapshot Application::NativeSnapshotForView(DocumentView& view, std::wstring_view text) const {
+  if (view.table_source_mode) return BuildNativeTextEditorSnapshot(text);
+  if (view.active_table_viewport) {
+    if (const auto table = ParseGfmTableAt(text, view.active_table_viewport->source_begin))
+      return BuildNativeTableViewportSnapshot(text, *table);
+  }
+  return NativeSnapshotFor(view.document.path(), text);
+}
+
+void Application::LayoutTableViewports(DocumentView& view) {
+  if (!view.editor || view.active_table_viewport || view.table_source_mode) return;
+  RECT format{};
+  SendMessageW(view.editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+  RECT client{};
+  GetClientRect(view.editor, &client);
+  const int available = std::max<LONG>(1, format.right - format.left);
+  for (auto& viewport : view.table_viewports) {
+    const auto table = std::ranges::find(view.editor_snapshot.tables, viewport->source_begin,
+                                       &EditorTableMapping::source_begin);
+    if (table == view.editor_snapshot.tables.end() || !table->native_coordinates_set ||
+        !viewport->editor || !IsWindow(viewport->editor)) continue;
+    POINT top{}, bottom{};
+    SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&top), table->native_begin);
+    SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&bottom), table->native_end);
+    const int natural_width = MulDiv(viewport->natural_width_twips, GetDpiForWindow(view.editor), 1440) + ScaleDip(view.editor, 2);
+    const int width = std::min(available, std::max(1, natural_width));
+    int height = std::max(ScaleDip(view.editor, 24), static_cast<int>(bottom.y - top.y));
+    if (!viewport->row_heights_twips.empty()) {
+      LONG rows_height{};
+      for (const auto row_height : viewport->row_heights_twips) rows_height += row_height;
+      height = MulDiv(rows_height, GetDpiForWindow(view.editor), 1440);
+    }
+    const int band = ScaleDip(view.editor, kTableOperationBandDip);
+    SetWindowPos(viewport->editor, HWND_TOP, format.left, top.y + band, width, height,
+                 SWP_NOACTIVATE | (top.y + height >= client.top && top.y < client.bottom ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+    const int button_width = std::max(ScaleDip(view.editor, 24), std::min(ScaleDip(view.editor, 44), available / 10));
+    for (std::size_t i{}; i < viewport->operation_buttons.size(); ++i) {
+      if (viewport->operation_buttons[i]) SetWindowPos(viewport->operation_buttons[i], HWND_TOP,
+          format.left + static_cast<int>(i) * button_width, top.y, button_width, band, SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+  }
+}
+
+void Application::RefreshTableViewports(DocumentView& view) {
+  if (view.active_table_viewport || view.refreshing_table_viewports || view.ime_composing ||
+      !view.editor || !IsWindow(view.editor)) return;
+  view.refreshing_table_viewports = true;
+  struct RefreshEnd { bool& flag; ~RefreshEnd() { flag = false; } } refresh_end{view.refreshing_table_viewports};
+  ScopedEditorChangeSuppression suppression(suppress_editor_change_);
+  const auto parsed = ParseMarkdown(view.document.text());
+  for (auto it = view.table_viewports.begin(); it != view.table_viewports.end();) {
+    if (view.table_source_mode || !(*it)->editor || !IsWindow((*it)->editor) ||
+        !std::ranges::any_of(parsed.tables, [&](const GfmTable& table) {
+          return table.begin == (*it)->source_begin;
+        })) {
+      if (GetFocus() == (*it)->editor) SetFocus(view.editor);
+      if (IsWindow((*it)->editor)) DestroyWindow((*it)->editor);
+      for (const auto button : (*it)->operation_buttons) if (IsWindow(button)) DestroyWindow(button);
+      it = view.table_viewports.erase(it);
+    } else ++it;
+  }
+  if (view.table_source_mode) return;
+  RECT format{};
+  SendMessageW(view.editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+  bool heights_changed{};
+  for (const auto& table : parsed.tables) {
+    auto found = std::ranges::find_if(view.table_viewports,
+        [&](const auto& item) { return item->source_begin == table.begin; });
+    if (found == view.table_viewports.end()) {
+      auto viewport = std::make_unique<DocumentView::TableViewport>();
+      viewport->source_begin = table.begin;
+      viewport->source_end = table.end;
+      viewport->editor = CreateWindowExW(0, MSFTEDIT_CLASS, nullptr,
+          WS_CHILD | WS_HSCROLL | ES_MULTILINE | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_WANTRETURN,
+          0, 0, std::max<LONG>(1, format.right - format.left), ScaleDip(view.editor, 200),
+          view.editor, reinterpret_cast<HMENU>(0x7100), instance_, nullptr);
+      if (!viewport->editor) continue;
+      SendMessageW(viewport->editor, EM_EXLIMITTEXT, 0, LONG_MAX);
+      SendMessageW(viewport->editor, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_UPDATE | ENM_SCROLL | ENM_LINK);
+      SendMessageW(viewport->editor, EM_SETBKGNDCOLOR, 0, theme_editor_);
+      SendMessageW(viewport->editor, WM_SETFONT, reinterpret_cast<WPARAM>(editor_font_), FALSE);
+      RECT local_format{0, 0, std::max<LONG>(1, format.right - format.left), ScaleDip(view.editor, 200)};
+      SendMessageW(viewport->editor, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&local_format));
+      ThemeSlimScrollbars(viewport->editor, theme_editor_, theme_border_, high_contrast_);
+      view.table_viewports.push_back(std::move(viewport));
+      found = std::prev(view.table_viewports.end());
+      SetWindowSubclass((*found)->editor, TableViewportSubclass, 2, reinterpret_cast<DWORD_PTR>(this));
+      constexpr std::array<const wchar_t*, 10> labels{L"上＋", L"下＋", L"行−", L"左＋", L"右＋", L"列−", L"左揃", L"中揃", L"右揃", L"ソース"};
+      for (std::size_t i{}; i < labels.size(); ++i) {
+        auto& button = (*found)->operation_buttons[i];
+        button = CreateWindowExW(0, L"BUTTON", labels[i], WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+            0, 0, 0, 0, view.editor, reinterpret_cast<HMENU>(kTableOperationButtonId + i), instance_, nullptr);
+        if (button) {
+          SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(ui_font_), FALSE);
+          SetWindowSubclass(button, TableOperationButtonSubclass, 3, reinterpret_cast<DWORD_PTR>(this));
+        }
+      }
+    }
+    auto& viewport = **found;
+    const UINT dpi = GetDpiForWindow(view.editor);
+    const LONG available = format.right - format.left;
+    if (viewport.revision == view.document.revision() && viewport.source_end == table.end &&
+        viewport.dpi == dpi && viewport.font_size_pt == settings_.font_size_pt &&
+        viewport.font_face == settings_.font_face && viewport.available_width == available) continue;
+    POINT scroll{};
+    SendMessageW(viewport.editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    const auto child_selection = viewport.snapshot.tables.empty()
+        ? SourceSelection{table.begin, table.begin}
+        : CaptureSourceSelection(viewport.editor, viewport.snapshot);
+    const auto old_heights = viewport.row_heights_twips;
+    {
+      TableViewportContext context(*this, view, viewport);
+      RebuildEditorProjection(view, BuildNativeTableViewportSnapshot(view.document.text(), table), child_selection);
+      ApplyMarkdownPresentation(view, true, child_selection);
+      viewport.row_heights_twips.clear();
+      if (!view.editor_snapshot.tables.empty()) {
+        const auto& mapping = view.editor_snapshot.tables.front();
+        for (std::size_t i{}; i < mapping.visual_rows.size(); ++i) {
+          POINT row_top{}, row_bottom{};
+          SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&row_top), mapping.visual_rows[i].native_begin);
+          SendMessageW(view.editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&row_bottom),
+              i + 1 < mapping.visual_rows.size() ? mapping.visual_rows[i + 1].native_begin : mapping.native_end);
+          const LONG height = std::max<LONG>(ScaleDip(view.editor, 24), row_bottom.y - row_top.y);
+          viewport.row_heights_twips.push_back(MulDiv(height, 1440, GetDpiForWindow(view.editor)));
+        }
+        const auto style = TableStyleForEditor(view.editor);
+        const auto widths = MeasureRichEditTableColumns(view.editor, view.editor_snapshot, 0, style);
+        LONG total{};
+        for (const auto width : widths) total += width;
+        viewport.natural_width_twips = total;
+        if (total > MulDiv(format.right - format.left, 1440, GetDpiForWindow(view.editor)) &&
+            !viewport.row_heights_twips.empty())
+          viewport.row_heights_twips.back() += MulDiv(GetSystemMetricsForDpi(SM_CYHSCROLL, GetDpiForWindow(view.editor)),
+                                                   1440, GetDpiForWindow(view.editor));
+      }
+    }
+    viewport.source_end = table.end;
+    viewport.revision = view.document.revision();
+    viewport.dpi = dpi;
+    viewport.font_size_pt = settings_.font_size_pt;
+    viewport.font_face = settings_.font_face;
+    viewport.available_width = available;
+    ShowTableHoverControls(view, viewport, viewport.hover_visible);
+    heights_changed |= old_heights != viewport.row_heights_twips;
+    SendMessageW(viewport.editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  }
+  if (heights_changed) {
+    const auto selection = CaptureSourceSelection(view.editor, view.editor_snapshot);
+    RebuildEditorProjection(view, NativeSnapshotForView(view, view.document.text()), selection);
+    ApplyMarkdownPresentation(view, true, selection);
+  }
+  LayoutTableViewports(view);
+}
+
+bool Application::SelectTableSourceRange(DocumentView& view, SourceSelection selection, bool focus) {
+  if (view.active_table_viewport) {
+    if (selection.active < view.active_table_viewport->source_begin ||
+        selection.active > view.active_table_viewport->source_end) return false;
+    RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+    SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+    if (focus) SetFocus(view.editor);
+    return true;
+  }
+  const auto table = ParseGfmTableAt(view.document.text(), selection.active);
+  if (view.table_source_revealed_for_search && view.table_source_mode) {
+    bool visible = !table.has_value();
+    if (table) {
+      const auto cell = ResolveTableCellIntent(view.document.text(), selection.active);
+      const auto content = cell ? TableCellContentRange(view.document.text(), *cell) : std::nullopt;
+      const auto begin = std::min(selection.anchor, selection.active);
+      const auto end = std::max(selection.anchor, selection.active);
+      visible = content && begin >= content->begin && end <= content->end &&
+          !std::ranges::any_of(view.parse.spans, [&](const StyleSpan& span) {
+            return span.kind == SpanKind::EmphasisMarker && span.begin < end && span.end > begin;
+          }) && !std::ranges::any_of(view.parse.images, [&](const ImageReference& image) {
+            return image.begin < end && image.end > begin;
+          });
+      if (visible) {
+        const auto projection = BuildNativeTableViewportSnapshot(view.document.text(), *table);
+        for (const auto& mapping : projection.tables) for (const auto& mapped : mapping.cells)
+          for (const auto& range : mapped.collapsed)
+            if (range.source_end - range.source_begin == 2 && range.source_begin >= begin && range.source_begin < end)
+              visible = false;
+      }
+    }
+    if (visible) ReleaseSearchTableSource(view);
+  }
+  if (!table || view.table_source_mode) {
+    RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+    SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+    if (focus) SetFocus(view.editor);
+    return true;
+  }
+  const auto cell = ResolveTableCellIntent(view.document.text(), selection.active);
+  const auto content = cell ? TableCellContentRange(view.document.text(), *cell) : std::nullopt;
+  const auto begin = std::min(selection.anchor, selection.active);
+  const auto end = std::max(selection.anchor, selection.active);
+  if (!content || begin < content->begin || end > content->end) return false;
+  if (std::ranges::any_of(view.parse.spans, [&](const StyleSpan& span) {
+        return span.kind == SpanKind::EmphasisMarker && span.begin < end && span.end > begin;
+      }) || std::ranges::any_of(view.editor_snapshot.collapsed, [&](const CollapsedRange& image) {
+        return image.source_begin < end && image.source_end > begin;
+      })) return false;
+  for (const auto& mapping : view.editor_snapshot.tables) {
+    for (const auto& mapped_cell : mapping.cells) {
+      for (const auto& range : mapped_cell.collapsed) {
+        if (range.source_end <= view.document.text().size() && range.source_end - range.source_begin == 2 &&
+            range.source_begin >= begin && range.source_begin < end &&
+            view.document.text()[range.source_begin] == L'\\' &&
+            (view.document.text()[range.source_begin + 1] == L'|' || view.document.text()[range.source_begin + 1] == L'\\'))
+          return false;
+      }
+    }
+  }
+  RefreshTableViewports(view);
+  const auto viewport = std::ranges::find_if(view.table_viewports,
+      [&](const auto& item) { return item->source_begin == table->begin; });
+  if (viewport == view.table_viewports.end()) return false;
+  RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+  SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+  LayoutTableViewports(view);
+  {
+    TableViewportContext context(*this, view, **viewport);
+    RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+    SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+    if (focus) SetFocus(view.editor);
+  }
+  return true;
+}
+
+void Application::ApplyTableSearchHighlights(DocumentView& view) {
+  if (view.active_table_viewport || view.refreshing_table_viewports) return;
+  view.refreshing_table_viewports = true;
+  for (auto& viewport : view.table_viewports) {
+    TableViewportContext context(*this, view, *viewport);
+    ApplyDocumentSearchHighlights(view);
+  }
+  view.refreshing_table_viewports = false;
+}
+
+void Application::ShowTableHoverControls(DocumentView& view, DocumentView::TableViewport& viewport,
+                                         bool show) {
+  show = show && viewport.hovered_cell.has_value() && !view.table_source_mode && !viewport.pointer_dragged;
+  viewport.hover_visible = show;
+  const auto table = std::ranges::find(view.parse.tables, viewport.source_begin, &GfmTable::begin);
+  if (show && table == view.parse.tables.end()) show = false;
+  viewport.hover_visible = show;
+  if (table != view.parse.tables.end() && viewport.hovered_cell) {
+    EnableWindow(viewport.operation_buttons[2], viewport.hovered_cell->row_begin != table->rows.front().begin && table->rows.size() > 3);
+    EnableWindow(viewport.operation_buttons[5], table->alignments.size() > 1);
+  }
+  for (const auto button : viewport.operation_buttons) {
+    if (button) ShowWindow(button, show ? SW_SHOWNA : SW_HIDE);
+  }
+}
+
+void Application::UpdateTableHoverTarget(DocumentView& view, DocumentView::TableViewport& viewport,
+                                         POINT point) {
+  const auto native = SendMessageW(viewport.editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&point));
+  const auto& snapshot = view.active_table_viewport == &viewport ? view.editor_snapshot : viewport.snapshot;
+  const auto source = snapshot.NativeToSource(static_cast<std::size_t>(std::max<LRESULT>(0, native)));
+  const auto table = std::ranges::find(view.parse.tables, viewport.source_begin, &GfmTable::begin);
+  viewport.hovered_cell = table == view.parse.tables.end() ? std::nullopt
+      : ResolveTableCellIntent(*table, view.document.text(), source);
+  for (const auto& mapping : snapshot.tables) {
+    for (const auto& row : mapping.visual_rows) {
+      for (std::size_t column{}; column < row.cells.size(); ++column) {
+        if (row.cells[column].virtual_cell && native == row.cells[column].native_begin)
+          viewport.hovered_cell = TableCellIntent{row.source_begin, column, row.cells[column].source_begin, true};
+      }
+    }
+  }
+  ShowTableHoverControls(view, viewport, viewport.hovered_cell.has_value());
+}
+
+void Application::ExecuteTableHoverCommand(DocumentView& view, DocumentView::TableViewport& viewport,
+                                           unsigned command) {
+  if (!viewport.hovered_cell || command >= viewport.operation_buttons.size() || view.ime_composing) return;
+  const auto target = *viewport.hovered_cell;
+  const auto table = ParseGfmTableAt(view.document.text(), target.row_begin);
+  if (!table) return;
+  TableViewportContext context(*this, view, viewport);
+  if (command < 6) {
+    const auto position = command >= 3 && target.column < table->rows.front().cells.size()
+        ? table->rows.front().cells[target.column].begin : target.source_position;
+    ApplyTableAction(static_cast<TableAction>(command), position);
+  } else if (command < 9) {
+    const auto selection = CaptureSourceSelection(view.editor, view.editor_snapshot);
+    const auto alignment = command == 6 ? TableAlignment::Left : command == 7
+        ? TableAlignment::Center : TableAlignment::Right;
+    const auto position = target.column < table->rows.front().cells.size()
+        ? table->rows.front().cells[target.column].begin : target.source_position;
+    const auto edit = SetTableColumnAlignment(view.document.text(), position, alignment);
+    if (edit.changed) ApplySourceTextWithUndo(view, edit.text, true, selection, selection);
+  } else {
+    RestoreSourceSelection(view.editor, view.editor_snapshot, {target.source_position, target.source_position});
+    ToggleTableSource(view);
+    view.table_exit_selection = SourceSelection{target.source_position, target.source_position};
+  }
+}
+
+void Application::DrawTableOperationButton(const DRAWITEMSTRUCT& draw) const {
+  const int saved = SaveDC(draw.hDC);
+  const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
+  const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
+  HBRUSH background = CreateSolidBrush(pressed ? theme_input_ : theme_surface_alt_);
+  FillRect(draw.hDC, &draw.rcItem, background);
+  DeleteObject(background);
+  SetBkMode(draw.hDC, TRANSPARENT);
+  SetTextColor(draw.hDC, disabled ? theme_muted_ : theme_foreground_);
+  if (ui_font_) SelectObject(draw.hDC, ui_font_);
+  wchar_t caption[40]{};
+  GetWindowTextW(draw.hwndItem, caption, static_cast<int>(std::size(caption)));
+  RECT text = draw.rcItem;
+  DrawTextW(draw.hDC, caption, -1, &text, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+  if (draw.itemState & ODS_FOCUS) {
+    RECT focus = draw.rcItem; InflateRect(&focus, -1, -1); DrawFocusRect(draw.hDC, &focus);
+  }
+  RestoreDC(draw.hDC, saved);
+}
+
+bool Application::HandleTableCommandInput(DocumentView& view, UINT message, WPARAM wparam,
+                                          LPARAM lparam) {
+  if (!IsMarkdownFile(view.document.path())) return false;
+  if (message == WM_CHAR && wparam == L'\r' && view.table_return_key_handled) {
+    view.table_return_key_handled = false;
+    return true;
+  }
+  if (message == WM_KEYUP && wparam == VK_RETURN) view.table_return_key_handled = false;
+  const bool key = message == WM_KEYDOWN;
+  const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  if (key && control && shift && wparam == L'T') { ToggleTableSource(view); return true; }
+  if (view.table_source_mode) {
+    if (message == WM_CONTEXTMENU || (key && wparam == VK_ESCAPE)) {
+      ToggleTableSource(view);
+      return true;
+    }
+    return false;
+  }
+  const bool clipboard = message == WM_COPY || message == WM_CUT || message == WM_PASTE ||
+      (key && control && (wparam == L'C' || wparam == L'X' || wparam == L'V'));
+  const bool deletion = message == WM_CLEAR || (key && (wparam == VK_BACK || wparam == VK_DELETE)) ||
+      (message == WM_CHAR && (wparam == 0x08 || wparam == 0x7f));
+  if (!key && !clipboard && !deletion && message != WM_CONTEXTMENU) return false;
+  if (view.sync_due != 0 || view.native_edit_pending) {
+    if (!SyncDocumentFromEditor(view)) return true;
+  }
+  auto selection = CaptureSourceSelection(view.editor, view.editor_snapshot);
+  const auto current = view.pending_virtual_table_cell ? view.pending_virtual_table_cell
+      : ResolveTableCellIntent(view.document.text(), selection.active);
+  if (!current) return false;
+  const auto range = TableCellContentRange(view.document.text(), *current);
+  const auto table = ParseGfmTableAt(view.document.text(), current->row_begin);
+  if (!table) return false;
+  if (key && control && (GetKeyState(VK_MENU) & 0x8000) != 0 && wparam == L'T' && view.active_table_viewport) {
+    auto& viewport = *view.active_table_viewport;
+    viewport.hovered_cell = current; viewport.pointer_dragged = false;
+    ShowTableHoverControls(view, viewport, true);
+    SetFocus(viewport.operation_buttons.front());
+    return true;
+  }
+  if (message == WM_CONTEXTMENU) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return true;
+    AppendMenuW(menu, MF_STRING, 1, L"上に行を追加");
+    AppendMenuW(menu, MF_STRING, 2, L"下に行を追加");
+    AppendMenuW(menu, MF_STRING, 3, L"行を削除");
+    AppendMenuW(menu, MF_STRING, 4, L"左に列を追加");
+    AppendMenuW(menu, MF_STRING, 5, L"右に列を追加");
+    AppendMenuW(menu, MF_STRING, 6, L"列を削除");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 7, L"列を左揃え");
+    AppendMenuW(menu, MF_STRING, 8, L"列を中央揃え");
+    AppendMenuW(menu, MF_STRING, 9, L"列を右揃え");
+    AppendMenuW(menu, MF_STRING, 10, L"表のソースを編集\tCtrl+Shift+T");
+    if (current->row_begin == table->rows.front().begin || table->rows.size() <= 3)
+      EnableMenuItem(menu, 3, MF_BYCOMMAND | MF_GRAYED);
+    if (table->alignments.size() <= 1) EnableMenuItem(menu, 6, MF_BYCOMMAND | MF_GRAYED);
+    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    if (point.x == -1 && point.y == -1) { GetCaretPos(&point); ClientToScreen(view.editor, &point); }
+    const auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                       point.x, point.y, 0, window_, nullptr);
+    DestroyMenu(menu);
+    if (command >= 1 && command <= 6) ApplyTableAction(static_cast<TableAction>(command - 1));
+    else if (command >= 7 && command <= 9) {
+      const auto alignment = command == 7 ? TableAlignment::Left : command == 8
+          ? TableAlignment::Center : TableAlignment::Right;
+      const auto edit = SetTableColumnAlignment(view.document.text(), selection.active, alignment);
+      if (edit.changed) ApplySourceTextWithUndo(view, edit.text, true, selection, selection);
+    } else if (command == 10) ToggleTableSource(view);
+    return true;
+  }
+  const auto apply_edit = [&](const TableEditResult& edit, bool select_content) {
+    if (edit.changed && !ApplySourceTextWithUndo(view, edit.text, true,
+          SourceSelection{edit.selection, edit.selection}, selection)) return;
+    if (edit.target_cell && edit.target_cell->virtual_cell)
+      view.pending_virtual_table_cell = edit.target_cell;
+    else view.pending_virtual_table_cell.reset();
+    auto target = SourceSelection{edit.selection, edit.selection};
+    if (select_content && !edit.changed && edit.target_cell) {
+      if (const auto content = TableCellContentRange(view.document.text(), *edit.target_cell))
+        target = {content->begin, content->end};
+    }
+    RestoreSourceSelection(view.editor, view.editor_snapshot, target);
+    if (edit.target_cell && edit.target_cell->virtual_cell)
+      RestoreVirtualTableCellCaret(view, *edit.target_cell);
+    if (view.active_table_viewport && (target.active < table->begin || target.active > table->end))
+      view.table_exit_selection = target;
+    SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+  };
+  if (key && (wparam == VK_TAB || wparam == VK_RETURN) && !control) {
+    const auto edit = MoveTableCellCommand(view.document.text(), *current, shift, wparam == VK_RETURN);
+    apply_edit(edit, true);
+    if (wparam == VK_TAB) table_tab_keydown_handled_ = true;
+    else view.table_return_key_handled = true;
+    return true;
+  }
+  if ((key && (wparam == VK_ESCAPE || (control && wparam == VK_RETURN)))) {
+    apply_edit(LeaveTable(view.document.text(), selection.active), false);
+    if (wparam == VK_RETURN) view.table_return_key_handled = true;
+    return true;
+  }
+  if (key && !control && (wparam == VK_HOME || wparam == VK_END)) {
+    const auto position = range ? (wparam == VK_HOME ? range->begin : range->end)
+                                : current->source_position;
+    RestoreSourceSelection(view.editor, view.editor_snapshot,
+                           {shift ? selection.anchor : position, position});
+    return true;
+  }
+  if (deletion && selection.anchor == selection.active) {
+    const bool back = wparam == VK_BACK || wparam == 0x08;
+    if (!range || (back ? selection.active <= range->begin : selection.active >= range->end))
+      return true;
+  }
+  CHARRANGE native_selection{};
+  SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&native_selection));
+  const bool explicit_table_selection = std::ranges::any_of(view.editor_snapshot.tables,
+      [&](const EditorTableMapping& mapping) {
+        return mapping.source_begin == table->begin && native_selection.cpMin <= mapping.native_begin &&
+               native_selection.cpMax >= mapping.native_end;
+      });
+  const bool copy = message == WM_COPY || (key && control && wparam == L'C');
+  const bool cut = message == WM_CUT || (key && control && wparam == L'X');
+  const bool paste = message == WM_PASTE || (key && control && wparam == L'V');
+  auto first = ResolveTableCellIntent(view.document.text(), std::min(selection.anchor, selection.active));
+  auto last = ResolveTableCellIntent(view.document.text(), std::max(selection.anchor, selection.active));
+  const auto native_begin = static_cast<std::size_t>(std::max<LONG>(0, native_selection.cpMin));
+  const auto native_end = static_cast<std::size_t>(std::max<LONG>(0, native_selection.cpMax));
+  if (!explicit_table_selection && (clipboard || deletion) && native_selection.cpMin < native_selection.cpMax) {
+    const auto mapping = std::ranges::find(view.editor_snapshot.tables, table->begin,
+                                          &EditorTableMapping::source_begin);
+    if (mapping != view.editor_snapshot.tables.end() && native_begin >= mapping->native_begin &&
+        native_end <= mapping->native_end) {
+      const auto cells = IntersectingNativeTableCells(*mapping, native_begin, native_end);
+      if (!cells) return true;  // Native row/cell markers contain no editable content.
+      first = cells->first;
+      last = cells->second;
+    }
+  }
+  const bool rectangle = first && last && (first->row_begin != last->row_begin || first->column != last->column);
+  if (rectangle && !explicit_table_selection && (copy || cut || deletion || paste)) {
+    const auto first_content = TableCellContentRange(view.document.text(), *first);
+    const auto last_content = TableCellContentRange(view.document.text(), *last);
+    const auto begin = first_content ? first_content->begin : first->source_position;
+    const auto end = last_content ? last_content->end : last->source_position;
+    selection = selection.anchor <= selection.active ? SourceSelection{begin, end} : SourceSelection{end, begin};
+    if ((copy || cut) && !PublishClipboardUnicodeText(view.editor,
+          CopyTableRectangle(view.document.text(), *first, *last))) return true;
+    if (copy) return true;
+    const auto payload = paste ? ReadClipboardUnicodeText(view.editor) : std::optional<std::wstring>(L"");
+    if (!payload) return true;
+    const auto edit = ReplaceTableRectangle(view.document.text(), *first, *last, *payload);
+    if (edit.changed) apply_edit(edit, false);
+    return true;
+  }
+  if (paste && range && !IsClipboardFormatAvailable(CF_BITMAP) &&
+      !IsClipboardFormatAvailable(CF_DIB) && !IsClipboardFormatAvailable(CF_DIBV5)) {
+    const auto payload = ReadClipboardUnicodeText(view.editor);
+    if (payload && payload->find_first_of(L"\r\n\t") != std::wstring::npos) {
+      const auto edit = ReplaceTableRectangle(view.document.text(), *current, *current, *payload);
+      if (edit.changed) apply_edit(edit, false);
+      return true;
+    }
+  }
+  if (paste && range && !IsClipboardFormatAvailable(CF_BITMAP) &&
+      !IsClipboardFormatAvailable(CF_DIB) && !IsClipboardFormatAvailable(CF_DIBV5)) {
+    const auto payload = ReadClipboardUnicodeText(view.editor);
+    if (payload &&
+        std::min(selection.anchor, selection.active) >= range->begin &&
+        std::max(selection.anchor, selection.active) <= range->end) {
+      const auto insertion = std::min(selection.anchor, selection.active);
+      const auto view_begin = view.editor_snapshot.SourceToView(insertion);
+      const auto view_end = view.editor_snapshot.SourceToView(std::max(selection.anchor, selection.active));
+      auto projected = view.editor_snapshot.view;
+      const auto plain = CanonicalizeNativeText(*payload);
+      projected.replace(view_begin, view_end - view_begin, plain);
+      const auto edit = ApplyEditorText(view.editor_snapshot, view.document.text(), projected,
+                                        {selection, EditorEditKind::Replace});
+      if (edit.changed && !edit.identity_ambiguous) {
+        const auto after = NativeSnapshotForView(view, edit.source);
+        auto target = after.ViewToSource(view_begin + plain.size());
+        if (const auto content = TableCellContentRange(edit.source, *current))
+          target = std::clamp(target, content->begin, content->end);
+        ApplySourceTextWithUndo(view, edit.source, true, SourceSelection{target, target}, selection);
+      }
+      return true;
+    }
+  }
+  if (explicit_table_selection && std::min(selection.anchor, selection.active) >= table->begin &&
+      std::max(selection.anchor, selection.active) <= table->end && (deletion || cut)) {
+    if (cut && !PublishClipboardUnicodeText(view.editor,
+          std::wstring_view(view.document.text()).substr(table->begin, table->end - table->begin))) return true;
+    std::wstring text = view.document.text();
+    text.erase(table->begin, table->end - table->begin);
+    const SourceSelection target{table->begin, table->begin};
+    ApplySourceTextWithUndo(view, std::move(text), true, target, selection);
+    if (view.active_table_viewport) view.table_exit_selection = target;
+    return true;
+  }
+  if (view.active_table_viewport && key && !control && !shift && range &&
+      (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN)) {
+    const bool backwards = wparam == VK_LEFT || wparam == VK_UP;
+    const bool at_edge = backwards ? selection.active <= range->begin : selection.active >= range->end;
+    const auto direction = wparam == VK_LEFT ? TableCaretDirection::Left : wparam == VK_RIGHT
+        ? TableCaretDirection::Right : wparam == VK_UP ? TableCaretDirection::Up : TableCaretDirection::Down;
+    if (at_edge && !MoveTableCaretTargetAtBoundary(*table, view.document.text(), *current, direction)) {
+      auto position = backwards ? (table->begin > 0 ? table->begin - 1 : range->begin) : range->end;
+      if (!backwards && table->end < view.document.text().size()) {
+        position = table->end;
+        if (view.document.text()[position] == L'\r') ++position;
+        if (position < view.document.text().size() && view.document.text()[position] == L'\n') ++position;
+      }
+      if (position < table->begin || position > table->end) view.table_exit_selection = SourceSelection{position, position};
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Application::PrepareTableProjectionForNativeMutation(DocumentView& view,
                                                            UINT message, WPARAM wparam) {
   if (!IsMarkdownFile(view.document.path()) || view.editor_projection_invalid ||
-      view.ime_composing || view.editor_snapshot.tables.empty()) return true;
+      view.ime_composing || view.table_source_mode || view.editor_snapshot.tables.empty()) return true;
 
   const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
   const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2357,7 +3513,8 @@ bool Application::PrepareTableProjectionForNativeMutation(DocumentView& view,
   // A table rebuild may be pending after a source-side action. If the old
   // mapping cannot prove that the native range stays within one cell, use the
   // current source as the edit surface and let normal sync rebuild topology.
-  if (touches_table && (deletes_cell_boundary || row_break || replace ||
+  if (deletes_cell_boundary) return false;
+  if (touches_table && (row_break || replace ||
                         (paste && paste_may_add_rows_or_cells))) {
     needs_flat_source = true;
   }
@@ -2448,7 +3605,9 @@ LRESULT CALLBACK Application::PanelHeaderSubclass(HWND window, UINT message, WPA
     int command{};
     if (x >= button_edge) {
       switch (GetDlgCtrlID(window)) {
-        case kPanelHeaderExplorer: command = kViewWorkspacePane; break;
+        case kPanelHeaderExplorer:
+          command = app->active_activity_ == 1 ? kSearchClose : kViewWorkspacePane;
+          break;
         case kPanelHeaderCalendar: command = kViewCalendar; break;
         case kPanelHeaderOutline: command = kViewOutlinePane; break;
         case kPanelHeaderGit: command = kViewGitPane; break;
@@ -2463,6 +3622,92 @@ LRESULT CALLBACK Application::PanelHeaderSubclass(HWND window, UINT message, WPA
     }
   }
   if (message == WM_NCDESTROY) RemoveWindowSubclass(window, PanelHeaderSubclass, 1);
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
+LRESULT CALLBACK Application::SearchControlSubclass(HWND window, UINT message, WPARAM wparam,
+                                                     LPARAM lparam, UINT_PTR subclass_id,
+                                                     DWORD_PTR reference) {
+  auto* app = reinterpret_cast<Application*>(reference);
+  if (!app) return DefSubclassProc(window, message, wparam, lparam);
+  if (window == app->search_scope_) {
+    if (message == WM_PAINT) {
+      const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+      if (HDC dc = GetDC(window)) {
+        app->DrawSearchScopeFrame(window, dc);
+        app->DrawSearchScopeArrow(window, dc);
+        ReleaseDC(window, dc);
+      }
+      return result;
+    }
+    if (message == WM_PRINTCLIENT) {
+      const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+      app->DrawSearchScopeFrame(window, reinterpret_cast<HDC>(wparam));
+      app->DrawSearchScopeArrow(window, reinterpret_cast<HDC>(wparam));
+      return result;
+    }
+  }
+  if (message == WM_PAINT &&
+      (window == app->find_case_ || window == app->find_regex_ || window == app->find_word_ ||
+       window == app->search_ignore_ || window == app->search_hidden_)) {
+    const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+    app->DrawSearchCheckbox(window);
+    return result;
+  }
+  if (message == WM_IME_STARTCOMPOSITION) {
+    app->search_ime_composing_ = true;
+  } else if (message == WM_KEYDOWN && wparam == VK_ESCAPE) {
+    if (window == app->search_scope_ &&
+        SendMessageW(window, CB_GETDROPPEDSTATE, 0, 0) != 0)
+      return DefSubclassProc(window, message, wparam, lparam);
+    HIMC context = ImmGetContext(window);
+    const LONG composing = context ? ImmGetCompositionStringW(context, GCS_COMPSTR, nullptr, 0) : 0;
+    if (context) ImmReleaseContext(window, context);
+    if (app->search_ime_composing_ || composing > 0)
+      return DefSubclassProc(window, message, wparam, lparam);
+    app->CloseSearchPanel();
+    return 0;
+  } else if ((message == WM_KEYDOWN || message == WM_CHAR) &&
+             wparam == VK_RETURN && window == app->find_edit_) {
+    HIMC context = ImmGetContext(window);
+    const LONG composing = context ? ImmGetCompositionStringW(context, GCS_COMPSTR, nullptr, 0) : 0;
+    if (context) ImmReleaseContext(window, context);
+    if (app->search_ime_composing_ || composing > 0)
+      return DefSubclassProc(window, message, wparam, lparam);
+    // TranslateMessage has already queued WM_CHAR before the keydown handler
+    // runs. Keep Enter as navigation without inserting a newline in the query.
+    if (message == WM_KEYDOWN)
+      app->NavigateSearchMatch((GetKeyState(VK_SHIFT) & 0x8000) != 0 ? -1 : 1);
+    return 0;
+  } else if (message == WM_KEYDOWN && wparam == VK_RETURN && window == app->find_results_) {
+    const HTREEITEM selected = TreeView_GetSelection(window);
+    if (selected) {
+      TVITEMW item{};
+      item.mask = TVIF_PARAM | TVIF_HANDLE;
+      item.hItem = selected;
+      if (TreeView_GetItem(window, &item)) {
+        if (item.lParam >= 0) app->OpenSearchResult(static_cast<std::size_t>(item.lParam), true);
+        else if (item.lParam == static_cast<LPARAM>(-2)) {
+          const auto group = std::ranges::find_if(app->search_file_nodes_, [&](const auto& entry) {
+            return entry.second == selected;
+          });
+          if (group != app->search_file_nodes_.end()) {
+            const auto first = app->search_file_first_result_.find(group->first);
+            if (first != app->search_file_first_result_.end())
+              app->OpenSearchResult(first->second, true);
+          }
+        }
+      }
+    }
+    return 0;
+  } else if (message == WM_IME_ENDCOMPOSITION) {
+    const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+    app->search_ime_composing_ = false;
+    app->ScheduleSearch();
+    return result;
+  } else if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(window, SearchControlSubclass, subclass_id);
+  }
   return DefSubclassProc(window, message, wparam, lparam);
 }
 
@@ -2705,6 +3950,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         CompleteGitStatusDeliveryFailure();
         CompleteCalendarIndexDeliveryFailure();
         if (external_operation_active_) return 0;
+        PruneSearchWorkers();
         const ULONGLONG now = GetTickCount64();
         bool pending = git_status_worker_.joinable() || calendar_index_active_;
         bool fast_poll = pending;
@@ -2727,7 +3973,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
           fast_poll = true;
           if (now >= workspace_search_due_) {
             workspace_search_due_ = 0;
-            SearchWorkspaceFromFindBar();
+            SearchNow();
           }
         }
         for (auto& view : documents_) {
@@ -3139,6 +4385,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       RunGitStatus();
       return TRUE;
     }
+    case kTestSetReplaceConfirmationUiMessage:
+      if (!TestAutomationSilent() || (wparam != 0 && wparam != 1)) return FALSE;
+      test_replace_confirmation_ui_enabled = wparam == 1;
+      return TRUE;
     case kTestGetGitActionActiveMessage:
       if (!TestAutomationSilent()) return -1;
       return git_action_active_ ? TRUE : FALSE;
@@ -3340,7 +4590,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kTabClose && active_document_ < documents_.size())
         CloseDocument(active_document_);
       else if (command == kActivityExplorer) ActivatePanel(PanelId::Explorer);
-      else if (command == kActivitySearch) ShowFindBar();
+      else if (command == kActivitySearch) ShowFindBar(SearchScope::Workspace);
       else if (command == kActivityGit) ActivatePanel(PanelId::Git);
       else if (command == kActivityCalendar) ActivatePanel(PanelId::Calendar);
       else if (command == kActivitySettings) OpenWorkspaceSettings();
@@ -3409,14 +4659,35 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kImageWidth480) ResizeImageAtCaret(480);
       else if (command == kImageWidth640) ResizeImageAtCaret(640);
       else if (command == kFileExit) SendMessageW(window_, WM_CLOSE, 0, 0);
-      else if (command == kEditFind) ShowFindBar();
+      else if (command == kEditFind) ShowFindBar(SearchScope::CurrentFile);
       else if (command == kEditFindNext || command == kFindNext) FindNext();
-      else if (command == kReplaceOne) ReplaceCurrentDocument(false);
-      else if (command == kReplaceDocument) ReplaceCurrentDocument(true);
-      else if (command == kEditFindWorkspace) SearchWorkspaceFromFindBar();
+      else if (command == kEditFindPrevious || command == kSearchPrevious) NavigateSearchMatch(-1);
+      else if (command == kSearchClose) CloseSearchPanel();
+      else if (command == kSearchScope && HIWORD(wparam) == CBN_SELCHANGE)
+        SetSearchScope(SendMessageW(search_scope_, CB_GETCURSEL, 0, 0) == 0
+            ? SearchScope::CurrentFile : SearchScope::Workspace);
+      else if (command == kSearchReplaceToggle && HIWORD(wparam) == BN_CLICKED) {
+        search_replace_expanded_ = !search_replace_expanded_;
+        LayoutControls();
+      }
+      else if (command == kSearchDetailsToggle && HIWORD(wparam) == BN_CLICKED) {
+        search_details_expanded_ = !search_details_expanded_;
+        LayoutControls();
+      }
+      else if (command == kReplaceOne) {
+        if (search_scope_state_ == SearchScope::Workspace) ReplaceSelectedWorkspace(false);
+        else ReplaceCurrentDocument(false);
+      }
+      else if (command == kReplaceDocument) {
+        if (search_scope_state_ == SearchScope::Workspace) ReplaceSelectedWorkspace(true);
+        else ReplaceCurrentDocument(true);
+      }
+      else if (command == kEditFindWorkspace) ShowFindBar(SearchScope::Workspace);
       else if (command == kEditReplaceWorkspace || command == kReplaceWorkspace)
         ReplaceWorkspaceFromFindBar();
-      else if (command == kFindWorkspace) SearchWorkspaceFromFindBar();
+      else if (command == kEditRollbackWorkspaceReplace || command == kRollbackWorkspaceReplace)
+        RollbackClosedWorkspaceReplace();
+      else if (command == kFindWorkspace) ShowFindBar(SearchScope::Workspace);
       else if (command == kViewCalendar) {
         if (auto* panel = panel_layout_.Find(PanelId::Calendar))
           panel->hidden = !panel->hidden;
@@ -3471,24 +4742,35 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       else if (command == kTableColumnBefore) ApplyTableAction(TableAction::InsertColumnBefore);
       else if (command == kTableColumnAfter) ApplyTableAction(TableAction::InsertColumnAfter);
       else if (command == kTableColumnDelete) ApplyTableAction(TableAction::DeleteColumn);
-      else if (workspace_search_started_ &&
-               (((command == kFindEdit || command == kFindIncludeGlob ||
-                  command == kFindExcludeGlob) && HIWORD(wparam) == EN_CHANGE) ||
-                ((command == kFindCase || command == kFindRegex || command == kFindWord) &&
-                 HIWORD(wparam) == BN_CLICKED)))
-        ScheduleWorkspaceSearch();
+      else if (((command == kFindEdit || command == kFindIncludeGlob ||
+                 command == kFindExcludeGlob) && HIWORD(wparam) == EN_CHANGE) ||
+               ((command == kFindCase || command == kFindRegex || command == kFindWord ||
+                 command == kSearchIgnore || command == kSearchHidden) &&
+                HIWORD(wparam) == BN_CLICKED))
+        ScheduleSearch();
       else if (HIWORD(wparam) == EN_CHANGE) OnEditorChanged(reinterpret_cast<HWND>(lparam));
       return 0;
     }
     case WM_MEASUREITEM: {
       auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
-      if (!measure || measure->CtlType != ODT_MENU) return FALSE;
-      MeasureMenuItem(*measure);
-      return TRUE;
+      if (!measure) return FALSE;
+      if (measure->CtlType == ODT_COMBOBOX && measure->CtlID == kSearchScope) {
+        measure->itemHeight = static_cast<UINT>(ScaleDip(window_, 20));
+        return TRUE;
+      }
+      if (measure->CtlType == ODT_MENU) {
+        MeasureMenuItem(*measure);
+        return TRUE;
+      }
+      return FALSE;
     }
     case WM_DRAWITEM: {
       const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
       if (!draw) return FALSE;
+      if (draw->hwndItem == search_scope_ && draw->CtlType == ODT_COMBOBOX) {
+        DrawSearchScopeItem(*draw);
+        return TRUE;
+      }
       if (draw->hwndItem == tabs_ && draw->CtlType == ODT_TAB) {
         DrawTabItem(*draw);
         return TRUE;
@@ -3508,6 +4790,10 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
           draw->hwndItem == git_unstage_ || draw->hwndItem == git_diff_ ||
           draw->hwndItem == git_commit_ || draw->hwndItem == git_trust_ ||
           draw->hwndItem == calendar_daily_ || draw->hwndItem == calendar_details_toggle_ ||
+           draw->hwndItem == find_next_ || draw->hwndItem == search_previous_ ||
+           draw->hwndItem == search_replace_toggle_ || draw->hwndItem == search_details_toggle_ ||
+           draw->hwndItem == replace_one_ || draw->hwndItem == replace_document_ ||
+           draw->hwndItem == replace_workspace_ || draw->hwndItem == rollback_workspace_replace_ ||
           std::ranges::find(activity_buttons_, draw->hwndItem) != activity_buttons_.end() ||
           std::ranges::find(panel_headers_, draw->hwndItem) != panel_headers_.end()) {
         DrawChromeButton(*draw);
@@ -3534,9 +4820,58 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
           return CDRF_NEWFONT;
         }
       }
+      if (header && header->hwndFrom == find_results_ && header->code == NM_CUSTOMDRAW) {
+        auto* draw = reinterpret_cast<NMTVCUSTOMDRAW*>(lparam);
+        if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+          const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+          draw->clrText = selected ? theme_selected_text_ : theme_foreground_;
+          draw->clrTextBk = selected ? theme_accent_ : theme_surface_;
+          return draw->nmcd.lItemlParam >= 0
+              ? static_cast<LRESULT>(CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT)
+              : CDRF_NEWFONT;
+        }
+        if (draw->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT && draw->nmcd.lItemlParam >= 0) {
+          const auto index = static_cast<std::size_t>(draw->nmcd.lItemlParam);
+          const auto& matches = search_scope_state_ == SearchScope::CurrentFile
+              ? document_search_results_ : workspace_search_results_;
+          if (index < matches.size()) {
+            const auto& match = matches[index];
+            const auto begin = std::min(match.preview_match_begin, match.preview.size());
+            const auto end = std::min(match.preview_match_end, match.preview.size());
+            if (end > begin) {
+              RECT text_rect{};
+              const auto item = reinterpret_cast<HTREEITEM>(draw->nmcd.dwItemSpec);
+              if (TreeView_GetItemRect(find_results_, item, &text_rect, TRUE)) {
+                const std::wstring prefix = std::to_wstring(match.line) + L": ";
+                SIZE prefix_size{};
+                SIZE match_size{};
+                const auto snippet = std::wstring_view(match.preview).substr(begin, end - begin);
+                if (GetTextExtentPoint32W(draw->nmcd.hdc, prefix.data(),
+                                          static_cast<int>(prefix.size()), &prefix_size) &&
+                    GetTextExtentPoint32W(draw->nmcd.hdc, snippet.data(),
+                                          static_cast<int>(snippet.size()), &match_size)) {
+                  const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+                  const int y = text_rect.bottom - ScaleDip(window_, 2);
+                  const int x = text_rect.left + prefix_size.cx + ScaleDip(window_, 1);
+                  HPEN pen = CreatePen(PS_SOLID, ScaleDip(window_, selected ? 2 : 1),
+                                       selected ? theme_selected_text_ : theme_accent_);
+                  if (pen) {
+                    const auto previous_pen = SelectObject(draw->nmcd.hdc, pen);
+                    MoveToEx(draw->nmcd.hdc, x, y, nullptr);
+                    LineTo(draw->nmcd.hdc, x + match_size.cx, y);
+                    SelectObject(draw->nmcd.hdc, previous_pen);
+                    DeleteObject(pen);
+                  }
+                }
+              }
+            }
+          }
+          return CDRF_DODEFAULT;
+        }
+      }
       if (header && header->code == NM_CUSTOMDRAW &&
           (header->hwndFrom == workspace_tree_ || header->hwndFrom == outline_ ||
-           header->hwndFrom == find_results_ ||
            header->hwndFrom == status_)) {
         auto* draw = reinterpret_cast<NMCUSTOMDRAW*>(lparam);
         if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
@@ -3618,17 +4953,29 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
         RefreshCalendarForSelection(selection->date);
       } else if (header->hwndFrom == calendar_ && header->code == CVN_MONTH_CHANGED) {
         UpdateCalendarViewMarkers();
-      } else if (header->hwndFrom == find_results_ &&
-                 (header->code == NM_DBLCLK || header->code == LVN_ITEMACTIVATE)) {
-        const int index = ListView_GetNextItem(find_results_, -1, LVNI_SELECTED);
-        if (index >= 0) OpenWorkspaceSearchResult(static_cast<std::size_t>(index));
+      } else if (header->hwndFrom == find_results_ && header->code == TVN_SELCHANGEDW &&
+                 !search_tree_selection_update_) {
+        const auto* selection = reinterpret_cast<const NMTREEVIEWW*>(lparam);
+        if (selection->itemNew.lParam >= 0) {
+          OpenSearchResult(static_cast<std::size_t>(selection->itemNew.lParam));
+        } else if (selection->itemNew.lParam == static_cast<LPARAM>(-2)) {
+          const auto group = std::ranges::find_if(search_file_nodes_, [&](const auto& item) {
+            return item.second == selection->itemNew.hItem;
+          });
+          if (group != search_file_nodes_.end()) {
+            const auto first = search_file_first_result_.find(group->first);
+            if (first != search_file_first_result_.end()) OpenSearchResult(first->second);
+          }
+        }
       } else if (!suppress_editor_change_ && active_document_ < documents_.size() &&
                  header->hwndFrom == documents_[active_document_]->editor &&
                  header->code == EN_SELCHANGE &&
                  !documents_[active_document_]->native_edit_in_flight &&
                  !documents_[active_document_]->ime_composing &&
                  documents_[active_document_]->sync_due == 0) {
-         QueueActiveLinePresentation(*documents_[active_document_]);
+         auto& view = *documents_[active_document_];
+         QueueActiveLinePresentation(view);
+         UpdateCurrentSearchMatchForCaret(view);
         UpdateStatus();
       } else if (active_document_ < documents_.size() &&
                  header->hwndFrom == documents_[active_document_]->editor &&
@@ -3698,7 +5045,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
       });
       const bool input = control == find_edit_ || control == replace_edit_ ||
           control == find_include_glob_ || control == find_exclude_glob_ ||
-          control == git_commit_edit_;
+          control == search_scope_ || control == git_commit_edit_;
       const COLORREF background = editor ? theme_editor_ : input ? theme_input_ : theme_surface_;
       HBRUSH brush = editor ? editor_brush_ : input ? input_brush_ : surface_brush_;
       SetTextColor(dc, theme_foreground_);
@@ -3764,6 +5111,7 @@ void Application::CreateMenuBar() {
   AppendMenuW(edit, MF_STRING, kEditFindNext, L"次を検索\tF3");
   AppendMenuW(edit, MF_STRING, kEditFindWorkspace, L"Workspaceを検索");
   AppendMenuW(edit, MF_STRING, kEditReplaceWorkspace, L"Workspaceを置換…");
+  AppendMenuW(edit, MF_STRING, kEditRollbackWorkspaceReplace, L"閉じたファイルの置換を戻す…");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), L"編集");
   HMENU view = CreatePopupMenu();
   AppendMenuW(view, MF_STRING, kCalendarOpenSelected, L"選択日のDailyを開く");
@@ -3942,50 +5290,93 @@ void Application::CreateControls() {
   SetStatusText(L"");
   find_bar_ = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD,
                               0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindBar), instance_, nullptr);
-  find_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+  find_edit_ = CreateWindowExW(0, L"EDIT", nullptr,
+                               WS_CHILD | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL |
+                                   ES_NOHIDESEL | WS_VSCROLL,
                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindEdit), instance_, nullptr);
-  find_next_ = CreateWindowExW(0, L"BUTTON", L"次を検索", WS_CHILD | BS_PUSHBUTTON,
+  find_next_ = CreateWindowExW(0, L"BUTTON", L"次へ", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindNext), instance_, nullptr);
+  search_previous_ = CreateWindowExW(0, L"BUTTON", L"前へ", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                     0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kSearchPrevious),
+                                     instance_, nullptr);
+  search_scope_ = CreateWindowExW(0, WC_COMBOBOXW, nullptr,
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kSearchScope), instance_, nullptr);
+  if (search_scope_) {
+    SendMessageW(search_scope_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"現在のファイル"));
+    SendMessageW(search_scope_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Workspace"));
+    SendMessageW(search_scope_, CB_SETCURSEL, 1, 0);
+  }
+  search_target_ = CreateWindowExW(0, L"STATIC", L"Workspace未選択",
+      WS_CHILD | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchTarget), instance_, nullptr);
+  search_replace_toggle_ = CreateWindowExW(0, L"BUTTON", L"置換を表示 ▸",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchReplaceToggle), instance_, nullptr);
+  search_details_toggle_ = CreateWindowExW(0, L"BUTTON", L"対象の詳細 ▸",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchDetailsToggle), instance_, nullptr);
+  search_count_ = CreateWindowExW(0, L"STATIC", L"0件",
+      WS_CHILD | SS_RIGHT | SS_ENDELLIPSIS, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchCount), instance_, nullptr);
+  search_status_ = CreateWindowExW(0, L"STATIC", L"検索語を入力してください。",
+      WS_CHILD | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchStatus), instance_, nullptr);
   replace_edit_ = CreateWindowExW(0, L"EDIT", nullptr, WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                   0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindReplaceEdit), instance_, nullptr);
   find_workspace_ = CreateWindowExW(0, L"BUTTON", L"全体検索", WS_CHILD | BS_PUSHBUTTON,
                                     0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindWorkspace), instance_, nullptr);
-  replace_workspace_ = CreateWindowExW(0, L"BUTTON", L"Preview→置換", WS_CHILD | BS_PUSHBUTTON,
-                                       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceWorkspace), instance_, nullptr);
+  replace_workspace_ = CreateWindowExW(0, L"BUTTON", L"Preview→置換",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kReplaceWorkspace), instance_, nullptr);
+  rollback_workspace_replace_ = CreateWindowExW(0, L"BUTTON", L"閉じたファイルの置換を戻す…",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kRollbackWorkspaceReplace), instance_, nullptr);
   find_case_ = CreateWindowExW(0, L"BUTTON", L"大小文字", WS_CHILD | BS_AUTOCHECKBOX,
                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindCase), instance_, nullptr);
   find_regex_ = CreateWindowExW(0, L"BUTTON", L"Regex", WS_CHILD | BS_AUTOCHECKBOX,
                                 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindRegex), instance_, nullptr);
   find_word_ = CreateWindowExW(0, L"BUTTON", L"単語", WS_CHILD | BS_AUTOCHECKBOX,
                                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindWord), instance_, nullptr);
-  find_include_glob_ = CreateWindowExW(0, L"EDIT", L"**/*.md;**/*.markdown",
+  find_include_glob_ = CreateWindowExW(0, L"EDIT", nullptr,
       WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kFindIncludeGlob), instance_, nullptr);
   SendMessageW(find_include_glob_, EM_SETCUEBANNER, TRUE,
-               reinterpret_cast<LPARAM>(L"対象glob（;区切り）"));
+               reinterpret_cast<LPARAM>(L"対象glob（カンマ区切り、空欄は全対象）"));
   find_exclude_glob_ = CreateWindowExW(0, L"EDIT", nullptr,
       WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, window_,
       reinterpret_cast<HMENU>(kFindExcludeGlob), instance_, nullptr);
   SendMessageW(find_exclude_glob_, EM_SETCUEBANNER, TRUE,
-               reinterpret_cast<LPARAM>(L"除外glob（;区切り）"));
-  replace_one_ = CreateWindowExW(0, L"BUTTON", L"1件置換", WS_CHILD | BS_PUSHBUTTON,
+               reinterpret_cast<LPARAM>(L"除外glob（カンマ区切り）"));
+  search_ignore_ = CreateWindowExW(0, L"BUTTON", L".gitignore等を適用",
+      WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchIgnore), instance_, nullptr);
+  SendMessageW(search_ignore_, BM_SETCHECK, BST_CHECKED, 0);
+  search_hidden_ = CreateWindowExW(0, L"BUTTON", L"隠しファイルを含む",
+      WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, window_,
+      reinterpret_cast<HMENU>(kSearchHidden), instance_, nullptr);
+  replace_one_ = CreateWindowExW(0, L"BUTTON", L"1件置換",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceOne), instance_, nullptr);
-  replace_document_ = CreateWindowExW(0, L"BUTTON", L"文書置換", WS_CHILD | BS_PUSHBUTTON,
+  replace_document_ = CreateWindowExW(0, L"BUTTON", L"文書置換",
+      WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kReplaceDocument), instance_, nullptr);
-  find_results_ = CreateWindowExW(0, WC_LISTVIEWW, nullptr,
-      WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+  find_results_ = CreateWindowExW(0, WC_TREEVIEWW, nullptr,
+      WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
       0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kFindResults), instance_, nullptr);
-  ListView_SetExtendedListViewStyle(find_results_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-  LVCOLUMNW result_column{LVCF_TEXT | LVCF_WIDTH};
-  result_column.pszText = const_cast<wchar_t*>(L"ファイル");
-  result_column.cx = 230;
-  ListView_InsertColumn(find_results_, 0, &result_column);
-  result_column.pszText = const_cast<wchar_t*>(L"行");
-  result_column.cx = 56;
-  ListView_InsertColumn(find_results_, 1, &result_column);
-  result_column.pszText = const_cast<wchar_t*>(L"内容");
-  result_column.cx = 560;
-  ListView_InsertColumn(find_results_, 2, &result_column);
+  if (find_results_) SetWindowTheme(find_results_, L"Explorer", nullptr);
+  for (HWND control : {find_edit_, replace_edit_, find_include_glob_, find_exclude_glob_,
+                       search_scope_, find_results_, search_ignore_, search_hidden_,
+                       find_case_, find_regex_, find_word_, find_next_, search_previous_,
+                       search_replace_toggle_, search_details_toggle_, replace_one_,
+                       replace_document_, replace_workspace_, rollback_workspace_replace_})
+    if (control) SetWindowSubclass(control, SearchControlSubclass, 1,
+                                   reinterpret_cast<DWORD_PTR>(this));
+  for (HWND control : {find_next_, search_previous_, search_replace_toggle_,
+                       search_details_toggle_, replace_one_, replace_document_, replace_workspace_,
+                       rollback_workspace_replace_})
+    if (control) SetWindowSubclass(control, ChromeBarSubclass, 1,
+                                   reinterpret_cast<DWORD_PTR>(this));
   if (CalendarView_RegisterClass(instance_)) {
     calendar_ = CalendarView_Create(window_, kCalendarView, RECT{0, 0, 0, 0});
   } else {
@@ -4091,8 +5482,11 @@ void Application::CreateControls() {
     }
   }
   HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-  for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_, replace_edit_,
-                       find_workspace_, replace_workspace_, find_case_, find_regex_, find_word_,
+  for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_,
+                       search_previous_, search_scope_, search_target_, search_count_, search_status_,
+                       search_replace_toggle_, search_details_toggle_, search_ignore_, search_hidden_,
+                       replace_edit_, find_workspace_, replace_workspace_, rollback_workspace_replace_,
+                       find_case_, find_regex_, find_word_,
                        find_include_glob_, find_exclude_glob_, replace_one_, replace_document_,
                        find_results_, git_panel_, calendar_details_, brand_, command_search_, tab_new_,
                        tab_close_, activity_buttons_[0], activity_buttons_[1], activity_buttons_[2],
@@ -4346,11 +5740,211 @@ void Application::UpdatePanelHeaders() {
     const auto* panel = panel_layout_.Find(id);
     const HWND header = panel_headers_[PanelIndex(id)];
     if (!panel || !header) continue;
-    const std::wstring text = PanelName(id);
+    const std::wstring text = id == PanelId::Explorer && active_activity_ == 1
+        ? L"検索" : PanelName(id);
     SetWindowTextW(header, text.c_str());
     if (ui_font_) SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(ui_font_), TRUE);
     InvalidateRect(header, nullptr, FALSE);
   }
+}
+
+void Application::DrawSearchScopeItem(const DRAWITEMSTRUCT& draw) const {
+  if (!draw.hDC || !draw.hwndItem) return;
+  const bool selection_field = (draw.itemState & ODS_COMBOBOXEDIT) != 0 ||
+      draw.itemID == static_cast<UINT>(-1);
+  const bool selected = !selection_field && (draw.itemState & ODS_SELECTED) != 0;
+  const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
+  const COLORREF background = high_contrast_
+      ? (selected ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW))
+      : selection_field ? theme_input_ : selected ? theme_accent_ : theme_surface_;
+  const COLORREF foreground = high_contrast_
+      ? (disabled ? GetSysColor(COLOR_GRAYTEXT) :
+         selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT))
+      : (disabled ? theme_muted_ : selected ? theme_selected_text_ : theme_foreground_);
+  HBRUSH background_brush = CreateSolidBrush(background);
+  if (background_brush) {
+    FillRect(draw.hDC, &draw.rcItem, background_brush);
+    DeleteObject(background_brush);
+  }
+
+  int item = draw.itemID == static_cast<UINT>(-1)
+      ? static_cast<int>(SendMessageW(search_scope_, CB_GETCURSEL, 0, 0))
+      : static_cast<int>(draw.itemID);
+  if (item >= 0) {
+    const LRESULT length = SendMessageW(search_scope_, CB_GETLBTEXTLEN, item, 0);
+    if (length >= 0 && length <= 128) {
+      std::wstring label(static_cast<std::size_t>(length) + 1, L'\0');
+      if (SendMessageW(search_scope_, CB_GETLBTEXT, item,
+                       reinterpret_cast<LPARAM>(label.data())) != CB_ERR) {
+        label.resize(static_cast<std::size_t>(length));
+        HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        const HGDIOBJ previous_font = SelectObject(draw.hDC, font);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, foreground);
+        RECT text = draw.rcItem;
+        text.left += ScaleDip(window_, 8);
+        text.right -= ScaleDip(window_, 8);
+        DrawTextW(draw.hDC, label.c_str(), -1, &text,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(draw.hDC, previous_font);
+      }
+    }
+  }
+  if ((draw.itemState & ODS_FOCUS) != 0) {
+    RECT focus = draw.rcItem;
+    InflateRect(&focus, -1, -1);
+    HBRUSH focus_brush = CreateSolidBrush(high_contrast_
+        ? GetSysColor(COLOR_WINDOWTEXT) : theme_accent_);
+    if (focus_brush) {
+      FrameRect(draw.hDC, &focus, focus_brush);
+      DeleteObject(focus_brush);
+    }
+  }
+}
+
+void Application::DrawSearchScopeArrow(HWND combo, HDC dc) const {
+  if (high_contrast_ || !combo || !IsWindow(combo) || !dc) return;
+  COMBOBOXINFO info{sizeof(info)};
+  if (!GetComboBoxInfo(combo, &info)) return;
+  RECT button = info.rcButton;
+  if (button.right <= button.left || button.bottom <= button.top) return;
+  HBRUSH fill = CreateSolidBrush(theme_input_);
+  if (fill) {
+    FillRect(dc, &button, fill);
+    DeleteObject(fill);
+  }
+  const int line_width = std::max(1, ScaleDip(window_, 1));
+  const COLORREF border_color = GetFocus() == combo ? theme_accent_ : theme_border_;
+  HPEN border = CreatePen(PS_SOLID, line_width, border_color);
+  if (border) {
+    const HGDIOBJ previous_pen = SelectObject(dc, border);
+    MoveToEx(dc, button.left, button.top + 1, nullptr);
+    LineTo(dc, button.left, button.bottom - 1);
+    MoveToEx(dc, button.left, button.top, nullptr);
+    LineTo(dc, button.right - 1, button.top);
+    LineTo(dc, button.right - 1, button.bottom - 1);
+    LineTo(dc, button.left, button.bottom - 1);
+    SelectObject(dc, previous_pen);
+    DeleteObject(border);
+  }
+  const int center_x = button.left + (button.right - button.left) / 2;
+  const int center_y = button.top + (button.bottom - button.top) / 2;
+  const int half = std::max(2, std::min<int>(ScaleDip(window_, 4), (button.bottom - button.top) / 4));
+  HPEN arrow = CreatePen(PS_SOLID, line_width, IsWindowEnabled(combo) ? theme_foreground_ : theme_muted_);
+  if (arrow) {
+    const HGDIOBJ previous_pen = SelectObject(dc, arrow);
+    MoveToEx(dc, center_x - half, center_y - half / 2, nullptr);
+    LineTo(dc, center_x, center_y + half / 2);
+    LineTo(dc, center_x + half, center_y - half / 2);
+    SelectObject(dc, previous_pen);
+    DeleteObject(arrow);
+  }
+}
+
+void Application::DrawSearchScopeFrame(HWND combo, HDC dc) const {
+  if (high_contrast_ || !combo || !IsWindow(combo) || !dc) return;
+  RECT client{};
+  if (!GetClientRect(combo, &client) || client.right <= client.left || client.bottom <= client.top) return;
+  const int border_width = 1;
+  const int edge_x = std::clamp(GetSystemMetrics(SM_CXEDGE), 1,
+                                std::max<int>(1, (client.right - client.left) / 3));
+  const int edge_y = std::clamp(GetSystemMetrics(SM_CYEDGE), 1,
+                                std::max<int>(1, (client.bottom - client.top) / 3));
+
+  HBRUSH fill = CreateSolidBrush(theme_input_);
+  if (fill) {
+    const RECT inner_bevel[] = {
+        {client.left + border_width, client.top + border_width,
+         client.right - border_width, std::min(client.bottom - border_width, client.top + border_width + edge_y)},
+        {client.left + border_width, std::max(client.top + border_width, client.bottom - border_width - edge_y),
+         client.right - border_width, client.bottom - border_width},
+        {client.left + border_width, client.top + border_width + edge_y,
+         std::min(client.right - border_width, client.left + border_width + edge_x),
+         std::max(client.top + border_width, client.bottom - border_width - edge_y)},
+        {std::max(client.left + border_width, client.right - border_width - edge_x),
+         client.top + border_width + edge_y, client.right - border_width,
+         std::max(client.top + border_width, client.bottom - border_width - edge_y)},
+    };
+    for (const auto& area : inner_bevel)
+      if (area.right > area.left && area.bottom > area.top) FillRect(dc, &area, fill);
+    DeleteObject(fill);
+  }
+
+  HBRUSH border = CreateSolidBrush(GetFocus() == combo ? theme_accent_ : theme_border_);
+  if (border) {
+    FrameRect(dc, &client, border);
+    DeleteObject(border);
+  }
+}
+
+void Application::DrawSearchCheckbox(HWND checkbox) const {
+  if (high_contrast_ || !checkbox || !IsWindow(checkbox)) return;
+  RECT client{};
+  if (!GetClientRect(checkbox, &client)) return;
+  HDC dc = GetDC(checkbox);
+  if (!dc) return;
+  if (surface_brush_) FillRect(dc, &client, surface_brush_);
+  const bool disabled = !IsWindowEnabled(checkbox);
+  const bool pressed = (SendMessageW(checkbox, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
+  const LRESULT state = SendMessageW(checkbox, BM_GETCHECK, 0, 0);
+  const int height = client.bottom - client.top;
+  const int side = std::min(ScaleDip(window_, 14), std::max(1, height - ScaleDip(window_, 4)));
+  const int margin = ScaleDip(window_, 2);
+  RECT glyph{client.left + margin, client.top + (height - side) / 2,
+             client.left + margin + side, client.top + (height - side) / 2 + side};
+  const bool checked = state == BST_CHECKED || state == BST_INDETERMINATE;
+  const COLORREF glyph_fill = checked
+      ? (disabled ? theme_surface_alt_ : theme_accent_)
+      : (pressed ? theme_surface_alt_ : theme_input_);
+  HBRUSH glyph_brush = CreateSolidBrush(glyph_fill);
+  if (glyph_brush) {
+    FillRect(dc, &glyph, glyph_brush);
+    DeleteObject(glyph_brush);
+  }
+  HBRUSH glyph_border = CreateSolidBrush(disabled ? theme_muted_ : theme_border_);
+  if (glyph_border) {
+    FrameRect(dc, &glyph, glyph_border);
+    DeleteObject(glyph_border);
+  }
+  if (checked) {
+    HPEN mark = CreatePen(PS_SOLID, std::max(1, ScaleDip(window_, 2)),
+                          disabled ? theme_muted_ : theme_selected_text_);
+    if (mark) {
+      const HGDIOBJ previous_pen = SelectObject(dc, mark);
+      if (state == BST_INDETERMINATE) {
+        const int y = glyph.top + (glyph.bottom - glyph.top) / 2;
+        MoveToEx(dc, glyph.left + ScaleDip(window_, 3), y, nullptr);
+        LineTo(dc, glyph.right - ScaleDip(window_, 3), y);
+      } else {
+        MoveToEx(dc, glyph.left + ScaleDip(window_, 3), glyph.top + side / 2, nullptr);
+        LineTo(dc, glyph.left + side / 2 - ScaleDip(window_, 1), glyph.bottom - ScaleDip(window_, 3));
+        LineTo(dc, glyph.right - ScaleDip(window_, 2), glyph.top + ScaleDip(window_, 3));
+      }
+      SelectObject(dc, previous_pen);
+      DeleteObject(mark);
+    }
+  }
+  wchar_t label[256]{};
+  GetWindowTextW(checkbox, label, static_cast<int>(std::size(label)));
+  RECT text{glyph.right + ScaleDip(window_, 5), client.top,
+            client.right, client.bottom};
+  HFONT font = ui_font_ ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  const HGDIOBJ previous_font = SelectObject(dc, font);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, disabled ? theme_muted_ : theme_foreground_);
+  DrawTextW(dc, label, -1, &text,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+  if (GetFocus() == checkbox) {
+    RECT focus = text;
+    InflateRect(&focus, -1, -1);
+    HBRUSH focus_brush = CreateSolidBrush(theme_accent_);
+    if (focus_brush) {
+      FrameRect(dc, &focus, focus_brush);
+      DeleteObject(focus_brush);
+    }
+  }
+  SelectObject(dc, previous_font);
+  ReleaseDC(checkbox, dc);
 }
 
 void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
@@ -4466,7 +6060,11 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     if (focused) stroke(rect, theme_accent_);
     return;
   }
-  if (draw.hwndItem == git_refresh_ || draw.hwndItem == git_stage_ ||
+  if (draw.hwndItem == find_next_ || draw.hwndItem == search_previous_ ||
+      draw.hwndItem == search_replace_toggle_ || draw.hwndItem == search_details_toggle_ ||
+      draw.hwndItem == replace_one_ || draw.hwndItem == replace_document_ ||
+      draw.hwndItem == replace_workspace_ || draw.hwndItem == rollback_workspace_replace_ ||
+      draw.hwndItem == git_refresh_ || draw.hwndItem == git_stage_ ||
       draw.hwndItem == git_unstage_ || draw.hwndItem == git_diff_ ||
       draw.hwndItem == git_commit_ || draw.hwndItem == git_trust_ ||
       draw.hwndItem == calendar_daily_ || draw.hwndItem == calendar_details_toggle_) {
@@ -4533,9 +6131,11 @@ void Application::DrawChromeButton(const DRAWITEMSTRUCT& draw) const {
     DrawUiIcon(dc, {rect.right - ScaleDip(window_, 56), center_y - side / 2,
                    rect.right - ScaleDip(window_, 56) + side, center_y + side / 2},
                UiIcon::More, theme_muted_);
-    DrawUiIcon(dc, {rect.right - ScaleDip(window_, 27), center_y - side / 2,
-                   rect.right - ScaleDip(window_, 27) + side, center_y + side / 2},
-               UiIcon::ChevronDown, theme_muted_);
+     const UiIcon panel_action = id_panel == PanelId::Explorer && active_activity_ == 1
+         ? UiIcon::Close : UiIcon::ChevronDown;
+     DrawUiIcon(dc, {rect.right - ScaleDip(window_, 27), center_y - side / 2,
+                    rect.right - ScaleDip(window_, 27) + side, center_y + side / 2},
+                panel_action, theme_muted_);
     if (focused) stroke(rect, theme_accent_);
   }
 }
@@ -4682,8 +6282,7 @@ void Application::LayoutControls() {
   MoveWindow(command_search_, search_x, search_y, search_width, search_height, TRUE);
   ShowWindow(brand_, client.right >= ScaleDip(window_, 300) ? SW_SHOW : SW_HIDE);
   ShowWindow(command_search_, search_width >= ScaleDip(window_, 140) ? SW_SHOW : SW_HIDE);
-  const bool find_visible = IsWindowVisible(find_bar_) != FALSE;
-  const bool results_visible = IsWindowVisible(find_results_) != FALSE;
+  const bool find_visible = active_activity_ == 1;
   const auto state_for_slot = [&](PanelSlot slot) -> const PanelState* {
     for (const auto& panel : panel_layout_.panels())
       if (panel.slot == slot) return &panel;
@@ -4697,7 +6296,7 @@ void Application::LayoutControls() {
   };
   const auto control_for = [&](PanelId id) {
     switch (id) {
-      case PanelId::Explorer: return workspace_tree_;
+      case PanelId::Explorer: return find_visible ? find_bar_ : workspace_tree_;
       case PanelId::Calendar: return calendar_;
       case PanelId::Outline: return outline_;
       case PanelId::Git: return git_panel_;
@@ -4758,6 +6357,13 @@ void Application::LayoutControls() {
     ShowWindow(control_for(panel.id), SW_HIDE);
     ShowWindow(header_for(panel.id), SW_HIDE);
   }
+  for (HWND control : {workspace_tree_, find_bar_, find_edit_, find_next_, search_previous_,
+                       search_scope_, search_target_, search_count_, search_replace_toggle_, search_details_toggle_,
+                       search_status_, replace_edit_, find_workspace_, replace_workspace_,
+                       rollback_workspace_replace_, find_case_,
+                       find_regex_, find_word_, find_include_glob_, find_exclude_glob_, replace_one_,
+                       replace_document_, find_results_, search_ignore_, search_hidden_})
+    ShowWindow(control, SW_HIDE);
   for (HWND control : {calendar_details_, calendar_summary_, calendar_daily_, calendar_details_toggle_,
                        git_files_, git_diff_view_, git_commit_edit_, git_refresh_, git_stage_,
                        git_unstage_, git_diff_, git_commit_, git_trust_})
@@ -4826,7 +6432,96 @@ void Application::LayoutControls() {
       return MeasurePanelTextHeight(item, inner_width -
           (item == git_panel_ ? GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(window_)) + gap : 0));
     };
-    if (panel->id == PanelId::Calendar) {
+    if (panel->id == PanelId::Explorer && find_visible) {
+      const int compact_gap = ScaleDip(window_, 4);
+      const int row_height = ScaleDip(window_, 24);
+      const int input_height = ScaleDip(window_, 26);
+      const int find_input_height = ScaleDip(window_, 52);
+      const auto place_search = [&](HWND item, int item_x, int item_top, int item_width,
+                                    int item_height, bool visible = true) {
+        const int clipped = std::min(std::max(0, item_height), std::max(0, bottom - item_top));
+        MoveWindow(item, item_x, item_top, std::max(0, item_width), clipped, TRUE);
+        ShowWindow(item, visible && item_width > 0 && clipped > 0 ? SW_SHOW : SW_HIDE);
+      };
+      int top = content_top + padding;
+      const int scope_width = std::min(inner_width / 2, ScaleDip(window_, 144));
+      place_search(search_scope_, inner_x, top, scope_width, row_height);
+      place_search(search_target_, inner_x + scope_width + compact_gap, top,
+                   std::max(0, inner_width - scope_width - compact_gap), row_height);
+      top += row_height + compact_gap;
+      place_search(find_edit_, inner_x, top, inner_width, find_input_height);
+      top += find_input_height + compact_gap;
+      const int nav_width = std::min(ScaleDip(window_, 58), std::max(0, (inner_width - compact_gap) / 2));
+      place_search(search_previous_, inner_x, top, nav_width, row_height);
+      place_search(find_next_, inner_x + nav_width + compact_gap, top, nav_width, row_height);
+      place_search(search_count_, inner_x + (nav_width + compact_gap) * 2, top,
+                   std::max(0, inner_width - (nav_width + compact_gap) * 2), row_height);
+      top += row_height + compact_gap;
+      const int case_width = std::min(ScaleDip(window_, 84), inner_width / 3);
+      const int word_width = std::min(ScaleDip(window_, 62), inner_width / 3);
+      const int regex_width = std::max(0, inner_width - case_width - word_width - compact_gap * 2);
+      place_search(find_case_, inner_x, top, case_width, row_height);
+      place_search(find_word_, inner_x + case_width + compact_gap, top, word_width, row_height);
+      place_search(find_regex_, inner_x + case_width + word_width + compact_gap * 2, top,
+                   regex_width, row_height);
+      top += row_height + compact_gap;
+      SetWindowTextW(search_replace_toggle_, search_replace_expanded_ ? L"置換を隠す ▾" : L"置換を表示 ▸");
+      place_search(search_replace_toggle_, inner_x, top, inner_width, row_height);
+      top += row_height + compact_gap;
+      if (search_replace_expanded_) {
+        place_search(replace_edit_, inner_x, top, inner_width, input_height);
+        top += input_height + compact_gap;
+        const int half = std::max(0, (inner_width - compact_gap) / 2);
+        const int action_height = row_height;
+        SetWindowTextW(replace_one_, search_scope_state_ == SearchScope::Workspace
+            ? L"結果を1件" : L"この1件を置換");
+        SetWindowTextW(replace_document_, search_scope_state_ == SearchScope::Workspace
+            ? L"選択ファイル" : L"文書を全置換");
+        SetWindowTextW(replace_workspace_, L"Workspace全体をPreview…");
+        place_search(replace_one_, inner_x, top, half, action_height);
+        place_search(replace_document_, inner_x + half + compact_gap, top,
+                     inner_width - half - compact_gap, action_height);
+        top += action_height + compact_gap;
+        place_search(replace_workspace_, inner_x, top, inner_width, action_height,
+                     search_scope_state_ == SearchScope::Workspace);
+        top += action_height + compact_gap;
+        place_search(rollback_workspace_replace_, inner_x, top, inner_width, action_height);
+        top += action_height + compact_gap;
+      }
+      SetWindowTextW(search_details_toggle_, search_details_expanded_ ? L"対象の詳細を隠す ▾" : L"対象の詳細 ▸");
+      place_search(search_details_toggle_, inner_x, top, inner_width, row_height);
+      top += row_height + compact_gap;
+      if (search_details_expanded_) {
+        const bool side_by_side = inner_width >= ScaleDip(window_, 300);
+        if (side_by_side) {
+          const int half = std::max(0, (inner_width - compact_gap) / 2);
+          place_search(find_include_glob_, inner_x, top, half, input_height);
+          place_search(find_exclude_glob_, inner_x + half + compact_gap, top,
+                       inner_width - half - compact_gap, input_height);
+          top += input_height + compact_gap;
+          const int check_width = std::max(0, (inner_width - compact_gap) / 2);
+          place_search(search_ignore_, inner_x, top, check_width, row_height);
+          place_search(search_hidden_, inner_x + check_width + compact_gap, top,
+                       inner_width - check_width - compact_gap, row_height);
+        } else {
+          place_search(find_include_glob_, inner_x, top, inner_width, input_height);
+          top += input_height + compact_gap;
+          place_search(find_exclude_glob_, inner_x, top, inner_width, input_height);
+          top += input_height + compact_gap;
+          place_search(search_ignore_, inner_x, top, inner_width, row_height);
+          top += row_height + compact_gap;
+          place_search(search_hidden_, inner_x, top, inner_width, row_height);
+        }
+        top += row_height + compact_gap;
+      }
+      const int status_height = ScaleDip(window_, 34);
+      place_search(search_status_, inner_x, top, inner_width, status_height);
+      // The compact count remains on the navigation row; the explanatory and
+      // error states occupy the full row immediately above the result tree.
+      place_search(find_results_, x, top + status_height + compact_gap, width,
+                   std::max(0, bottom - top - status_height - compact_gap));
+      return;
+    } else if (panel->id == PanelId::Calendar) {
       const int summary_height = text_height(calendar_summary_);
       const bool wide = inner_width >= ScaleDip(window_, 240);
       const int actions_height = wide ? button_height : button_height * 2;
@@ -4920,81 +6615,17 @@ void Application::LayoutControls() {
   const int center_left = rail_width + tree_width + (want_tree ? splitter_width : 0);
   const int center_width = std::max(0L, client.right - center_left - outline_width -
       (want_outline ? splitter_width : 0));
-  const int compact_find_width = ScaleDip(window_, kFindCompactWidth);
-  const bool compact_find = center_width < compact_find_width;
-  const int find_height = ScaleDip(window_, find_visible ? (compact_find ? 64 : kFindHeight) : 0);
-  const int results_height = ScaleDip(window_, kFindResultsHeight);
-  const int padding = ScaleDip(window_, 8);
-  const int gap = ScaleDip(window_, 4);
-  const int input_height = ScaleDip(window_, 24);
-  const int button_height = ScaleDip(window_, 25);
-  const int minimum_input_width = ScaleDip(window_, 80);
-  const int base_button_width = ScaleDip(window_, 100);
-  const bool show_advanced_find = find_visible && !compact_find;
-  const bool show_workspace_actions = show_advanced_find && center_width >= ScaleDip(window_, 720);
-  const bool show_globs = show_advanced_find && center_width >= ScaleDip(window_, 600);
-  auto place = [](HWND control, int x, int y, int width, int height, bool visible) {
-    if (!control) return;
-    MoveWindow(control, x, y, std::max(0, width), std::max(0, height), TRUE);
-    ShowWindow(control, visible && width > 0 && height > 0 ? SW_SHOW : SW_HIDE);
-  };
-  const int option_cluster = show_advanced_find ? ScaleDip(window_, 72 + 62 + 58 + 8) : 0;
-  const int first_row_available = std::max(0, center_width - padding * 2);
-  const int button_width = std::min(base_button_width,
-                                    std::max(0, first_row_available - minimum_input_width -
-                                                   option_cluster - gap * 2));
-  const int input_width = std::max(0, first_row_available - button_width - option_cluster - gap * 2);
   const int center_top = topbar_height;
   const int tab_action_width = ScaleDip(window_, 68);
   const int tab_strip_width = std::max(0, center_width - tab_action_width);
   MoveWindow(tabs_, center_left, center_top, tab_strip_width, tab_height, TRUE);
-  place(tab_close_, center_left + tab_strip_width, center_top,
-        ScaleDip(window_, 34), tab_height, true);
-  place(tab_new_, center_left + tab_strip_width + ScaleDip(window_, 34), center_top,
-        ScaleDip(window_, 34), tab_height, true);
-  MoveWindow(find_bar_, center_left, center_top + tab_height, center_width,
-             find_visible ? find_height : 0, TRUE);
-  place(find_edit_, center_left + padding, center_top + tab_height + ScaleDip(window_, 4), input_width,
-        input_height, find_visible);
-  const int find_next_x = center_left + padding + input_width + gap;
-  place(find_next_, find_next_x, center_top + tab_height + ScaleDip(window_, 3), button_width,
-        button_height, find_visible);
-  int option_x = find_next_x + button_width + gap;
-  place(find_case_, option_x, center_top + tab_height + ScaleDip(window_, 5), ScaleDip(window_, 72),
-        ScaleDip(window_, 22), show_advanced_find);
-  option_x += ScaleDip(window_, 72) + gap;
-  place(find_regex_, option_x, center_top + tab_height + ScaleDip(window_, 5), ScaleDip(window_, 62),
-        ScaleDip(window_, 22), show_advanced_find);
-  option_x += ScaleDip(window_, 62) + gap;
-  place(find_word_, option_x, center_top + tab_height + ScaleDip(window_, 5), ScaleDip(window_, 58),
-        ScaleDip(window_, 22), show_advanced_find);
-  const int replacement_cluster = show_workspace_actions ?
-      ScaleDip(window_, 82 + 92 + 118 + 12) : ScaleDip(window_, 82);
-  const int replacement_width = std::max(0, first_row_available - replacement_cluster - gap);
-  place(replace_edit_, center_left + padding, center_top + tab_height + ScaleDip(window_, 36), replacement_width,
-        input_height, find_visible);
-  int replace_x = center_left + padding + replacement_width + gap;
-  place(replace_one_, replace_x, center_top + tab_height + ScaleDip(window_, 35), ScaleDip(window_, 82),
-        button_height, find_visible);
-  replace_x += ScaleDip(window_, 82) + gap;
-  place(replace_document_, replace_x, center_top + tab_height + ScaleDip(window_, 35), ScaleDip(window_, 92),
-        button_height, show_workspace_actions);
-  replace_x += ScaleDip(window_, 92) + gap;
-  place(replace_workspace_, replace_x, center_top + tab_height + ScaleDip(window_, 35), ScaleDip(window_, 118),
-        button_height, show_workspace_actions);
-  const int glob_button_width = show_workspace_actions ? base_button_width : 0;
-  const int glob_width = show_globs ? std::max(0, (center_width - padding * 2 - glob_button_width - gap * 2) / 2) : 0;
-  place(find_include_glob_, center_left + padding, center_top + tab_height + ScaleDip(window_, 66), glob_width,
-        input_height, show_globs);
-  place(find_exclude_glob_, center_left + padding + glob_width + gap,
-        center_top + tab_height + ScaleDip(window_, 66), glob_width, input_height, show_globs);
-  place(find_workspace_, center_left + center_width - padding - glob_button_width,
-        center_top + tab_height + ScaleDip(window_, 65), glob_button_width, button_height,
-        show_workspace_actions);
-  const int results_top = tab_height + (find_visible ? find_height : 0);
-  MoveWindow(find_results_, center_left, center_top + results_top, center_width,
-             results_visible ? results_height : 0, TRUE);
-  const int editor_top = center_top + results_top + (results_visible ? results_height : 0);
+  MoveWindow(tab_close_, center_left + tab_strip_width, center_top,
+             ScaleDip(window_, 34), tab_height, TRUE);
+  ShowWindow(tab_close_, SW_SHOW);
+  MoveWindow(tab_new_, center_left + tab_strip_width + ScaleDip(window_, 34), center_top,
+             ScaleDip(window_, 34), tab_height, TRUE);
+  ShowWindow(tab_new_, SW_SHOW);
+  const int editor_top = center_top + tab_height;
   for (auto& view : documents_) {
     if (view->editor && GetParent(view->editor) == window_) {
       MoveWindow(view->editor, center_left, editor_top, center_width,
@@ -5156,10 +6787,6 @@ void Application::QuickOpen() {
 
 void Application::OpenWorkspace(const std::filesystem::path& path) {
   TestStartupPhase startup_trace(TestStartupPhaseId::Workspace);
-  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
-  ++workspace_search_generation_;
-  workspace_search_due_ = 0;
-  workspace_search_started_ = false;
   std::error_code error;
   const auto absolute = std::filesystem::weakly_canonical(path, error);
   if (error || !std::filesystem::is_directory(absolute)) {
@@ -5173,6 +6800,11 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
       MessageBoxW(window_, launch_error.c_str(), L"Workspaceを開けません", MB_ICONERROR);
     return;
   }
+  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
+  ++workspace_search_generation_;
+  workspace_search_due_ = 0;
+  workspace_search_started_ = false;
+  ClearSearchResults();
   HANDLE new_mutex = CreateMutexW(nullptr, FALSE, WorkspaceMutexName(absolute).c_str());
   if (new_mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
     if (new_mutex) CloseHandle(new_mutex);
@@ -5183,6 +6815,7 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
   if (workspace_mutex_) CloseHandle(workspace_mutex_);
   workspace_mutex_ = new_mutex;
   workspace_ = absolute;
+  latest_closed_replace_journal_.clear();
   git_panel_status_ = {};
   git_status_workspace_ = workspace_;
   SessionState session;
@@ -5289,6 +6922,8 @@ void Application::OpenWorkspace(const std::filesystem::path& path) {
   }
   if (restored_autosave_pending) SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
   RunGitStatus();
+  UpdateSearchPanelLabels();
+  if (!ControlText(find_edit_).empty()) ScheduleSearch();
 }
 
 void Application::PopulateWorkspaceTree(bool refresh_calendar_index) {
@@ -5587,6 +7222,8 @@ void Application::ActivateDocument(std::size_t index) {
     }
     target.presentation_due = 0;
   }
+  if (previous_active_document < documents_.size() && previous_active_document != index)
+    ReleaseSearchTableSource(*documents_[previous_active_document]);
   active_document_ = index;
   TabCtrl_SetCurSel(tabs_, static_cast<int>(index));
   for (std::size_t i = 0; i < documents_.size(); ++i) {
@@ -5605,6 +7242,9 @@ void Application::ActivateDocument(std::size_t index) {
     RestoreEditorViewState(target);
     target.suspended_view_state_valid = false;
   }
+  UpdateSearchPanelLabels();
+  if (search_scope_state_ == SearchScope::CurrentFile && !ControlText(find_edit_).empty())
+    ScheduleSearch();
   UpdateStatus();
 }
 
@@ -5620,6 +7260,7 @@ bool Application::EnsureEditor(DocumentView& view) {
                                 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kEditor),
                                 instance_, nullptr);
   if (!view.editor) return false;
+  ThemeSlimScrollbars(view.editor, theme_editor_, theme_border_, high_contrast_);
   // RichEdit's default user-entry limit is 32,767 characters even when a
   // larger plain-text document can be loaded. Keep the full supported source
   // editable; Document loading and editor coordinates are already bounded by
@@ -5822,7 +7463,8 @@ bool Application::SuspendEditor(DocumentView& view) {
 Application::DocumentView* Application::FindDocumentView(HWND editor) {
   if (!editor) return nullptr;
   const auto found = std::ranges::find_if(documents_, [editor](const auto& view) {
-    return view->editor == editor;
+    return view->editor == editor || view->table_parent_editor == editor ||
+        std::ranges::any_of(view->table_viewports, [&](const auto& viewport) { return viewport->editor == editor; });
   });
   return found == documents_.end() ? nullptr : found->get();
 }
@@ -5830,7 +7472,7 @@ Application::DocumentView* Application::FindDocumentView(HWND editor) {
 void Application::SelectDocumentForEditor(HWND editor) {
   if (!editor) return;
   for (std::size_t index = 0; index < documents_.size(); ++index) {
-    if (documents_[index]->editor != editor || active_document_ == index) continue;
+    if (FindDocumentView(editor) != documents_[index].get() || active_document_ == index) continue;
     active_document_ = index;
     TabCtrl_SetCurSel(tabs_, static_cast<int>(index));
     RebuildOutline(*documents_[index]);
@@ -5865,7 +7507,13 @@ bool Application::CloseDocument(std::size_t index) {
     DestroyWindow(view.compact_window);
     view.compact_window = nullptr;
   }
+  ReleaseSearchTableSource(view);
+  const auto closing_path = view.document.path();
   if (view.editor) DestroyWindow(view.editor);
+  search_content_hash_cache_.erase(SearchPathKey(closing_path));
+  std::erase_if(search_highlight_states_, [&](const auto& entry) {
+    return SameSearchPath(entry.second.path, closing_path);
+  });
   view.editor = nullptr;
   view.editor_formatting_rect_request.reset();
   TabCtrl_DeleteItem(tabs_, static_cast<int>(index));
@@ -5877,6 +7525,8 @@ bool Application::CloseDocument(std::size_t index) {
   } else {
     ActivateDocument(std::min(index, documents_.size() - 1));
   }
+  UpdateSearchPanelLabels();
+  if (!ControlText(find_edit_).empty()) ScheduleSearch();
   SaveSession();
   return true;
 }
@@ -5960,6 +7610,11 @@ Application::SaveResult Application::SaveDocumentAs(DocumentView& view) {
   view.autosave_due = 0;
   view.recovery_due = 0;
   UpdateStatus();
+  if (!SameSearchPath(old_path, view.document.path())) {
+    search_content_hash_cache_.erase(SearchPathKey(old_path));
+    search_content_hash_cache_.erase(SearchPathKey(view.document.path()));
+    ScheduleSearch();
+  }
   return SaveResult::Saved;
 }
 
@@ -5986,6 +7641,15 @@ void Application::ReloadDocumentFromDisk() {
     MessageBoxW(window_, error.c_str(), L"再読込みできません", MB_ICONWARNING);
     return;
   }
+  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
+  for (auto& retired : retired_search_workers_)
+    if (retired.worker.joinable()) retired.worker.request_stop();
+  ++workspace_search_generation_;
+  workspace_search_due_ = 0;
+  pending_search_navigation_ = 0;
+  workspace_search_started_ = false;
+  search_content_hash_cache_.erase(SearchPathKey(view.document.path()));
+  ClearSearchResults();
   const auto selection = view.editor && IsWindow(view.editor)
       ? CaptureSourceSelection(view.editor, view.editor_snapshot)
       : view.suspended_selection;
@@ -6008,6 +7672,7 @@ void Application::ReloadDocumentFromDisk() {
   }
   if (!view.editor_projection_invalid) ApplyMarkdownPresentation(view, true, selection);
   RebuildOutline(view);
+  ScheduleSearch();
   UpdateStatus();
 }
 
@@ -6120,6 +7785,7 @@ void Application::OnEditorChanged(HWND editor) {
     view->autosave_due = settings_.auto_save ? now + settings_.auto_save_delay_ms : 0;
     if (view->recovery_due == 0) view->recovery_due = now + kRecoveryDelayMs;
     SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
+    if (!ControlText(find_edit_).empty()) ScheduleSearch();
     UpdateStatus();
     break;
   }
@@ -6179,7 +7845,7 @@ void Application::ApplyActiveLinePresentation(DocumentView& view) {
   const std::uint64_t revision = view.document.revision();
   if (!IsWindow(view.editor) || view.ime_composing || view.native_edit_in_flight ||
       view.native_edit_pending || view.sync_due != 0 || view.presentation_due != 0 ||
-      suppress_editor_change_ || !IsMarkdownFile(view.document.path()) ||
+      suppress_editor_change_ || view.table_source_mode || !IsMarkdownFile(view.document.path()) ||
       view.presentation_revision != revision) return;
 
   const SourceSelection selection = CaptureSourceSelection(view.editor, view.editor_snapshot);
@@ -6203,6 +7869,24 @@ void Application::ApplyActiveLinePresentation(DocumentView& view) {
       SourceLineRange(view.document.text(), previous_source_begin);
   (void)previous_source_begin_checked;
 
+  const auto line_has_presentation = [&](std::size_t begin, std::size_t end) {
+    return std::ranges::any_of(view.parse.spans, [&](const StyleSpan& span) {
+      return span.begin >= begin && span.begin < end &&
+          (span.kind == SpanKind::HeadingMarker || span.kind == SpanKind::EmphasisMarker ||
+           span.kind == SpanKind::ListMarker || span.kind == SpanKind::CodeFence);
+    }) || std::ranges::any_of(view.parse.blocks, [&](const MarkdownBlock& block) {
+      return block.begin >= begin && block.begin < end &&
+          (block.kind == BlockKind::BulletListItem || block.kind == BlockKind::TaskListItem);
+    });
+  };
+  if (!line_has_presentation(previous_source_begin, previous_source_end) &&
+      !line_has_presentation(active_source_begin, active_source_end)) {
+    view.active_source_line_begin = active_source_begin;
+    view.active_line = active_line;
+    return;
+  }
+
+  RichEditCaretPaintGuard caret_paint(view.editor);
   ScopedEditorChangeSuppression suppression(suppress_editor_change_);
   PresentationUndoGuard undo_guard(view.editor);
   if (!undo_guard) return;
@@ -6229,6 +7913,9 @@ void Application::ApplyActiveLinePresentation(DocumentView& view) {
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   const auto apply_marker_spans = [&](std::size_t line_begin, std::size_t line_end,
                                       bool active) {
+    if (std::ranges::any_of(view.parse.tables, [&](const GfmTable& table) {
+          return line_begin >= table.begin && line_begin <= table.end;
+        })) active = false;
     auto span = std::lower_bound(view.parse.spans.begin(), view.parse.spans.end(), line_begin,
         [](const StyleSpan& candidate, std::size_t begin) { return candidate.begin < begin; });
     for (; span != view.parse.spans.end() && span->begin < line_end; ++span) {
@@ -6318,7 +8005,7 @@ void Application::ApplyActiveLinePresentation(DocumentView& view) {
   apply_list_blocks(active_source_begin, active_source_end, true);
   apply_ragged_row(active_source_begin, true);
 
-  RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
+  if (changed) RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
   SendMessageW(view.editor, WM_SETREDRAW, TRUE, 0);
   view.active_source_line_begin = active_source_begin;
   view.active_line = active_line;
@@ -6330,6 +8017,7 @@ void Application::ApplyActiveLinePresentation(DocumentView& view) {
                              static_cast<int>(client.top), static_cast<int>(client.bottom));
     InvalidateRect(view.editor, &invalid, FALSE);
   }
+  ApplyDocumentSearchHighlights(view);
 }
 
 SourceSelection Application::CaptureSourceSelection(HWND editor,
@@ -6461,10 +8149,24 @@ RichEditTableStyle Application::TableStyleForEditor(HWND editor) const {
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
   RichEditTableStyle style;
   style.available_width_twips = MulDiv(available_width, 1440, dpi);
-  style.minimum_cell_width_twips =
-      std::max<LONG>(800, static_cast<LONG>(settings_.font_size_pt) * 20 * 6);
-  style.cell_margin_twips = ScaleDip(window_, kTableCellPadding / 2) * 15;
+  style.minimum_cell_width_twips = MulDiv(static_cast<LONG>(settings_.font_size_pt), 95, 1);
+  style.maximum_cell_width_twips = static_cast<LONG>(settings_.font_size_pt) * 640;
+  style.cell_margin_twips = 90;
+  style.row_padding_twips = 45;
   style.font_size_half_points = static_cast<LONG>(settings_.font_size_pt) * 2;
+  style.font_face = settings_.font_face;
+  for (const auto& document : documents_) {
+    if (document->editor != editor) continue;
+    style.layout_footprint = !document->active_table_viewport && !document->table_source_mode;
+    if (style.layout_footprint) {
+      for (const auto& viewport : document->table_viewports) {
+        auto heights = viewport->row_heights_twips;
+        if (!heights.empty()) heights.front() += kTableOperationBandDip * 15;
+        style.row_heights_twips[viewport->source_begin] = std::move(heights);
+      }
+    }
+    break;
+  }
   style.border_color = theme_border_;
   style.header_background = ThemeColor(settings_, L"table_header_background",
                                         dark ? RGB(31, 40, 52) : RGB(231, 236, 242));
@@ -6477,6 +8179,9 @@ Application::EditorProjectionRebuildResult Application::RebuildEditorProjection(
     DocumentView& view, EditorSnapshot target, SourceSelection selection) {
   if (view.editor_projection_invalid || !view.editor || !IsWindow(view.editor))
     return EditorProjectionRebuildResult::Failed;
+  if (view.table_source_mode) target = BuildNativeTextEditorSnapshot(view.document.text());
+  else if (view.active_table_viewport) target = NativeSnapshotForView(view, view.document.text());
+  RichEditCaretPaintGuard caret_paint(view.editor);
   ScopedEditorChangeSuppression suppression(suppress_editor_change_);
   PresentationUndoGuard undo_guard(view.editor);
   if (!undo_guard) {
@@ -6741,7 +8446,7 @@ bool Application::SyncDocumentFromEditor(DocumentView& view) {
     UpdateStatus();
     return true;
   }
-  auto target_native = NativeSnapshotFor(view.document.path(), transaction.source);
+  auto target_native = NativeSnapshotForView(view, transaction.source);
   const bool table_topology_same = SameNativeTableTopology(before_native_snapshot, target_native);
   const bool target_native_mapped = table_topology_same &&
       RefreshRichEditTableCoordinates(target_native, current_native_text);
@@ -6805,6 +8510,7 @@ bool Application::SyncDocumentFromEditor(DocumentView& view) {
   }
   bool projection_verified = true;
   {
+    RichEditCaretPaintGuard caret_paint(view.editor);
     ScopedEditorChangeSuppression suppression(suppress_editor_change_);
     PresentationUndoGuard undo_guard(view.editor);
     if (!undo_guard) {
@@ -7004,7 +8710,7 @@ bool Application::ApplySourceTextWithUndo(DocumentView& view, std::wstring text,
       : was_suspended && stored_view_state_valid
           ? stored_selection
           : CaptureSourceSelection(view.editor, view.editor_snapshot);
-  auto target_native = NativeSnapshotFor(view.document.path(), text);
+  auto target_native = NativeSnapshotForView(view, text);
   std::optional<DocumentView::SourceEdit> history_entry;
   if (record_history) {
     const auto& before = view.document.text();
@@ -7159,8 +8865,15 @@ bool Application::InsertTextIntoPendingVirtualTableCell(
   const auto target = *view.pending_virtual_table_cell;
   view.pending_virtual_table_cell.reset();
   view.pending_table_high_surrogate = 0;
+  std::wstring encoded;
+  std::size_t backslashes{};
+  for (const auto character : text) {
+    if (character == L'|' && backslashes % 2 == 0) encoded += L'\\';
+    encoded += character;
+    backslashes = character == L'\\' ? backslashes + 1 : 0;
+  }
   const auto edit = InsertTextIntoMissingTableCell(view.document.text(), target.row_begin,
-                                                    target.column, text);
+                                                    target.column, encoded);
   if (!edit.changed) return false;
   const bool applied = ApplySourceTextWithUndo(
       view, edit.text, true, SourceSelection{edit.selection, edit.selection}, selection_before,
@@ -7499,6 +9212,7 @@ void Application::ApplyMarkdownPresentation(
     std::optional<SourceSelection> source_selection) {
   if (view.editor_projection_invalid || view.native_readback_failed) return;
   if (!IsMarkdownFile(view.document.path())) return;
+  if (view.table_source_mode) return;
   if (view.ime_composing) return;
   if (view.sync_due != 0) return;
   if (!view.editor || !IsWindow(view.editor)) {
@@ -7533,6 +9247,7 @@ void Application::ApplyMarkdownPresentation(
   const bool dark = settings_.theme == ThemeMode::Dark ||
                     (settings_.theme == ThemeMode::System && SystemUsesDarkTheme());
 
+  RichEditCaretPaintGuard caret_paint(view.editor);
   ScopedEditorChangeSuppression suppression(suppress_editor_change_);
   PresentationUndoGuard undo_guard(view.editor);
   if (!undo_guard) return;
@@ -7544,11 +9259,10 @@ void Application::ApplyMarkdownPresentation(
     SendMessageW(view.editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&formatting_rect));
     const LONG available_width = std::max<LONG>(1, formatting_rect.right - formatting_rect.left);
     const LONG dpi = static_cast<LONG>(std::max<UINT>(1, GetDpiForWindow(window_)));
-    RichEditTableStyle table_style;
+    RichEditTableStyle table_style = TableStyleForEditor(view.editor);
     table_style.available_width_twips = MulDiv(available_width, 1440, dpi);
-    table_style.minimum_cell_width_twips =
-        std::max<LONG>(800, static_cast<LONG>(settings_.font_size_pt) * 20 * 6);
-    table_style.cell_margin_twips = ScaleDip(window_, 6) * 15;
+    table_style.minimum_cell_width_twips = static_cast<LONG>(settings_.font_size_pt) * 95;
+    table_style.cell_margin_twips = 90;
     table_style.font_size_half_points = static_cast<LONG>(settings_.font_size_pt) * 2;
     table_style.border_color = theme_border_;
     table_style.header_background = ThemeColor(settings_, L"table_header_background",
@@ -7735,7 +9449,10 @@ void Application::ApplyMarkdownPresentation(
       format.crTextColor = foreground;
     } else if (span.kind == SpanKind::HeadingMarker || span.kind == SpanKind::EmphasisMarker ||
                span.kind == SpanKind::ListMarker) {
-      const bool intersects_active = span.begin < active_source_line_end &&
+      const bool table_marker = std::ranges::any_of(view.parse.tables, [&](const GfmTable& table) {
+        return span.begin >= table.begin && span.end <= table.end;
+      });
+      const bool intersects_active = !table_marker && span.begin < active_source_line_end &&
                                      span.end > active_source_line_begin;
       if (!intersects_active) {
         format.dwMask |= CFM_HIDDEN;
@@ -7752,7 +9469,8 @@ void Application::ApplyMarkdownPresentation(
                                             dark ? RGB(31, 40, 52) : RGB(231, 236, 242));
   const bool force_cell_failure = TestAutomationSilent() && view.force_table_cell_formatting_failure_for_test;
   view.force_table_cell_formatting_failure_for_test = false;
-  if (force_cell_failure || !FormatRichEditTableCells(view.editor, view.editor_snapshot, table_header, table_body)) {
+  if (force_cell_failure || !FormatRichEditTableCells(view.editor, view.editor_snapshot, table_header, table_body,
+                                                    !view.active_table_viewport)) {
     view.presentation_revision = std::numeric_limits<std::uint64_t>::max();
     SchedulePresentation(view);
     RestoreSourceSelection(view.editor, view.editor_snapshot, selection);
@@ -7797,6 +9515,8 @@ void Application::ApplyMarkdownPresentation(
     view.presentation_revision = std::numeric_limits<std::uint64_t>::max();
     SchedulePresentation(view);
   }
+  ApplyDocumentSearchHighlights(view, true);
+  if (!view.active_table_viewport) RefreshTableViewports(view);
 }
 void Application::InvalidateTableGrid(DocumentView& view) {
   if (!view.editor) return;
@@ -8280,24 +10000,159 @@ void Application::UpdateStatus() {
   SetStatusSegments(std::move(segments));
 }
 
-void Application::ShowFindBar() {
+void Application::ShowFindBar(SearchScope scope) {
+  const bool scope_changed = search_scope_state_ != scope;
+  auto* panel = panel_layout_.Find(PanelId::Explorer);
+  bool changed = false;
+  if (panel) {
+    changed = panel->hidden || panel->collapsed || workspace_pane_collapsed_;
+    panel->hidden = false;
+    panel->collapsed = false;
+  }
+  workspace_pane_collapsed_ = false;
+  if (changed) SavePanelLayout();
+  focused_panel_ = PanelId::Explorer;
   active_activity_ = 1;
-  ShowWindow(find_bar_, SW_SHOW);
-  ShowWindow(find_edit_, SW_SHOW);
-  ShowWindow(find_next_, SW_SHOW);
-  ShowWindow(replace_edit_, SW_SHOW);
-  ShowWindow(find_workspace_, SW_SHOW);
-  ShowWindow(replace_workspace_, SW_SHOW);
-  ShowWindow(find_case_, SW_SHOW);
-  ShowWindow(find_regex_, SW_SHOW);
-  ShowWindow(find_word_, SW_SHOW);
-  ShowWindow(find_include_glob_, SW_SHOW);
-  ShowWindow(find_exclude_glob_, SW_SHOW);
-  ShowWindow(replace_one_, SW_SHOW);
-  ShowWindow(replace_document_, SW_SHOW);
+  SetSearchScope(scope);
+  UpdatePanelHeaders();
+  UpdateSearchPanelLabels();
   LayoutControls();
   SetFocus(find_edit_);
   SendMessageW(find_edit_, EM_SETSEL, 0, -1);
+  if (!scope_changed) ScheduleSearch();
+}
+
+void Application::CloseSearchPanel() {
+  workspace_search_due_ = 0;
+  ++workspace_search_generation_;
+  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
+  pending_search_navigation_ = 0;
+  workspace_search_started_ = false;
+  ClearSearchResults();
+  focused_panel_ = PanelId::Explorer;
+  active_activity_ = 0;
+  UpdatePanelHeaders();
+  LayoutControls();
+  if (active_document_ < documents_.size() && documents_[active_document_]->editor)
+    SetFocus(documents_[active_document_]->editor);
+  else
+    SetFocus(panel_headers_[PanelIndex(PanelId::Explorer)]);
+}
+
+void Application::SetSearchScope(SearchScope scope) {
+  const bool changed = search_scope_state_ != scope;
+  search_scope_state_ = scope;
+  SendMessageW(search_scope_, CB_SETCURSEL, scope == SearchScope::CurrentFile ? 0 : 1, 0);
+  UpdateSearchPanelLabels();
+  LayoutControls();
+  if (changed) ScheduleSearch();
+}
+
+void Application::ClearSearchResults() {
+  for (auto& view : documents_) ReleaseSearchTableSource(*view);
+  workspace_search_results_.clear();
+  document_search_results_.clear();
+  search_result_items_.clear();
+  search_file_nodes_.clear();
+  search_file_first_result_.clear();
+  search_file_match_counts_.clear();
+  workspace_search_error_count_ = 0;
+  workspace_search_excluded_count_ = 0;
+  workspace_search_failed_ = false;
+  current_search_match_index_ = static_cast<std::size_t>(-1);
+  current_workspace_match_index_ = static_cast<std::size_t>(-1);
+  document_search_path_.clear();
+  document_search_revision_ = 0;
+  if (find_results_) TreeView_DeleteAllItems(find_results_);
+  for (auto& view : documents_) {
+    if (!view->editor) continue;
+    ApplyDocumentSearchHighlights(*view);
+    ApplyTableSearchHighlights(*view);
+  }
+  UpdateSearchPanelLabels();
+}
+
+void Application::UpdateSearchPanelLabels() {
+  if (!search_target_ || !search_count_) return;
+  if (search_scope_state_ == SearchScope::CurrentFile) {
+    if (active_document_ < documents_.size()) {
+      const auto& view = *documents_[active_document_];
+      const auto name = view.document.untitled() ? L"未保存の文書" : view.document.path().filename().wstring();
+      SetWindowTextW(search_target_, (L"現在のファイル: " + name).c_str());
+    } else {
+      SetWindowTextW(search_target_, L"文書なし");
+    }
+  } else if (workspace_.empty()) {
+    SetWindowTextW(search_target_, L"Workspace未選択");
+  } else {
+    SetWindowTextW(search_target_, (L"Workspace: " + workspace_.filename().wstring()).c_str());
+  }
+  const std::size_t count = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_.size() : workspace_search_results_.size();
+  std::wstring count_text = std::to_wstring(count) + L"件";
+  if (search_scope_state_ == SearchScope::CurrentFile && current_search_match_index_ < count)
+    count_text = std::to_wstring(current_search_match_index_ + 1) + L" / " + std::to_wstring(count);
+  else if (search_scope_state_ == SearchScope::Workspace && current_workspace_match_index_ < count)
+    count_text = std::to_wstring(current_workspace_match_index_ + 1) + L" / " + std::to_wstring(count);
+  SetWindowTextW(search_count_, count_text.c_str());
+  const bool can_replace = !workspace_search_failed_ && (search_scope_state_ == SearchScope::CurrentFile
+      ? active_document_ < documents_.size()
+      : active_document_ < documents_.size() || !workspace_search_results_.empty());
+  EnableWindow(find_next_, count > 0 || workspace_search_due_ != 0);
+  EnableWindow(search_previous_, count > 0 || workspace_search_due_ != 0);
+  EnableWindow(replace_one_, can_replace);
+  EnableWindow(replace_document_, can_replace);
+  EnableWindow(replace_workspace_, !workspace_search_failed_ &&
+      search_scope_state_ == SearchScope::Workspace && !workspace_.empty());
+  EnableWindow(rollback_workspace_replace_, !workspace_.empty());
+}
+
+void Application::ScheduleSearch() {
+  if (search_ime_composing_) return;
+  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
+  for (auto& retired : retired_search_workers_)
+    if (retired.worker.joinable()) retired.worker.request_stop();
+  ++workspace_search_generation_;
+  pending_search_navigation_ = 0;
+  workspace_search_results_.clear();
+  document_search_results_.clear();
+  search_result_items_.clear();
+  search_file_nodes_.clear();
+  search_file_first_result_.clear();
+  search_file_match_counts_.clear();
+  workspace_search_error_count_ = 0;
+  workspace_search_excluded_count_ = 0;
+  workspace_search_failed_ = false;
+  current_search_match_index_ = static_cast<std::size_t>(-1);
+  current_workspace_match_index_ = static_cast<std::size_t>(-1);
+  document_search_path_.clear();
+  document_search_revision_ = 0;
+  if (find_results_) TreeView_DeleteAllItems(find_results_);
+  for (auto& view : documents_) {
+    ReleaseSearchTableSource(*view);
+    if (!view->editor) continue;
+    ApplyDocumentSearchHighlights(*view);
+    ApplyTableSearchHighlights(*view);
+  }
+  const auto query = SearchQueryFromFindBar();
+  if (query.text.empty()) {
+    workspace_search_due_ = 0;
+    SetWindowTextW(search_status_, L"検索語を入力してください。");
+  } else {
+    workspace_search_due_ = GetTickCount64() + 200;
+    SetWindowTextW(search_status_, L"検索中…");
+    SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
+  }
+  workspace_search_started_ = !query.text.empty();
+  UpdateSearchPanelLabels();
+}
+
+void Application::PruneSearchWorkers() {
+  std::erase_if(retired_search_workers_, [](RetiredSearchWorker& retired) {
+    if (!retired.finished || !retired.finished->load(std::memory_order_acquire)) return false;
+    if (retired.worker.joinable()) retired.worker.join();
+    return true;
+  });
 }
 
 SearchQuery Application::SearchQueryFromFindBar() const {
@@ -8306,51 +10161,19 @@ SearchQuery Application::SearchQueryFromFindBar() const {
   query.match_case = SendMessageW(find_case_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   query.regular_expression = SendMessageW(find_regex_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   query.whole_word = SendMessageW(find_word_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  query.include_hidden = SendMessageW(search_hidden_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  query.respect_gitignore = SendMessageW(search_ignore_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   query.include_globs = SplitGlobList(ControlText(find_include_glob_));
   query.exclude_globs = SplitGlobList(ControlText(find_exclude_glob_));
   return query;
 }
 
 void Application::FindNext(bool restart_from_beginning) {
-  if (active_document_ >= documents_.size()) return;
-  if (!documents_[active_document_]->editor) ActivateDocument(active_document_);
-  if (active_document_ >= documents_.size() || !documents_[active_document_]->editor) return;
-  const auto search = SearchQueryFromFindBar();
-  if (search.text.empty()) {
-    ShowFindBar();
-    return;
+  if (restart_from_beginning) {
+    if (search_scope_state_ == SearchScope::CurrentFile) current_search_match_index_ = static_cast<std::size_t>(-1);
+    else current_workspace_match_index_ = static_cast<std::size_t>(-1);
   }
-  auto& view = *documents_[active_document_];
-  if (!SyncDocumentFromEditor(view)) {
-    SetStatusText(L"入力内容を読み取れなかったため検索を中止しました。再試行してください。");
-    return;
-  }
-  HWND editor = view.editor;
-  CHARRANGE selection{};
-  SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  std::vector<SearchMatch> matches;
-  std::wstring error;
-  if (!SearchDocumentText(view.document.path(), view.document.text(), search, matches, error)) {
-    MessageBoxW(window_, error.c_str(), L"文書検索", MB_ICONWARNING);
-    return;
-  }
-  if (matches.empty()) {
-    MessageBoxW(window_, L"一致する箇所はありません。", L"文書検索", MB_ICONINFORMATION);
-    return;
-  }
-  const std::size_t source_start = restart_from_beginning
-      ? 0
-      : view.editor_snapshot.NativeToSource(static_cast<std::size_t>(selection.cpMax));
-  auto match = std::ranges::find_if(matches, [source_start](const auto& item) {
-    return item.begin >= source_start;
-  });
-  if (match == matches.end()) match = matches.begin();
-  const CHARRANGE target{
-        static_cast<LONG>(view.editor_snapshot.SourceToNative(match->begin)),
-        static_cast<LONG>(view.editor_snapshot.SourceToNative(match->end))};
-  SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&target));
-  SendMessageW(editor, EM_SCROLLCARET, 0, 0);
-  SetFocus(editor);
+  NavigateSearchMatch(1);
 }
 
 void Application::ReplaceCurrentDocument(bool all) {
@@ -8363,7 +10186,8 @@ void Application::ReplaceCurrentDocument(bool all) {
   }
   const auto query = SearchQueryFromFindBar();
   if (query.text.empty()) {
-    ShowFindBar();
+    SetWindowTextW(search_status_, L"置換する検索語を入力してください。");
+    SetFocus(find_edit_);
     return;
   }
   const std::wstring replacement = ControlText(replace_edit_);
@@ -8387,6 +10211,7 @@ void Application::ReplaceCurrentDocument(bool all) {
     }
     const std::wstring message = std::to_wstring(count) + L"箇所を1つのUndo操作として置換しました。";
     SetStatusText(message);
+    ScheduleSearch();
     return;
   }
 
@@ -8422,165 +10247,667 @@ void Application::ReplaceCurrentDocument(bool all) {
   SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&target));
   SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
   SetFocus(view.editor);
+  ScheduleSearch();
 }
 
 void Application::SearchWorkspaceFromFindBar() {
-  if (workspace_.empty()) return;
-  const auto query = SearchQueryFromFindBar();
-  if (query.text.empty()) {
-    ShowFindBar();
-    return;
-  }
-  std::map<std::filesystem::path, std::wstring> unsaved;
-  for (auto& view : documents_) {
-    if (view->ime_composing || !SyncDocumentFromEditor(*view)) {
-      SetStatusText(L"開いている文書の入力内容を読み取れなかったためWorkspace検索を中止しました。再試行してください。");
-      return;
-    }
-    if (!view->document.untitled())
-      unsaved.insert_or_assign(std::filesystem::absolute(view->document.path()).lexically_normal(),
-                               view->document.text());
-  }
-  if (workspace_search_worker_.joinable()) {
-    workspace_search_worker_.request_stop();
-    workspace_search_worker_.join();
-  }
-  workspace_search_started_ = true;
-  workspace_search_due_ = 0;
-  const std::uint64_t generation = ++workspace_search_generation_;
-  workspace_search_results_.clear();
-  workspace_search_issue_count_ = 0;
-  ListView_DeleteAllItems(find_results_);
-  ShowWindow(find_results_, SW_SHOW);
-  LayoutControls();
-  SetStatusText(L"Workspace検索中… 0件（逐次結果）");
-  const auto root = workspace_;
-  const HWND owner = window_;
-  workspace_search_worker_ = std::jthread(
-      [root, query, unsaved = std::move(unsaved), generation, owner](std::stop_token stop) {
-        std::vector<SearchMatch> final_matches;
-        std::wstring error;
-        const bool completed = SearchWorkspace(
-            root, query, unsaved, final_matches, error, [&] { return stop.stop_requested(); },
-            [generation, owner, &stop](std::vector<SearchMatch> batch) {
-              if (stop.stop_requested()) return;
-              auto* payload = new WorkspaceSearchBatchMessage{generation, std::move(batch), {}};
-              if (!PostMessageW(owner, kWorkspaceSearchBatchMessage, 0,
-                                reinterpret_cast<LPARAM>(payload))) delete payload;
-            }, nullptr,
-            [generation, owner, &stop](std::vector<SearchIssue> issues) {
-              if (stop.stop_requested()) return;
-              auto* payload = new WorkspaceSearchBatchMessage{generation, {}, std::move(issues)};
-              if (!PostMessageW(owner, kWorkspaceSearchBatchMessage, 0,
-                                reinterpret_cast<LPARAM>(payload))) delete payload;
-            });
-        auto* payload = new WorkspaceSearchCompleteMessage{generation, completed, std::move(error)};
-        if (!PostMessageW(owner, kWorkspaceSearchCompleteMessage, 0,
-                          reinterpret_cast<LPARAM>(payload))) delete payload;
-      });
+  SetSearchScope(SearchScope::Workspace);
+  SearchNow();
 }
 
 void Application::ScheduleWorkspaceSearch() {
-  if (!workspace_search_started_) return;
-  if (workspace_search_worker_.joinable()) workspace_search_worker_.request_stop();
-  ++workspace_search_generation_;
-  workspace_search_results_.clear();
-  workspace_search_issue_count_ = 0;
-  ListView_DeleteAllItems(find_results_);
-  workspace_search_due_ = GetTickCount64() + 250;
-  SetTimer(window_, kAutosaveTimer, kTimerPollMs, nullptr);
-  SetStatusText(L"検索条件が変わりました。旧結果を破棄して再検索します…");
+  ScheduleSearch();
+}
+
+void Application::SearchNow() {
+  workspace_search_due_ = 0;
+  workspace_search_failed_ = false;
+  if (search_ime_composing_) return;
+  const SearchQuery query = SearchQueryFromFindBar();
+  if (query.text.empty()) {
+    ClearSearchResults();
+    workspace_search_started_ = false;
+    SetWindowTextW(search_status_, L"検索語を入力してください。");
+    return;
+  }
+
+  const bool current_document = search_scope_state_ == SearchScope::CurrentFile;
+  std::filesystem::path root = workspace_;
+  std::filesystem::path document_path;
+  std::uint64_t document_revision{};
+  std::wstring document_text;
+  std::map<std::filesystem::path, std::wstring> unsaved;
+  if (current_document) {
+    if (active_document_ >= documents_.size()) {
+      ClearSearchResults();
+      SetWindowTextW(search_status_, L"検索対象の文書がありません。");
+      return;
+    }
+    auto& view = *documents_[active_document_];
+    if (!view.editor) ActivateDocument(active_document_);
+    if (active_document_ >= documents_.size() || !documents_[active_document_]->editor) return;
+    if (view.ime_composing || !SyncDocumentFromEditor(view)) {
+      SetWindowTextW(search_status_, L"入力が確定してから検索を更新します。");
+      return;
+    }
+    document_path = view.document.path();
+    document_revision = view.document.revision();
+    document_text = view.document.text();
+    document_search_path_ = document_path;
+    document_search_revision_ = document_revision;
+  } else {
+    if (workspace_.empty()) {
+      ClearSearchResults();
+      SetWindowTextW(search_status_, L"Workspaceを選択すると検索できます。");
+      return;
+    }
+    for (auto& view : documents_) {
+      if (view->ime_composing || !SyncDocumentFromEditor(*view)) {
+        SetWindowTextW(search_status_, L"開いている文書の入力内容を読み取れないため検索を保留しました。");
+        return;
+      }
+      if (!view->document.untitled()) {
+        std::error_code path_error;
+        auto path = std::filesystem::absolute(view->document.path(), path_error);
+        if (path_error) path = view->document.path();
+        unsaved.insert_or_assign(path.lexically_normal(), view->document.text());
+      }
+    }
+  }
+
+  PruneSearchWorkers();
+  if (workspace_search_worker_.joinable()) {
+    workspace_search_worker_.request_stop();
+    if (workspace_search_worker_finished_ &&
+        workspace_search_worker_finished_->load(std::memory_order_acquire)) {
+      workspace_search_worker_.join();
+    } else {
+      retired_search_workers_.push_back(
+          {std::move(workspace_search_worker_), workspace_search_worker_finished_});
+    }
+  }
+  const std::uint64_t generation = ++workspace_search_generation_;
+  const HWND owner = window_;
+  const auto finished = std::make_shared<std::atomic_bool>(false);
+  workspace_search_worker_finished_ = finished;
+  workspace_search_started_ = true;
+  if (find_results_) TreeView_DeleteAllItems(find_results_);
+  SetWindowTextW(search_status_, current_document ? L"文書を検索中…" : L"Workspaceを検索中…");
+  UpdateSearchPanelLabels();
+
+  const auto report_start_failure = [&](const wchar_t* message) {
+    finished->store(true, std::memory_order_release);
+    workspace_search_started_ = false;
+    ClearSearchResults();
+    workspace_search_failed_ = true;
+    UpdateSearchPanelLabels();
+    SetWindowTextW(search_status_, message);
+  };
+  std::unique_ptr<WorkspaceSearchCompleteMessage> failure_payload;
+  try {
+    failure_payload = std::make_unique<WorkspaceSearchCompleteMessage>(WorkspaceSearchCompleteMessage{
+        generation, current_document, root, document_path, document_revision, false, false,
+        L"検索処理で例外が発生しました。検索をやり直してください。"});
+  } catch (...) {
+    report_start_failure(L"検索処理を開始できませんでした。");
+    return;
+  }
+
+  try {
+    if (current_document) {
+      workspace_search_worker_ = std::jthread(
+          [document_path, document_text = std::move(document_text), root, query, generation,
+           document_revision, owner, finished,
+           failure_payload = std::move(failure_payload)](std::stop_token stop) mutable {
+            SearchWorkerFinishedGuard finished_guard{finished};
+            try {
+              std::vector<SearchMatch> matches;
+              std::wstring error;
+              bool truncated = false;
+              const bool completed = SearchDocumentText(
+                  document_path, document_text, query, matches, error,
+                  [&] { return stop.stop_requested(); }, &truncated);
+              constexpr std::size_t batch_size = 128;
+              for (std::size_t begin = 0; begin < matches.size() && !stop.stop_requested(); begin += batch_size) {
+                const auto end = std::min(matches.size(), begin + batch_size);
+                std::vector<SearchMatch> batch;
+                batch.reserve(end - begin);
+                std::move(matches.begin() + static_cast<std::ptrdiff_t>(begin),
+                          matches.begin() + static_cast<std::ptrdiff_t>(end),
+                          std::back_inserter(batch));
+                auto* payload = new WorkspaceSearchBatchMessage{
+                    generation, true, root, document_path, document_revision, std::move(batch), {}};
+                if (!PostMessageW(owner, kWorkspaceSearchBatchMessage, 0,
+                                  reinterpret_cast<LPARAM>(payload))) delete payload;
+              }
+              auto* payload = new WorkspaceSearchCompleteMessage{
+                  generation, true, root, document_path, document_revision, completed, truncated,
+                  std::move(error)};
+              if (!PostMessageW(owner, kWorkspaceSearchCompleteMessage, 0,
+                                reinterpret_cast<LPARAM>(payload))) delete payload;
+            } catch (...) {
+              PostWorkspaceSearchFailure(owner, std::move(failure_payload));
+            }
+          });
+    } else {
+      workspace_search_worker_ = std::jthread(
+          [root, query, unsaved = std::move(unsaved), generation, owner, finished,
+           failure_payload = std::move(failure_payload)](std::stop_token stop) mutable {
+            SearchWorkerFinishedGuard finished_guard{finished};
+            try {
+              std::vector<SearchMatch> all_matches;
+              std::wstring error;
+              const bool completed = SearchWorkspace(
+                  root, query, unsaved, all_matches, error, [&] { return stop.stop_requested(); },
+                  [generation, root, owner, &stop](std::vector<SearchMatch> batch) {
+                    if (stop.stop_requested()) return;
+                    auto* payload = new WorkspaceSearchBatchMessage{
+                        generation, false, root, {}, 0, std::move(batch), {}};
+                    if (!PostMessageW(owner, kWorkspaceSearchBatchMessage, 0,
+                                      reinterpret_cast<LPARAM>(payload))) delete payload;
+                  }, nullptr,
+                  [generation, root, owner, &stop](std::vector<SearchIssue> issues) {
+                    if (stop.stop_requested()) return;
+                    auto* payload = new WorkspaceSearchBatchMessage{
+                        generation, false, root, {}, 0, {}, std::move(issues)};
+                    if (!PostMessageW(owner, kWorkspaceSearchBatchMessage, 0,
+                                      reinterpret_cast<LPARAM>(payload))) delete payload;
+                  });
+              auto* payload = new WorkspaceSearchCompleteMessage{
+                  generation, false, root, {}, 0, completed, false, std::move(error)};
+              if (!PostMessageW(owner, kWorkspaceSearchCompleteMessage, 0,
+                                reinterpret_cast<LPARAM>(payload))) delete payload;
+            } catch (...) {
+              PostWorkspaceSearchFailure(owner, std::move(failure_payload));
+            }
+          });
+    }
+  } catch (...) {
+    report_start_failure(L"検索処理を開始できませんでした。");
+  }
 }
 
 void Application::ApplyWorkspaceSearchBatch(void* raw_payload) {
   std::unique_ptr<WorkspaceSearchBatchMessage> payload(
       static_cast<WorkspaceSearchBatchMessage*>(raw_payload));
   if (!payload || payload->generation != workspace_search_generation_) return;
+  if (payload->current_document != (search_scope_state_ == SearchScope::CurrentFile)) return;
+  if (payload->current_document) {
+    if (active_document_ >= documents_.size() ||
+        !SameSearchPath(documents_[active_document_]->document.path(), payload->document) ||
+        documents_[active_document_]->document.revision() != payload->document_revision) {
+      ScheduleSearch();
+      return;
+    }
+  } else if (!SameSearchPath(workspace_, payload->workspace)) {
+    return;
+  }
+
+  const auto item_for = [&](std::wstring text, LPARAM data, HTREEITEM parent) {
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = parent;
+    insert.hInsertAfter = TVI_LAST;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    insert.item.pszText = text.data();
+    insert.item.lParam = data;
+    return TreeView_InsertItem(find_results_, &insert);
+  };
+  const auto path_for_group = [&](const std::filesystem::path& path) {
+    return SearchPathKey(path);
+  };
+  const auto ensure_group = [&](const std::filesystem::path& path) {
+    const auto key = path_for_group(path.empty() ? workspace_ : path);
+    if (const auto found = search_file_nodes_.find(key); found != search_file_nodes_.end())
+      return std::pair{key, found->second};
+    std::wstring label;
+    if (path.empty()) {
+      label = L"検索エラー";
+    } else if (search_scope_state_ == SearchScope::CurrentFile) {
+      label = path.filename().wstring();
+    } else {
+      std::error_code relative_error;
+      const auto relative = std::filesystem::relative(path, workspace_, relative_error);
+      label = relative_error ? path.wstring() : relative.wstring();
+    }
+    const HTREEITEM group = item_for(label, static_cast<LPARAM>(-2), TVI_ROOT);
+    search_file_nodes_.emplace(key, group);
+    search_file_first_result_.try_emplace(key, static_cast<std::size_t>(-1));
+    search_file_match_counts_.try_emplace(key, 0);
+    return std::pair{key, group};
+  };
+
   for (auto& match : payload->matches) {
-    const std::size_t index = workspace_search_results_.size();
-    workspace_search_results_.push_back(std::move(match));
-    const auto& inserted = workspace_search_results_.back();
-    std::error_code relative_error;
-    auto relative = std::filesystem::relative(inserted.path, workspace_, relative_error).wstring();
-    if (relative_error) relative = inserted.path.wstring();
-    LVITEMW item{LVIF_TEXT | LVIF_PARAM};
-    item.iItem = ListView_GetItemCount(find_results_);
-    item.pszText = relative.data();
-    item.lParam = static_cast<LPARAM>(index);
-    ListView_InsertItem(find_results_, &item);
-    auto line = std::to_wstring(inserted.line);
-    ListView_SetItemText(find_results_, item.iItem, 1, line.data());
+    auto& results = payload->current_document ? document_search_results_ : workspace_search_results_;
+    const std::size_t index = results.size();
+    results.push_back(std::move(match));
+    const auto& inserted = results.back();
+    const auto [key, group] = ensure_group(inserted.path);
+    if (search_file_first_result_[key] == static_cast<std::size_t>(-1))
+      search_file_first_result_[key] = index;
+    const std::size_t group_count = ++search_file_match_counts_[key];
+    if (group_count == 1) TreeView_Expand(find_results_, group, TVE_EXPAND);
+    std::wstring group_label;
+    if (search_scope_state_ == SearchScope::CurrentFile) {
+      group_label = inserted.path.filename().wstring();
+    } else {
+      std::error_code relative_error;
+      const auto relative = std::filesystem::relative(inserted.path, workspace_, relative_error);
+      group_label = relative_error ? inserted.path.wstring() : relative.wstring();
+    }
+    group_label += L" (" + std::to_wstring(group_count) + L")";
+    TVITEMW update{};
+    update.mask = TVIF_TEXT;
+    update.hItem = group;
+    update.pszText = group_label.data();
+    TreeView_SetItem(find_results_, &update);
     auto preview = inserted.preview;
     std::ranges::replace(preview, L'\r', L' ');
     std::ranges::replace(preview, L'\n', L' ');
-    ListView_SetItemText(find_results_, item.iItem, 2, preview.data());
+    const std::wstring result_text = std::to_wstring(inserted.line) + L": " + preview;
+    const HTREEITEM result = item_for(result_text, static_cast<LPARAM>(index), group);
+    if (search_result_items_.size() <= index) search_result_items_.resize(index + 1);
+    search_result_items_[index] = result;
   }
   for (auto& issue : payload->issues) {
-    ++workspace_search_issue_count_;
-    std::error_code relative_error;
-    auto relative = std::filesystem::relative(issue.path, workspace_, relative_error).wstring();
-    if (relative_error) relative = issue.path.wstring();
-    LVITEMW item{LVIF_TEXT | LVIF_PARAM};
-    item.iItem = ListView_GetItemCount(find_results_);
-    item.pszText = relative.data();
-    item.lParam = static_cast<LPARAM>(-1);
-    ListView_InsertItem(find_results_, &item);
-    auto issue_mark = std::wstring(L"!");
-    ListView_SetItemText(find_results_, item.iItem, 1, issue_mark.data());
-    ListView_SetItemText(find_results_, item.iItem, 2, issue.message.data());
+    const bool excluded = issue.kind == SearchIssueKind::Excluded;
+    if (excluded) ++workspace_search_excluded_count_;
+    else ++workspace_search_error_count_;
+    const auto [key, group] = ensure_group(issue.path);
+    const std::wstring issue_text = (excluded ? L"対象外: " : L"未処理: ") + issue.message;
+    (void)key;
+    item_for(issue_text, static_cast<LPARAM>(-1), group);
   }
-  const std::wstring status = L"Workspace検索中… " +
-      std::to_wstring(workspace_search_results_.size()) + L"件 / 未処理 " +
-      std::to_wstring(workspace_search_issue_count_) + L"件（逐次結果）";
-  SetStatusText(status);
+  const std::size_t count = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_.size() : workspace_search_results_.size();
+  std::wstring progress_status = L"検索中… " + std::to_wstring(count) + L"件";
+  if (workspace_search_error_count_ > 0)
+    progress_status += L" / 未処理 " + std::to_wstring(workspace_search_error_count_) + L"件";
+  if (workspace_search_excluded_count_ > 0)
+    progress_status += L" / 対象外 " + std::to_wstring(workspace_search_excluded_count_) + L"件";
+  SetWindowTextW(search_status_, progress_status.c_str());
+  UpdateSearchPanelLabels();
+  if (active_document_ < documents_.size() && documents_[active_document_]->editor) {
+    ApplyDocumentSearchHighlights(*documents_[active_document_]);
+    ApplyTableSearchHighlights(*documents_[active_document_]);
+  }
 }
 
 void Application::CompleteWorkspaceSearch(void* raw_payload) {
   std::unique_ptr<WorkspaceSearchCompleteMessage> payload(
       static_cast<WorkspaceSearchCompleteMessage*>(raw_payload));
   if (!payload || payload->generation != workspace_search_generation_) return;
+  if (payload->current_document != (search_scope_state_ == SearchScope::CurrentFile)) return;
+  if (payload->current_document) {
+    if (active_document_ >= documents_.size() ||
+        !SameSearchPath(documents_[active_document_]->document.path(), payload->document) ||
+        documents_[active_document_]->document.revision() != payload->document_revision) {
+      ScheduleSearch();
+      return;
+    }
+  } else if (!SameSearchPath(workspace_, payload->workspace)) {
+    return;
+  }
   if (!payload->completed) {
     if (payload->error.find(L"中止") == std::wstring::npos && !payload->error.empty()) {
       RecordDiagnosticSummary(L"Workspace検索でエラーを検出しました");
-      MessageBoxW(window_, payload->error.c_str(), L"Workspace検索", MB_ICONWARNING);
     }
-    const std::wstring status = payload->error.empty() ? L"Workspace検索を中止しました。"
-                                                       : payload->error;
-    SetStatusText(status);
+    ClearSearchResults();
+    workspace_search_failed_ = true;
+    UpdateSearchPanelLabels();
+    SetWindowTextW(search_status_, payload->error.empty() ? L"検索を中止しました。"
+                                                           : payload->error.c_str());
     return;
   }
-  const std::wstring status = L"Workspace検索完了: " +
-      std::to_wstring(workspace_search_results_.size()) +
-      L"件 / 未処理 " + std::to_wstring(workspace_search_issue_count_) +
-      L"件。結果一覧で詳細を確認できます。";
-  SetStatusText(status);
+  const std::size_t count = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_.size() : workspace_search_results_.size();
+  std::wstring status;
+  if (payload->truncated || workspace_search_error_count_ > 0) {
+    status = L"部分結果: " + std::to_wstring(count) + L"件";
+    if (payload->truncated) status += L" / 上限に達しました";
+    if (workspace_search_error_count_ > 0)
+      status += L" / 未処理 " + std::to_wstring(workspace_search_error_count_) + L"件";
+    if (workspace_search_excluded_count_ > 0)
+      status += L" / 対象外 " + std::to_wstring(workspace_search_excluded_count_) + L"件";
+    status += L"。詳細は結果一覧を確認してください。";
+  } else if (count == 0) {
+    status = L"検索結果なし";
+    if (workspace_search_excluded_count_ > 0)
+      status += L" / 対象外 " + std::to_wstring(workspace_search_excluded_count_) + L"件";
+  } else {
+    status = (search_scope_state_ == SearchScope::CurrentFile ? L"文書内 " : L"Workspace ") +
+        std::to_wstring(count) + L"件の検索結果";
+    if (workspace_search_excluded_count_ > 0)
+      status += L" / 対象外 " + std::to_wstring(workspace_search_excluded_count_) + L"件";
+  }
+  SetWindowTextW(search_status_, status.c_str());
+  UpdateSearchPanelLabels();
+  if (active_document_ < documents_.size() && documents_[active_document_]->editor)
+    UpdateCurrentSearchMatchForCaret(*documents_[active_document_]);
+  if (pending_search_navigation_ != 0) {
+    const int direction = pending_search_navigation_;
+    pending_search_navigation_ = 0;
+    if (search_scope_state_ == SearchScope::CurrentFile)
+      current_search_match_index_ = static_cast<std::size_t>(-1);
+    else
+      current_workspace_match_index_ = static_cast<std::size_t>(-1);
+    NavigateSearchMatch(direction);
+  }
 }
 
 void Application::OpenWorkspaceSearchResult(std::size_t index) {
-  LVITEMW item{LVIF_PARAM};
-  item.iItem = static_cast<int>(index);
-  if (!ListView_GetItem(find_results_, &item) || item.lParam < 0 ||
-      static_cast<std::size_t>(item.lParam) >= workspace_search_results_.size()) return;
-  const auto match = workspace_search_results_[static_cast<std::size_t>(item.lParam)];
-  OpenDocument(match.path);
+  OpenSearchResult(index, true);
+}
+
+void Application::OpenSearchResult(std::size_t index, bool focus_editor) {
+  const HWND original_focus = GetFocus();
+  const auto& matches = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_ : workspace_search_results_;
+  if (index >= matches.size()) return;
+  const SearchMatch match = matches[index];
+  if (search_scope_state_ == SearchScope::Workspace) OpenDocument(match.path);
   if (active_document_ >= documents_.size()) return;
   if (!documents_[active_document_]->editor) ActivateDocument(active_document_);
   if (active_document_ >= documents_.size() || !documents_[active_document_]->editor) return;
   auto& view = *documents_[active_document_];
-  if (!SyncDocumentFromEditor(view)) {
-    SetStatusText(L"入力内容を読み取れなかったため検索結果への移動を中止しました。再試行してください。");
+  if (!SameSearchPath(view.document.path(), match.path) || !SyncDocumentFromEditor(view)) {
+    SetWindowTextW(search_status_, L"検索結果へ移動できません。入力を確認してください。");
     return;
   }
-  const CHARRANGE selection{
-      static_cast<LONG>(view.editor_snapshot.SourceToNative(match.begin)),
-      static_cast<LONG>(view.editor_snapshot.SourceToNative(match.end))};
-  SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-  SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
-  SetFocus(view.editor);
+  if (SearchContentHash(view) != match.snapshot_hash) {
+    SetWindowTextW(search_status_, L"検索後に文書が変更されました。最新内容を検索しています…");
+    ScheduleSearch();
+    return;
+  }
+
+  const SourceSelection source_selection{match.begin, match.end};
+  bool selected_in_table = SelectTableSourceRange(view, source_selection, focus_editor);
+  if (!selected_in_table) {
+    const bool touches_table = std::ranges::any_of(view.editor_snapshot.tables, [&](const auto& table) {
+      return match.begin < table.source_end && match.end > table.source_begin;
+    });
+    if (touches_table && !view.table_source_mode) {
+      RestoreSourceSelection(view.editor, view.editor_snapshot, source_selection);
+      ToggleTableSource(view, true);
+    }
+    const std::size_t native_begin = view.editor_snapshot.SourceToNative(match.begin);
+    const std::size_t native_end = view.editor_snapshot.SourceToNative(match.end);
+    const CHARRANGE selection{
+        static_cast<LONG>(native_begin), static_cast<LONG>(std::max(native_begin, native_end))};
+    SendMessageW(view.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    SendMessageW(view.editor, EM_SCROLLCARET, 0, 0);
+  }
+  if (search_scope_state_ == SearchScope::CurrentFile) current_search_match_index_ = index;
+  else current_workspace_match_index_ = index;
+  ApplyDocumentSearchHighlights(view);
+  ApplyTableSearchHighlights(view);
+  UpdateSearchPanelLabels();
+  if (focus_editor) {
+    if (!selected_in_table) SetFocus(view.editor);
+  } else if (original_focus && IsWindow(original_focus)) {
+    SetFocus(original_focus);
+  }
+}
+
+void Application::NavigateSearchMatch(int direction) {
+  direction = direction < 0 ? -1 : 1;
+  const auto& matches = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_ : workspace_search_results_;
+  if (workspace_search_due_ != 0) {
+    pending_search_navigation_ = direction;
+    workspace_search_due_ = 0;
+    SearchNow();
+    return;
+  }
+  const bool worker_running = workspace_search_worker_.joinable() &&
+      (!workspace_search_worker_finished_ ||
+       !workspace_search_worker_finished_->load(std::memory_order_acquire));
+  if (matches.empty()) {
+    if (SearchQueryFromFindBar().text.empty()) return;
+    pending_search_navigation_ = direction;
+    if (!worker_running) SearchNow();
+    return;
+  }
+
+  std::size_t current = search_scope_state_ == SearchScope::CurrentFile
+      ? current_search_match_index_ : current_workspace_match_index_;
+  if (current >= matches.size()) {
+    if (active_document_ < documents_.size() && documents_[active_document_]->editor) {
+      CHARRANGE selection{};
+      auto& view = *documents_[active_document_];
+      SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+      const std::size_t caret = view.editor_snapshot.NativeToSource(
+          static_cast<std::size_t>(direction > 0 ? selection.cpMax : selection.cpMin));
+      const auto path = view.document.path();
+      const auto content_hash = search_scope_state_ == SearchScope::Workspace
+          ? SearchContentHash(view) : 0;
+      if (direction > 0) {
+        const auto found = std::ranges::find_if(matches, [&](const auto& item) {
+          return (search_scope_state_ == SearchScope::CurrentFile ||
+                  (SameSearchPath(item.path, path) && item.snapshot_hash == content_hash)) &&
+                 item.begin >= caret;
+        });
+        current = found == matches.end() ? matches.size() - 1 :
+            static_cast<std::size_t>(found - matches.begin()) == 0 ? matches.size() - 1 :
+            static_cast<std::size_t>(found - matches.begin()) - 1;
+      } else {
+        const auto found = std::ranges::find_if(matches.rbegin(), matches.rend(), [&](const auto& item) {
+          return (search_scope_state_ == SearchScope::CurrentFile ||
+                  (SameSearchPath(item.path, path) && item.snapshot_hash == content_hash)) &&
+                 item.end <= caret;
+        });
+        current = found == matches.rend() ? 0 :
+            (matches.size() - static_cast<std::size_t>(found - matches.rbegin())) % matches.size();
+      }
+    } else {
+      current = direction > 0 ? matches.size() - 1 : 0;
+    }
+  }
+  const std::size_t next = static_cast<std::size_t>(
+      (static_cast<std::ptrdiff_t>(current) + direction +
+       static_cast<std::ptrdiff_t>(matches.size())) % static_cast<std::ptrdiff_t>(matches.size()));
+  if (search_scope_state_ == SearchScope::CurrentFile) current_search_match_index_ = next;
+  else current_workspace_match_index_ = next;
+  if (next < search_result_items_.size() && search_result_items_[next]) {
+    search_tree_selection_update_ = true;
+    TreeView_SelectItem(find_results_, search_result_items_[next]);
+    search_tree_selection_update_ = false;
+  }
+  OpenSearchResult(next);
+}
+
+void Application::UpdateCurrentSearchMatchForCaret(DocumentView& view) {
+  if (!view.editor || SearchQueryFromFindBar().text.empty()) return;
+  const auto& matches = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_ : workspace_search_results_;
+  if (matches.empty()) return;
+  if (search_scope_state_ == SearchScope::CurrentFile &&
+      (!SameSearchPath(view.document.path(), document_search_path_) ||
+       view.document.revision() != document_search_revision_)) return;
+  const auto content_hash = search_scope_state_ == SearchScope::Workspace
+      ? SearchContentHash(view) : 0;
+  CHARRANGE selection{};
+  SendMessageW(view.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  const std::size_t caret = view.editor_snapshot.NativeToSource(
+      static_cast<std::size_t>(selection.cpMax));
+
+  std::size_t selected = static_cast<std::size_t>(-1);
+  std::size_t next = static_cast<std::size_t>(-1);
+  std::size_t previous = static_cast<std::size_t>(-1);
+  for (std::size_t index = 0; index < matches.size(); ++index) {
+    const auto& match = matches[index];
+    if (search_scope_state_ == SearchScope::Workspace &&
+        (!SameSearchPath(match.path, view.document.path()) || match.snapshot_hash != content_hash)) continue;
+    if (caret >= match.begin && caret <= match.end) { selected = index; break; }
+    if (match.begin >= caret && next == static_cast<std::size_t>(-1)) next = index;
+    if (match.end <= caret) previous = index;
+  }
+  if (selected == static_cast<std::size_t>(-1))
+    selected = next != static_cast<std::size_t>(-1) ? next : previous;
+  if (selected == static_cast<std::size_t>(-1)) return;
+  if (search_scope_state_ == SearchScope::CurrentFile) current_search_match_index_ = selected;
+  else current_workspace_match_index_ = selected;
+  if (selected < search_result_items_.size() && search_result_items_[selected]) {
+    search_tree_selection_update_ = true;
+    TreeView_SelectItem(find_results_, search_result_items_[selected]);
+    search_tree_selection_update_ = false;
+  }
+  ApplyDocumentSearchHighlights(view);
+  ApplyTableSearchHighlights(view);
+  UpdateSearchPanelLabels();
+}
+
+std::uint64_t Application::SearchContentHash(const DocumentView& view) {
+  const auto key = SearchPathKey(view.document.path());
+  const auto revision = view.document.revision();
+  const auto found = search_content_hash_cache_.find(key);
+  if (found != search_content_hash_cache_.end() && found->second.first == revision)
+    return found->second.second;
+  const auto hash = SearchSnapshotHash(view.document.text());
+  search_content_hash_cache_.insert_or_assign(key, std::pair{revision, hash});
+  return hash;
+}
+
+void Application::ApplyDocumentSearchHighlights(DocumentView& view, bool formatting_reset) {
+  if (!view.editor || !IsWindow(view.editor)) return;
+  const HWND editor = view.editor;
+  const auto& matches = search_scope_state_ == SearchScope::CurrentFile
+      ? document_search_results_ : workspace_search_results_;
+  const bool has_document_matches = std::ranges::any_of(matches, [&](const auto& match) {
+    return SameSearchPath(match.path, view.document.path());
+  });
+  const bool current_scope_matches = search_scope_state_ != SearchScope::CurrentFile ||
+      (SameSearchPath(view.document.path(), document_search_path_) &&
+       view.document.revision() == document_search_revision_);
+  const auto content_hash = search_scope_state_ == SearchScope::Workspace && has_document_matches
+      ? SearchContentHash(view) : 0;
+  std::vector<SearchHighlightRange> next_ranges;
+  if (current_scope_matches && !SearchQueryFromFindBar().text.empty()) {
+    for (std::size_t index = 0; index < matches.size(); ++index) {
+      const auto& match = matches[index];
+      if (!SameSearchPath(match.path, view.document.path()) ||
+          (search_scope_state_ == SearchScope::Workspace && match.snapshot_hash != content_hash)) continue;
+      const auto begin = view.editor_snapshot.SourceToNative(match.begin);
+      const auto end = view.editor_snapshot.SourceToNative(match.end);
+      if (end <= begin || begin >= static_cast<std::size_t>(GetWindowTextLengthW(editor))) continue;
+      const LONG native_begin = static_cast<LONG>(begin);
+      const LONG native_end = static_cast<LONG>(std::min<std::size_t>(end,
+          static_cast<std::size_t>(GetWindowTextLengthW(editor))));
+      if (native_end <= native_begin) continue;
+      next_ranges.push_back({native_begin, native_end,
+          search_scope_state_ == SearchScope::CurrentFile
+              ? index == current_search_match_index_
+              : index == current_workspace_match_index_});
+    }
+  }
+  std::ranges::sort(next_ranges, [](const auto& left, const auto& right) {
+    return left.begin < right.begin || (left.begin == right.begin && left.end < right.end);
+  });
+
+  auto& previous = search_highlight_states_[editor];
+  if (formatting_reset) {
+    previous.path = view.document.path();
+    previous.revision = view.document.revision();
+    previous.original_backgrounds.clear();
+    previous.ranges.clear();
+  }
+  const bool same_revision = SameSearchPath(previous.path, view.document.path()) &&
+      previous.revision == view.document.revision();
+  if (same_revision && previous.ranges == next_ranges) return;
+
+  CHARRANGE selection{};
+  SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  POINT scroll{};
+  SendMessageW(editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  const bool caret_visible = GetFocus() == editor;
+  if (caret_visible) HideCaret(editor);
+  ScopedEditorChangeSuppression suppression(suppress_editor_change_);
+  PresentationUndoGuard undo_guard(editor);
+  if (!undo_guard) {
+    if (caret_visible) ShowCaret(editor);
+    return;
+  }
+  SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
+
+  const auto set_background = [&](LONG begin, LONG end, COLORREF color, bool automatic) {
+    if (end <= begin) return;
+    const CHARRANGE range{begin, end};
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    CHARFORMAT2W format{sizeof(format)};
+    format.dwMask = CFM_BACKCOLOR;
+    format.dwEffects = automatic ? CFE_AUTOBACKCOLOR : 0;
+    format.crBackColor = color;
+    SendMessageW(editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+  };
+  if (same_revision) {
+    for (const auto& span : previous.original_backgrounds)
+      set_background(span.begin, span.end, span.background, span.automatic_background);
+  }
+
+  std::vector<SearchFormatSpan> original_backgrounds;
+  const COLORREF base = theme_editor_;
+  const auto mix = [](COLORREF from, COLORREF to, int amount) {
+    const int inverse = 100 - amount;
+    return RGB((GetRValue(from) * inverse + GetRValue(to) * amount) / 100,
+               (GetGValue(from) * inverse + GetGValue(to) * amount) / 100,
+               (GetBValue(from) * inverse + GetBValue(to) * amount) / 100);
+  };
+  const COLORREF normal_match = high_contrast_ ? GetSysColor(COLOR_INFOBK)
+      : mix(base, theme_accent_, dark_theme_ ? 26 : 20);
+  const COLORREF current_match = high_contrast_ ? GetSysColor(COLOR_HIGHLIGHT)
+      : mix(base, theme_accent_, dark_theme_ ? 56 : 44);
+  for (const auto& range : next_ranges) {
+    CHARFORMAT2W first_style{sizeof(first_style)};
+    const CHARRANGE whole{range.begin, range.end};
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&whole));
+    SendMessageW(editor, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&first_style));
+    if ((first_style.dwEffects & CFE_HIDDEN) != 0) continue;
+
+    if ((first_style.dwMask & CFM_BACKCOLOR) != 0) {
+      original_backgrounds.push_back({range.begin, range.end, first_style.crBackColor,
+          (first_style.dwEffects & CFE_AUTOBACKCOLOR) != 0});
+    } else {
+      bool have_span = false;
+      SearchFormatSpan span{};
+      for (LONG position = range.begin; position < range.end; ++position) {
+        const CHARRANGE one{position, position + 1};
+        SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&one));
+        CHARFORMAT2W format{sizeof(format)};
+        SendMessageW(editor, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+        const bool automatic = (format.dwEffects & CFE_AUTOBACKCOLOR) != 0;
+        if (!have_span) {
+          span = {position, position + 1, format.crBackColor, automatic};
+          have_span = true;
+        } else if (span.automatic_background == automatic &&
+                   (automatic || span.background == format.crBackColor)) {
+          span.end = position + 1;
+        } else {
+          original_backgrounds.push_back(span);
+          span = {position, position + 1, format.crBackColor, automatic};
+        }
+      }
+      if (have_span) original_backgrounds.push_back(span);
+    }
+    set_background(range.begin, range.end,
+                   range.current ? current_match : normal_match, false);
+  }
+
+  SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+  SendMessageW(editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  SendMessageW(editor, WM_SETREDRAW, TRUE, 0);
+  InvalidateRect(editor, nullptr, FALSE);
+  if (caret_visible) ShowCaret(editor);
+  previous.path = view.document.path();
+  previous.revision = view.document.revision();
+  previous.original_backgrounds = std::move(original_backgrounds);
+  previous.ranges = std::move(next_ranges);
 }
 
 void Application::ReplaceWorkspaceFromFindBar() {
   if (workspace_.empty()) return;
+  if (workspace_search_failed_) {
+    SetWindowTextW(search_status_, L"検索エラーがあるため、検索を更新してからWorkspace置換を実行してください。");
+    return;
+  }
   // The preview and closed-file transaction must be based on every open
   // editor's latest text.  Fail before either operation if any editor cannot
   // be read back.
@@ -8590,13 +10917,18 @@ void Application::ReplaceWorkspaceFromFindBar() {
       return;
     }
   }
-  ShowFindBar();
+  ShowFindBar(SearchScope::Workspace);
   const auto query = SearchQueryFromFindBar();
   const std::wstring replacement = ControlText(replace_edit_);
   if (query.text.empty()) { SetFocus(find_edit_); return; }
   std::map<std::filesystem::path, std::wstring> buffers;
   for (auto& view : documents_) {
-    if (!view->document.untitled()) buffers.emplace(view->document.path(), view->document.text());
+    if (!view->document.untitled()) {
+      std::error_code path_error;
+      auto path = std::filesystem::absolute(view->document.path(), path_error);
+      if (path_error) path = view->document.path();
+      buffers.emplace(path.lexically_normal(), view->document.text());
+    }
   }
   ReplacePlan plan;
   std::wstring error;
@@ -8609,15 +10941,26 @@ void Application::ReplaceWorkspaceFromFindBar() {
     MessageBoxW(window_, error.c_str(), L"置換preview", MB_ICONWARNING);
     return;
   }
+  const auto blocking_issue = std::ranges::find_if(plan.search_issues, [](const SearchIssue& issue) {
+    return issue.kind == SearchIssueKind::Error;
+  });
+  if (blocking_issue != plan.search_issues.end()) {
+    MessageBoxW(window_, blocking_issue->message.c_str(), L"置換preview", MB_ICONWARNING);
+    return;
+  }
+  const std::size_t excluded_count = static_cast<std::size_t>(std::ranges::count_if(
+      plan.search_issues, [](const SearchIssue& issue) { return issue.kind == SearchIssueKind::Excluded; }));
+  const std::wstring exclusion_summary = SearchExcludedIssuesSummary(workspace_, plan.search_issues);
   std::size_t replacements{};
   for (const auto& file : plan.files) replacements += file.replacement_count;
   if (replacements == 0) {
-    MessageBoxW(window_, L"置換対象はありません。", L"置換preview", MB_ICONINFORMATION);
+    const std::wstring no_target = L"置換対象はありません。" + exclusion_summary;
+    MessageBoxW(window_, no_target.c_str(), L"置換preview", MB_ICONINFORMATION);
     return;
   }
   std::wstring preview = std::to_wstring(plan.files.size()) + L"ファイル、" +
       std::to_wstring(replacements) + L"箇所を置換します。\n"
-      L"開いている文書は未保存bufferへ1つのUndo操作として適用し、閉じた文書は安全保存とjournalを使います。\n";
+      L"各対象の変更前後を確認した後に適用します。開いている文書は各タブでUndoでき、閉じた文書はjournalから戻せます。\n";
   const std::size_t preview_limit = std::min<std::size_t>(plan.files.size(), 8);
   for (std::size_t index = 0; index < preview_limit; ++index) {
     std::error_code relative_error;
@@ -8627,14 +10970,26 @@ void Application::ReplaceWorkspaceFromFindBar() {
   }
   if (plan.files.size() > preview_limit)
     preview += L"\n- ほか " + std::to_wstring(plan.files.size() - preview_limit) + L" ファイル";
+  preview += exclusion_summary;
   preview += L"\n\n続行しますか？";
-  if (MessageBoxW(window_, preview.c_str(), L"置換preview", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+  std::wstring preview_status = L"置換preview: " + std::to_wstring(plan.files.size()) +
+      L"ファイル、" + std::to_wstring(replacements) + L"箇所";
+  if (excluded_count > 0) preview_status += L" / 対象外 " + std::to_wstring(excluded_count) + L"件";
+  SetWindowTextW(search_status_, preview_status.c_str());
+  std::vector<ReplaceReviewFile> review_files;
+  review_files.reserve(plan.files.size());
+  for (const auto& file : plan.files)
+    review_files.push_back({&file.path, file.before, file.after, file.replacement_count});
+  if (!ReviewReplaceFiles(window_, workspace_, review_files, theme_surface_, theme_editor_,
+                          theme_foreground_, theme_border_, high_contrast_)) return;
+  if (MessageBoxW(window_, preview.c_str(), L"Workspace置換",
+                  MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
 
   ReplacePlan disk_plan{plan.query, plan.replacement, {}};
   std::vector<const ReplaceFilePlan*> buffer_plans;
   for (const auto& item : plan.files) {
     const auto open = std::ranges::find_if(documents_, [&](const auto& view) {
-      return _wcsicmp(view->document.path().c_str(), item.path.c_str()) == 0;
+      return SameSearchPath(view->document.path(), item.path);
     });
     if (open == documents_.end()) disk_plan.files.push_back(item);
     else buffer_plans.push_back(&item);
@@ -8649,7 +11004,7 @@ void Application::ReplaceWorkspaceFromFindBar() {
   }
   for (const auto* item : buffer_plans) {
     const auto open = std::ranges::find_if(documents_, [&](const auto& view) {
-      return _wcsicmp(view->document.path().c_str(), item->path.c_str()) == 0;
+      return SameSearchPath(view->document.path(), item->path);
     });
     if (open == documents_.end() || (*open)->document.text() != item->before ||
         (*open)->ime_composing) {
@@ -8671,7 +11026,7 @@ void Application::ReplaceWorkspaceFromFindBar() {
   if (!cancelled) {
     for (const auto* item : buffer_plans) {
       const auto open = std::ranges::find_if(documents_, [&](const auto& view) {
-        return _wcsicmp(view->document.path().c_str(), item->path.c_str()) == 0;
+        return SameSearchPath(view->document.path(), item->path);
       });
       if (open == documents_.end() || (*open)->document.text() != item->before ||
           (*open)->ime_composing) {
@@ -8688,17 +11043,385 @@ void Application::ReplaceWorkspaceFromFindBar() {
       result.applied_replacements += item->replacement_count;
     }
   }
+  if (!cancelled && !result.journal.empty() && result.applied_files > 0)
+    latest_closed_replace_journal_ = result.journal;
   PopulateWorkspaceTree();
   std::wstring message = std::to_wstring(result.applied_files) + L"ファイル、" +
       std::to_wstring(result.applied_replacements) + L"箇所を置換しました。";
-  if (!result.journal.empty()) message += L"\nclosed文書 journal: " + result.journal.wstring();
+  if (!result.journal.empty()) message += L"\n閉じたファイルの復旧journal: " + result.journal.wstring();
   if (!buffer_plans.empty()) message += L"\nopen文書の置換は各タブでUndoできます。";
   if (!complete && !error.empty()) message += L"\n" + error;
+  message += exclusion_summary;
   if (!result.conflicts.empty()) {
     message += L"\n競合した" + std::to_wstring(result.conflicts.size()) +
         L"ファイルは変更していません。";
   }
+  if (result.applied_replacements > 0) ScheduleSearch();
   MessageBoxW(window_, message.c_str(), L"Workspace置換", complete ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+void Application::RollbackClosedWorkspaceReplace() {
+  if (workspace_.empty()) {
+    SetWindowTextW(search_status_, L"置換journalを戻すにはWorkspaceを開いてください。");
+    return;
+  }
+
+  std::filesystem::path journal = latest_closed_replace_journal_;
+  const auto journal_workspace = journal.empty()
+      ? std::filesystem::path{}
+      : journal.parent_path().parent_path().parent_path().parent_path();
+  std::error_code journal_error;
+  if (journal.empty() || !SameSearchPath(journal_workspace, workspace_) ||
+      !std::filesystem::is_regular_file(journal, journal_error)) {
+    const auto selected = PickReplaceJournal(window_, workspace_);
+    if (!selected) return;
+    journal = *selected;
+  }
+
+  const auto show_failure = [&](const std::wstring& message) {
+    SetWindowTextW(search_status_, message.c_str());
+    MessageBoxW(window_, message.c_str(), L"閉じたファイルの置換を戻す", MB_ICONWARNING);
+  };
+  ReplaceRollbackPreview preview;
+  std::wstring error;
+  if (!PreviewWorkspaceReplaceRollback(workspace_, journal, preview, error)) {
+    show_failure(error.empty() ? L"置換journalをpreviewできません。" : error);
+    return;
+  }
+  if (!SameSearchPath(workspace_, preview.owning_workspace) ||
+      !SameSearchPath(journal, preview.journal)) {
+    show_failure(L"置換journalのWorkspaceが現在のWorkspaceと一致しません。");
+    return;
+  }
+  latest_closed_replace_journal_ = preview.journal;
+  if (preview.files.empty()) {
+    const std::wstring message = L"このjournalに、まだ戻せる閉じたファイルはありません。";
+    SetWindowTextW(search_status_, message.c_str());
+    MessageBoxW(window_, message.c_str(), L"閉じたファイルの置換を戻す", MB_ICONINFORMATION);
+    latest_closed_replace_journal_.clear();
+    return;
+  }
+
+  const auto reject_open_targets = [&](const ReplaceRollbackPreview& rollback_preview) {
+    for (const auto& file : rollback_preview.files) {
+      const auto open = std::ranges::find_if(documents_, [&](const auto& view) {
+        return SameSearchPath(view->document.path(), file.path);
+      });
+      if (open == documents_.end()) continue;
+      if ((*open)->ime_composing || !SyncDocumentFromEditor(**open)) {
+        error = L"戻す対象が開いている文書ですが、編集内容を読み取れません。タブを閉じてから再試行してください。";
+        return true;
+      }
+      error = (*open)->document.dirty()
+          ? L"戻す対象に未保存編集があります。編集を解決し、対象タブを閉じてから再試行してください。"
+          : L"戻す対象のタブが開いています。対象タブを閉じてから再試行してください。";
+      return true;
+    }
+    return false;
+  };
+  if (reject_open_targets(preview)) {
+    show_failure(error);
+    return;
+  }
+
+  std::vector<ReplaceReviewFile> review_files;
+  review_files.reserve(preview.files.size());
+  for (const auto& file : preview.files)
+    review_files.push_back({&file.path, file.expected_current, file.restore_text, 0});
+  SetWindowTextW(search_status_, (L"戻すpreview: " + std::to_wstring(preview.files.size()) + L"ファイル").c_str());
+  if (!ReviewReplaceFiles(window_, workspace_, review_files, theme_surface_, theme_editor_,
+                          theme_foreground_, theme_border_, high_contrast_)) return;
+
+  if (!SameSearchPath(workspace_, preview.owning_workspace)) {
+    show_failure(L"確認中にWorkspaceが変わったため、置換を戻しませんでした。");
+    return;
+  }
+  ReplaceRollbackPreview current_preview;
+  if (!PreviewWorkspaceReplaceRollback(workspace_, preview.journal, current_preview, error)) {
+    show_failure(error.empty() ? L"確認後のjournal再確認に失敗したため、置換を戻しませんでした。" : error);
+    return;
+  }
+  const bool preview_unchanged = current_preview.files.size() == preview.files.size() &&
+      std::ranges::equal(current_preview.files, preview.files, [](const auto& current, const auto& shown) {
+        return SameSearchPath(current.path, shown.path) &&
+            current.expected_current == shown.expected_current && current.restore_text == shown.restore_text;
+      });
+  if (!preview_unchanged) {
+    show_failure(L"preview後に対象ファイルが変わったため、置換を戻しませんでした。もう一度previewしてください。");
+    return;
+  }
+  if (reject_open_targets(current_preview)) {
+    show_failure(error);
+    return;
+  }
+
+  std::wstring confirmation = std::to_wstring(current_preview.files.size()) +
+      L"個の閉じたファイルをjournal保存前の内容へ戻します。\n" +
+      current_preview.journal.wstring() + L"\n\n続行しますか？";
+  SetWindowTextW(search_status_, (L"戻すpreview確認済み: " +
+      std::to_wstring(current_preview.files.size()) + L"ファイル").c_str());
+  if (MessageBoxW(window_, confirmation.c_str(), L"閉じたファイルの置換を戻す",
+                  MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+  if (!SameSearchPath(workspace_, current_preview.owning_workspace) || reject_open_targets(current_preview)) {
+    show_failure(error.empty() ? L"対象タブまたはWorkspaceが変わったため、置換を戻しませんでした。" : error);
+    return;
+  }
+
+  ReplaceApplyResult result;
+  const bool complete = RollbackWorkspaceReplace(current_preview.journal, result, error);
+  const bool partial = !complete || !result.conflicts.empty();
+  std::wstring message = L"戻した閉じたファイル: " + std::to_wstring(result.applied_files);
+  if (!result.conflicts.empty()) {
+    message += L"\n競合し変更しなかったファイル: " + std::to_wstring(result.conflicts.size());
+    constexpr std::size_t conflict_preview_limit = 8;
+    for (std::size_t index = 0; index < std::min(conflict_preview_limit, result.conflicts.size()); ++index) {
+      std::error_code relative_error;
+      const auto relative = std::filesystem::relative(result.conflicts[index], workspace_, relative_error);
+      message += L"\n- " + (relative_error ? result.conflicts[index].wstring() : relative.wstring());
+    }
+    if (result.conflicts.size() > conflict_preview_limit)
+      message += L"\n- ほか " + std::to_wstring(result.conflicts.size() - conflict_preview_limit) + L"件";
+  }
+  if (!complete && !error.empty()) message += L"\n" + error;
+  if (partial && error.empty()) message += L"\n対象ファイルが外部変更または保存競合となったため、一部のみ戻しました。";
+  if (!partial) {
+    message += L"\njournal対象の復旧が完了しました。";
+    latest_closed_replace_journal_.clear();
+  }
+  if (result.applied_files > 0) {
+    PopulateWorkspaceTree();
+    ScheduleSearch();
+  }
+  SetWindowTextW(search_status_, message.c_str());
+  MessageBoxW(window_, message.c_str(), L"閉じたファイルの置換を戻す",
+              partial ? MB_ICONWARNING : MB_ICONINFORMATION);
+}
+
+void Application::ReplaceSelectedWorkspace(bool all_matches) {
+  if (search_scope_state_ != SearchScope::Workspace) return;
+  std::size_t index = current_workspace_match_index_;
+  if (index >= workspace_search_results_.size()) {
+    const HTREEITEM selected = TreeView_GetSelection(find_results_);
+    if (selected) {
+      TVITEMW item{};
+      item.mask = TVIF_PARAM | TVIF_HANDLE;
+      item.hItem = selected;
+      if (TreeView_GetItem(find_results_, &item)) {
+        if (item.lParam >= 0) {
+          index = static_cast<std::size_t>(item.lParam);
+        } else if (item.lParam == static_cast<LPARAM>(-2)) {
+          const auto group = std::ranges::find_if(search_file_nodes_, [&](const auto& entry) {
+            return entry.second == selected;
+          });
+          if (group != search_file_nodes_.end()) {
+            const auto first = search_file_first_result_.find(group->first);
+            if (first != search_file_first_result_.end()) index = first->second;
+          }
+        }
+      }
+    }
+  }
+  if (index >= workspace_search_results_.size()) {
+    SetWindowTextW(search_status_, L"置換する検索結果を選択してください。");
+    return;
+  }
+  current_workspace_match_index_ = index;
+  const SearchMatch selected_match = workspace_search_results_[index];
+  ReplaceWorkspaceFile(selected_match, all_matches);
+}
+
+void Application::ReplaceWorkspaceFile(const SearchMatch& match, bool all_matches) {
+  if (workspace_.empty()) {
+    SetWindowTextW(search_status_, L"Workspaceが未選択です。");
+    return;
+  }
+  if (workspace_search_failed_) {
+    SetWindowTextW(search_status_, L"検索エラーがあるため、検索を更新してからファイル置換を実行してください。");
+    return;
+  }
+  const SearchQuery query = SearchQueryFromFindBar();
+  if (query.text.empty()) {
+    SetWindowTextW(search_status_, L"置換する検索語を入力してください。");
+    SetFocus(find_edit_);
+    return;
+  }
+  const std::wstring replacement = ControlText(replace_edit_);
+  std::map<std::filesystem::path, std::wstring> buffers;
+  for (auto& view : documents_) {
+    if (view->ime_composing || !SyncDocumentFromEditor(*view)) {
+      SetWindowTextW(search_status_, L"開いている文書を読み取れないため置換を中止しました。");
+      return;
+    }
+    if (!view->document.untitled()) {
+      std::error_code path_error;
+      auto path = std::filesystem::absolute(view->document.path(), path_error);
+      if (path_error) path = view->document.path();
+      buffers.insert_or_assign(path.lexically_normal(), view->document.text());
+    }
+  }
+
+  std::wstring validation_error;
+  const auto open = std::ranges::find_if(documents_, [&](const auto& view) {
+    return SameSearchPath(view->document.path(), match.path);
+  });
+  if (open != documents_.end()) {
+    auto& view = **open;
+    if (SearchContentHash(view) != match.snapshot_hash) {
+      SetWindowTextW(search_status_, L"文書が検索後に変更されました。最新内容を検索しています…");
+      ScheduleSearch();
+      return;
+    }
+    if (!ContainsSearchMatch(match, view.document.text(), query, validation_error)) {
+      SetWindowTextW(search_status_, validation_error.empty()
+          ? L"選択した一致が現在の検索語と一致しません。最新内容を検索しています…" : validation_error.c_str());
+      ScheduleSearch();
+      return;
+    }
+    std::wstring output;
+    std::wstring error;
+    std::size_t count{};
+    std::size_t replaced_begin{};
+    std::size_t replaced_end{};
+    if (all_matches) {
+      if (!ReplaceDocumentText(view.document.text(), query, replacement, output, count, error)) {
+        SetWindowTextW(search_status_, error.c_str());
+        return;
+      }
+      if (count == 0) {
+        SetWindowTextW(search_status_, L"このファイルに置換対象はありません。");
+        return;
+      }
+      if (!ApplySourceTextWithUndo(view, std::move(output))) {
+        SetWindowTextW(search_status_, L"文書が同期中のため置換できません。再試行してください。");
+        return;
+      }
+    } else {
+      bool replaced{};
+      if (!ReplaceDocumentMatch(view.document.text(), query, replacement,
+                                match.begin, match.end, output,
+                                replaced_begin, replaced_end, replaced, error)) {
+        SetWindowTextW(search_status_, error.c_str());
+        return;
+      }
+      if (!replaced || replaced_begin != match.begin) {
+        SetWindowTextW(search_status_, L"選択した一致が古くなりました。最新内容を検索しています…");
+        ScheduleSearch();
+        return;
+      }
+      if (!ApplySourceTextWithUndo(view, std::move(output), true,
+                                   SourceSelection{replaced_begin, replaced_end})) {
+        SetWindowTextW(search_status_, L"文書が同期中のため置換できません。再試行してください。");
+        return;
+      }
+      count = 1;
+    }
+    std::wstring status = std::to_wstring(count) + L"件を置換しました。Undoで戻せます。";
+    SetWindowTextW(search_status_, status.c_str());
+    ScheduleSearch();
+    return;
+  }
+
+  std::error_code relative_error;
+  const auto relative = std::filesystem::relative(match.path, workspace_, relative_error);
+  if (relative_error || relative.empty() || relative.is_absolute() ||
+      (!relative.empty() && *relative.begin() == std::filesystem::path(L".."))) {
+    SetWindowTextW(search_status_, L"Workspace外の検索結果は置換できません。");
+    return;
+  }
+  SearchQuery scoped_query = query;
+  scoped_query.include_globs = {relative.generic_wstring()};
+  ReplacePlan preview_plan;
+  std::wstring error;
+  if (!RunCancellableTask(window_, L"ファイル置換preview", L"選択ファイルの置換内容を確認しています",
+      [&](HANDLE cancellation) {
+        return PreviewWorkspaceReplace(workspace_, scoped_query, replacement, buffers,
+            preview_plan, error, [&] { return WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0; });
+      }, error)) {
+    SetWindowTextW(search_status_, error.c_str());
+    return;
+  }
+  const auto blocking_issue = std::ranges::find_if(preview_plan.search_issues,
+      [](const SearchIssue& issue) { return issue.kind == SearchIssueKind::Error; });
+  if (blocking_issue != preview_plan.search_issues.end()) {
+    SetWindowTextW(search_status_, blocking_issue->message.c_str());
+    return;
+  }
+  const std::wstring exclusion_summary = SearchExcludedIssuesSummary(workspace_, preview_plan.search_issues);
+  const auto file = std::ranges::find_if(preview_plan.files, [&](const auto& item) {
+    return SameSearchPath(item.path, match.path);
+  });
+  if (file == preview_plan.files.end() || SearchSnapshotHash(file->before) != match.snapshot_hash) {
+    SetWindowTextW(search_status_, L"ファイルが検索後に変更されました。最新内容を検索しています…");
+    ScheduleSearch();
+    return;
+  }
+  if (!ContainsSearchMatch(match, file->before, query, error)) {
+    SetWindowTextW(search_status_, error.empty()
+        ? L"選択した一致が現在の検索語と一致しません。最新内容を検索しています…" : error.c_str());
+    ScheduleSearch();
+    return;
+  }
+
+  ReplaceFilePlan selected_file = *file;
+  std::size_t count = selected_file.replacement_count;
+  if (!all_matches) {
+    std::size_t replaced_begin{};
+    std::size_t replaced_end{};
+    bool replaced{};
+    std::wstring after;
+    if (!ReplaceDocumentMatch(selected_file.before, query, replacement,
+                              match.begin, match.end, after,
+                              replaced_begin, replaced_end, replaced, error) ||
+        !replaced || replaced_begin != match.begin) {
+      SetWindowTextW(search_status_, error.empty()
+          ? L"選択した一致が古くなりました。最新内容を検索しています…" : error.c_str());
+      ScheduleSearch();
+      return;
+    }
+    selected_file.after = std::move(after);
+    selected_file.replacement_count = 1;
+    selected_file.selected_match = ReplaceMatchSelection{match.begin, match.end, match.snapshot_hash};
+    count = 1;
+  }
+  if (count == 0) {
+    const std::wstring no_target = L"このファイルに置換対象はありません。" + exclusion_summary;
+    SetWindowTextW(search_status_, no_target.c_str());
+    return;
+  }
+  const std::wstring name = relative.wstring();
+  std::wstring confirmation = L"Preview: " + name + L"\n" + std::to_wstring(count) +
+      L"件を置換します。閉じたファイルは安全保存と復旧journalを使います。\n\n" +
+      ReplaceDiffPreview(selected_file.before, selected_file.after) + exclusion_summary +
+      L"\n\n続行しますか？";
+  std::wstring preview_status = L"ファイル置換preview: " + name + L" / " + std::to_wstring(count) + L"件";
+  if (!preview_plan.search_issues.empty())
+    preview_status += L" / 対象外 " + std::to_wstring(static_cast<std::size_t>(std::ranges::count_if(
+        preview_plan.search_issues, [](const SearchIssue& issue) {
+          return issue.kind == SearchIssueKind::Excluded;
+        }))) + L"件";
+  SetWindowTextW(search_status_, preview_status.c_str());
+  if (MessageBoxW(window_, confirmation.c_str(), L"ファイル置換preview",
+                  MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+
+  ReplacePlan apply_plan{scoped_query, replacement, {std::move(selected_file)}};
+  ReplaceApplyResult result;
+  const bool applied = RunCancellableTask(window_, L"ファイル置換", L"安全保存とjournalを適用しています",
+      [&](HANDLE cancellation) {
+        return ApplyWorkspaceReplace(workspace_, apply_plan, result, error,
+            [&] { return WaitForSingleObject(cancellation, 0) == WAIT_OBJECT_0; });
+      }, error);
+  if (!applied) {
+    SetWindowTextW(search_status_, error.empty() ? L"ファイル置換に失敗しました。" : error.c_str());
+    return;
+  }
+  if (!result.journal.empty() && result.applied_files > 0)
+    latest_closed_replace_journal_ = result.journal;
+  PopulateWorkspaceTree();
+  std::wstring status = std::to_wstring(result.applied_replacements) + L"件を置換しました。";
+  status += exclusion_summary;
+  if (!result.journal.empty()) status += L" 復旧journal: " + result.journal.wstring();
+  SetWindowTextW(search_status_, status.c_str());
+  ScheduleSearch();
 }
 
 void Application::CreateProfile(BuiltInProfile profile) {
@@ -8847,7 +11570,7 @@ void Application::CreateProfileById(std::wstring id, const SYSTEMTIME* requested
   PopulateWorkspaceTree();
 }
 
-void Application::ApplyTableAction(TableAction action) {
+void Application::ApplyTableAction(TableAction action, std::optional<std::size_t> target_source) {
   if (active_document_ >= documents_.size() || documents_[active_document_]->ime_composing ||
       !IsMarkdownFile(documents_[active_document_]->document.path())) return;
   auto& view = *documents_[active_document_];
@@ -8859,7 +11582,7 @@ void Application::ApplyTableAction(TableAction action) {
   CHARRANGE selection{};
   SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
   const std::wstring source = view.document.text();
-  const auto source_caret = view.editor_snapshot.NativeToSource(selection.cpMin);
+  const auto source_caret = target_source.value_or(view.editor_snapshot.NativeToSource(selection.cpMin));
   TableEditResult edit;
   switch (action) {
     case TableAction::InsertRowBefore: edit = InsertTableRow(source, source_caret, false); break;
@@ -8870,8 +11593,7 @@ void Application::ApplyTableAction(TableAction action) {
     case TableAction::DeleteColumn: edit = DeleteTableColumn(source, source_caret); break;
   }
   if (!edit.changed) {
-    MessageBoxW(window_, L"カーソルをMarkdown表のセル内へ移動してください。",
-                L"表の編集", MB_ICONINFORMATION);
+    if (!ParseGfmTableAt(source, source_caret)) SetStatusText(L"表のセル内で操作してください。");
     return;
   }
   if (!ApplySourceTextWithUndo(view, edit.text, true,
@@ -10279,7 +13001,10 @@ void Application::ApplySettings() {
       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
   if (ui_replacement) {
     for (HWND control : {workspace_tree_, tabs_, outline_, status_, find_edit_, find_next_,
-                         replace_edit_, find_workspace_, replace_workspace_, find_case_, find_regex_,
+                         search_previous_, search_scope_, search_target_, search_count_, search_status_,
+                         search_replace_toggle_, search_details_toggle_, search_ignore_, search_hidden_,
+                          replace_edit_, find_workspace_, replace_workspace_, rollback_workspace_replace_,
+                          find_case_, find_regex_,
                          find_word_, find_include_glob_, find_exclude_glob_, replace_one_,
                          replace_document_, find_results_, calendar_, git_panel_, calendar_details_,
                          calendar_summary_, calendar_daily_, calendar_details_toggle_,
@@ -10301,9 +13026,8 @@ void Application::ApplySettings() {
   TreeView_SetTextColor(workspace_tree_, foreground);
   TreeView_SetBkColor(outline_, theme_surface_);
   TreeView_SetTextColor(outline_, foreground);
-  ListView_SetBkColor(find_results_, theme_surface_);
-  ListView_SetTextBkColor(find_results_, theme_surface_);
-  ListView_SetTextColor(find_results_, foreground);
+  TreeView_SetBkColor(find_results_, theme_surface_);
+  TreeView_SetTextColor(find_results_, foreground);
   ListView_SetBkColor(git_files_, theme_surface_);
   ListView_SetTextBkColor(git_files_, theme_surface_);
   ListView_SetTextColor(git_files_, foreground);
@@ -10339,6 +13063,16 @@ void Application::ApplySettings() {
     if (previous) DeleteObject(previous);
   }
   ApplyChromeTheme();
+  for (HWND control : {workspace_tree_, outline_, find_results_, git_files_,
+                        git_diff_view_, git_panel_, calendar_details_,
+                        find_edit_, replace_edit_})
+    ThemeSlimScrollbars(control, control == find_edit_ || control == replace_edit_
+        ? theme_input_ : theme_surface_, theme_border_, high_contrast_);
+  for (const auto& view : documents_) {
+    ThemeSlimScrollbars(view->editor, theme_editor_, theme_border_, high_contrast_);
+    for (const auto& viewport : view->table_viewports)
+      ThemeSlimScrollbars(viewport->editor, theme_editor_, theme_border_, high_contrast_);
+  }
   LayoutControls();
   InvalidateRect(window_, nullptr, TRUE);
 }
@@ -10352,6 +13086,8 @@ void Application::RebuildAccelerators() {
       std::pair{std::wstring_view(L"file.close"), static_cast<WORD>(kFileClose)},
       std::pair{std::wstring_view(L"edit.find"), static_cast<WORD>(kEditFind)},
       std::pair{std::wstring_view(L"edit.findNext"), static_cast<WORD>(kEditFindNext)},
+      std::pair{std::wstring_view(L"edit.findPrevious"), static_cast<WORD>(kEditFindPrevious)},
+      std::pair{std::wstring_view(L"edit.findWorkspace"), static_cast<WORD>(kEditFindWorkspace)},
       std::pair{std::wstring_view(L"view.commandPalette"), static_cast<WORD>(kViewCommandPalette)},
   };
   std::vector<ACCEL> accelerators;
@@ -10375,6 +13111,20 @@ void Application::RebuildAccelerators() {
     const auto parsed = ParseAccelerator(value->second, command);
     if (parsed) accelerators.push_back(*parsed);
   }
+  const auto add_default = [&](std::wstring_view name, BYTE modifiers, WORD key, WORD command) {
+    if (settings_.keybindings.contains(std::wstring(name))) return;
+    const bool occupied = std::ranges::any_of(accelerators, [&](const ACCEL& item) {
+      return item.fVirt == static_cast<BYTE>(FVIRTKEY | modifiers) && item.key == key;
+    });
+    if (!occupied) accelerators.push_back(
+        ACCEL{static_cast<BYTE>(FVIRTKEY | modifiers), key, command});
+  };
+  add_default(L"edit.find", FCONTROL, static_cast<WORD>('F'), static_cast<WORD>(kEditFind));
+  add_default(L"edit.findWorkspace", static_cast<BYTE>(FCONTROL | FSHIFT),
+              static_cast<WORD>('F'), static_cast<WORD>(kEditFindWorkspace));
+  add_default(L"edit.findNext", 0, static_cast<WORD>(VK_F3), static_cast<WORD>(kEditFindNext));
+  add_default(L"edit.findPrevious", FSHIFT, static_cast<WORD>(VK_F3),
+              static_cast<WORD>(kEditFindPrevious));
   HACCEL replacement = accelerators.empty() ? nullptr :
       CreateAcceleratorTableW(accelerators.data(), static_cast<int>(accelerators.size()));
   if (accelerator_table_) DestroyAcceleratorTable(accelerator_table_);
@@ -10750,6 +13500,7 @@ void Application::ShowCommandPalette() {
       Entry{L"Workspace: 信頼する", kWorkspaceTrust, has_workspace, L"Workspaceが未選択です"},
       Entry{L"Workspace: 信頼を解除", kWorkspaceUntrust, trusted, L"信頼済みWorkspaceが必要です"},
       Entry{L"編集: Workspaceを置換", kEditReplaceWorkspace, has_workspace, L"Workspaceが未選択です"},
+      Entry{L"編集: 閉じたファイルの置換を戻す", kEditRollbackWorkspaceReplace, has_workspace, L"Workspaceが未選択です"},
       Entry{L"表示: 選択日のDailyを開く", kCalendarOpenSelected, has_workspace, L"Workspaceが未選択です"},
       Entry{L"カレンダー: 今日へ移動", kCalendarGoToToday, true, L""},
       Entry{L"表示: Calendarを表示/非表示", kViewCalendar, true, L""},
@@ -10919,12 +13670,15 @@ void Application::ShowDiagnostics() {
 
     snapshot.app_version = L"MDLite " MDLITE_VERSION;
     snapshot.application_update_status = L"更新元未設定（確認・通信なし）";
-    snapshot.dependency_update_status = L"libwebp固定版。URL・SHA-256を確認して手動更新";
+    snapshot.dependency_update_status = L"libwebp・PCRE2固定版。URL・SHA-256を確認して手動更新";
     const auto webp_version = static_cast<unsigned int>(WebPGetDecoderVersion());
     snapshot.dependency_versions.push_back({
         L"libwebp", std::to_wstring((webp_version >> 16) & 0xffU) + L"." +
                         std::to_wstring((webp_version >> 8) & 0xffU) + L"." +
                         std::to_wstring(webp_version & 0xffU)});
+    wchar_t pcre_version[64]{};
+    if (pcre2_config(PCRE2_CONFIG_VERSION, pcre_version) >= 0)
+      snapshot.dependency_versions.push_back({L"PCRE2", pcre_version});
     snapshot.recent_summaries = application->recent_diagnostic_summaries_;
     return true;
   };

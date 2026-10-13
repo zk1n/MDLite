@@ -1426,52 +1426,24 @@ impl App {
             range
         };
         let mut replacement = text.to_owned();
-        let mut gap_caret = None;
         if !self.tabs[self.active].raw && !authoring_table {
             if range.is_empty()
                 && !replacement.is_empty()
-                && range.start == 0
                 && self
                     .views
                     .iter()
-                    .any(|view| view.source.is_empty() && view.source.start == 0)
-                && let Some(table) = self.tables.first()
-                && self.doc().source()[..table.table.range.start]
-                    .trim()
-                    .is_empty()
-            {
-                let missing = 2usize.saturating_sub(physical_line_endings(
-                    &self.doc().source()[..table.table.range.start],
-                ));
-                if missing > 0 {
-                    let newline = if self.doc().source().contains("\r\n") {
-                        "\r\n"
-                    } else {
-                        "\n"
-                    };
-                    let plan = LiveEdit {
-                        range,
-                        caret: replacement.len(),
-                        replacement: format!("{replacement}{}", newline.repeat(missing)),
-                    };
-                    self.apply_live_edit(plan);
-                    return;
-                }
-            }
-            if range.is_empty()
-                && !replacement.is_empty()
-                && let Some(plan) = self.tables.windows(2).find_map(|tables| {
-                    table_gap_insertion(
-                        &tables[0].table,
-                        &tables[1].table,
+                    .any(|view| view.source.is_empty() && view.source.start == range.start)
+                && let Some(plan) = self.tables.iter().find_map(|table| {
+                    table_before_insertion(
                         self.doc().source(),
+                        table.table.range.start,
                         range.start,
                         &replacement,
                     )
                 })
             {
-                gap_caret = Some(plan.caret);
-                replacement = plan.replacement;
+                self.apply_live_edit(plan);
+                return;
             }
             if range.is_empty()
                 && !replacement.is_empty()
@@ -1523,12 +1495,9 @@ impl App {
                 &replacement,
             )
         };
-        let Some(mut plan) = plan else {
+        let Some(plan) = plan else {
             return;
         };
-        if let Some(caret) = gap_caret {
-            plan.caret = caret;
-        }
         self.apply_live_edit(plan);
     }
     fn apply_live_edit(&mut self, plan: LiveEdit) {
@@ -3728,14 +3697,21 @@ impl App {
                 return Ok(y);
             }
             let source = self.doc().source_shared();
-            let marker = if let Some(previous) = self.tables.last() {
-                table_gap_marker(&source, previous.table.range.end, table.range.start)
+            // Every table owns a real insertion point immediately before its
+            // source range, including after an edit shifts the range start.
+            let mut markers = vec![table.range.start];
+            if let Some(previous) = self.tables.last() {
+                markers.extend(table_gap_marker(
+                    &source,
+                    previous.table.range.end,
+                    table.range.start,
+                ));
             } else if source[..table.range.start].trim().is_empty() {
-                Some(0)
-            } else {
-                None
-            };
-            if let Some(marker) = marker {
+                markers.push(0);
+            }
+            markers.sort_unstable();
+            markers.dedup();
+            for marker in markers {
                 self.push_view(
                     "",
                     (vec![marker], vec![marker]),
@@ -5075,6 +5051,36 @@ fn table_gap_marker(source: &str, start: usize, end: usize) -> Option<usize> {
     let base = start + first;
     adjacent_line_ending(source, base, false).map(|range| range.end)
 }
+fn table_before_insertion(
+    source: &str,
+    table_start: usize,
+    p: usize,
+    text: &str,
+) -> Option<LiveEdit> {
+    let after = source.get(p..table_start)?;
+    if !after.trim().is_empty() {
+        return None;
+    }
+    let eol = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let before = source.get(..p)?;
+    let body_end = before.trim_end_matches(char::is_whitespace).len();
+    let prefix = if body_end == 0 {
+        String::new()
+    } else {
+        eol.repeat(2usize.saturating_sub(physical_line_endings(&before[body_end..])))
+    };
+    let suffix = eol.repeat(2usize.saturating_sub(physical_line_endings(after)));
+    Some(LiveEdit {
+        range: p..p,
+        caret: p + prefix.len() + text.len(),
+        replacement: format!("{prefix}{text}{suffix}"),
+    })
+}
+#[cfg(test)]
 fn table_gap_insertion(
     left: &Table,
     right: &Table,
@@ -5085,16 +5091,7 @@ fn table_gap_insertion(
     if table_gap_marker(source, left.range.end, right.range.start) != Some(p) {
         return None;
     }
-    let eol = table_insert_eol(left, source)?;
-    let before = physical_line_endings(source.get(left.range.end..p)?);
-    let after = physical_line_endings(source.get(p..right.range.start)?);
-    let prefix = eol.repeat(2usize.saturating_sub(before));
-    let suffix = eol.repeat(2usize.saturating_sub(after));
-    Some(LiveEdit {
-        range: p..p,
-        caret: p + prefix.len() + text.len(),
-        replacement: format!("{prefix}{text}{suffix}"),
-    })
+    table_before_insertion(source, right.range.start, p, text)
 }
 fn table_exit_action(table: &Table, source: &str, after: Option<usize>) -> Option<TableKeyAction> {
     let tail = source.get(table.range.end..)?;
@@ -5740,6 +5737,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_table_boundary_enter_typing_undo_source_and_geometry() {
+        for eol in ["\n", "\r\n"] {
+            let table = format!("| H |{eol}|---|{eol}| cell |{eol}");
+            let sources = [
+                table.clone(),
+                format!("before{eol}{eol}{table}after"),
+                format!("{table}{eol}{table}after"),
+            ];
+            for (index, source) in sources.iter().enumerate() {
+                let fixture = EditorFixture::new(source, false);
+                let p;
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    p = app.tables[if index == 2 { 1 } else { 0 }].table.range.start;
+                    if index == 0 {
+                        let eof = app.doc().byte_len();
+                        app.doc_mut().set_selection(eof, eof).unwrap();
+                        unsafe {
+                            app.key_with_modifiers(VK_HOME.0, true, false);
+                        }
+                        assert_eq!(app.doc().selection(), Selection::caret(0));
+                    } else {
+                        app.doc_mut().set_selection(p, p).unwrap();
+                    }
+                    unsafe {
+                        app.after_input();
+                    }
+                }
+                fixture.message(WM_KEYDOWN, VK_RETURN.0 as usize);
+                let after_enter = format!("{}{eol}{}", &source[..p], &source[p..]);
+                let q = p + eol.len();
+                {
+                    let app = fixture.state.app.borrow();
+                    assert_eq!(app.doc().source(), after_enter);
+                    assert_eq!(app.doc().selection(), Selection::caret(q));
+                    assert!(
+                        app.views.iter().any(|view| view.source == (q..q)),
+                        "shifted table start {q} has no exact source-affine marker ({eol:?}, fixture {index})"
+                    );
+                    assert_eq!(app.caret_view().unwrap().source, q..q);
+                    assert!(app.caret_location().1 < app.tables[if index == 2 { 1 } else { 0 }].y);
+                }
+                fixture.message(WM_CHAR, '前' as usize);
+                let app = &mut *fixture.state.app.borrow_mut();
+                assert_eq!(
+                    app.doc().source(),
+                    format!("{}前{eol}{eol}{}", &after_enter[..q], &after_enter[q..])
+                );
+                assert_eq!(app.doc().selection(), Selection::caret(q + "前".len()));
+                unsafe {
+                    app.key_with_modifiers(0x5a, true, false);
+                }
+                assert_eq!(app.doc().source(), after_enter);
+                assert_eq!(app.doc().selection(), Selection::caret(q));
+                assert_eq!(app.caret_view().unwrap().source, q..q);
+                unsafe {
+                    app.key_with_modifiers(0x5a, true, false);
+                }
+                assert_eq!(app.doc().source(), *source);
+                assert_eq!(app.doc().selection(), Selection::caret(p));
+                assert_eq!(app.caret_view().unwrap().source, p..p);
+                assert!(!app.doc().is_dirty());
+            }
+        }
+    }
     #[test]
     fn review_leading_table_home_is_visible_and_accepts_before_table_typing() {
         for source in [

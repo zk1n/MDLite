@@ -1,5 +1,74 @@
 # Rust試験版の受入記録
 
+## 2026-10-13 crop・Markdown改修
+
+本文の編集正本をcrop 0.4.3へ統合し、履歴はCOW snapshotを使用する。
+解析・保存API用の連続文字列、projection、表解析は文書ID／revisionに結び付ける。
+採用構文と原文編集の扱いは[Markdown方言](markdown-dialect.md)、保持データと
+crop iteratorの回避理由は[設計](rust-architecture.md)に記録する。
+
+最終ソースaggregateは`c303c87856f3e531bc38df7d9ff99ea766f67dda040c4acc73031d4d7370b519`。
+通常のDebug／Releaseで、それぞれ55 library＋48 native＝103 tests、fmt、ClippyがPASS。
+実装者・Rootとは別のSol Highによるcorrectness reviewの4件のP2を修正し、同じreviewerの
+修正部分の再確認がPASSした。Ponytailの複雑性確認は別に実施した。
+
+| 対象 | 実装・確認結果 | 確認範囲と限界 |
+|---|---|---|
+| 本文・履歴 | 唯一のRope、atomic範囲編集、saved state、Undo／Redo分岐、共有snapshot | ランダム編集を独立String期待値と照合。chunk跨ぎ、RI、ZWJ、結合文字、CRLF、UTF-16途中を試験。履歴nodeの正確なbytesは未測定 |
+| 保存 | UTF-8／BOM、Windows CP932、元bytes、外部変更・変換不能時の保護 | 純粋I/OとRope経由の保存を試験。最終Releaseの所有fixtureでWM_CHAR編集、Raw／Live、保存、切替、通常closeもPASS |
+| 入力 | Ctrl+Z／Shift+Z／Y振り分け、composition優先、後続control文字抑制 | native履歴経路を試験。実際の物理key／OS shortcut送信の一式とは区別 |
+| IME位置 | 要求UTF-16位置を実DirectWrite layoutからscreen pixelへ変換 | 所有する非表示Win32 windowで先頭／途中／末尾、複数行、emoji、表offset、scroll、DPI、無効size／owner／境界を試験。実MS IME候補UI・取消・再変換は未確認 |
+| Markdown | 明示4 flags、全15 flagsの採否、裸リンク、表、チェック、list／quote／rule、safe HTML／Front Matter | 画像前後の親本文、style後の高さ、画像のhit／damage、表末尾EOLを含む回帰を試験。公開仕様の完全conformanceは主張しない |
+| 画像 | 入力・寸法・展開量の上限、SVG構造／外部参照拒否、可視域中心decode、推定cache予算 | 5形式の正常・不正・過大入力、失敗保護、所有する非表示windowでupload／再利用／全owner evictionを確認。codec scratch／COM overheadの厳密な総量は未測定 |
+| 通常デバッグ | 最終DebugでIDEのStart Debugging、実CodeLLDB child／native window／fixture／EXE hashを確認 | IDE Stopと所有windowだけのcloseまでPASS。物理F5、synthetic F5送信はNOT_RUN |
+| 配送・採用 | experiment refだけを通常配送する。main／developを保持 | 実際のcommit／remote OID／HANDOFF readbackはlocal HANDOFFに記録。Rust正式採用と全製品のHuman受入は別判断 |
+
+### 今回の資源・応答確認
+
+**50MBは望ましい目安であり、今回の必達・合否条件ではない。**
+以下は一回の小さな同条件比較で、旧visible／focused測定や完成製品の総資源保証とは別である。
+同じfixture・画像、1／6文書、client 1084×761、outer 1100×800、96 DPI、ATOK閉、
+opt-in診断で、所有する非表示windowにWM_PAINTを送り実アプリを計測した。
+前後のgeometry／profile／open state／fixture bytesと通常終了を照合した。
+
+| 文書数 | 前 Working Set bytes | 後 Working Set bytes | 前 private bytes | 後 private bytes |
+|---:|---:|---:|---:|---:|
+| 1 | 26,132,480 | 25,223,168 | 9,994,240 | 9,695,232 |
+| 6 | 25,350,144 | 25,305,088 | 10,006,528 | 9,904,128 |
+
+本文・履歴・解析だけの別probeは、144,384-byte文書6件に各100編集、全Undo／Redo、
+全projection保持を行った。同じ論理byte位置を使い、旧版はStringのlen、新版はRopeの
+byte_lenを参照し、長さ取得のための不要なparser用コピーを行わない。
+
+| 6文書合計の処理 | 前 µs | 後 µs |
+|---|---:|---:|
+| 600編集 | 724 | 898 |
+| Undo | 382 | 490 |
+| Redo | 493 | 114 |
+| 全体解析 | 35,074 | 35,482 |
+| selection／同revision読み取り | 12 | 27 |
+
+全projection／履歴保持時のprivate bytesは25,657,344→27,181,056。
+COW履歴と連続read bufferを持つ構造上の増加はあるが、共有node／allocatorの内訳は未測定で、
+この差を特定部品の実測costとは断定しない。短い計測の揺らぎもあり、広い性能保証とは扱わない。
+Working Set trim、数字を下げるための機能無効化、renderer刷新は行っていない。
+
+### 未確認・禁止・scope外
+
+OS clipboardの読み取り・列挙・書込み・backup／restore・消去、Ctrl+C／X／V、画像貼付けは
+明示禁止のため実施していない。純粋TSV／DIB payload試験をOS統合の証拠にしない。
+実MS IME候補・取消・再変換はNOT_RUN。今回の所有processで確認したprofileはATOK閉であり、
+入力profileを変更しない境界を維持した。これは実IMEの開発側確認の未実施で、Human受入済みとは扱わない。
+物理typematic／F5、別monitor／実DPI、Narrator、主観的UI受入も未確認。
+今回のnative API／所有fixture／IDE commandのPASSをそれらへ転用しない。
+Explorer／Calendar／Git／検索の全移植、autosave／復旧の完成、Rust正式採用、main／develop統合、
+tag／Releaseはscope外。依存advisory確認の制約と保守終了通知は[依存説明](dependencies.md)に残す。
+
+## 以前の編集基盤試験の履歴
+
+以下は以前のsource／EXE／旧50MB必達条件での記録をそのまま保持したもの。
+今回ソースのPASSや今回の完了条件へ読み替えない。
+
 この記録は、機械検証、GUIで確認できた範囲、未完了の受入項目を分けて示す。
 最後にbuild/test/fmt/Clippyを完了したproduct checkpointのsource aggregateは
 `6a408c1b3a5156c45d4e160d20514f73680a0abaa19230472b2c7726af8e3847`。

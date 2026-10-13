@@ -6,7 +6,8 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use crate::markdown::{gfm_autolinks, parser_options};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, HeadingLevel, Parser, Tag, TagEnd};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryAffinity {
@@ -115,12 +116,51 @@ struct SourceProjectionSpan {
     display_utf16: Range<usize>,
 }
 
+struct PendingText<'a> {
+    text: CowStr<'a>,
+    range: Range<usize>,
+}
+
+impl PendingText<'_> {
+    fn append(&mut self, next: CowStr<'_>, range: Range<usize>) {
+        let mut text = std::mem::replace(&mut self.text, CowStr::Borrowed("")).into_string();
+        text.push_str(&next);
+        self.text = text.into();
+        self.range.end = range.end;
+    }
+}
+
 impl DisplayProjection {
     pub fn parse(source: &str) -> Self {
         let mut builder = ProjectionBuilder::new(source);
-        let parser = Parser::new_ext(source, Options::all()).into_offset_iter();
+        let parser = Parser::new_ext(source, parser_options()).into_offset_iter();
+        let mut pending_text: Option<PendingText<'_>> = None;
         for (event, range) in parser {
-            builder.process(event, range);
+            match event {
+                Event::Text(text) => {
+                    let source_start = include_escape_prefix(source, range.clone()).start;
+                    match pending_text.take() {
+                        Some(mut pending) if pending.range.end == source_start => {
+                            pending.append(text, range);
+                            pending_text = Some(pending);
+                        }
+                        Some(pending) => {
+                            builder.process(Event::Text(pending.text), pending.range);
+                            pending_text = Some(PendingText { text, range });
+                        }
+                        None => pending_text = Some(PendingText { text, range }),
+                    }
+                }
+                event => {
+                    if let Some(pending) = pending_text.take() {
+                        builder.process(Event::Text(pending.text), pending.range);
+                    }
+                    builder.process(event, range);
+                }
+            }
+        }
+        if let Some(pending) = pending_text {
+            builder.process(Event::Text(pending.text), pending.range);
         }
         builder.finish()
     }
@@ -264,7 +304,7 @@ impl<'a> ProjectionBuilder<'a> {
                 if self.in_literal_context() {
                     self.append_literal(&value, range, kinds, '\n');
                 } else {
-                    self.append_visible(&value, range, kinds);
+                    self.append_text_with_autolinks(&value, range, kinds);
                 }
             }
             Event::Code(value) => {
@@ -296,11 +336,15 @@ impl<'a> ProjectionBuilder<'a> {
                 self.append_visible("\n", range, vec![InlineKind::Break]);
             }
             Event::Rule => {
+                let display_start = self.display_utf16;
+                let rule_line = self.source.get(range.clone()).unwrap_or_default();
+                let marker_end = range.start + rule_line.trim_end_matches(['\r', '\n']).len();
+                self.append_visible("─", range.start..marker_end, vec![InlineKind::Text]);
                 self.hidden(&range);
                 self.blocks.push(ProjectionBlock {
                     kind: BlockKind::ThematicBreak,
                     source: range,
-                    display_utf16: self.display_utf16..self.display_utf16,
+                    display_utf16: display_start..self.display_utf16,
                     depth: self.open_blocks.len(),
                 });
             }
@@ -496,7 +540,88 @@ impl<'a> ProjectionBuilder<'a> {
         let range = include_escape_prefix(self.source, range);
         let raw = self.source.get(range.clone()).unwrap_or_default();
         let tokens = align_visible_tokens(raw, range.start, visible);
-        self.append_tokens(visible, range, kinds, tokens);
+        self.append_tokens(visible, range, kinds, &tokens);
+    }
+
+    fn append_text_with_autolinks(
+        &mut self,
+        visible: &str,
+        range: Range<usize>,
+        kinds: Vec<InlineKind>,
+    ) {
+        if kinds
+            .iter()
+            .any(|kind| matches!(kind, InlineKind::Link { .. } | InlineKind::Image { .. }))
+        {
+            self.append_visible(visible, range, kinds);
+            return;
+        }
+
+        let source_range = include_escape_prefix(self.source, range.clone());
+        let Some(raw) = self.source.get(source_range.clone()) else {
+            self.append_visible(visible, range, kinds);
+            return;
+        };
+        let tokens = align_visible_tokens(raw, source_range.start, visible);
+        if !tokens_align_with_visible(&tokens, visible) {
+            self.append_visible(visible, range, kinds);
+            return;
+        }
+
+        let mut links = gfm_autolinks(visible);
+        links.retain(|link| {
+            source_range_for_display_range(&tokens, &link.range).is_some_and(|source| {
+                !link.needs_url_boundary
+                    || source_preceded_by_gfm_url_delimiter(self.source, source.start)
+            })
+        });
+        if links.is_empty() {
+            self.append_tokens(visible, source_range, kinds, &tokens);
+            return;
+        }
+
+        let mut display_cursor = 0;
+        for link in links {
+            if link.range.start < display_cursor {
+                continue;
+            }
+            self.append_text_segment(
+                visible,
+                &tokens,
+                display_cursor..link.range.start,
+                kinds.clone(),
+            );
+            let mut link_kinds = kinds.clone();
+            link_kinds.push(InlineKind::Link {
+                destination: link.destination,
+                title: None,
+            });
+            self.append_text_segment(visible, &tokens, link.range.clone(), link_kinds);
+            display_cursor = link.range.end;
+        }
+        self.append_text_segment(visible, &tokens, display_cursor..visible.len(), kinds);
+    }
+
+    fn append_text_segment(
+        &mut self,
+        visible: &str,
+        tokens: &[(String, Range<usize>)],
+        display_range: Range<usize>,
+        kinds: Vec<InlineKind>,
+    ) {
+        if display_range.is_empty() {
+            return;
+        }
+        let Some(text) = visible.get(display_range.clone()) else {
+            return;
+        };
+        let Some(tokens) = token_slice_for_display_range(tokens, &display_range) else {
+            return;
+        };
+        let Some(source) = source_range_for_tokens(tokens) else {
+            return;
+        };
+        self.append_tokens(text, source, kinds, tokens);
     }
 
     fn append_literal(
@@ -512,7 +637,7 @@ impl<'a> ProjectionBuilder<'a> {
         }
         let raw = self.source.get(range.clone()).unwrap_or_default();
         let tokens = align_literal_tokens(raw, range.start, visible, newline);
-        self.append_tokens(visible, range, kinds, tokens);
+        self.append_tokens(visible, range, kinds, &tokens);
     }
 
     fn append_inline_code(&mut self, visible: &str, range: Range<usize>, kinds: Vec<InlineKind>) {
@@ -521,7 +646,7 @@ impl<'a> ProjectionBuilder<'a> {
             return;
         }
         let tokens = inline_code_tokens(self.source, range.clone(), visible);
-        self.append_tokens(visible, range.clone(), kinds, tokens);
+        self.append_tokens(visible, range.clone(), kinds, &tokens);
         // Inline code has no Start/End events, so collapse the closing
         // backtick delimiter here after mapping each literal content scalar.
         self.hidden(&range);
@@ -532,28 +657,62 @@ impl<'a> ProjectionBuilder<'a> {
         visible: &str,
         range: Range<usize>,
         kinds: Vec<InlineKind>,
-        tokens: Vec<(String, Range<usize>)>,
+        tokens: &[(String, Range<usize>)],
     ) {
         let display_start = self.display_utf16;
-        let mut source_start = range.start;
-        let mut source_end = range.end;
-        if !tokens.is_empty() {
-            source_start = tokens.first().map_or(range.start, |token| token.1.start);
-            source_end = tokens.last().map_or(range.end, |token| token.1.end);
-            for (text, source_range) in tokens {
-                self.append_chunk(&text, source_range);
+        if tokens.is_empty() {
+            if !visible.is_empty() {
+                self.append_chunk(visible, range.clone());
             }
-        } else if !visible.is_empty() {
-            self.append_chunk(visible, range.clone());
+            if self.display_utf16 > display_start {
+                self.push_run(display_start, range, kinds);
+            } else {
+                self.hidden(&range);
+            }
+            return;
         }
+
+        let mut run_display_start = self.display_utf16;
+        let mut run_source_start = None;
+        let mut run_source_end = None;
+        for (text, source_range) in tokens {
+            let transformed = self.source.get(source_range.clone()) != Some(text.as_str());
+            if transformed
+                && self.display_utf16 > run_display_start
+                && let (Some(source_start), Some(source_end)) =
+                    (run_source_start.take(), run_source_end.take())
+            {
+                self.push_run(run_display_start, source_start..source_end, kinds.clone());
+            }
+
+            let token_display_start = self.display_utf16;
+            self.append_chunk(text, source_range.clone());
+            if transformed {
+                self.push_run(token_display_start, source_range.clone(), kinds.clone());
+                run_display_start = self.display_utf16;
+            } else {
+                run_source_start.get_or_insert(source_range.start);
+                run_source_end = Some(source_range.end);
+            }
+        }
+
+        if self.display_utf16 > run_display_start
+            && let (Some(source_start), Some(source_end)) = (run_source_start, run_source_end)
+        {
+            self.push_run(run_display_start, source_start..source_end, kinds);
+        }
+        if self.display_utf16 == display_start {
+            self.hidden(&range);
+        }
+    }
+
+    fn push_run(&mut self, display_start: usize, source: Range<usize>, kinds: Vec<InlineKind>) {
         if self.display_utf16 > display_start {
             self.runs.push(ProjectionRun {
                 display_utf16: display_start..self.display_utf16,
-                source: source_start..source_end,
+                source,
                 kinds,
             });
-        } else {
-            self.hidden(&range);
         }
     }
 
@@ -801,6 +960,90 @@ fn align_tokens(
     mapped
 }
 
+fn tokens_align_with_visible(tokens: &[(String, Range<usize>)], visible: &str) -> bool {
+    let mut offset = 0;
+    for (token, _) in tokens {
+        let Some(rest) = visible.get(offset..) else {
+            return false;
+        };
+        if !rest.starts_with(token) {
+            return false;
+        }
+        offset += token.len();
+    }
+    offset == visible.len()
+}
+
+fn token_slice_for_display_range<'a>(
+    tokens: &'a [(String, Range<usize>)],
+    display_range: &Range<usize>,
+) -> Option<&'a [(String, Range<usize>)]> {
+    if display_range.start > display_range.end {
+        return None;
+    }
+    let mut display_offset = 0usize;
+    let mut covered_end = display_range.start;
+    let mut selected_start = None;
+    let mut selected_end = None;
+    for (index, token) in tokens.iter().enumerate() {
+        let token_end = display_offset.checked_add(token.0.len())?;
+        if token_end <= display_range.start {
+            display_offset = token_end;
+            continue;
+        }
+        if display_offset >= display_range.end {
+            selected_end = Some(index);
+            break;
+        }
+        if display_offset < display_range.start || token_end > display_range.end {
+            return None;
+        }
+        selected_start.get_or_insert(index);
+        covered_end = token_end;
+        display_offset = token_end;
+    }
+    if covered_end != display_range.end {
+        return None;
+    }
+    let start = selected_start?;
+    let end = selected_end.unwrap_or(tokens.len());
+    Some(&tokens[start..end])
+}
+
+fn source_range_for_tokens(tokens: &[(String, Range<usize>)]) -> Option<Range<usize>> {
+    Some(tokens.first()?.1.start..tokens.last()?.1.end)
+}
+
+fn source_range_for_display_range(
+    tokens: &[(String, Range<usize>)],
+    display_range: &Range<usize>,
+) -> Option<Range<usize>> {
+    source_range_for_tokens(token_slice_for_display_range(tokens, display_range)?)
+}
+
+fn source_preceded_by_gfm_url_delimiter(source: &str, source_byte: usize) -> bool {
+    let Some(prefix) = source.get(..source_byte) else {
+        return false;
+    };
+    let Some(previous) = prefix.chars().next_back() else {
+        return true;
+    };
+    if previous.is_whitespace() || matches!(previous, '*' | '_' | '~' | '(') {
+        return true;
+    }
+
+    // A blockquote marker is syntax rather than visible text, so a URL at the
+    // first text position in `>https://...` is still at the start of its line.
+    let line_prefix = prefix.rsplit(['\r', '\n']).next().unwrap_or_default();
+    let mut markers = line_prefix.trim_start();
+    let mut saw_marker = false;
+    while let Some(rest) = markers.strip_prefix('>') {
+        saw_marker = true;
+        markers = rest.trim_start_matches([' ', '\t']);
+    }
+    saw_marker && markers.is_empty()
+}
+
 fn include_escape_prefix(source: &str, range: Range<usize>) -> Range<usize> {
     if range.start > range.end || range.end > source.len() {
         return range;
@@ -980,6 +1223,17 @@ fn entity_at(raw: &str, start: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulldown_cmark::Options;
+
+    const DIALECT_FIXTURE: &str = include_str!("../tests/fixtures/markdown_dialect.md");
+
+    fn project_with_options(source: &str, options: Options) -> DisplayProjection {
+        let mut builder = ProjectionBuilder::new(source);
+        for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+            builder.process(event, range);
+        }
+        builder.finish()
+    }
 
     #[test]
     fn projects_blocks_inline_formatting_and_image_metadata_without_changing_source() {
@@ -1039,6 +1293,64 @@ mod tests {
             source,
             "---\ntitle: 日本語\n---\n\n# **見出し**\n\n> 引用\n\n- 項目\n\n```rust\nlet x = 1;\n```\n\n![猫](cat.png)<!-- mdlite-width:320 -->"
         );
+    }
+
+    #[test]
+    fn thematic_breaks_keep_one_visible_atomic_source_mapped_marker() {
+        for syntax in ["***", "---", "___"] {
+            let source = format!("before\n\n{syntax}\n\nafter");
+            let projection = DisplayProjection::parse(&source);
+            let block = projection
+                .blocks
+                .iter()
+                .find(|block| matches!(block.kind, BlockKind::ThematicBreak))
+                .expect("thematic-break block");
+            assert!(source[block.source.clone()].starts_with(syntax));
+            let text_before = projection.text[..]
+                .split_once('─')
+                .map(|(before, _)| before.encode_utf16().count())
+                .expect("visible thematic-break marker");
+            assert_eq!(block.display_utf16, text_before..text_before + 1);
+            assert_eq!(projection.text.matches('─').count(), 1);
+            let run = projection
+                .runs
+                .iter()
+                .find(|run| run.display_utf16 == block.display_utf16)
+                .expect("source-backed marker run");
+            assert_eq!(&source[run.source.clone()], syntax);
+        }
+    }
+
+    #[test]
+    fn thematic_break_projection_leaves_literal_contexts_and_table_delimiters_alone() {
+        let source = concat!(
+            "---\ntitle: ---\n---\n\n",
+            "```md\n---\n***\n```\n\n",
+            "`---` and \\***\n\n",
+            "| A | B |\n| --- | --- |\n| x --- y | `---` |\n",
+        );
+        let projection = DisplayProjection::parse(source);
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::ThematicBreak))
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::FrontMatter))
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Table))
+        );
+        assert!(projection.text.contains("title: ---"));
+        assert!(projection.text.contains("---\n***"));
+        assert!(projection.text.contains("x --- y"));
     }
 
     #[test]
@@ -1151,7 +1463,7 @@ mod tests {
             .iter()
             .find(|run| run.display_utf16.start == displayed_pipe)
             .expect("escaped text run");
-        assert_eq!(escaped_run.source, escape_start..escape_start + 3);
+        assert_eq!(escaped_run.source, escape_start..escape_start + 2);
         let malformed = "| heading | other |\n| --- |\n| value | other |";
         let malformed_projection = DisplayProjection::parse(malformed);
         assert!(malformed_projection.text.contains("heading"));
@@ -1231,6 +1543,387 @@ mod tests {
         assert_eq!(
             projection.utf16_at_source_byte(newline_start + 1, BoundaryAffinity::Before),
             Some(space + 1)
+        );
+    }
+
+    #[test]
+    fn adopted_commonmark_and_gfm_fixture_keeps_source_ranges_for_native_editing() {
+        let projection = DisplayProjection::parse(DIALECT_FIXTURE);
+        assert_eq!(projection.source_len, DIALECT_FIXTURE.len());
+        assert!(projection.blocks.iter().any(|block| {
+            block.kind == BlockKind::FrontMatter
+                && DIALECT_FIXTURE
+                    .get(block.source.clone())
+                    .is_some_and(|source| {
+                        source.starts_with("---\n") && source.trim_end().ends_with("...")
+                    })
+        }));
+        for level in 1..=6 {
+            assert!(
+                projection
+                    .blocks
+                    .iter()
+                    .any(|block| block.kind == BlockKind::Heading { level })
+            );
+        }
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| { matches!(block.kind, BlockKind::List { ordered: None }) })
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| { matches!(block.kind, BlockKind::List { ordered: Some(1) }) })
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Quote)
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| { matches!(block.kind, BlockKind::Code { fenced: true, .. }) })
+        );
+        assert!(projection.text.contains("title: `literal` &amp; source"));
+        assert!(projection.text.contains("reference link.\nThe next line"));
+        assert!(projection.text.contains("code span\ta|b\tbold"));
+        assert!(
+            projection
+                .text
+                .contains("[!NOTE] This remains ordinary quote text.")
+        );
+        assert!(
+            projection
+                .text
+                .contains("<script>window.alert(\"literal\")</script>")
+        );
+        assert!(projection.text.contains("[unfinished **nested markup"));
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Strong))
+        );
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Emphasis))
+        );
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Code))
+        );
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Strikethrough))
+        );
+        let tasks = projection
+            .runs
+            .iter()
+            .filter_map(|run| {
+                run.kinds.iter().find_map(|kind| match kind {
+                    InlineKind::TaskMarker { checked } => Some((run, *checked)),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        assert!(!tasks[0].1);
+        assert!(tasks[1].1);
+        assert_eq!(DIALECT_FIXTURE.get(tasks[0].0.source.clone()), Some("[ ]"));
+        assert_eq!(DIALECT_FIXTURE.get(tasks[1].0.source.clone()), Some("[x]"));
+
+        let destinations = projection
+            .runs
+            .iter()
+            .flat_map(|run| run.kinds.iter())
+            .filter_map(|kind| match kind {
+                InlineKind::Link { destination, .. } => Some(destination.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(destinations.contains(&"https://example.org/inline"));
+        assert!(destinations.contains(&"https://example.org/reference"));
+        assert!(destinations.contains(&"https://example.org/path_(part)"));
+        assert!(destinations.contains(&"http://www.example.org/path"));
+        assert!(destinations.contains(&"mailto:help+tag@example.org"));
+        for url in [
+            "https://example.org/inline-code",
+            "https://example.org/fenced-code",
+        ] {
+            let source_byte = DIALECT_FIXTURE.find(url).expect("code URL");
+            assert!(!projection.runs.iter().any(|run| {
+                run.source.start <= source_byte
+                    && source_byte < run.source.end
+                    && run
+                        .kinds
+                        .iter()
+                        .any(|kind| matches!(kind, InlineKind::Link { .. }))
+            }));
+        }
+
+        let tables = crate::table::find_tables(DIALECT_FIXTURE);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].alignments,
+            [
+                crate::table::TableAlignment::Left,
+                crate::table::TableAlignment::Center,
+                crate::table::TableAlignment::Right,
+            ]
+        );
+        assert_eq!(
+            DIALECT_FIXTURE.get(tables[0].rows[1].cells[0].content_range.clone()),
+            Some("`code span`")
+        );
+        assert_eq!(
+            DIALECT_FIXTURE.get(tables[0].rows[1].cells[1].content_range.clone()),
+            Some("a\\|b")
+        );
+    }
+
+    #[test]
+    fn gfm_autolinks_keep_entity_and_escape_source_spelling_and_offsets() {
+        let source =
+            "URL https://example.org/a&amp;b, www.example.org/path. and user+tag@example.org.";
+        let projection = DisplayProjection::parse(source);
+        assert!(projection.text.contains("https://example.org/a&b"));
+
+        let raw_url = "https://example.org/a&amp;b";
+        let raw_start = source.find(raw_url).expect("raw URL");
+        let link_runs = projection
+            .runs
+            .iter()
+            .filter(|run| {
+                run.kinds.iter().any(|kind| {
+                    matches!(kind, InlineKind::Link { destination, .. } if destination == "https://example.org/a&b")
+                })
+            })
+            .collect::<Vec<_>>();
+        let first = link_runs.first().expect("source-mapped GFM URL");
+        let last = link_runs.last().expect("source-mapped GFM URL");
+        let source_range = first.source.start..last.source.end;
+        let display_range = first.display_utf16.start..last.display_utf16.end;
+        assert_eq!(source_range, raw_start..raw_start + raw_url.len());
+        assert_eq!(
+            projection.source_byte_at_utf16(display_range.start, BoundaryAffinity::After),
+            Some(source_range.start)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(display_range.end, BoundaryAffinity::Before),
+            Some(source_range.end)
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(source_range.start, BoundaryAffinity::After),
+            Some(display_range.start)
+        );
+
+        let no_match = concat!(
+            "prefixhttps://example.org, ftp://example.org, example.org, ",
+            ")https://example.org, ,www.example.org"
+        );
+        let projection = DisplayProjection::parse(no_match);
+        assert!(!projection.runs.iter().any(|run| {
+            run.kinds
+                .iter()
+                .any(|kind| matches!(kind, InlineKind::Link { .. }))
+        }));
+
+        for source in ["(https://example.org", ">https://example.org"] {
+            let projection = DisplayProjection::parse(source);
+            assert!(projection.runs.iter().any(|run| {
+                run.kinds.iter().any(|kind| {
+                    matches!(kind, InlineKind::Link { destination, .. } if destination == "https://example.org")
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn gfm_autolink_source_range_includes_markdown_escape_spelling() {
+        let source = r"Escaped https://example.org/a\*b.";
+        let projection = DisplayProjection::parse(source);
+        let raw_url = r"https://example.org/a\*b";
+        let start = source.find(raw_url).expect("escaped URL source");
+        let link_runs = projection
+            .runs
+            .iter()
+            .filter(|run| {
+                run.kinds.iter().any(|kind| {
+                    matches!(kind, InlineKind::Link { destination, .. } if destination == "https://example.org/a*b")
+                })
+            })
+            .collect::<Vec<_>>();
+        let first = link_runs.first().expect("escaped URL link run");
+        let last = link_runs.last().expect("escaped URL link run");
+        assert_eq!(
+            first.source.start..last.source.end,
+            start..start + raw_url.len()
+        );
+        assert!(projection.text.contains("https://example.org/a*b"));
+    }
+
+    #[test]
+    fn front_matter_needs_a_complete_boundary_and_uses_literal_source_text() {
+        for (closing, closing_text) in [("---", "---"), ("...", "...")] {
+            let source = format!("---\r\ntitle: `raw` &amp;\r\n{closing}\r\n# body");
+            let projection = DisplayProjection::parse(&source);
+            let block = projection
+                .blocks
+                .iter()
+                .find(|block| block.kind == BlockKind::FrontMatter)
+                .expect("closed YAML front matter");
+            let raw = source
+                .get(block.source.clone())
+                .expect("front matter source");
+            assert!(raw.starts_with("---\r\n"));
+            assert!(raw.trim_end().ends_with(closing_text));
+            assert!(projection.text.contains("title: `raw` &amp;"));
+            assert!(!projection.runs.iter().any(|run| {
+                run.kinds
+                    .iter()
+                    .any(|kind| matches!(kind, InlineKind::Link { .. }))
+            }));
+        }
+
+        for source in [
+            "---\ntitle: not closed\n# body\n",
+            "---\ntitle: ambiguous\n--- trailing text\n# body\n",
+            "body\n---\ntitle: not at document start\n---\n",
+        ] {
+            let projection = DisplayProjection::parse(source);
+            assert!(
+                !projection
+                    .blocks
+                    .iter()
+                    .any(|block| block.kind == BlockKind::FrontMatter)
+            );
+            assert_eq!(projection.source_len, source.len());
+        }
+    }
+
+    #[test]
+    fn deferred_extensions_and_smart_punctuation_stay_literal() {
+        let punctuation = "\"straight\" 'quotes' ... -- remain literal";
+        assert_eq!(DisplayProjection::parse(punctuation).text, punctuation);
+
+        let source = concat!(
+            "[^note] and [^note]: definition\n\n",
+            "x^2^ and H~2O~ and [[Wiki Page]]\n\n",
+            "$$x^2$$\n\n",
+            "+++\nkey: value\n+++\n\n",
+            "# Heading {#id .class}\n\n",
+            "> [!NOTE] ordinary quote text"
+        );
+        let projection = DisplayProjection::parse(source);
+        assert!(projection.text.contains("[^note]"));
+        assert!(projection.text.contains("x^2^ and H~2O~ and [[Wiki Page]]"));
+        assert!(projection.text.contains("$$x^2$$"));
+        assert!(projection.text.contains("+++"));
+        assert!(projection.text.contains("Heading {#id .class}"));
+        assert!(projection.text.contains("[!NOTE] ordinary quote text"));
+        assert!(
+            !projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::FrontMatter)
+        );
+        assert!(!projection.runs.iter().any(|run| {
+            run.kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    InlineKind::Math
+                        | InlineKind::FootnoteReference
+                        | InlineKind::Superscript
+                        | InlineKind::Subscript
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn footnotes_and_alerts_are_deferred_until_their_markers_are_source_safe() {
+        let footnotes = "A reference[^1].\n\n[^1]: Footnote body";
+        // The current projection displays only the parsed label and treats the
+        // definition as a raw block, hiding the Markdown marker spellings.
+        let enabled = project_with_options(footnotes, Options::ENABLE_FOOTNOTES);
+        assert!(
+            enabled
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::FootnoteReference))
+        );
+        assert!(!enabled.text.contains("[^1]"));
+        assert!(!enabled.text.contains("[^1]:"));
+        assert!(
+            enabled
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Raw)
+        );
+        let deferred = DisplayProjection::parse(footnotes);
+        assert!(deferred.text.contains("[^1]"));
+        assert!(deferred.text.contains("[^1]: Footnote body"));
+        assert_eq!(deferred.source_len, footnotes.len());
+
+        let alert = "> [!NOTE]\n> Alert body\n";
+        // ENABLE_GFM turns [!NOTE] into BlockQuoteKind metadata, but the
+        // current projection only retains the generic Quote block kind.
+        let enabled = project_with_options(alert, Options::ENABLE_GFM);
+        assert!(!enabled.text.contains("[!NOTE]"));
+        let deferred = DisplayProjection::parse(alert);
+        assert!(deferred.text.contains("[!NOTE]"));
+        assert!(
+            deferred
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Quote)
+        );
+        assert_eq!(deferred.source_len, alert.len());
+    }
+
+    #[test]
+    fn table_discovery_uses_the_same_front_matter_boundaries_as_projection() {
+        let source = concat!(
+            "---\n",
+            "| YAML key | YAML value |\n",
+            "| --- | --- |\n",
+            "...\n\n",
+            "| Header | Value |\n",
+            "| --- | --- |\n",
+            "| body | table |\n"
+        );
+        let projection = DisplayProjection::parse(source);
+        let front_matter = projection
+            .blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::FrontMatter)
+            .expect("front matter");
+        let tables = crate::table::find_tables(source);
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].range.start >= front_matter.source.end);
+        let table_blocks = projection
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Table)
+            .collect::<Vec<_>>();
+        assert_eq!(table_blocks.len(), 1);
+        assert!(table_blocks[0].source.start >= front_matter.source.end);
+        assert!(
+            source
+                .get(front_matter.source.clone())
+                .is_some_and(|raw| raw.contains("YAML key"))
         );
     }
 }

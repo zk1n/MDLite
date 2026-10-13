@@ -52,6 +52,64 @@ pub struct LineColumn {
     pub utf16_column: usize,
 }
 
+/// Checked Rope coordinates use crop's metrics without a contiguous copy.
+pub fn rope_byte_to_utf16(text: &crop::Rope, byte: usize) -> Result<usize, CoordinateError> {
+    check_rope_byte(text, byte)?;
+    Ok(text.utf16_code_unit_of_byte(byte))
+}
+pub fn rope_utf16_to_byte(text: &crop::Rope, units: usize) -> Result<usize, CoordinateError> {
+    if units > text.utf16_len() {
+        return Err(CoordinateError::Utf16OffsetOutOfBounds {
+            offset: units,
+            len: text.utf16_len(),
+        });
+    }
+    let byte = text.byte_of_utf16_code_unit(units);
+    if text.utf16_code_unit_of_byte(byte) != units {
+        return Err(CoordinateError::InsideSurrogatePair { offset: units });
+    }
+    Ok(byte)
+}
+fn check_rope_byte(text: &crop::Rope, byte: usize) -> Result<(), CoordinateError> {
+    if byte > text.byte_len() {
+        return Err(CoordinateError::ByteOffsetOutOfBounds {
+            offset: byte,
+            len: text.byte_len(),
+        });
+    }
+    if !text.is_char_boundary(byte) {
+        return Err(CoordinateError::NotCharBoundary { offset: byte });
+    }
+    Ok(())
+}
+/// crop joins graphemes across chunks; chunks are never segmented separately.
+pub fn rope_is_grapheme_boundary(text: &crop::Rope, byte: usize) -> Result<bool, CoordinateError> {
+    check_rope_byte(text, byte)?;
+    Ok(text.is_grapheme_boundary(byte))
+}
+pub fn rope_previous_grapheme_boundary(
+    text: &crop::Rope,
+    byte: usize,
+) -> Result<usize, CoordinateError> {
+    check_rope_byte(text, byte)?;
+    // crop 0.4.3's iterator loses regional-indicator context after yielding a
+    // cluster. Its boundary API consults the original chunks and keeps parity.
+    Ok((0..byte)
+        .rev()
+        .find(|&candidate| text.is_char_boundary(candidate) && text.is_grapheme_boundary(candidate))
+        .unwrap_or(0))
+}
+pub fn rope_next_grapheme_boundary(
+    text: &crop::Rope,
+    byte: usize,
+) -> Result<usize, CoordinateError> {
+    check_rope_byte(text, byte)?;
+    Ok((byte..text.byte_len())
+        .map(|candidate| candidate + 1)
+        .find(|&candidate| text.is_char_boundary(candidate) && text.is_grapheme_boundary(candidate))
+        .unwrap_or(text.byte_len()))
+}
+
 fn check_byte_offset(text: &str, byte_offset: usize) -> Result<(), CoordinateError> {
     if byte_offset > text.len() {
         return Err(CoordinateError::ByteOffsetOutOfBounds {
@@ -270,6 +328,107 @@ pub fn line_column_to_byte(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rope_metrics_and_graphemes_cross_real_chunks_without_flattening() {
+        let text = format!("Ae{}👨‍👩‍👧‍👦\u{fe0f}\r\n日本語😀", "\u{301}".repeat(4000));
+        let rope = crop::Rope::from(text.as_str());
+        assert!(rope.chunks().count() > 4);
+        let mut chunk_end = 0;
+        assert!(rope.chunks().any(|chunk| {
+            chunk_end += chunk.len();
+            chunk_end < text.len() && !is_grapheme_boundary(&text, chunk_end).unwrap()
+        }));
+        for byte in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let units = rope_byte_to_utf16(&rope, byte).unwrap();
+            assert_eq!(units, byte_to_utf16(&text, byte).unwrap());
+            assert_eq!(rope_utf16_to_byte(&rope, units).unwrap(), byte);
+        }
+        for byte in [0, 1, 3, 8002, text.len()] {
+            assert_eq!(
+                rope_is_grapheme_boundary(&rope, byte),
+                is_grapheme_boundary(&text, byte)
+            );
+            assert_eq!(
+                rope_previous_grapheme_boundary(&rope, byte),
+                previous_grapheme_boundary(&text, byte)
+            );
+            assert_eq!(
+                rope_next_grapheme_boundary(&rope, byte),
+                next_grapheme_boundary(&text, byte)
+            );
+        }
+        let emoji = text.len() - 4;
+        let units = rope_byte_to_utf16(&rope, emoji).unwrap();
+        assert!(matches!(
+            rope_utf16_to_byte(&rope, units + 1),
+            Err(CoordinateError::InsideSurrogatePair { .. })
+        ));
+        assert!(rope_byte_to_utf16(&rope, emoji + 1).is_err());
+        assert!(rope_utf16_to_byte(&rope, rope.utf16_len() + 1).is_err());
+        for sample in ["a🇦🇧🇨🇩🇪z", "a👩‍💻\u{fe0f}z", "a\r\nz", "aक्‍षz"]
+        {
+            let rope = crop::Rope::from(sample);
+            for byte in sample.char_indices().map(|(i, _)| i).chain([sample.len()]) {
+                assert_eq!(
+                    rope_is_grapheme_boundary(&rope, byte),
+                    is_grapheme_boundary(sample, byte)
+                );
+                assert_eq!(
+                    rope_previous_grapheme_boundary(&rope, byte),
+                    previous_grapheme_boundary(sample, byte),
+                    "sample={sample:?}, byte={byte}, crop={:?}",
+                    rope.graphemes().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    rope_next_grapheme_boundary(&rope, byte),
+                    next_grapheme_boundary(sample, byte),
+                    "sample={sample:?}, byte={byte}, crop={:?}",
+                    rope.graphemes().collect::<Vec<_>>()
+                );
+            }
+        }
+        let regional = format!("{}{}z", "a".repeat(1020), "🇦🇧🇨🇩🇪".repeat(600));
+        let rope = crop::Rope::from(regional.as_str());
+        let boundaries: Vec<_> = regional
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain([regional.len()])
+            .collect();
+        assert!(rope.chunks().count() > 8);
+        for byte in regional
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([regional.len()])
+        {
+            assert_eq!(
+                rope_is_grapheme_boundary(&rope, byte).unwrap(),
+                boundaries.binary_search(&byte).is_ok(),
+                "regional byte={byte}"
+            );
+        }
+        let mut end = 0;
+        for chunk in rope.chunks() {
+            end += chunk.len();
+            assert_eq!(
+                rope_previous_grapheme_boundary(&rope, end).unwrap(),
+                boundaries
+                    .iter()
+                    .copied()
+                    .take_while(|&byte| byte < end)
+                    .last()
+                    .unwrap_or(0)
+            );
+            assert_eq!(
+                rope_next_grapheme_boundary(&rope, end).unwrap(),
+                boundaries
+                    .iter()
+                    .copied()
+                    .find(|&byte| byte > end)
+                    .unwrap_or(regional.len())
+            );
+        }
+    }
 
     #[test]
     fn utf8_byte_and_utf16_offsets_round_trip_unicode() {

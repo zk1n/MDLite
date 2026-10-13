@@ -1,7 +1,9 @@
 param(
     [ValidateSet('Debug','Release')][string]$Configuration = 'Debug',
     [switch]$Verify,
-    [switch]$PrepareDemo
+    [switch]$PrepareDemo,
+    [string]$TargetDirectory = 'target',
+    [string]$EvidenceDirectory = '.codex-runtime/rust-foundation'
 )
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -14,22 +16,22 @@ try {
     if ($RustVersion -notmatch '^rustc 1\.99\.0\s') {
         throw 'This experiment requires the recorded Rust 1.99.0 toolchain. Do not update or reinstall automatically.'
     }
-    $BuildArgs = @('exec','--','cargo','build','--locked')
+    $BuildArgs = @('exec','--','cargo','build','--locked','--target-dir',$TargetDirectory)
     if ($Configuration -eq 'Release') { $BuildArgs += '--release' }
     & $Mise @BuildArgs
     if ($LASTEXITCODE -ne 0) { throw 'Cargo build failed.' }
     if ($Verify) {
-        $TestArgs = @('exec','--','cargo','test','--locked','--all-targets')
+        $TestArgs = @('exec','--','cargo','test','--locked','--all-targets','--target-dir',$TargetDirectory)
         if ($Configuration -eq 'Release') { $TestArgs += '--release' }
         & $Mise @TestArgs
         if ($LASTEXITCODE -ne 0) { throw 'Cargo tests failed.' }
-        & $Mise exec -- cargo clippy --locked --all-targets -- -D warnings
+        & $Mise @('exec','--','cargo','clippy','--locked','--all-targets','--target-dir',$TargetDirectory,'--','-D','warnings')
         if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
         & $Mise exec -- cargo fmt --check
         if ($LASTEXITCODE -ne 0) { throw 'Rust formatting differs.' }
     }
     $ProfileDirectory = $Configuration.ToLowerInvariant()
-    $Executable = Join-Path $ProjectRoot "target/$ProfileDirectory/mdlite.exe"
+    $Executable = Join-Path (Join-Path $ProjectRoot $TargetDirectory) "$ProfileDirectory/mdlite.exe"
     $SourcePaths = @('Cargo.toml','Cargo.lock','rust-toolchain.toml') +
         @(Get-ChildItem (Join-Path $ProjectRoot 'src') -File -Recurse | ForEach-Object {
             [IO.Path]::GetRelativePath($ProjectRoot, $_.FullName).Replace('\','/')
@@ -39,7 +41,7 @@ try {
     }
     $SourceHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
         [Text.Encoding]::UTF8.GetBytes(($SourceManifest -join "`n")))).ToLowerInvariant()
-    $EvidenceDirectory = Join-Path $ProjectRoot '.codex-runtime/rust-foundation'
+    $EvidenceDirectory = Join-Path $ProjectRoot $EvidenceDirectory
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     @{
         configuration=$Configuration; rust_version=$RustVersion; build='PASS'

@@ -4,11 +4,13 @@
 
 use mdlite::{
     document::{Document, Selection},
-    projection::{BlockKind, BoundaryAffinity, DisplayProjection},
+    projection::{BlockKind, BoundaryAffinity, DisplayProjection, ProjectionBlock},
     storage::{FileFormat, FileSnapshot},
     table::{Table, TableAlignment, TableEdit, TableRect},
 };
-use std::{cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, time::Instant};
+use std::{
+    cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, sync::Arc, time::Instant,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use windows::{
     Win32::{
@@ -41,6 +43,8 @@ const CMD_SAVE_AS: usize = 4;
 const CMD_CLOSE: usize = 5;
 const CMD_RAW: usize = 6;
 const ANIMATION_TIMER: usize = 1;
+// Bounded retained image cache, independent of the historical 50 MB app target.
+const IMAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const TOOLBAR: [(usize, &str, f32); 6] = [
     (CMD_NEW, "新規", 65.0),
     (CMD_OPEN, "開く", 65.0),
@@ -67,13 +71,29 @@ struct TextView {
     height: f32,
     table: Option<usize>,
     source: Range<usize>,
+    marker: Option<(IDWriteTextLayout, f32)>,
+    quoted: bool,
+    thematic_break: bool,
+}
+struct GutterPresentation {
+    marker: Option<(IDWriteTextLayout, f32)>,
+    quoted: bool,
+    indent: f32,
 }
 #[derive(Clone, Debug)]
 struct VisibleToken {
-    spans: Vec<Range<usize>>,
-    text: String,
+    spans: smallvec::SmallVec<[Range<usize>; 1]>,
+    // Only transformed or split spelling needs a separate display string.
+    text: Option<String>,
     display_utf16: Range<usize>,
     atomic: bool,
+}
+impl VisibleToken {
+    fn spelling<'a>(&'a self, source: &'a str) -> &'a str {
+        self.text
+            .as_deref()
+            .unwrap_or_else(|| &source[self.spans[0].clone()])
+    }
 }
 struct LiveEdit {
     range: Range<usize>,
@@ -93,7 +113,7 @@ enum TableKeyAction {
     Edit(TableEdit, Selection),
 }
 struct TableView {
-    table: Table,
+    table: Arc<Table>,
     y: f32,
     height: f32,
     width: f32,
@@ -102,10 +122,21 @@ struct ImageView {
     bitmap: Option<ID2D1Bitmap>,
     path: Option<PathBuf>,
     source: Range<usize>,
+    x: f32,
     y: f32,
     width: f32,
     height: f32,
+    quoted: bool,
     label: String,
+    load_failed: bool,
+}
+struct PendingListItem {
+    block: ProjectionBlock,
+    children: Vec<ProjectionBlock>,
+    cursor: usize,
+    next_child: usize,
+    waiting_for: Range<usize>,
+    gutter_pending: bool,
 }
 struct CachedImage {
     bitmap: ID2D1Bitmap,
@@ -113,6 +144,7 @@ struct CachedImage {
     height: u32,
     animation: Option<mdlite::assets::AnimatedImage>,
     frame_sequence: u64,
+    retained_bytes: u64,
 }
 struct Graphics {
     factory: ID2D1Factory,
@@ -158,6 +190,8 @@ struct App {
     width: f32,
     dpi: f32,
     layout_key: Option<(u64, u64, u32, bool)>,
+    projection_cache: Option<(u64, u64, Arc<DisplayProjection>)>,
+    parsed_tables: Vec<Arc<Table>>,
     dragging: bool,
     dragging_scroll: bool,
     preedit: String,
@@ -275,6 +309,8 @@ pub fn run() -> windows::core::Result<()> {
             width: 900.0,
             dpi: 1.0,
             layout_key: None,
+            projection_cache: None,
+            parsed_tables: Vec::new(),
             dragging: false,
             dragging_scroll: false,
             preedit: String::new(),
@@ -453,6 +489,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     app.dragging_scroll = true;
                     app.scroll_at(y);
                     SetCapture(hwnd);
+                } else if app.toggle_task_at(x, y) {
+                    app.after_input();
                 } else {
                     app.select_at(x, y, GetKeyState(VK_SHIFT.0 as i32) < 0);
                     app.dragging = true;
@@ -694,12 +732,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|path| changed.contains(path))
                 {
-                    let damage = RECT {
-                        left: (LEFT * self.dpi).floor() as i32,
-                        top: ((image.y - scroll) * self.dpi).floor() as i32,
-                        right: ((LEFT + image.width) * self.dpi).ceil() as i32,
-                        bottom: ((image.y - scroll + image.height) * self.dpi).ceil() as i32,
-                    };
+                    let damage = image_damage_rect(image, scroll, self.dpi);
                     let _ = InvalidateRect(Some(self.hwnd), Some(&damage), false);
                 }
             }
@@ -775,22 +808,50 @@ impl App {
                     )
                 }
                 IMR_QUERYCHARPOSITION => {
-                    if parameter.0 == 0 {
+                    if parameter.0 == 0
+                        || !(parameter.0 as usize)
+                            .is_multiple_of(std::mem::align_of::<IMECHARPOSITION>())
+                    {
                         return LRESULT(0);
                     }
                     let info = &mut *(parameter.0 as *mut IMECHARPOSITION);
                     if info.dwSize < std::mem::size_of::<IMECHARPOSITION>() as u32 {
                         return LRESULT(0);
                     }
-                    let (x, y, h) = self.caret;
-                    let mut p = POINT {
-                        x: (x * self.dpi) as i32,
-                        y: (y * self.dpi) as i32,
+                    let Some((x, y, h)) = self.composition_position(info.dwCharPos) else {
+                        return LRESULT(0);
                     };
-                    let _ = ClientToScreen(self.hwnd, &mut p);
+                    let mut p = POINT {
+                        x: (x * self.dpi).round() as i32,
+                        y: (y * self.dpi).round() as i32,
+                    };
+                    let mut document = RECT::default();
+                    if !ClientToScreen(self.hwnd, &mut p).as_bool()
+                        || GetClientRect(self.hwnd, &mut document).is_err()
+                    {
+                        return LRESULT(0);
+                    }
+                    let mut start = POINT {
+                        x: document.left,
+                        y: document.top,
+                    };
+                    let mut end = POINT {
+                        x: document.right,
+                        y: document.bottom,
+                    };
+                    if !ClientToScreen(self.hwnd, &mut start).as_bool()
+                        || !ClientToScreen(self.hwnd, &mut end).as_bool()
+                    {
+                        return LRESULT(0);
+                    }
                     info.pt = p;
-                    info.cLineHeight = (h * self.dpi) as u32;
-                    let _ = GetWindowRect(self.hwnd, &mut info.rcDocument);
+                    info.cLineHeight = (h * self.dpi).round().max(1.0) as u32;
+                    info.rcDocument = RECT {
+                        left: start.x,
+                        top: start.y,
+                        right: end.x,
+                        bottom: end.y,
+                    };
                     LRESULT(1)
                 }
                 _ => LRESULT(0),
@@ -978,9 +1039,10 @@ impl App {
     fn visible_step(&self, p: usize, back: bool) -> usize {
         if self.tabs[self.active].raw {
             return if back {
-                previous(self.doc().source(), p)
+                mdlite::coordinates::rope_previous_grapheme_boundary(self.doc().rope(), p)
+                    .unwrap_or(p)
             } else {
-                next(self.doc().source(), p)
+                mdlite::coordinates::rope_next_grapheme_boundary(self.doc().rope(), p).unwrap_or(p)
             };
         }
         let tables: Vec<_> = self
@@ -1270,6 +1332,11 @@ impl App {
         unsafe {
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            self.key_with_modifiers(key, ctrl, shift);
+        }
+    }
+    unsafe fn key_with_modifiers(&mut self, key: u16, ctrl: bool, shift: bool) {
+        unsafe {
             if self.composing {
                 // Composition owns Escape before table exit or other editing.
                 // Failed cancellation keeps the local preedit/owner intact.
@@ -1279,6 +1346,16 @@ impl App {
                 return;
             }
             self.suppress_chars.clear();
+            if let Some(redo) = history_shortcut(key, ctrl, shift) {
+                self.suppress_chars.push(key - 0x40);
+                if redo {
+                    self.doc_mut().redo();
+                } else {
+                    self.doc_mut().undo();
+                }
+                self.after_input();
+                return;
+            }
             if !self.tabs[self.active].raw
                 && self.active_cell().is_some()
                 && let Some(intent) = table_key_intent(key, ctrl, shift)
@@ -1312,14 +1389,6 @@ impl App {
                     0x53 => self.command(if shift { CMD_SAVE_AS } else { CMD_SAVE }),
                     0x57 => self.command(CMD_CLOSE),
                     0x45 => self.command(CMD_RAW),
-                    0x5a => {
-                        self.doc_mut().undo();
-                        self.layout_key = None;
-                    }
-                    0x59 => {
-                        self.doc_mut().redo();
-                        self.layout_key = None;
-                    }
                     0x41 => {
                         let end = self.doc().source().len();
                         let _ = self.doc_mut().set_selection(0, end);
@@ -1433,11 +1502,11 @@ impl App {
         }
     }
     fn move_table(&mut self, back: bool, horizontal: bool) {
-        let source = self.doc().source();
         let p = self.doc().selection().head;
         let target = self.tables.iter().find_map(|view| {
             view.table.cell_at(p)?;
-            let candidate = table_navigation_target(&view.table, source, p, back, horizontal)?;
+            let candidate =
+                table_navigation_target(&view.table, self.doc().rope(), p, back, horizontal)?;
             if let Some(position) = view.table.cell_at(candidate) {
                 let cell = &view.table.rows[position.row].cells[position.column];
                 Some(if back && horizontal {
@@ -1577,7 +1646,7 @@ impl App {
                 self.doc().source()[range.clone()].to_owned()
             } else {
                 selected_token(&self.visible_tokens, range.clone())
-                    .map(|t| t.text.as_str())
+                    .map(|t| t.spelling(self.doc().source()))
                     .collect()
             };
             if write_clipboard(self.hwnd, &text) && cut {
@@ -1606,6 +1675,9 @@ impl App {
             table_scroll: HashMap::new(),
         });
         self.active = self.tabs.len() - 1;
+        self.projection_cache = None;
+        self.parsed_tables.clear();
+        self.clear_images();
         self.layout_key = None;
     }
     fn open_path(&mut self, path: PathBuf) {
@@ -1625,20 +1697,34 @@ impl App {
                     table_scroll: HashMap::new(),
                 });
                 self.active = self.tabs.len() - 1;
+                self.projection_cache = None;
+                self.parsed_tables.clear();
+                self.clear_images();
                 self.layout_key = None;
             }
             Err(e) => self.status = format!("開けません: {e}"),
         }
+    }
+    fn clear_images(&mut self) {
+        if self.animation_timer_armed {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), ANIMATION_TIMER);
+            }
+            self.animation_timer_armed = false;
+        }
+        self.images.clear();
+        self.image_cache.clear();
     }
     fn switch_tab(&mut self, index: usize) {
         if self.composing {
             return;
         }
         self.active = index;
+        self.projection_cache = None;
+        self.parsed_tables.clear();
         self.views.clear();
         self.tables.clear();
-        self.images.clear();
-        self.image_cache.clear();
+        self.clear_images();
         self.layout_key = None;
         self.pending_surrogate = None;
         self.suppress_chars.clear();
@@ -1810,8 +1896,9 @@ impl App {
                 }
                 CMD_CLOSE => {
                     if self.confirm_current() {
-                        self.images.clear();
-                        self.image_cache.clear();
+                        self.clear_images();
+                        self.projection_cache = None;
+                        self.parsed_tables.clear();
                         self.tabs.remove(self.active);
                         self.active = self.active.saturating_sub(1);
                         if self.tabs.is_empty() {
@@ -1823,6 +1910,9 @@ impl App {
                 CMD_RAW => {
                     let tab = &mut self.tabs[self.active];
                     tab.raw = !tab.raw;
+                    if tab.raw {
+                        self.clear_images();
+                    }
                     self.layout_key = None;
                 }
                 _ => {}
@@ -1856,6 +1946,33 @@ impl App {
                 width.max(1.0),
                 100000.0,
             )
+        }
+    }
+    unsafe fn gutter_presentation(
+        &self,
+        projection: &DisplayProjection,
+        block: &ProjectionBlock,
+        show_marker: bool,
+        size: f32,
+    ) -> windows::core::Result<GutterPresentation> {
+        unsafe {
+            let (label, quoted) = block_gutter(projection, block);
+            let marker_layout = if let Some(label) = label {
+                let layout = self.text_layout(&label, 200.0, size)?;
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                layout.GetMetrics(&mut metrics)?;
+                Some((layout, metrics.widthIncludingTrailingWhitespace))
+            } else {
+                None
+            };
+            let indent = (block.depth.saturating_sub(1) as f32 * 12.0)
+                .max(marker_layout.as_ref().map_or(0.0, |(_, width)| width + 8.0));
+            let marker = if show_marker { marker_layout } else { None };
+            Ok(GutterPresentation {
+                marker,
+                quoted,
+                indent,
+            })
         }
     }
     unsafe fn push_view(
@@ -1902,10 +2019,36 @@ impl App {
                 height,
                 table,
                 source,
+                marker: None,
+                quoted: false,
+                thematic_break: false,
             });
             Ok(height)
         }
     }
+    /// One parsed projection for the active document revision; layout-only
+    /// invalidations (width/table scrolling) reuse it and the Document API buffer.
+    fn cached_projection(&mut self) -> Arc<DisplayProjection> {
+        let id = self.doc().id();
+        let revision = self.doc().revision();
+        if let Some((cached_id, cached_revision, projection)) = &self.projection_cache
+            && (*cached_id, *cached_revision) == (id, revision)
+        {
+            return Arc::clone(projection);
+        }
+        let projection = Arc::new(DisplayProjection::parse(self.doc().source()));
+        self.parsed_tables = projection
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::Table))
+            .filter_map(|block| {
+                Table::parse(self.doc().source(), block.source.clone()).map(Arc::new)
+            })
+            .collect();
+        self.projection_cache = Some((id, revision, Arc::clone(&projection)));
+        projection
+    }
+
     unsafe fn ensure_layout(&mut self) -> windows::core::Result<()> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
@@ -1927,7 +2070,7 @@ impl App {
             self.literal_blocks.clear();
             self.tables.clear();
             self.images.clear();
-            let source = self.doc().source().to_owned();
+            let source = self.doc().source_shared();
             let mut y = TOP;
             let width = (self.width - LEFT * 2.0 - 12.0).max(50.0);
             if self.tabs[self.active].raw {
@@ -1941,7 +2084,7 @@ impl App {
                     None,
                 )?;
             } else {
-                let projection = DisplayProjection::parse(&source);
+                let projection = self.cached_projection();
                 self.literal_blocks = projection
                     .blocks
                     .iter()
@@ -1970,7 +2113,25 @@ impl App {
                 self.image_cache
                     .retain(|path, _| retained_paths.contains(path));
                 let utf16: Vec<u16> = projection.text.encode_utf16().collect();
+                let mut pending_list_items: Vec<PendingListItem> = Vec::new();
                 for block in &projection.blocks {
+                    let mut pending_index = pending_list_items.len();
+                    while pending_index > 0 {
+                        pending_index -= 1;
+                        if block.source.start >= pending_list_items[pending_index].waiting_for.end {
+                            let pending = pending_list_items.remove(pending_index);
+                            if let Some(pending) = self.layout_list_item_fragments(
+                                &projection,
+                                &utf16,
+                                pending,
+                                &mut y,
+                                width,
+                                &mut handled_images,
+                            )? {
+                                pending_list_items.push(pending);
+                            }
+                        }
+                    }
                     if matches!(block.kind, BlockKind::Image { .. })
                         && handled_images.contains(&block.source.start)
                     {
@@ -1988,15 +2149,18 @@ impl App {
                             .collect();
                         if !children.is_empty() {
                             let mut cursor = block.display_utf16.start;
+                            let mut gutter_pending = true;
                             for child in children {
                                 if cursor < child.display_utf16.start {
                                     y += self.projected_fragment(
                                         &projection,
                                         &utf16,
                                         cursor..child.display_utf16.start,
-                                        y,
-                                        width,
+                                        block,
+                                        gutter_pending,
+                                        (y, width),
                                     )?;
+                                    gutter_pending = false;
                                 }
                                 if let BlockKind::Image {
                                     destination,
@@ -2005,12 +2169,14 @@ impl App {
                                 } = &child.kind
                                 {
                                     y = self.layout_image(
+                                        &projection,
+                                        (block, gutter_pending),
                                         destination,
                                         *preferred,
                                         child.source.clone(),
-                                        y,
-                                        width,
+                                        (y, width),
                                     )?;
+                                    gutter_pending = false;
                                     handled_images.insert(child.source.start);
                                 }
                                 cursor = child.display_utf16.end;
@@ -2020,23 +2186,83 @@ impl App {
                                     &projection,
                                     &utf16,
                                     cursor..block.display_utf16.end,
-                                    y,
-                                    width,
+                                    block,
+                                    gutter_pending,
+                                    (y, width),
                                 )?;
                             }
                             continue;
                         }
                     }
+                    if matches!(block.kind, BlockKind::ListItem) {
+                        let children: Vec<_> = projection
+                            .blocks
+                            .iter()
+                            .filter(|child| {
+                                child.depth == block.depth + 1
+                                    && block.source.start <= child.source.start
+                                    && child.source.end <= block.source.end
+                                    && child.display_utf16.start >= block.display_utf16.start
+                                    && child.display_utf16.end <= block.display_utf16.end
+                            })
+                            .cloned()
+                            .collect();
+                        if children
+                            .iter()
+                            .any(|child| matches!(child.kind, BlockKind::Image { .. }))
+                        {
+                            let pending = PendingListItem {
+                                block: block.clone(),
+                                children,
+                                cursor: block.display_utf16.start,
+                                next_child: 0,
+                                waiting_for: 0..0,
+                                gutter_pending: true,
+                            };
+                            if let Some(pending) = self.layout_list_item_fragments(
+                                &projection,
+                                &utf16,
+                                pending,
+                                &mut y,
+                                width,
+                                &mut handled_images,
+                            )? {
+                                pending_list_items.push(pending);
+                            }
+                            continue;
+                        }
+                    }
+                    let mut own_fragment = None;
                     if matches!(
                         block.kind,
                         BlockKind::List { .. } | BlockKind::Quote | BlockKind::ListItem
-                    ) && projection.blocks.iter().any(|child| {
-                        child.depth > block.depth
-                            && block.source.start <= child.source.start
-                            && child.source.end <= block.source.end
-                    }) {
-                        continue;
+                    ) {
+                        let first_child = projection
+                            .blocks
+                            .iter()
+                            .filter(|child| {
+                                child.depth > block.depth
+                                    && block.source.start <= child.source.start
+                                    && child.source.end <= block.source.end
+                            })
+                            .min_by_key(|child| child.display_utf16.start);
+                        if let Some(child) = first_child {
+                            if !matches!(block.kind, BlockKind::ListItem)
+                                || block.display_utf16.start >= child.display_utf16.start
+                            {
+                                continue;
+                            }
+                            // Tight list items have no Paragraph event. Preserve
+                            // their own leading text before a nested child list.
+                            own_fragment = Some(ProjectionBlock {
+                                kind: BlockKind::ListItem,
+                                source: block.source.start..child.source.start,
+                                display_utf16: block.display_utf16.start..child.display_utf16.start,
+                                depth: block.depth,
+                            });
+                        }
                     }
+                    let block = own_fragment.as_ref().unwrap_or(block);
                     if matches!(block.kind, BlockKind::Paragraph)
                         && projection.blocks.iter().any(|child| {
                             matches!(child.kind, BlockKind::Image { .. })
@@ -2046,7 +2272,19 @@ impl App {
                         continue;
                     }
                     if matches!(block.kind, BlockKind::Table)
-                        && let Some(table) = Table::parse(&source, block.source.clone())
+                        && let Some(table) = self
+                            .parsed_tables
+                            .iter()
+                            .find(|table| {
+                                table.range.start == block.source.start
+                                    && (table.range.end == block.source.end
+                                        || source
+                                            .get(table.range.end..block.source.end)
+                                            .is_some_and(|ending| {
+                                                matches!(ending, "\n" | "\r" | "\r\n")
+                                            }))
+                            })
+                            .cloned()
                     {
                         y = self.layout_table(table, y, width)?;
                         continue;
@@ -2058,11 +2296,12 @@ impl App {
                     } = &block.kind
                     {
                         y = self.layout_image(
+                            &projection,
+                            (block, true),
                             destination,
                             *preferred,
                             block.source.clone(),
-                            y,
-                            width,
+                            (y, width),
                         )?;
                         continue;
                     }
@@ -2075,54 +2314,36 @@ impl App {
                         }
                         _ => FONT,
                     };
+                    let (marker, quoted) = block_gutter(&projection, block);
+                    let marker = if let Some(label) = marker {
+                        let layout = self.text_layout(&label, 200.0, size)?;
+                        let mut metrics = DWRITE_TEXT_METRICS::default();
+                        layout.GetMetrics(&mut metrics)?;
+                        Some((layout, metrics.widthIncludingTrailingWhitespace))
+                    } else {
+                        None
+                    };
+                    let indent = (block.depth.saturating_sub(1) as f32 * 12.0)
+                        .max(marker.as_ref().map_or(0.0, |(_, width)| width + 8.0));
                     y += self.push_view(
                         &text,
                         (map, before),
                         block.source.clone(),
-                        (
-                            LEFT + block.depth.saturating_sub(1) as f32 * 12.0,
-                            y,
-                            width - block.depth.saturating_sub(1) as f32 * 12.0,
-                        ),
+                        (LEFT + indent, y, width - indent),
                         size,
                         None,
                     )? + 10.0;
+                    if let Some(view) = self.views.last_mut() {
+                        view.marker = marker;
+                        view.quoted = quoted;
+                        view.thematic_break = matches!(block.kind, BlockKind::ThematicBreak);
+                    }
                     if let Some(view) = self.views.last() {
-                        for run in &projection.runs {
-                            let start = run.display_utf16.start.max(block.display_utf16.start);
-                            let end = run.display_utf16.end.min(block.display_utf16.end);
-                            if start >= end {
-                                continue;
-                            }
-                            let range = DWRITE_TEXT_RANGE {
-                                startPosition: (start - block.display_utf16.start) as u32,
-                                length: (end - start) as u32,
-                            };
-                            for kind in &run.kinds {
-                                use mdlite::projection::InlineKind;
-                                match kind {
-                                    InlineKind::Strong => {
-                                        view.layout
-                                            .SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?;
-                                    }
-                                    InlineKind::Emphasis => {
-                                        view.layout
-                                            .SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range)?;
-                                    }
-                                    InlineKind::Code => {
-                                        view.layout
-                                            .SetFontFamilyName(w!("Cascadia Mono"), range)?;
-                                    }
-                                    InlineKind::Link { .. } => {
-                                        view.layout.SetUnderline(true, range)?;
-                                    }
-                                    InlineKind::Strikethrough => {
-                                        view.layout.SetStrikethrough(true, range)?;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        Self::apply_projection_styles(
+                            &view.layout,
+                            &projection,
+                            block.display_utf16.clone(),
+                        )?;
                     }
                     if let Some(view) = self.views.last_mut() {
                         let mut metrics = DWRITE_TEXT_METRICS::default();
@@ -2130,6 +2351,19 @@ impl App {
                         let height = metrics.height.max(size * 1.6);
                         y += height - view.height;
                         view.height = height;
+                    }
+                }
+                while let Some(pending) = pending_list_items.pop() {
+                    let mut next = Some(pending);
+                    while let Some(pending) = next.take() {
+                        next = self.layout_list_item_fragments(
+                            &projection,
+                            &utf16,
+                            pending,
+                            &mut y,
+                            width,
+                            &mut handled_images,
+                        )?;
                     }
                 }
             }
@@ -2166,35 +2400,170 @@ impl App {
             Ok(())
         }
     }
+    unsafe fn layout_list_item_fragments(
+        &mut self,
+        projection: &DisplayProjection,
+        utf16: &[u16],
+        mut pending: PendingListItem,
+        y: &mut f32,
+        width: f32,
+        handled_images: &mut std::collections::HashSet<usize>,
+    ) -> windows::core::Result<Option<PendingListItem>> {
+        unsafe {
+            while pending.next_child < pending.children.len() {
+                let child = &pending.children[pending.next_child];
+                if pending.cursor < child.display_utf16.start {
+                    *y += self.projected_fragment(
+                        projection,
+                        utf16,
+                        pending.cursor..child.display_utf16.start,
+                        &pending.block,
+                        pending.gutter_pending,
+                        (*y, width),
+                    )?;
+                    pending.gutter_pending = false;
+                }
+                if let BlockKind::Image {
+                    destination,
+                    width: preferred,
+                    ..
+                } = &child.kind
+                {
+                    *y = self.layout_image(
+                        projection,
+                        (&pending.block, pending.gutter_pending),
+                        destination,
+                        *preferred,
+                        child.source.clone(),
+                        (*y, width),
+                    )?;
+                    handled_images.insert(child.source.start);
+                    pending.gutter_pending = false;
+                    pending.cursor = pending.cursor.max(child.display_utf16.end);
+                    pending.next_child += 1;
+                    continue;
+                }
+
+                if child.display_utf16.start == pending.block.display_utf16.start {
+                    pending.gutter_pending = false;
+                }
+                pending.cursor = pending.cursor.max(child.display_utf16.end);
+                pending.waiting_for = child.source.clone();
+                pending.next_child += 1;
+                return Ok(Some(pending));
+            }
+            if pending.cursor < pending.block.display_utf16.end {
+                *y += self.projected_fragment(
+                    projection,
+                    utf16,
+                    pending.cursor..pending.block.display_utf16.end,
+                    &pending.block,
+                    pending.gutter_pending,
+                    (*y, width),
+                )?;
+            }
+            Ok(None)
+        }
+    }
+    unsafe fn apply_projection_styles(
+        layout: &IDWriteTextLayout,
+        projection: &DisplayProjection,
+        display_range: Range<usize>,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            for run in &projection.runs {
+                let start = run.display_utf16.start.max(display_range.start);
+                let end = run.display_utf16.end.min(display_range.end);
+                if start >= end {
+                    continue;
+                }
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: (start - display_range.start) as u32,
+                    length: (end - start) as u32,
+                };
+                for kind in &run.kinds {
+                    use mdlite::projection::InlineKind;
+                    match kind {
+                        InlineKind::Strong => {
+                            layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?
+                        }
+                        InlineKind::Emphasis => {
+                            layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range)?;
+                        }
+                        InlineKind::Code => {
+                            layout.SetFontFamilyName(w!("Cascadia Mono"), range)?;
+                        }
+                        InlineKind::Link { .. } => layout.SetUnderline(true, range)?,
+                        InlineKind::Strikethrough => layout.SetStrikethrough(true, range)?,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
     unsafe fn projected_fragment(
         &mut self,
         projection: &DisplayProjection,
         utf16: &[u16],
         range: Range<usize>,
-        y: f32,
-        width: f32,
+        block: &ProjectionBlock,
+        show_marker: bool,
+        geometry: (f32, f32),
     ) -> windows::core::Result<f32> {
         // SAFETY: the projection owns checked source mappings and the layout is
         // retained by this window's App after the synchronous DirectWrite call.
         unsafe {
+            let (y, width) = geometry;
             let text = String::from_utf16_lossy(&utf16[range.clone()]);
             let (map, before) = projection_mapping(projection, range.clone());
             let source = *map.first().unwrap()..*map.last().unwrap();
-            self.push_view(&text, (map, before), source, (LEFT, y, width), FONT, None)
-                .map(|height| height + 10.0)
+            let GutterPresentation {
+                marker,
+                quoted,
+                indent,
+            } = self.gutter_presentation(projection, block, show_marker, FONT)?;
+            let mut height = self.push_view(
+                &text,
+                (map, before),
+                source,
+                (LEFT + indent, y, width - indent),
+                FONT,
+                None,
+            )?;
+            if let Some(view) = self.views.last_mut() {
+                view.marker = marker;
+                view.quoted = quoted;
+                Self::apply_projection_styles(&view.layout, projection, range)?;
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                view.layout.GetMetrics(&mut metrics)?;
+                height = metrics.height.max(FONT * 1.6);
+                view.height = height;
+            }
+            Ok(height + 10.0)
         }
     }
     unsafe fn layout_image(
         &mut self,
+        projection: &DisplayProjection,
+        gutter: (&ProjectionBlock, bool),
         destination: &str,
         preferred: Option<u32>,
         source: Range<usize>,
-        y: f32,
-        available: f32,
+        geometry: (f32, f32),
     ) -> windows::core::Result<f32> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            let (gutter_block, show_marker) = gutter;
+            let (y, available) = geometry;
+            let GutterPresentation {
+                marker,
+                quoted,
+                indent,
+            } = self.gutter_presentation(projection, gutter_block, show_marker, FONT)?;
+            let x = LEFT + indent;
+            let available = (available - indent).max(1.0);
             let dir = self.tabs[self.active]
                 .file
                 .as_ref()
@@ -2206,71 +2575,23 @@ impl App {
             let mut height = 90.0;
             let mut label = format!("画像: {destination}");
             if let Some(dir) = dir {
-                match mdlite::assets::local_image_path(&dir, destination).and_then(|p| {
-                    image_path = Some(p.clone());
-                    if let Some(cached) = self.image_cache.get(&p) {
-                        return Ok((cached.bitmap.clone(), cached.width, cached.height));
-                    }
-                    let mut animation = if p.extension().is_some_and(|ext| {
-                        matches!(
-                            ext.to_string_lossy().to_ascii_lowercase().as_str(),
-                            "gif" | "webp"
-                        )
-                    }) {
-                        Some(mdlite::assets::AnimatedImage::open(&p)?)
-                    } else {
-                        None
-                    };
-                    let static_image = if animation.is_none() {
-                        Some(mdlite::assets::decode(&p)?)
-                    } else {
-                        None
-                    };
-                    let decoded = animation
-                        .as_ref()
-                        .map(|a| a.current())
-                        .or(static_image.as_ref())
-                        .unwrap();
-                    let target = self.target().map_err(std::io::Error::other)?;
-                    let properties = D2D1_BITMAP_PROPERTIES {
-                        pixelFormat: D2D1_PIXEL_FORMAT {
-                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                        },
-                        dpiX: 96.0,
-                        dpiY: 96.0,
-                    };
-                    let bitmap = target
-                        .CreateBitmap(
-                            D2D_SIZE_U {
-                                width: decoded.width,
-                                height: decoded.height,
-                            },
-                            Some(decoded.pixels.as_ptr().cast()),
-                            decoded.width * 4,
-                            &properties,
-                        )
-                        .map_err(std::io::Error::other)?;
-                    let entry = (bitmap.clone(), decoded.width, decoded.height);
-                    if animation.as_ref().is_some_and(|a| !a.is_animated()) {
-                        animation = None;
-                    }
-                    self.image_cache.insert(
-                        p,
-                        CachedImage {
-                            bitmap,
-                            width: entry.1,
-                            height: entry.2,
-                            animation,
-                            frame_sequence: 0,
-                        },
-                    );
-                    Ok(entry)
+                match mdlite::assets::local_image_path(&dir, destination).and_then(|path| {
+                    let dimensions = self
+                        .image_cache
+                        .get(&path)
+                        .map(|cached| (cached.width, cached.height))
+                        .map(Ok)
+                        .unwrap_or_else(|| mdlite::assets::image_dimensions(&path));
+                    dimensions.map(|(w, h)| (path, w, h))
                 }) {
-                    Ok((b, w, h)) => {
+                    Ok((path, w, h)) => {
                         (width, height) = image_dimensions(w, h, preferred, available);
-                        bitmap = Some(b);
-                        label.clear();
+                        bitmap = self
+                            .image_cache
+                            .get(&path)
+                            .map(|cached| cached.bitmap.clone());
+                        image_path = Some(path);
+                        label = "画像を読み込み中".into();
                     }
                     Err(e) => label = format!("画像を表示できません: {e}"),
                 }
@@ -2282,18 +2603,25 @@ impl App {
                 "",
                 (vec![source.start], vec![source.start]),
                 source.start..source.start,
-                (LEFT, y, available),
+                (x, y, available),
                 FONT,
                 None,
             )?;
+            if let Some(view) = self.views.last_mut() {
+                view.marker = marker;
+                view.quoted = quoted;
+            }
             self.images.push(ImageView {
                 bitmap,
                 path: image_path,
                 source: source.clone(),
+                x,
                 y: y + FONT * 1.6,
                 width,
                 height,
+                quoted,
                 label,
+                load_failed: false,
             });
             self.visible_tokens
                 .push(image_token(self.doc().source(), source.clone()));
@@ -2301,16 +2629,190 @@ impl App {
                 "",
                 (vec![source.end], vec![source.end]),
                 source.end..source.end,
-                (LEFT, y + FONT * 1.6 + height, available),
+                (x, y + FONT * 1.6 + height, available),
                 FONT,
                 None,
             )?;
             Ok(y + height + FONT * 3.2 + 15.0)
         }
     }
+    /// Decode/upload only visible images and one viewport of lookahead.
+    /// Cache entries own decoders; views hold bitmap clones only near the viewport.
+    unsafe fn prepare_images(&mut self) {
+        unsafe {
+            let bottom = self.animation_viewport();
+            let scroll = self.tabs[self.active].scroll;
+            let page = (bottom - TOP).max(1.0);
+            let wanted: std::collections::HashSet<_> = self
+                .images
+                .iter()
+                .filter(|image| {
+                    image.y + image.height - scroll > TOP - page && image.y - scroll < bottom + page
+                })
+                .filter_map(|image| image.path.clone())
+                .collect();
+            for image in &mut self.images {
+                if image
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| !wanted.contains(path))
+                {
+                    image.bitmap = None;
+                }
+            }
+            for index in 0..self.images.len() {
+                let Some(path) = self.images[index].path.clone() else {
+                    continue;
+                };
+                if !wanted.contains(&path) || self.images[index].load_failed {
+                    continue;
+                }
+                if !self.image_cache.contains_key(&path) {
+                    match self.load_cached_image(&path, &wanted) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.images[index].label = "画像cacheの保持上限に達しました".into();
+                            continue;
+                        }
+                        Err(error) => {
+                            self.images[index].label = format!("画像を表示できません: {error}");
+                            self.images[index].load_failed = true;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(cached) = self.image_cache.get(&path) {
+                    self.images[index].bitmap = Some(cached.bitmap.clone());
+                    self.images[index].label.clear();
+                }
+            }
+        }
+    }
+    fn reserve_image_cache(
+        &mut self,
+        estimate: u64,
+        wanted: &std::collections::HashSet<PathBuf>,
+    ) -> bool {
+        let used: u64 = self
+            .image_cache
+            .values()
+            .map(|cached| cached.retained_bytes)
+            .sum();
+        if used
+            .checked_add(estimate)
+            .is_none_or(|sum| sum > IMAGE_CACHE_BYTES)
+        {
+            for image in &mut self.images {
+                if image
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| !wanted.contains(path))
+                {
+                    image.bitmap = None;
+                }
+            }
+            self.image_cache.retain(|path, _| wanted.contains(path));
+        }
+        let used: u64 = self
+            .image_cache
+            .values()
+            .map(|cached| cached.retained_bytes)
+            .sum();
+        used.checked_add(estimate)
+            .is_some_and(|sum| sum <= IMAGE_CACHE_BYTES)
+    }
+    unsafe fn load_cached_image(
+        &mut self,
+        path: &std::path::Path,
+        wanted: &std::collections::HashSet<PathBuf>,
+    ) -> std::io::Result<bool> {
+        unsafe {
+            let animated = path.extension().is_some_and(|ext| {
+                matches!(
+                    ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "gif" | "webp"
+                )
+            });
+            let (width, height) = mdlite::assets::image_dimensions(path)?;
+            let frame = mdlite::assets::decoded_bytes(width, height)?;
+            // GIF canvas + CPU current frame + D2D bitmap. Compressed input is
+            // accounted conservatively; codec internals and transient decode are
+            // additional and this is not a strict process-memory measurement.
+            let input = if animated {
+                std::fs::metadata(path)?.len()
+            } else {
+                0
+            };
+            let estimate = retained_image_bytes(frame, animated, input)?;
+            if !self.reserve_image_cache(estimate, wanted) {
+                return Ok(false);
+            }
+            let mut animation = if animated {
+                Some(mdlite::assets::AnimatedImage::open(path)?)
+            } else {
+                None
+            };
+            let static_image = if animation.is_none() {
+                Some(mdlite::assets::decode(path)?)
+            } else {
+                None
+            };
+            let decoded = animation
+                .as_ref()
+                .map(|a| a.current())
+                .or(static_image.as_ref())
+                .expect("one decoder branch");
+            let actual_frame = mdlite::assets::decoded_bytes(decoded.width, decoded.height)?;
+            let actual_estimate = retained_image_bytes(actual_frame, animated, input)?;
+            if !self.reserve_image_cache(actual_estimate, wanted) {
+                return Ok(false);
+            }
+            let target = self.target().map_err(std::io::Error::other)?;
+            let properties = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let bitmap = target
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: decoded.width,
+                        height: decoded.height,
+                    },
+                    Some(decoded.pixels.as_ptr().cast()),
+                    decoded.width * 4,
+                    &properties,
+                )
+                .map_err(std::io::Error::other)?;
+            let dimensions = (decoded.width, decoded.height);
+            if animation.as_ref().is_some_and(|a| !a.is_animated()) {
+                animation = None;
+            }
+            self.image_cache.insert(
+                path.into(),
+                CachedImage {
+                    bitmap,
+                    width: dimensions.0,
+                    height: dimensions.1,
+                    retained_bytes: if animation.is_some() {
+                        actual_estimate
+                    } else {
+                        actual_frame
+                    },
+                    animation,
+                    frame_sequence: 0,
+                },
+            );
+            Ok(true)
+        }
+    }
+
     unsafe fn layout_table(
         &mut self,
-        table: Table,
+        table: Arc<Table>,
         mut y: f32,
         available: f32,
     ) -> windows::core::Result<f32> {
@@ -2322,7 +2824,7 @@ impl App {
             if cols == 0 {
                 return Ok(y);
             }
-            let source = self.doc().source().to_owned();
+            let source = self.doc().source_shared();
             let marker = if let Some(previous) = self.tables.last() {
                 table_gap_marker(&source, previous.table.range.end, table.range.start)
             } else if source[..table.range.start].trim().is_empty()
@@ -2448,6 +2950,7 @@ impl App {
             }
             self.ensure_layout()?;
             self.update_caret();
+            self.prepare_images();
             let t = self.target()?;
             let text = t.CreateSolidColorBrush(&color(0.83, 0.85, 0.87), None)?;
             let muted = t.CreateSolidColorBrush(&color(0.48, 0.52, 0.56), None)?;
@@ -2559,6 +3062,33 @@ impl App {
                         None,
                     );
                 }
+                if let Some((marker, width)) = &view.marker {
+                    t.DrawTextLayout(
+                        point(view.x - width - 8.0, y),
+                        marker,
+                        &muted,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                if view.quoted {
+                    t.DrawLine(
+                        point(view.x - 5.0, y),
+                        point(view.x - 5.0, y + view.height),
+                        &border,
+                        2.0,
+                        None,
+                    );
+                }
+                if view.thematic_break {
+                    let line_y = y + view.height * 0.5;
+                    t.DrawLine(
+                        point(view.x, line_y),
+                        point(view.x + view.width, line_y),
+                        &border,
+                        1.5,
+                        None,
+                    );
+                }
                 t.DrawTextLayout(
                     point(view.x, y),
                     &view.layout,
@@ -2571,7 +3101,16 @@ impl App {
                 if y + image.height < TOP || y > viewport {
                     continue;
                 }
-                let r = rect(LEFT, y, image.width, image.height);
+                let r = rect(image.x, y, image.width, image.height);
+                if image.quoted {
+                    t.DrawLine(
+                        point(image.x - 5.0, y),
+                        point(image.x - 5.0, y + image.height),
+                        &border,
+                        2.0,
+                        None,
+                    );
+                }
                 if let Some(bitmap) = &image.bitmap {
                     t.DrawBitmap(
                         bitmap,
@@ -2584,7 +3123,7 @@ impl App {
                     t.DrawRectangle(&r, &border, 1.0, None);
                     let layout = self.text_layout(&image.label, image.width - 12.0, 13.0)?;
                     t.DrawTextLayout(
-                        point(LEFT + 6.0, y + 6.0),
+                        point(image.x + 6.0, y + 6.0),
                         &layout,
                         &muted,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -2597,7 +3136,9 @@ impl App {
             if !self.preedit.is_empty() {
                 let layout = self.text_layout(
                     &self.preedit,
-                    (self.width - self.caret.0 - LEFT).max(100.0),
+                    self.caret_view()
+                        .map(|v| self.composition_width(v, self.caret.0))
+                        .unwrap_or(1.0),
                     FONT,
                 )?;
                 let (x, y, h) = self.caret;
@@ -2660,19 +3201,21 @@ impl App {
             self.native_caret = NativeCaretState::default();
         }
     }
-    fn caret_location(&self) -> (f32, f32, f32) {
+    fn caret_view(&self) -> Option<&TextView> {
         let byte = self.doc().selection().head;
-        let scroll = self.tabs[self.active].scroll;
-        let candidate = self
-            .views
+        self.views
             .iter()
-            .find(|v| v.source.is_empty() && v.source.start == byte)
+            .find(|view| view.source.is_empty() && view.source.start == byte)
             .or_else(|| {
                 self.views
                     .iter()
-                    .find(|v| v.source.start <= byte && byte <= v.source.end)
+                    .find(|view| view.source.start <= byte && byte <= view.source.end)
             })
-            .or_else(|| self.views.last());
+    }
+    fn caret_location(&self) -> (f32, f32, f32) {
+        let byte = self.doc().selection().head;
+        let scroll = self.tabs[self.active].scroll;
+        let candidate = self.caret_view().or_else(|| self.views.last());
         if let Some(view) = candidate {
             let u = view
                 .map
@@ -2731,26 +3274,63 @@ impl App {
             self.ime_geometry();
         }
     }
-    fn composition_caret(&self) -> (f32, f32, f32) {
-        let (x, y, h) = self.caret;
-        if self.preedit.is_empty() {
-            return (x, y, h);
+    /// Position in the exact DirectWrite composition layout drawn by paint.
+    /// No fallback coordinates are reported as a successful IMM query.
+    fn composition_position(&self, utf16: u32) -> Option<(f32, f32, f32)> {
+        let selection = self.doc().selection();
+        if !self.composing
+            || self.ime_owner
+                != Some((
+                    self.doc().id(),
+                    self.doc().revision(),
+                    selection.anchor,
+                    selection.head,
+                ))
+        {
+            return None;
         }
+        let (id, revision, _, raw) = self.layout_key?;
+        if (id, revision, raw)
+            != (
+                self.doc().id(),
+                self.doc().revision(),
+                self.tabs[self.active].raw,
+            )
+        {
+            return None;
+        }
+        mdlite::coordinates::utf16_to_byte(&self.preedit, utf16 as usize).ok()?;
+        let byte = selection.head;
+        let view = self.caret_view()?;
+        let position = view
+            .map
+            .partition_point(|&p| p < byte)
+            .min(view.map.len().checked_sub(1)?);
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            if let Ok(layout) =
-                self.text_layout(&self.preedit, (self.width - x - LEFT).max(100.0), FONT)
-            {
-                let (mut dx, mut dy) = (0.0, 0.0);
-                let mut metrics = DWRITE_HIT_TEST_METRICS::default();
-                if layout
-                    .HitTestTextPosition(self.ime_cursor, false, &mut dx, &mut dy, &mut metrics)
-                    .is_ok()
-                {
-                    return (x + dx, y + dy, metrics.height.max(h));
-                }
+            view.layout
+                .HitTestTextPosition(position as u32, false, &mut x, &mut y, &mut metrics)
+                .ok()?;
+            let origin = (view.x + x, view.y + y - self.tabs[self.active].scroll);
+            if self.preedit.is_empty() {
+                return Some((origin.0, origin.1, metrics.height));
             }
+            let layout = self
+                .text_layout(&self.preedit, self.composition_width(view, origin.0), FONT)
+                .ok()?;
+            layout
+                .HitTestTextPosition(utf16, false, &mut x, &mut y, &mut metrics)
+                .ok()?;
+            Some((origin.0 + x, origin.1 + y, metrics.height))
         }
-        (x, y, h)
+    }
+    fn composition_width(&self, view: &TextView, x: f32) -> f32 {
+        (view.x + view.width - x).max(1.0)
+    }
+    fn composition_caret(&self) -> (f32, f32, f32) {
+        self.composition_position(self.ime_cursor)
+            .unwrap_or(self.caret)
     }
     unsafe fn ime_geometry(&self) {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -2842,7 +3422,7 @@ impl App {
         if let Some(image) = self
             .images
             .iter()
-            .find(|i| x >= LEFT && x <= LEFT + i.width && y >= i.y && y <= i.y + i.height)
+            .find(|image| image_contains_point(image, x, y))
         {
             return if y < image.y + image.height / 2.0 {
                 image.source.start
@@ -2896,7 +3476,67 @@ impl App {
             &view.map
         };
         let byte = *positions.get(u).unwrap_or(&view.source.end);
-        snap(self.doc().source(), byte, false)
+        snap(self.doc().rope(), byte, false)
+    }
+    fn toggle_task_at(&mut self, x: f32, y: f32) -> bool {
+        if self.composing || self.tabs[self.active].raw {
+            return false;
+        }
+        let Some((id, revision, projection)) = &self.projection_cache else {
+            return false;
+        };
+        if (*id, *revision) != (self.doc().id(), self.doc().revision()) {
+            return false;
+        }
+        let y = y + self.tabs[self.active].scroll;
+        let Some(view) = self.views.iter().find(|view| {
+            x >= view.x && x <= view.x + view.width && y >= view.y && y <= view.y + view.height
+        }) else {
+            return false;
+        };
+        let mut trailing = windows::core::BOOL::default();
+        let mut inside = windows::core::BOOL::default();
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        if unsafe {
+            view.layout.HitTestPoint(
+                x - view.x,
+                y - view.y,
+                &mut trailing,
+                &mut inside,
+                &mut metrics,
+            )
+        }
+        .is_err()
+            || !inside.as_bool()
+        {
+            return false;
+        }
+        let Some(&byte) = view.map.get(metrics.textPosition as usize) else {
+            return false;
+        };
+        let Some(run) = projection.runs.iter().find(|run| {
+            run.source.contains(&byte)
+                && run
+                    .kinds
+                    .iter()
+                    .any(|kind| matches!(kind, mdlite::projection::InlineKind::TaskMarker { .. }))
+        }) else {
+            return false;
+        };
+        let range = run.source.clone();
+        let selection = self.doc().selection();
+        let Some(replacement) =
+            task_marker_replacement(self.doc().source().get(range.clone()).unwrap_or_default())
+        else {
+            return false;
+        };
+        if let Err(error) =
+            self.doc_mut()
+                .replace_range_with_selection(range, replacement, selection)
+        {
+            self.status = error.to_string();
+        }
+        true
     }
     fn select_at(&mut self, x: f32, y: f32, extend: bool) {
         if self.composing {
@@ -2925,6 +3565,61 @@ impl App {
             let _ = std::fs::write(path, data);
         }
     }
+}
+
+/// Read presentation decisions from the existing parser block tree. Gutter
+/// decorations never enter the source/view edit mapping or document history.
+fn block_gutter(projection: &DisplayProjection, block: &ProjectionBlock) -> (Option<String>, bool) {
+    let contains = |parent: &ProjectionBlock, child: &ProjectionBlock| {
+        parent.source.start <= child.source.start && child.source.end <= parent.source.end
+    };
+    let quoted = projection
+        .blocks
+        .iter()
+        .any(|parent| matches!(parent.kind, BlockKind::Quote) && contains(parent, block));
+    let Some(item) = projection
+        .blocks
+        .iter()
+        .filter(|item| matches!(item.kind, BlockKind::ListItem) && contains(item, block))
+        .max_by_key(|item| item.depth)
+    else {
+        return (None, quoted);
+    };
+    if item.display_utf16.start != block.display_utf16.start {
+        return (None, quoted);
+    }
+    let Some(list) = projection
+        .blocks
+        .iter()
+        .filter(|list| {
+            matches!(list.kind, BlockKind::List { .. })
+                && list.depth < item.depth
+                && contains(list, item)
+        })
+        .max_by_key(|list| list.depth)
+    else {
+        return (None, quoted);
+    };
+    let BlockKind::List { ordered } = list.kind else {
+        unreachable!()
+    };
+    let marker = ordered.map_or_else(
+        || "•".to_owned(),
+        |start| {
+            let previous = projection
+                .blocks
+                .iter()
+                .filter(|sibling| {
+                    matches!(sibling.kind, BlockKind::ListItem)
+                        && sibling.depth == item.depth
+                        && contains(list, sibling)
+                        && sibling.source.start < item.source.start
+                })
+                .count() as u64;
+            format!("{}.", start.saturating_add(previous))
+        },
+    );
+    (Some(marker), quoted)
 }
 
 fn composition_is_cancelled(flags: u32) -> bool {
@@ -3081,7 +3776,7 @@ fn projection_mapping(
 }
 fn table_navigation_target(
     table: &Table,
-    source: &str,
+    source: &crop::Rope,
     p: usize,
     back: bool,
     horizontal: bool,
@@ -3121,6 +3816,20 @@ fn table_navigation_target(
             table.range.end
         });
     Some(snap(source, byte, !back))
+}
+fn task_marker_replacement(raw: &str) -> Option<&'static str> {
+    match raw {
+        "[ ]" => Some("[x]"),
+        "[x]" | "[X]" => Some("[ ]"),
+        _ => None,
+    }
+}
+fn history_shortcut(key: u16, ctrl: bool, shift: bool) -> Option<bool> {
+    match (key, ctrl, shift) {
+        (0x5a, true, false) => Some(false),
+        (0x5a, true, true) | (0x59, true, _) => Some(true),
+        _ => None,
+    }
 }
 fn table_key_intent(key: u16, ctrl: bool, shift: bool) -> Option<TableKeyIntent> {
     match key {
@@ -3320,7 +4029,7 @@ fn visible_tokens(
     let mut tokens = Vec::new();
     for grapheme in text.graphemes(true) {
         let display_start = offset;
-        let mut spans: Vec<Range<usize>> = Vec::new();
+        let mut spans = smallvec::SmallVec::<[Range<usize>; 1]>::new();
         for character in grapheme.chars() {
             let next = offset + character.len_utf16();
             if let (Some(&mapped_start), Some(&mapped_end)) = (after.get(offset), before.get(next))
@@ -3359,8 +4068,8 @@ fn visible_tokens(
                 .flat_map(|span| source.get(span.clone()).unwrap_or_default().bytes())
                 .eq(grapheme.bytes());
             tokens.push(VisibleToken {
+                text: (atomic || spans.len() != 1).then(|| grapheme.to_owned()),
                 spans,
-                text: grapheme.to_owned(),
                 display_utf16: display_start..offset,
                 atomic,
             });
@@ -3401,8 +4110,8 @@ fn resolve_live_point(
 }
 fn image_token(source: &str, range: Range<usize>) -> VisibleToken {
     VisibleToken {
-        spans: vec![range.clone()],
-        text: source[range].to_owned(),
+        spans: smallvec::smallvec![range.clone()],
+        text: Some(source[range].to_owned()),
         display_utf16: 0..0,
         atomic: true,
     }
@@ -3600,6 +4309,23 @@ fn live_edit(
 fn image_intersects_viewport(y: f32, height: f32, scroll: f32, bottom: f32) -> bool {
     y + height - scroll > TOP && y - scroll < bottom && bottom > TOP
 }
+fn image_contains_point(image: &ImageView, x: f32, y: f32) -> bool {
+    x >= image.x && x <= image.x + image.width && y >= image.y && y <= image.y + image.height
+}
+fn image_damage_rect(image: &ImageView, scroll: f32, dpi: f32) -> RECT {
+    RECT {
+        left: (image.x * dpi).floor() as i32,
+        top: ((image.y - scroll) * dpi).floor() as i32,
+        right: ((image.x + image.width) * dpi).ceil() as i32,
+        bottom: ((image.y - scroll + image.height) * dpi).ceil() as i32,
+    }
+}
+fn retained_image_bytes(frame: u64, animated: bool, input: u64) -> std::io::Result<u64> {
+    frame
+        .checked_mul(if animated { 3 } else { 1 })
+        .and_then(|bytes| bytes.checked_add(input))
+        .ok_or_else(|| std::io::Error::other("画像cache保持量のoverflow"))
+}
 fn image_dimensions(
     intrinsic_width: u32,
     intrinsic_height: u32,
@@ -3632,33 +4358,19 @@ fn unescape_cell(text: &str, base: usize) -> (String, Vec<usize>) {
     map.push(base + text.len());
     (output, map)
 }
-fn snap(source: &str, byte: usize, forward: bool) -> usize {
-    let byte = byte.min(source.len());
-    if byte == source.len() {
+fn snap(source: &crop::Rope, byte: usize, forward: bool) -> usize {
+    let mut byte = byte.min(source.byte_len());
+    while !source.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    if mdlite::coordinates::rope_is_grapheme_boundary(source, byte).unwrap_or(false) {
         return byte;
     }
     if forward {
-        source
-            .grapheme_indices(true)
-            .map(|(b, _)| b)
-            .find(|&b| b >= byte)
-            .unwrap_or(source.len())
+        mdlite::coordinates::rope_next_grapheme_boundary(source, byte).unwrap_or(byte)
     } else {
-        source
-            .grapheme_indices(true)
-            .map(|(b, _)| b)
-            .take_while(|&b| b <= byte)
-            .last()
-            .unwrap_or(0)
+        mdlite::coordinates::rope_previous_grapheme_boundary(source, byte).unwrap_or(byte)
     }
-}
-fn previous(source: &str, byte: usize) -> usize {
-    source
-        .grapheme_indices(true)
-        .map(|(b, _)| b)
-        .take_while(|&b| b < byte)
-        .last()
-        .unwrap_or(0)
 }
 fn is_image_path(path: &std::path::Path) -> bool {
     path.extension().is_some_and(|e| {
@@ -3743,13 +4455,6 @@ unsafe fn read_dib(hwnd: HWND) -> Result<(u32, u32, Vec<u8>), String> {
         let _ = CloseClipboard();
         result
     }
-}
-fn next(source: &str, byte: usize) -> usize {
-    source
-        .grapheme_indices(true)
-        .map(|(b, _)| b)
-        .find(|&b| b > byte)
-        .unwrap_or(source.len())
 }
 unsafe fn read_clipboard(hwnd: HWND) -> Option<String> {
     // SAFETY: called on the window owner thread; handles and COM resources
@@ -3843,6 +4548,8 @@ mod tests {
             width: 900.0,
             dpi: 1.0,
             layout_key: None,
+            projection_cache: None,
+            parsed_tables: Vec::new(),
             dragging: false,
             dragging_scroll: false,
             preedit: "かな".into(),
@@ -3857,6 +4564,922 @@ mod tests {
             status: String::new(),
         }
     }
+    fn hidden_test_window() -> HWND {
+        hidden_test_window_size(640, 480)
+    }
+    fn hidden_test_window_size(width: i32, height: i32) -> HWND {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                width,
+                height,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        }
+    }
+    fn query_test_app(preedit: &str) -> App {
+        let mut app = composing_test_app("| H |\n|---|\n| a日本語😀b |\n");
+        app.preedit = preedit.into();
+        let table = mdlite::table::find_tables(app.doc().source()).remove(0);
+        let range = table.rows[1].cells[0].content_range.clone();
+        let byte = range.start + 1;
+        app.doc_mut().set_selection(byte, byte).unwrap();
+        app.ime_owner = Some((app.doc().id(), app.doc().revision(), byte, byte));
+        let source = app.doc().source_shared();
+        let map = byte_map(&source[range.clone()], range.start);
+        unsafe {
+            app.push_view(
+                &source[range.clone()],
+                (map.clone(), map),
+                range,
+                (LEFT - 24.0, TOP + 40.0, 120.0),
+                FONT,
+                Some(0),
+            )
+            .unwrap();
+        }
+        app.tables.push(TableView {
+            table: Arc::new(table),
+            y: TOP + 40.0,
+            height: 30.0,
+            width: 120.0,
+        });
+        app.layout_key = Some((
+            app.doc().id(),
+            app.doc().revision(),
+            app.width.to_bits(),
+            false,
+        ));
+        app
+    }
+
+    #[test]
+    fn composition_positions_use_requested_utf16_actual_layout_scroll_and_table_origin() {
+        let mut app = query_test_app("日本語😀\n次の行👩‍💻");
+        let first = app.composition_position(0).unwrap();
+        let middle = app.composition_position(3).unwrap();
+        let end = app
+            .composition_position(app.preedit.encode_utf16().count() as u32)
+            .unwrap();
+        assert!(middle.0 > first.0);
+        assert!(end.1 > first.1);
+        assert!(first.0 < LEFT + FONT * 2.0); // actual horizontally scrolled table view
+        assert!(app.composition_position(4).is_none()); // surrogate midpoint
+        assert!(app.composition_position(1000).is_none());
+        app.tabs[0].scroll += 30.0;
+        let scrolled = app.composition_position(0).unwrap();
+        assert_eq!(scrolled.0, first.0);
+        assert_eq!(scrolled.1, first.1 - 30.0);
+        app.doc_mut().replace_range(0..0, "x").unwrap();
+        assert!(app.composition_position(0).is_none());
+    }
+
+    #[test]
+    fn native_query_response_checks_size_ownership_and_screen_pixels() {
+        let mut app = query_test_app("日本語😀\n次");
+        // Own hidden built-in window; no input, activation, clipboard, or existing app.
+        app.hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                170,
+                230,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        app.dpi = 1.5;
+        let position = app.composition_position(3).unwrap();
+        let mut origin = POINT::default();
+        unsafe {
+            assert!(ClientToScreen(app.hwnd, &mut origin).as_bool());
+        }
+        let mut query = IMECHARPOSITION {
+            dwSize: std::mem::size_of::<IMECHARPOSITION>() as u32,
+            dwCharPos: 3,
+            ..Default::default()
+        };
+        let pointer =
+            |query: &mut IMECHARPOSITION| LPARAM((query as *mut IMECHARPOSITION) as isize);
+        unsafe {
+            assert_eq!(
+                app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                    .0,
+                1
+            );
+            assert_eq!(query.pt.x, origin.x + (position.0 * app.dpi).round() as i32);
+            assert_eq!(query.pt.y, origin.y + (position.1 * app.dpi).round() as i32);
+            assert_eq!(query.cLineHeight, (position.2 * app.dpi).round() as u32);
+            assert_eq!(
+                (query.rcDocument.left, query.rcDocument.top),
+                (origin.x, origin.y)
+            );
+            assert_eq!(
+                (
+                    query.rcDocument.right - query.rcDocument.left,
+                    query.rcDocument.bottom - query.rcDocument.top
+                ),
+                (640, 480)
+            );
+            for requested in [0, 1, 3, 5, app.preedit.encode_utf16().count() as u32] {
+                query.dwCharPos = requested;
+                let expected = app.composition_position(requested).unwrap();
+                assert_eq!(
+                    app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                        .0,
+                    1
+                );
+                assert_eq!(query.dwCharPos, requested);
+                assert_eq!(query.pt.x, origin.x + (expected.0 * app.dpi).round() as i32);
+                assert_eq!(query.pt.y, origin.y + (expected.1 * app.dpi).round() as i32);
+            }
+            query.dwCharPos = 4;
+            assert_eq!(
+                app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                    .0,
+                0
+            );
+            query.dwSize = 1;
+            assert_eq!(
+                app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                    .0,
+                0
+            );
+            assert_eq!(app.ime_request(IMR_QUERYCHARPOSITION, LPARAM(0)).0, 0);
+            assert_eq!(app.ime_request(IMR_QUERYCHARPOSITION, LPARAM(1)).0, 0);
+            query.dwSize = std::mem::size_of::<IMECHARPOSITION>() as u32;
+            query.dwCharPos = 0;
+            let key = app.layout_key.take();
+            assert_eq!(
+                app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                    .0,
+                0
+            );
+            app.layout_key = key;
+            app.ime_owner = Some((99, app.doc().revision(), 1, 1));
+            assert_eq!(
+                app.ime_request(IMR_QUERYCHARPOSITION, pointer(&mut query))
+                    .0,
+                0
+            );
+            DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_keys_dispatch_in_raw_live_table_and_respect_ime_priority() {
+        assert_eq!(history_shortcut(0x5a, false, true), None);
+        for raw in [false, true] {
+            for source in ["body", "| h |\n|---|\n| v |\n"] {
+                let mut app = composing_test_app(source);
+                app.clear_composition();
+                app.tabs[0].raw = raw;
+                if source.starts_with('|') {
+                    let table = mdlite::table::find_tables(source).remove(0);
+                    let range = table.rows[1].cells[0].content_range.clone();
+                    app.doc_mut().set_selection(range.start, range.end).unwrap();
+                    app.doc_mut().replace_range(range, "u").unwrap();
+                    app.tables.push(TableView {
+                        table: Arc::new(table),
+                        y: TOP,
+                        height: 80.0,
+                        width: 120.0,
+                    });
+                    assert_eq!(app.active_cell().is_some(), !raw);
+                } else {
+                    app.doc_mut().replace_range(0..0, "猫").unwrap();
+                }
+                let after = app.doc().source_shared();
+                unsafe {
+                    app.key_with_modifiers(0x5a, true, false);
+                    assert_eq!(app.doc().source(), source);
+                    app.character(0x1a);
+                    assert_eq!(app.doc().source(), source);
+                    app.key_with_modifiers(0x5a, true, true);
+                    assert_eq!(app.doc().source(), &*after);
+                    app.key_with_modifiers(0x5a, true, false);
+                    app.key_with_modifiers(0x59, true, false);
+                    app.character(0x19);
+                    assert_eq!(app.doc().source(), &*after);
+                    app.composing = true;
+                    let before = document_state(app.doc());
+                    app.key_with_modifiers(0x5a, true, false);
+                    app.key_with_modifiers(0x59, true, false);
+                    assert_eq!(document_state(app.doc()), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_cache_reuses_revision_for_selection_and_layout_changes() {
+        let mut app = composing_test_app("**body**");
+        let first = app.cached_projection();
+        app.doc_mut().set_selection(2, 4).unwrap();
+        app.layout_key = None;
+        assert!(Arc::ptr_eq(&first, &app.cached_projection()));
+        app.doc_mut().replace_selection("new").unwrap();
+        assert!(!Arc::ptr_eq(&first, &app.cached_projection()));
+    }
+
+    #[test]
+    fn task_click_edits_only_marker_and_undo_restores_case_and_selection() {
+        let source = "- [X] **done**\r\n- [ ] todo\r\n";
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        app.doc_mut()
+            .set_selection(source.len(), source.len())
+            .unwrap();
+        let before_selection = app.doc().selection();
+        let projection = app.cached_projection();
+        let (map, before) =
+            projection_mapping(&projection, 0..projection.text.encode_utf16().count());
+        unsafe {
+            app.push_view(
+                &projection.text,
+                (map, before),
+                0..source.len(),
+                (LEFT, TOP, 500.0),
+                FONT,
+                None,
+            )
+            .unwrap();
+        }
+        let marker = projection
+            .runs
+            .iter()
+            .find(|run| {
+                run.kinds
+                    .iter()
+                    .any(|kind| matches!(kind, mdlite::projection::InlineKind::TaskMarker { .. }))
+            })
+            .unwrap();
+        let position = app.views[0]
+            .map
+            .iter()
+            .position(|&byte| byte == marker.source.start)
+            .unwrap();
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        let (mut x, mut y) = (0.0, 0.0);
+        unsafe {
+            app.views[0]
+                .layout
+                .HitTestTextPosition(position as u32, false, &mut x, &mut y, &mut metrics)
+                .unwrap();
+        }
+        app.tabs[0].scroll = 0.0;
+        assert!(app.toggle_task_at(
+            LEFT + x + metrics.width / 2.0,
+            TOP + y + metrics.height / 2.0
+        ));
+        assert_eq!(app.doc().source(), "- [ ] **done**\r\n- [ ] todo\r\n");
+        assert_eq!(app.doc().selection(), before_selection);
+        assert_eq!(app.doc().undo_count(), 1);
+        assert!(app.doc_mut().undo());
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().selection(), before_selection);
+        assert_eq!(task_marker_replacement("[z]"), None);
+    }
+
+    #[test]
+    fn ordinary_display_tokens_borrow_source_and_inline_their_span() {
+        let source = "plain é 👩‍💻 &amp;";
+        let tokens = projected_tokens(source);
+        let ordinary = &tokens[0];
+        assert!(ordinary.text.is_none());
+        assert!(!ordinary.spans.spilled());
+        assert_eq!(ordinary.spelling(source), "p");
+        let entity = tokens.last().unwrap();
+        assert_eq!(entity.spelling(source), "&");
+        assert_eq!(entity.text.as_deref(), Some("&"));
+        assert_eq!(retained_image_bytes(16, false, 0).unwrap(), 16);
+        assert_eq!(retained_image_bytes(16, true, 7).unwrap(), 55);
+        assert!(retained_image_bytes(u64::MAX, true, 0).is_err());
+    }
+
+    #[test]
+    fn raw_flag_navigation_and_delete_keep_original_regional_indicator_context() {
+        let source = "a🇦🇧🇨🇩🇪z";
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        app.tabs[0].raw = true;
+        assert_eq!(app.visible_step(9, false), 17);
+        assert_eq!(app.visible_step(17, true), 9);
+        assert_eq!(snap(app.doc().rope(), 13, false), 9);
+        app.doc_mut().set_selection(17, 17).unwrap();
+        unsafe {
+            app.key_with_modifiers(0x08, false, false);
+        }
+        assert_eq!(app.doc().source(), "a🇦🇧🇪z");
+        assert!(app.doc_mut().undo());
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().selection(), Selection::caret(17));
+    }
+
+    #[test]
+    fn offscreen_images_probe_only_then_reuse_upload_and_evict_all_owners() {
+        let directory = std::env::temp_dir().join(format!(
+            "mdlite-native-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("image.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="red"/></svg>"#).unwrap();
+        let source = "![fixture](image.svg)";
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        app.tabs[0].scroll = 0.0;
+        app.tabs[0].file = Some(
+            FileSnapshot::create_new(
+                directory.join("fixture.md"),
+                source,
+                FileFormat::Utf8 { bom: false },
+            )
+            .unwrap(),
+        );
+        unsafe {
+            let projection = DisplayProjection::parse(source);
+            let image = projection
+                .blocks
+                .iter()
+                .find(|block| matches!(block.kind, BlockKind::Image { .. }))
+                .unwrap();
+            app.layout_image(
+                &projection,
+                (image, true),
+                "image.svg",
+                None,
+                0..source.len(),
+                (10000.0, 500.0),
+            )
+            .unwrap();
+        }
+        assert_eq!((app.images[0].width, app.images[0].height), (40.0, 20.0));
+        assert!(app.images[0].bitmap.is_none());
+        assert!(app.image_cache.is_empty());
+        assert!(app.graphics.target.is_none());
+        app.hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            app.prepare_images();
+        }
+        assert!(app.image_cache.is_empty());
+        assert!(app.graphics.target.is_none());
+        app.images[0].y = TOP;
+        unsafe {
+            app.prepare_images();
+        }
+        let bitmap = app.images[0].bitmap.as_ref().unwrap().as_raw();
+        let path = app.images[0].path.clone().unwrap();
+        assert_eq!(app.image_cache[&path].retained_bytes, 40 * 20 * 4);
+        unsafe {
+            app.prepare_images();
+        }
+        assert_eq!(app.images[0].bitmap.as_ref().unwrap().as_raw(), bitmap);
+        app.images[0].y = 10000.0;
+        assert!(app.reserve_image_cache(IMAGE_CACHE_BYTES, &Default::default()));
+        assert!(app.image_cache.is_empty());
+        assert!(app.images[0].bitmap.is_none());
+        assert!(!app.reserve_image_cache(IMAGE_CACHE_BYTES + 1, &Default::default()));
+        app.animation_timer_armed = true;
+        app.clear_images();
+        assert!(!app.animation_timer_armed);
+        unsafe {
+            DestroyWindow(app.hwnd).unwrap();
+        }
+        drop(app);
+        std::fs::remove_file(directory.join("fixture.md")).unwrap();
+        std::fs::remove_file(directory.join("image.svg")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn list_gutter_decisions_honor_start_nested_depth_and_loose_paragraphs() {
+        let source = "7. first\n   continued\n8. second\n\n   another paragraph\n\n   - nested one\n   - nested two\n9. third\n\n> quoted\n";
+        let projection = DisplayProjection::parse(source);
+        let paragraph = |needle: &str| {
+            projection
+                .blocks
+                .iter()
+                .find(|block| {
+                    matches!(block.kind, BlockKind::Paragraph)
+                        && source[block.source.clone()].contains(needle)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            block_gutter(&projection, paragraph("first")).0.as_deref(),
+            Some("7.")
+        );
+        assert_eq!(
+            block_gutter(&projection, paragraph("second")).0.as_deref(),
+            Some("8.")
+        );
+        assert_eq!(block_gutter(&projection, paragraph("another")).0, None);
+        assert_eq!(
+            block_gutter(&projection, paragraph("third")).0.as_deref(),
+            Some("9.")
+        );
+        let nested: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(block.kind, BlockKind::ListItem)
+                    && source[block.source.clone()].contains("nested")
+                    && !source[block.source.clone()].contains("second")
+            })
+            .collect();
+        assert_eq!(nested.len(), 2);
+        for item in nested {
+            assert_eq!(block_gutter(&projection, item).0.as_deref(), Some("•"));
+        }
+        assert!(block_gutter(&projection, paragraph("quoted")).1);
+    }
+
+    #[test]
+    fn native_list_gutters_keep_tight_parent_text_and_code_font_without_edits() {
+        let source =
+            "7. first\n   - nested\n8. second\n\n> quoted\n\n```rust\nlet value = 1;\n```\n";
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        let caret = source.find("first").unwrap();
+        app.doc_mut().set_selection(caret, caret).unwrap();
+        let before = document_state(app.doc());
+        app.hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(document_state(app.doc()), before);
+        assert_eq!(
+            app.views
+                .iter()
+                .filter(|view| view.marker.is_some())
+                .count(),
+            3
+        );
+        assert_eq!(
+            app.views
+                .iter()
+                .filter(|view| source[view.source.clone()].contains("first"))
+                .count(),
+            1
+        );
+        assert!(app.views.iter().any(|view| view.quoted));
+        for view in &app.views {
+            if let Some((layout, width)) = &view.marker {
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                unsafe {
+                    layout.GetMetrics(&mut metrics).unwrap();
+                }
+                assert!(*width > 0.0 && metrics.height > 0.0);
+                assert!(view.x - width - 8.0 >= LEFT - 0.01);
+            }
+        }
+        let code = app
+            .views
+            .iter()
+            .find(|view| source[view.source.clone()].contains("let value"))
+            .unwrap();
+        let mut family = [0u16; 64];
+        unsafe {
+            code.layout.GetFontFamilyName(0, &mut family, None).unwrap();
+        }
+        let length = family.iter().position(|&unit| unit == 0).unwrap();
+        assert_eq!(
+            String::from_utf16(&family[..length]).unwrap(),
+            "Cascadia Mono"
+        );
+        let layouts: Vec<_> = app.views.iter().map(|view| view.layout.as_raw()).collect();
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(
+            layouts,
+            app.views
+                .iter()
+                .map(|view| view.layout.as_raw())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(document_state(app.doc()), before);
+        unsafe {
+            DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_list_images_keep_all_parent_fragments_and_one_gutter_per_item() {
+        let source = concat!(
+            "- lead ![one](one.png) middle ![two](two.png) **end**\n",
+            "- ![first](first.png) trailing\n",
+            "- parent\n",
+            "  - nested ![inner](inner.png) nested-tail\n",
+            "- loose first\n\n",
+            "  second paragraph before ![loose](loose.png) loose-tail\n",
+            "> - quoted before ![quoted](quoted.png) quoted-tail\n",
+        );
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        let caret = source.find("lead").unwrap();
+        app.doc_mut().set_selection(caret, caret).unwrap();
+        let before = document_state(app.doc());
+        app.hwnd = hidden_test_window();
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+
+        assert_eq!(app.images.len(), 6);
+        assert_eq!(
+            app.views
+                .iter()
+                .filter(|view| view.marker.is_some())
+                .count(),
+            6
+        );
+        assert!(app.views.iter().any(|view| view.quoted));
+        assert!(
+            app.images
+                .iter()
+                .find(|image| source[image.source.clone()].contains("![quoted]"))
+                .unwrap()
+                .quoted
+        );
+        for text in [
+            "lead",
+            "middle",
+            "end",
+            "trailing",
+            "parent",
+            "nested ",
+            "nested-tail",
+            "loose first",
+            "second paragraph before",
+            "loose-tail",
+            "quoted before",
+            "quoted-tail",
+        ] {
+            assert_eq!(
+                app.views
+                    .iter()
+                    .filter(|view| source[view.source.clone()].contains(text))
+                    .count(),
+                1,
+                "text fragment {text:?} should have one native view"
+            );
+        }
+        let view_y = |needle: &str| {
+            app.views
+                .iter()
+                .find(|view| source[view.source.clone()].contains(needle))
+                .unwrap()
+                .y
+        };
+        let image_y = |needle: &str| {
+            app.images
+                .iter()
+                .find(|image| source[image.source.clone()].contains(needle))
+                .unwrap()
+                .y
+        };
+        assert!(view_y("lead") < image_y("![one]"));
+        assert!(image_y("![one]") < view_y("middle"));
+        assert!(view_y("middle") < image_y("![two]"));
+        assert!(image_y("![two]") < view_y("end"));
+        let end_source = source.find("end").unwrap();
+        let end_view = app
+            .views
+            .iter()
+            .find(|view| source[view.source.clone()].contains("end"))
+            .unwrap();
+        let end_position = end_view
+            .map
+            .iter()
+            .position(|&source_byte| source_byte == end_source)
+            .unwrap();
+        let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
+        unsafe {
+            end_view
+                .layout
+                .GetFontWeight(end_position as u32, &mut weight, None)
+                .unwrap();
+        }
+        assert_eq!(weight, DWRITE_FONT_WEIGHT_BOLD);
+
+        let first_image = app
+            .images
+            .iter()
+            .find(|image| source[image.source.clone()].contains("![first]"))
+            .unwrap();
+        assert!(app.views.iter().any(|view| {
+            view.marker.is_some() && view.source.start == first_image.source.start
+        }));
+        let mut ranges: Vec<_> = app
+            .visible_tokens
+            .iter()
+            .flat_map(|token| token.spans.iter().cloned())
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        assert!(
+            ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "parent fragments and nested descendants must not overlap: {ranges:?}"
+        );
+        assert_eq!(document_state(app.doc()), before);
+        let end_range = end_source..end_source + "end".len();
+        app.doc_mut()
+            .set_selection(end_range.start, end_range.end)
+            .unwrap();
+        let edit = live_edit(source, &app.visible_tokens, end_range.clone(), "x").unwrap();
+        app.doc_mut()
+            .replace_range_with_selection(
+                edit.range,
+                &edit.replacement,
+                Selection {
+                    anchor: edit.caret,
+                    head: edit.caret,
+                },
+            )
+            .unwrap();
+        assert_eq!(app.doc().source(), source.replacen("end", "x", 1));
+        assert!(app.doc_mut().undo());
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: end_range.start,
+                head: end_range.end,
+            }
+        );
+        unsafe {
+            DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn wrapped_code_image_fragments_use_post_style_metrics_for_layout() {
+        let before_code = "iiiiiiii ".repeat(5);
+        let after_code = "iiiiiiii ".repeat(6);
+        let source = format!(
+            "- `{before_code}` ![image](image.png) `{after_code}`\n\nfollowing paragraph\n"
+        );
+        let mut app = composing_test_app(&source);
+        app.clear_composition();
+        let caret = source.find("iiii").unwrap();
+        app.doc_mut().set_selection(caret, caret).unwrap();
+        let before = document_state(app.doc());
+        app.hwnd = hidden_test_window_size(360, 480);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+
+        let before_view = app
+            .views
+            .iter()
+            .find(|view| source[view.source.clone()].contains(&before_code))
+            .unwrap();
+        let after_view = app
+            .views
+            .iter()
+            .find(|view| source[view.source.clone()].contains(&after_code))
+            .unwrap();
+        for view in [before_view, after_view] {
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            unsafe {
+                view.layout.GetMetrics(&mut metrics).unwrap();
+            }
+            assert!(metrics.height > FONT * 1.6, "inline code should wrap");
+            assert_eq!(view.height, metrics.height.max(FONT * 1.6));
+        }
+        let mut family = [0u16; 64];
+        unsafe {
+            before_view
+                .layout
+                .GetFontFamilyName(0, &mut family, None)
+                .unwrap();
+        }
+        let length = family.iter().position(|&unit| unit == 0).unwrap();
+        assert_eq!(
+            String::from_utf16(&family[..length]).unwrap(),
+            "Cascadia Mono"
+        );
+
+        let image = app
+            .images
+            .iter()
+            .find(|image| source[image.source.clone()].contains("![image]"))
+            .unwrap();
+        assert!(image.y >= before_view.y + before_view.height + 10.0 + FONT * 1.6 - 0.01);
+        assert!(
+            after_view.y >= image.y + image.height + FONT * 1.6 + 15.0 - 0.01,
+            "trailing fragment must start below the image"
+        );
+        let following = app
+            .views
+            .iter()
+            .find(|view| source[view.source.clone()].contains("following paragraph"))
+            .unwrap();
+        assert!(following.y >= after_view.y + after_view.height + 10.0 - 0.01);
+        assert_eq!(document_state(app.doc()), before);
+        unsafe {
+            DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    fn thematic_break_markers_draw_and_edit_as_exact_source_tokens() {
+        for syntax in ["***", "---", "___"] {
+            let source = format!("before\n\n{syntax}\n\nafter");
+            let mut app = composing_test_app(&source);
+            app.clear_composition();
+            app.hwnd = hidden_test_window();
+            let before_layout = document_state(app.doc());
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            assert_eq!(document_state(app.doc()), before_layout);
+            let rule_views: Vec<_> = app
+                .views
+                .iter()
+                .filter(|view| view.thematic_break)
+                .collect();
+            assert_eq!(rule_views.len(), 1);
+            assert!(rule_views[0].width > 100.0);
+            let rule_start = source.find(syntax).unwrap();
+            assert!(source[rule_views[0].source.clone()].starts_with(syntax));
+            let rule = app
+                .visible_tokens
+                .iter()
+                .find(|token| {
+                    token.spans.len() == 1
+                        && token.spans[0] == (rule_start..rule_start + syntax.len())
+                })
+                .unwrap();
+            assert!(rule.atomic);
+            assert_eq!(rule.text.as_deref(), Some("─"));
+            assert_eq!(rule.display_utf16.end - rule.display_utf16.start, 1);
+            assert_eq!(
+                live_horizontal_step(&source, &app.visible_tokens, &[], &[], rule_start, false,),
+                rule_start + syntax.len()
+            );
+            assert_eq!(
+                live_horizontal_step(
+                    &source,
+                    &app.visible_tokens,
+                    &[],
+                    &[],
+                    rule_start + syntax.len(),
+                    true,
+                ),
+                rule_start
+            );
+
+            app.doc_mut()
+                .set_selection(rule_start, rule_start + syntax.len())
+                .unwrap();
+            let edit = live_edit(
+                &source,
+                &app.visible_tokens,
+                rule_start..rule_start + syntax.len(),
+                "",
+            )
+            .unwrap();
+            app.doc_mut()
+                .replace_range_with_selection(
+                    edit.range,
+                    &edit.replacement,
+                    Selection {
+                        anchor: edit.caret,
+                        head: edit.caret,
+                    },
+                )
+                .unwrap();
+            assert_eq!(app.doc().source(), source.replacen(syntax, "", 1));
+            assert_eq!(app.doc().undo_count(), 1);
+            assert!(app.doc_mut().undo());
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(
+                app.doc().selection(),
+                Selection {
+                    anchor: rule_start,
+                    head: rule_start + syntax.len(),
+                }
+            );
+
+            app.tabs[app.active].raw = true;
+            app.layout_key = None;
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            assert!(app.views.iter().all(|view| !view.thematic_break));
+            assert_eq!(app.views[0].source, 0..source.len());
+            assert!((rule_start..rule_start + syntax.len()).all(|byte| {
+                app.visible_tokens
+                    .iter()
+                    .any(|token| token.spans.len() == 1 && token.spans[0] == (byte..byte + 1))
+            }));
+            unsafe {
+                DestroyWindow(app.hwnd).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn native_thematic_breaks_leave_literal_contexts_and_table_cells_unchanged() {
+        let base = concat!(
+            "---\ntitle: ---\n---\n\n",
+            "```md\n---\n***\n```\n\n",
+            "`---` and \\***\n\n",
+            "| A | B |\n| --- | --- |\n| x --- y | `---` |",
+        );
+        for ending in ["", "\n", "\r\n"] {
+            let source = format!("{base}{ending}");
+            let mut app = composing_test_app(&source);
+            app.clear_composition();
+            let caret = source.find("title").unwrap();
+            app.doc_mut().set_selection(caret, caret).unwrap();
+            let before = document_state(app.doc());
+            app.hwnd = hidden_test_window();
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            assert_eq!(
+                app.views.iter().filter(|view| view.thematic_break).count(),
+                0
+            );
+            assert_eq!(app.tables.len(), 1, "final EOL {ending:?}");
+            assert!(
+                app.literal_blocks
+                    .iter()
+                    .any(|range| { source[range.clone()].starts_with("---\ntitle") })
+            );
+            assert_eq!(
+                app.tables[0].table.range.end,
+                source.len() - ending.len(),
+                "table editing excludes final EOL {ending:?}"
+            );
+            assert_eq!(
+                source[app.tables[0].table.rows[1].cells[0].content_range.clone()].trim(),
+                "x --- y"
+            );
+            assert_eq!(
+                source[app.tables[0].table.rows[1].cells[1].content_range.clone()].trim(),
+                "`---`"
+            );
+            assert_eq!(document_state(app.doc()), before);
+            unsafe {
+                DestroyWindow(app.hwnd).unwrap();
+            }
+        }
+    }
+
     fn document_state(doc: &Document) -> (String, u64, u64, bool, usize, usize, Selection) {
         (
             doc.source().into(),
@@ -3993,7 +5616,7 @@ mod tests {
         app.doc_mut().set_selection(cell.start, cell.end).unwrap();
         app.ime_owner = Some((1, app.doc().revision(), cell.start, cell.end));
         app.tables.push(TableView {
-            table,
+            table: Arc::new(table),
             y: TOP,
             height: 60.0,
             width: 200.0,
@@ -4371,7 +5994,7 @@ mod tests {
                 assert_eq!(table_key_intent(key, false, false), None);
                 let target = table_navigation_target(
                     &table,
-                    source,
+                    doc.rope(),
                     doc.selection().head,
                     key == 0x25 || key == 0x26,
                     key == 0x25 || key == 0x27,
@@ -4636,7 +6259,7 @@ mod tests {
         let tokens = vec![image_token(source, range.clone())];
         let markers = [range.start, range.end];
         assert!(tokens[0].atomic);
-        assert_eq!(tokens[0].spans, vec![range.clone()]);
+        assert_eq!(tokens[0].spans.as_slice(), std::slice::from_ref(&range));
         for (p, text, expected) in [
             (0, "前", format!("前{source}")),
             (source.len(), "後", format!("{source}後")),
@@ -4731,20 +6354,21 @@ mod tests {
         ];
         for value in expected {
             let target =
-                table_navigation_target(&table, source, doc.selection().head, false, true).unwrap();
+                table_navigation_target(&table, doc.rope(), doc.selection().head, false, true)
+                    .unwrap();
             assert_eq!(target, value);
             doc.set_selection(target, target).unwrap();
         }
         for _ in 0..20 {
             if let Some(target) =
-                table_navigation_target(&table, source, doc.selection().head, false, true)
+                table_navigation_target(&table, doc.rope(), doc.selection().head, false, true)
             {
                 doc.set_selection(target, target).unwrap();
             }
         }
         let b = table.rows[0].cells[1].content_range.start;
         assert_eq!(
-            table_navigation_target(&table, source, b, false, false),
+            table_navigation_target(&table, doc.rope(), b, false, false),
             Some(table.rows[1].cells[1].content_range.start)
         );
         assert_eq!(doc.source(), source);
@@ -4785,10 +6409,10 @@ mod tests {
         let source = "&amp;\\|e\u{301}👨‍👩‍👧‍👦";
         let tokens = projected_tokens(source);
         assert_eq!(tokens.len(), 4);
-        assert_eq!(tokens[0].spans, vec![0..5]);
-        assert_eq!(tokens[1].spans, vec![5..7]);
-        assert_eq!(tokens[2].text, "e\u{301}");
-        assert_eq!(tokens[3].text, "👨‍👩‍👧‍👦");
+        assert_eq!(tokens[0].spans.as_slice(), std::slice::from_ref(&(0..5)));
+        assert_eq!(tokens[1].spans.as_slice(), std::slice::from_ref(&(5..7)));
+        assert_eq!(tokens[2].spelling(source), "e\u{301}");
+        assert_eq!(tokens[3].spelling(source), "👨‍👩‍👧‍👦");
         assert_eq!(perform_live_edit(source, 0..5, ""), "\\|e\u{301}👨‍👩‍👧‍👦");
         let emoji_start = source.find('👨').unwrap();
         assert_eq!(
@@ -4801,11 +6425,14 @@ mod tests {
         let source = "**&fjlig;** z";
         let tokens = projected_tokens(source);
         assert_eq!(
-            tokens.iter().map(|t| t.text.as_str()).collect::<String>(),
+            tokens
+                .iter()
+                .map(|t| t.spelling(source))
+                .collect::<String>(),
             "fj z"
         );
-        assert_eq!(tokens[0].spans, vec![2..9]);
-        assert_eq!(tokens[1].spans, vec![2..9]);
+        assert_eq!(tokens[0].spans.as_slice(), std::slice::from_ref(&(2..9)));
+        assert_eq!(tokens[1].spans.as_slice(), std::slice::from_ref(&(2..9)));
         assert_eq!(perform_live_edit(source, 2..9, "x"), "**x** z");
     }
     #[test]
@@ -4820,12 +6447,17 @@ mod tests {
             assert!(
                 projected_tokens(source)
                     .iter()
-                    .any(|token| token.text == "\\"
+                    .any(|token| token.spelling(source) == "\\"
                         && token.spans.len() == 1
                         && token.spans[0] == (slash..slash + 1))
             );
         }
-        assert_eq!(perform_live_edit("a\\*b", 1..3, ""), "ab");
+        assert_eq!(
+            perform_live_edit("a\\*b", 1..3, ""),
+            "ab",
+            "tokens={:?}",
+            projected_tokens("a\\*b")
+        );
     }
     #[test]
     fn cut_copies_visible_text_and_replacement_history_restores_exact_caret() {
@@ -4834,7 +6466,7 @@ mod tests {
         let selected = 2..source.len();
         assert_eq!(
             selected_token(&tokens, selected.clone())
-                .map(|t| t.text.as_str())
+                .map(|t| t.spelling(source))
                 .collect::<String>(),
             "abc"
         );
@@ -4872,10 +6504,58 @@ mod tests {
     fn combining_grapheme_across_style_boundary_preserves_hidden_gap() {
         let source = "**e**\u{301}z";
         let tokens = projected_tokens(source);
-        assert_eq!(tokens[0].text, "e\u{301}");
-        assert_eq!(tokens[0].spans, vec![2..3, 5..7]);
+        assert_eq!(tokens[0].spelling(source), "e\u{301}");
+        assert_eq!(tokens[0].spans.as_slice(), &[2..3, 5..7]);
         assert_eq!(perform_live_edit(source, 2..7, ""), "****z");
     }
+    #[test]
+    fn image_hit_edges_exclude_gutter_and_damage_respects_scroll_and_dpi() {
+        let image = ImageView {
+            bitmap: None,
+            path: None,
+            source: 3..9,
+            x: LEFT + 9.5,
+            y: 200.25,
+            width: 13.25,
+            height: 7.0,
+            quoted: false,
+            label: String::new(),
+            load_failed: false,
+        };
+        assert!(image_contains_point(&image, image.x, image.y));
+        assert!(image_contains_point(
+            &image,
+            image.x + image.width,
+            image.y + image.height
+        ));
+        assert!(!image_contains_point(
+            &image,
+            LEFT + 1.0,
+            image.y + image.height / 2.0
+        ));
+
+        let damage = image_damage_rect(&image, 11.0, 1.5);
+        assert_eq!(
+            (damage.left, damage.top, damage.right, damage.bottom),
+            (80, 283, 101, 295)
+        );
+
+        let mut app = composing_test_app("0123456789");
+        app.clear_composition();
+        app.tabs[0].scroll = 0.0;
+        app.images.push(image);
+        let image = &app.images[0];
+        assert_eq!(app.hit(image.x, image.y + 0.25), image.source.start);
+        assert_eq!(
+            app.hit(image.x + image.width, image.y + image.height - 0.25),
+            image.source.end
+        );
+        assert_ne!(
+            app.hit(LEFT + 1.0, image.y + image.height / 2.0),
+            image.source.start
+        );
+    }
+
     #[test]
     fn animation_only_runs_for_intersecting_image() {
         assert!(image_intersects_viewport(100.0, 40.0, 0.0, 600.0));
@@ -4911,10 +6591,23 @@ mod tests {
     #[test]
     fn navigation_preserves_graphemes_and_eof() {
         let source = "e\u{301}😀\r\n日本";
-        assert_eq!(next(source, 0), 3);
-        assert_eq!(previous(source, 7), 3);
-        assert_eq!(next(source, 7), 9);
-        assert_eq!(snap(source, source.len(), false), source.len());
-        assert_eq!(snap(source, 2, false), 0);
+        assert_eq!(
+            mdlite::coordinates::rope_next_grapheme_boundary(&crop::Rope::from(source), 0).unwrap(),
+            3
+        );
+        assert_eq!(
+            mdlite::coordinates::rope_previous_grapheme_boundary(&crop::Rope::from(source), 7)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            mdlite::coordinates::rope_next_grapheme_boundary(&crop::Rope::from(source), 7).unwrap(),
+            9
+        );
+        assert_eq!(
+            snap(&crop::Rope::from(source), source.len(), false),
+            source.len()
+        );
+        assert_eq!(snap(&crop::Rope::from(source), 2, false), 0);
     }
 }

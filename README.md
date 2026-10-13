@@ -40,6 +40,9 @@ rust-analyzerとCodeLLDBを使います。実際に確認した操作範囲は�
 Markdown原文を正本とし、Live表示の見出し・表・画像を同じ面で扱います。
 Ctrl+Eで明示的ソース表示へ切り替えます。Ctrl+N／O／S／Shift+Sで
 新規／開く／保存／名前を付けて保存、Ctrl+Z／YでUndo／Redoを行います。
+Ctrl+Shift+ZもRedoです。本文と履歴はcropの共有Ropeを使い、parser向けの
+連続文字列は同じrevisionで共有します。[Markdown方言](docs/markdown-dialect.md)
+に採用構文、原文の扱い、対応範囲を記載します。
 表操作と画像の比率固定resizeは対象のコンテキスト操作から行います。
 
 未実装のExplorer、Workspace検索、Calendar、Git UI、autosaveや復旧を
@@ -47,6 +50,10 @@ Ctrl+Eで明示的ソース表示へ切り替えます。Ctrl+N／O／S／Shift+
 [受入記録](docs/rust-acceptance.md)に保持しています。
 
 [部品選定と責務](docs/rust-architecture.md)、[依存ライセンス](docs/dependencies.md)。
+
+起動中のアプリを保全する必要がある場合は、buildの`-TargetDirectory`で
+別の出力先、`-EvidenceDirectory`で別の検証記録先を指定できます。
+通常のVS Code起動設定は既定の`target`を使用します。
 
 ## ライセンス
 

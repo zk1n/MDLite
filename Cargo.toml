@@ -6,9 +6,12 @@ rust-version = "1.99"
 license = "MIT"
 
 [dependencies]
+crop = { version = "=0.4.3", features = ["utf16-metric", "graphemes"] }
+linkify = "=0.11.0"
+smallvec = "1"
 unicode-segmentation = "1.12"
 encoding_rs = "0.8"
-pulldown-cmark = "0.13"
+pulldown-cmark = { version = "=0.13.4", default-features = false }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Globalization"] }
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_TextServices"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

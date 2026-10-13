@@ -1,6 +1,7 @@
 //! Mutable canonical Markdown source and transaction-based edit history.
 
-use std::{fmt, ops::Range};
+use crop::{Rope, RopeSlice};
+use std::{cell::OnceCell, fmt, ops::Range, sync::Arc};
 
 use crate::coordinates::{self, CoordinateError};
 
@@ -58,9 +59,8 @@ impl From<CoordinateError> for DocumentError {
 
 #[derive(Debug)]
 struct Edit {
-    start: usize,
-    removed: String,
-    inserted: String,
+    before: Rope,
+    after: Rope,
     before_selection: Selection,
     after_selection: Selection,
     before_state: u64,
@@ -69,13 +69,13 @@ struct Edit {
 
 /// The one editable source buffer for a document.
 ///
-/// Edits store only their removed/inserted slices; the document source is never
-/// cloned to build history. Selection-only movement does not change revision or
-/// dirty state.
+/// COW snapshots share history nodes. Selection-only movement does not revise
+/// source. The lazy contiguous buffer is only for parser/save APIs and never edits.
 #[derive(Debug)]
 pub struct Document {
     id: DocumentId,
-    source: String,
+    source: Rope,
+    contiguous: OnceCell<Arc<str>>,
     selection: Selection,
     revision: u64,
     current_state: u64,
@@ -99,7 +99,8 @@ impl Document {
     fn with_saved_state(id: DocumentId, source: String, saved_state: Option<u64>) -> Self {
         Self {
             id,
-            source,
+            source: Rope::from(source),
+            contiguous: OnceCell::new(),
             selection: Selection::caret(0),
             revision: 0,
             current_state: 0,
@@ -115,7 +116,41 @@ impl Document {
     }
 
     pub fn source(&self) -> &str {
+        self.contiguous
+            .get_or_init(|| Arc::from(self.source.to_string()))
+    }
+
+    /// Shares the once-per-revision parser/save boundary buffer.
+    pub fn source_shared(&self) -> Arc<str> {
+        Arc::clone(
+            self.contiguous
+                .get_or_init(|| Arc::from(self.source.to_string())),
+        )
+    }
+
+    pub fn rope(&self) -> &Rope {
         &self.source
+    }
+    pub fn byte_len(&self) -> usize {
+        self.source.byte_len()
+    }
+    /// COW snapshot is read-only and its offsets belong to this id/revision.
+    pub fn snapshot(&self) -> DocumentSnapshot {
+        DocumentSnapshot {
+            id: self.id,
+            revision: self.revision,
+            source: self.source.clone(),
+        }
+    }
+    pub fn slice(&self, range: Range<usize>) -> Result<RopeSlice<'_>, DocumentError> {
+        validate_range(&self.source, &range)?;
+        Ok(self.source.byte_slice(range))
+    }
+    pub fn byte_to_utf16(&self, byte: usize) -> Result<usize, CoordinateError> {
+        coordinates::rope_byte_to_utf16(&self.source, byte)
+    }
+    pub fn utf16_to_byte(&self, units: usize) -> Result<usize, CoordinateError> {
+        coordinates::rope_utf16_to_byte(&self.source, units)
     }
 
     pub const fn selection(&self) -> Selection {
@@ -140,8 +175,8 @@ impl Document {
 
     /// Set a selection using UTF-8 byte offsets. Both endpoints must be scalar boundaries.
     pub fn set_selection(&mut self, anchor: usize, head: usize) -> Result<(), DocumentError> {
-        coordinates::byte_to_utf16(&self.source, anchor)?;
-        coordinates::byte_to_utf16(&self.source, head)?;
+        coordinates::rope_byte_to_utf16(&self.source, anchor)?;
+        coordinates::rope_byte_to_utf16(&self.source, head)?;
         self.selection = Selection { anchor, head };
         Ok(())
     }
@@ -165,7 +200,7 @@ impl Document {
     /// Replace one source range and restore an explicitly chosen selection after the edit.
     ///
     /// The requested selection is checked against the resulting source's UTF-8 scalar
-    /// boundaries. If an endpoint is invalid, the source splice is rolled back before
+    /// boundaries. An invalid endpoint discards the COW candidate before source,
     /// history or document state changes.
     pub fn replace_range_with_selection(
         &mut self,
@@ -182,26 +217,14 @@ impl Document {
         inserted: &str,
         requested_after_selection: Option<Selection>,
     ) -> Result<(), DocumentError> {
-        if range.start > range.end {
-            return Err(DocumentError::InvalidRange {
-                start: range.start,
-                end: range.end,
-            });
-        }
-        coordinates::byte_to_utf16(&self.source, range.start)?;
-        coordinates::byte_to_utf16(&self.source, range.end)?;
-
-        let removed = self.source[range.clone()].to_owned();
+        validate_range(&self.source, &range)?;
         let after_selection = requested_after_selection
             .unwrap_or_else(|| Selection::caret(range.start + inserted.len()));
-        if removed == inserted {
-            if requested_after_selection.is_some() {
-                validate_selection(&self.source, after_selection)?;
-            }
+        if self.source.byte_slice(range.clone()) == inserted {
+            validate_selection(&self.source, after_selection)?;
             self.selection = after_selection;
             return Ok(());
         }
-
         let next_revision = self
             .revision
             .checked_add(1)
@@ -210,25 +233,20 @@ impl Document {
             .next_state
             .checked_add(1)
             .ok_or(DocumentError::RevisionExhausted)?;
+        // Validate a COW candidate before publishing any source/history state.
+        let mut after = self.source.clone();
+        after.replace(range, inserted);
+        validate_selection(&after, after_selection)?;
         let edit = Edit {
-            start: range.start,
-            removed,
-            inserted: inserted.to_owned(),
+            before: self.source.clone(),
+            after: after.clone(),
             before_selection: self.selection,
             after_selection,
             before_state: self.current_state,
             after_state: self.next_state,
         };
-
-        let inserted_end = range.start + inserted.len();
-        self.source.replace_range(range.clone(), inserted);
-        if requested_after_selection.is_some()
-            && let Err(error) = validate_selection(&self.source, after_selection)
-        {
-            self.source
-                .replace_range(range.start..inserted_end, &edit.removed);
-            return Err(error);
-        }
+        self.source = after;
+        self.contiguous.take();
 
         self.history.truncate(self.history_cursor);
         self.history.push(edit);
@@ -245,13 +263,16 @@ impl Document {
         if self.history_cursor == 0 {
             return false;
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
         let edit = &self.history[self.history_cursor - 1];
-        let end = edit.start + edit.inserted.len();
-        self.source.replace_range(edit.start..end, &edit.removed);
+        self.source = edit.before.clone();
+        self.contiguous.take();
         self.selection = edit.before_selection;
         self.current_state = edit.before_state;
         self.history_cursor -= 1;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         true
     }
 
@@ -260,13 +281,16 @@ impl Document {
         if self.history_cursor == self.history.len() {
             return false;
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
         let edit = &self.history[self.history_cursor];
-        let end = edit.start + edit.removed.len();
-        self.source.replace_range(edit.start..end, &edit.inserted);
+        self.source = edit.after.clone();
+        self.contiguous.take();
         self.selection = edit.after_selection;
         self.current_state = edit.after_state;
         self.history_cursor += 1;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         true
     }
 
@@ -276,9 +300,33 @@ impl Document {
     }
 }
 
-fn validate_selection(source: &str, selection: Selection) -> Result<(), DocumentError> {
+#[derive(Clone, Debug)]
+pub struct DocumentSnapshot {
+    pub id: DocumentId,
+    pub revision: u64,
+    source: Rope,
+}
+impl DocumentSnapshot {
+    pub fn rope(&self) -> &Rope {
+        &self.source
+    }
+}
+
+fn validate_range(source: &Rope, range: &Range<usize>) -> Result<(), DocumentError> {
+    if range.start > range.end {
+        return Err(DocumentError::InvalidRange {
+            start: range.start,
+            end: range.end,
+        });
+    }
+    coordinates::rope_byte_to_utf16(source, range.start)?;
+    coordinates::rope_byte_to_utf16(source, range.end)?;
+    Ok(())
+}
+
+fn validate_selection(source: &Rope, selection: Selection) -> Result<(), DocumentError> {
     for offset in [selection.anchor, selection.head] {
-        coordinates::byte_to_utf16(source, offset)?;
+        coordinates::rope_byte_to_utf16(source, offset)?;
     }
     Ok(())
 }
@@ -286,6 +334,139 @@ fn validate_selection(source: &str, selection: Selection) -> Result<(), Document
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_and_parser_buffer_are_read_only_and_revision_owned() {
+        let mut doc = Document::new(9, "a".repeat(8192));
+        let snapshot = doc.snapshot();
+        let input = doc.source_shared();
+        doc.set_selection(10, 10).unwrap();
+        assert!(Arc::ptr_eq(&input, &doc.source_shared()));
+        doc.replace_range(10..11, "a").unwrap();
+        assert!(Arc::ptr_eq(&input, &doc.source_shared()));
+        assert!(
+            doc.replace_range_with_selection(10..11, "😀", Selection::caret(11))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&input, &doc.source_shared()));
+        doc.replace_range(10..11, "猫").unwrap();
+        assert!(!Arc::ptr_eq(&input, &doc.source_shared()));
+        assert_eq!(snapshot.rope(), &*input);
+        assert_eq!((snapshot.id, snapshot.revision), (9, 0));
+        assert!(doc.undo());
+        assert_eq!(doc.rope(), snapshot.rope());
+        let cached = doc.source_shared();
+        let revision = doc.revision();
+        assert!(doc.replace_range(8193..8193, "x").is_err());
+        doc.replace_range(10..11, "a").unwrap();
+        assert_eq!(doc.revision(), revision);
+        assert_eq!(doc.redo_count(), 1);
+        assert!(Arc::ptr_eq(&cached, &doc.source_shared()));
+        assert!(doc.redo());
+        assert_eq!(doc.source().get(10..13), Some("猫"));
+    }
+
+    #[test]
+    fn randomized_edits_and_history_match_independent_string_states() {
+        let mut doc = Document::new(10, "a😀\r\né日本語".repeat(300));
+        let mut states = vec![doc.source().to_owned()];
+        let mut cursor = 0;
+        let mut random = 0x726f7065_u64;
+        for step in 0..600 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match random % 7 {
+                0 => {
+                    let changed = doc.undo();
+                    assert_eq!(changed, cursor > 0);
+                    if changed {
+                        cursor -= 1;
+                    }
+                }
+                1 => {
+                    let changed = doc.redo();
+                    assert_eq!(changed, cursor + 1 < states.len());
+                    if changed {
+                        cursor += 1;
+                    }
+                }
+                _ => {
+                    let reference = &states[cursor];
+                    let boundaries: Vec<_> = reference
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .chain([reference.len()])
+                        .collect();
+                    let a = boundaries[(random as usize / 7) % boundaries.len()];
+                    let b = boundaries[(random as usize / 97) % boundaries.len()];
+                    let range = a.min(b)..a.max(b);
+                    let inserted = ["猫", "😀", "\r\n", "é", "👩‍💻", ""][step % 6];
+                    let mut expected = reference.clone();
+                    expected.replace_range(range.clone(), inserted);
+                    doc.replace_range(range, inserted).unwrap();
+                    if expected != *reference {
+                        states.truncate(cursor + 1);
+                        states.push(expected);
+                        cursor += 1;
+                    }
+                }
+            }
+            assert_eq!(doc.source(), states[cursor]);
+            assert_eq!(doc.undo_count(), cursor);
+            assert_eq!(doc.redo_count(), states.len() - cursor - 1);
+        }
+    }
+
+    #[test]
+    fn invalid_ranges_and_exhausted_revisions_are_atomic() {
+        let mut doc = Document::new(1, "😀".into());
+        for range in [Range { start: 4, end: 3 }, 0..5, 1..4] {
+            assert!(doc.replace_range(range, "x").is_err());
+            assert_eq!(doc.source(), "😀");
+            assert_eq!(doc.undo_count(), 0);
+        }
+        doc.replace_range(0..0, "a").unwrap();
+        doc.revision = u64::MAX;
+        assert!(!doc.undo());
+        assert!(matches!(
+            doc.replace_range(0..0, "b"),
+            Err(DocumentError::RevisionExhausted)
+        ));
+        assert_eq!(doc.source(), "a😀");
+    }
+
+    #[test]
+    fn rope_save_boundary_keeps_bytes_and_failed_cp932_save_keeps_history() {
+        use crate::storage::{FileFormat, FileSnapshot};
+        let path = std::env::temp_dir().join(format!(
+            "mdlite-rope-save-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = "日本語\r\nline\nlast\r";
+        let mut doc = Document::new(20, original.into());
+        let mut file = FileSnapshot::create_new(&path, doc.source(), FileFormat::Cp932).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        doc.set_selection(0, 0).unwrap();
+        file.save(doc.source()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        doc.replace_selection("😀").unwrap();
+        let source = doc.source_shared();
+        let revision = doc.revision();
+        assert!(file.save(doc.source()).is_err());
+        assert_eq!(doc.source(), &*source);
+        assert_eq!(doc.revision(), revision);
+        assert_eq!(doc.undo_count(), 1);
+        assert!(doc.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(doc.undo());
+        file.save(doc.source()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!doc.is_dirty());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn edit_undo_redo_restores_source_selection_and_saved_state() {

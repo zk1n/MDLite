@@ -6,7 +6,8 @@
 
 use std::{cmp::Reverse, ops::Range};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use crate::markdown::parser_options;
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableCell {
@@ -393,7 +394,7 @@ impl Table {
 
 /// Find all well-formed GFM tables in document order.
 pub fn find_tables(source: &str) -> Vec<Table> {
-    let parser = Parser::new_ext(source, Options::all()).into_offset_iter();
+    let parser = Parser::new_ext(source, parser_options()).into_offset_iter();
     let mut start = None;
     let mut tables = Vec::new();
     for (event, range) in parser {
@@ -469,7 +470,7 @@ pub fn parse_table_row(text: &str, from: usize) -> TableRow {
 }
 
 fn is_gfm_table(source: &str) -> bool {
-    Parser::new_ext(source, Options::all())
+    Parser::new_ext(source, parser_options())
         .any(|event| matches!(event, Event::Start(Tag::Table(_))))
 }
 

@@ -11,7 +11,8 @@ Markdown原文を永続正本とし、表示は派生データとする。
 | 日本語入力 | Windows IMM | 未確定状態と確定transaction、候補位置 |
 | Markdown | pulldown-cmark | 編集可能範囲、未完成構文、原文保持 |
 | Raster/SVG | image、resvg/usvg | ローカルのみ、安全検査、保存後の挿入 |
-| Unicode境界 | unicode-segmentation | UTF-8/UTF-16/source/view対応 |
+| 本文・履歴・Unicode境界 | crop 0.4.3 (`utf16-metric`, `graphemes`) | checked byte/UTF-16 API、source/view対応 |
+| 派生表示・未確定文字の境界 | unicode-segmentation | Markdownで隠す記号・entity・表示UTF-16との対応 |
 | 保存 | Windows CP932変換、ファイル置換 | BOM、改行、外部変更、失敗保護 |
 
 ## 選定
@@ -28,7 +29,7 @@ DEFAULT target作成は約50MBの追加private memoryを確保した。同じ文
 32,014,336 bytesで、private memoryはDEFAULTより50,065,408 bytes少なかった。
 これはrenderer targetの診断値であり、product memory baselineやbudget PASS
 ではない。描画方式をsoftwareへ固定し、同じDirectWrite layoutと画像・
-選択処理を使う。現在のcanonical Release EXE focused runでは1／6文書の
+選択処理を使う。初回Rust版のcanonical Release EXE focused runでは1／6文書の
 Working Setが固定50,000,000-byte目標を超えてFAILしているため、その値は
 受入記録に残す。他のGPU／VMで同じ値になるとは仮定せず、GPUメモリと
 完成製品の総資源は今回の測定対象外とする。
@@ -72,5 +73,88 @@ viewの解放を管理する。CP932はWindowsの変換を使いbest-fitを拒�
 [usvg resolver](https://docs.rs/usvg/0.45.1/usvg/struct.ImageHrefResolver.html)、
 [Windows文字変換](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte)。
 
-50,000,000 bytes目標は実測で判断する。薄いshellの値を完成製品の保証に
+旧測定の50,000,000 bytes目標は履歴として保持する。今回の望ましい目安を薄いshellの値で完成製品の保証に
 しない。採用可否、C++比較、GUI証拠と未検証範囲は受入記録に残す。
+
+
+## crop本文と派生データの所有
+
+`Document::source`の編集正本は`crop::Rope`一つである。挿入・削除・置換は
+checked byte rangeを検証し、COW candidateへ適用してselectionも検証した後だけ
+公開する。不正境界・範囲・selectionやrevision枯渇では本文、dirty、履歴は変わらない。
+履歴はbefore/after Rope snapshot、selection、saved-state identityを保持し、Undo/Redoは
+共有treeの切替を行う。全文Stringによる第二編集engineやdelta文字列の再適用はない。
+Undo後の編集でRedoを破棄し、saved-stateへ戻るとcleanになる。履歴は文書closeで解放し、
+現時点では履歴件数に上限を設けない。cropの共有nodeの正確な保持bytesは計測していない。
+
+`rope()`とchecked `slice()`は参照寿命で文書をborrowし、編集との同時使用を防ぐ。
+`snapshot()`はDocument ID/revisionとCOW Ropeを所有するread-only snapshotである。
+source byteはUTF-8 scalar境界を検証し、UTF-16変換はcrop metricを利用して
+サロゲート途中を拒否する。raw移動・削除、native hit位置と表外へのsnapはcropの
+chunkをまたぐgrapheme APIを使う。表示で隠すMarkdownやentityの対応はMDLiteの
+source-affine tokenに残す。普通の表示graphemeはsource rangeからspellingを借り、
+一つのrangeはsmallvecのinline領域に保持する。変換されたentity、escape、分割された
+style間graphemeのみ短い表示Stringを持つ。
+
+crop 0.4.3の`Rope::graphemes()`にはregional-indicatorのcontextを失う既知の
+再現がある。`a🇦🇧🇨🇩🇪z`で`a / 🇦🇧 / 🇨 / 🇩🇪 / z`を返すが、Unicode標準の
+境界は`a / 🇦🇧 / 🇨🇩 / 🇪 / z`である。このiteratorはsource navigationに使用しない。
+同版の`Rope::is_grapheme_boundary`はoriginal chunks/contextから判定し、RI列、
+chunk跨ぎ、ZWJ、異体字セレクター、結合文字、CRLFのfixtureで正しい境界を確認する。
+MDLiteの小さなprevious/next wrapperは、このpredicateが真になる最寄りscalar境界を
+探すだけで、Unicode分割規則は実装しない。本文をStringへ戻すfallbackやlibrary forkは
+持たない。raw native移動・削除にもこのcontext保持経路を使う。
+
+
+pulldown-cmarkと保存APIには連続`&str`が必要なため、Documentが
+`OnceCell<Arc<str>>`を一revisionにつき最大一つ生成する。`source_shared()`は同じ
+bufferのArcを共有し、編集・Undo・RedoでDocumentのcacheを破棄する。
+選択移動、no-op、失敗はcacheを維持する。保存はこの読み取り境界を使い、既存の
+BOM/CP932、混在改行、外部変更拒否、best-fit拒否、元bytes snapshotを維持する。
+元bytesは保存保護のため別途保持する必要データである。
+
+UIのAppはactive Document ID/revisionで一つのprojectionとparsed tableの共有cacheを
+所有する。幅、表scroll等のlayout-only更新は再parseも全文copyも行わない。
+通常の選択移動・再paintはlayout keyが同じならDirectWrite layoutも再構築しない。
+編集後はcache keyで破棄・再解析し、tab切替・closeではactive解析cacheを解放する。
+全体Markdown解析はrevision変更時に残る。完全な差分parser/全文書仮想化は導入しない。
+DirectWrite用UTF-16や短い描画ラベルは外部API向けの派生入力で、編集本文ではない。
+
+箇条書きと番号付きリストは既存projection block treeからnative gutterの短いlabelを
+一itemにつき一つ作り、DirectWriteの実測幅に合わせてtext viewのindentを確保する。
+番号はlist startと同depthのsibling順に従い、tight/loose・複数段落・複数行・nested itemで
+同itemの番号を重複しない。tight itemがnested listを含む場合、その前の親本文も描画する。
+引用はindentとnative gutterの縦線を使う。gutterはsource/view mapに入れず、表示だけで
+source、dirty、Undo、selectionを変更しない。marker記法の直接編集はraw modeを使う。
+code blockは既存InlineKind::CodeのDirectWrite stylingでCascadia Monoを指定し、OS font
+fallbackを維持する。所有hidden windowでlabel layout、code family、source/history不変性を
+確認するが、実際のfontの外観やphysical GUI受入とは区別する。
+
+
+crop 0.4.3はMIT、MSRV 1.85で、既存Rust 1.99と互換である。manifestをexact pinし、
+Cargo.lockにはcropとstr_indicesが追加される。pulldown-cmark 0.13.4もexact pinし、
+HTML生成/CLIを使わないためdefault featuresを無効にしてgetopts、unicode-width、
+pulldown-cmark-escapeを除く。GFM bare link用linkify 0.11.0はparser不足を補う。
+smallvecは一source spanをallocationなしで保持するための直接依存である。
+
+## native入力と画像保持
+
+compositionがUndo/Redoや表keyに先行する。composition外ではCtrl+ZをUndo、
+Ctrl+Shift+Z/Ctrl+YをRedoへ振り分け、後続control文字を抑制する。
+`IMR_QUERYCHARPOSITION`は構造体size/alignment、active owner、revision-owned layout、
+requested composition UTF-16位置とscalar境界を検証する。描画と同じ幅で作成した
+DirectWrite layoutのHitTestTextPositionを用い、表viewの実座標、scroll、DPIを反映し、
+clientからscreen pixelへ変換する。解決できないqueryには0を返す。固定文字幅やcaret
+への代替を成功応答にしない。先頭/途中/末尾、改行、emoji、表offset、scroll、DPI、
+不正sizeとstale ownerの試験は純粋計算とowned hidden Win32 windowで行う。
+実MS IME候補UIやphysical keyboardの受入とは分ける。
+
+画像layoutはbounded metadata probeで寸法だけを取得し、decode/uploadは可視範囲と
+前後一viewportのlookaheadに限定する。512 MiBのaggregate cache保持予算を設け、
+追加時にoffscreen entryをevictする前にImageViewのCOM cloneも解放する。
+同じviewportの再paintではcacheを再利用する。静止画は一frameのchecked RGBA bytes、
+animationはcurrent CPU frame、canvas、Direct2D bitmapの三frameと圧縮inputを
+保守的に見積もる。decode後の実寸でも入場を検証する。decoder内部・一時decode資源や
+OS COM allocationはこの見積り外であり、process memoryの厳密な上限ではない。
+過大入力や予算不足はplaceholderと診断を残して本文を保持する。tab切替、close、raw
+切替ではdecoder/bitmapとtimerを解放する。50 MBは望ましい目安で、今回の必達条件ではない。

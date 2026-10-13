@@ -6,16 +6,9 @@
 
 use std::ops::Range;
 
+pub use crate::coordinates::BoundaryAffinity;
 use crate::markdown::{gfm_autolinks, parser_options};
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, HeadingLevel, Parser, Tag, TagEnd};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoundaryAffinity {
-    /// Resolve a collapsed display boundary toward the preceding source text.
-    Before,
-    /// Resolve a collapsed display boundary toward the following source text.
-    After,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -106,6 +99,9 @@ pub struct DisplayProjection {
     /// Index `n` corresponds to UTF-16 display boundary `n`.
     pub boundaries: Vec<SourceBoundary>,
     pub source_len: usize,
+    /// Source insertion points which can disappear from the rendered text,
+    /// including physical line starts and projected block boundaries.
+    pub editable_source_positions: Vec<usize>,
     source_boundary_bits: Vec<u64>,
     source_spans: Vec<SourceProjectionSpan>,
 }
@@ -841,16 +837,56 @@ impl<'a> ProjectionBuilder<'a> {
                 .cmp(&right.source.start)
                 .then_with(|| right.source.end.cmp(&left.source.end))
         });
+        let editable_source_positions = editable_source_positions(self.source, &self.blocks);
         DisplayProjection {
             text: self.text,
             blocks: self.blocks,
             runs: self.runs,
             boundaries: self.boundaries,
             source_len: self.source.len(),
+            editable_source_positions,
             source_boundary_bits: source_boundary_bits(self.source),
             source_spans: self.source_spans,
         }
     }
+}
+
+fn editable_source_positions(source: &str, blocks: &[ProjectionBlock]) -> Vec<usize> {
+    let bytes = source.as_bytes();
+    let mut positions = vec![0, source.len()];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\r' if bytes.get(offset + 1) == Some(&b'\n') => {
+                offset += 2;
+                positions.push(offset);
+            }
+            b'\r' | b'\n' => {
+                offset += 1;
+                positions.push(offset);
+            }
+            _ => {
+                let character = source[offset..]
+                    .chars()
+                    .next()
+                    .expect("valid source boundary");
+                offset += character.len_utf8();
+            }
+        }
+    }
+    for block in blocks {
+        positions.extend([block.source.start, block.source.end]);
+    }
+    positions.retain(|&position| {
+        source.is_char_boundary(position)
+            && !(position > 0
+                && position < bytes.len()
+                && bytes[position - 1] == b'\r'
+                && bytes[position] == b'\n')
+    });
+    positions.sort_unstable();
+    positions.dedup();
+    positions
 }
 
 fn end_tag_for_block(tag: &TagEnd) -> Option<EndTag> {
@@ -1233,6 +1269,38 @@ mod tests {
             builder.process(event, range);
         }
         builder.finish()
+    }
+
+    #[test]
+    fn editable_source_positions_keep_blank_lines_soft_breaks_and_fence_edges() {
+        let source = "before\r\nsecond\r\n\r\n```rs\r\nlet x = 1;\r\n```\r\n\r\n## ";
+        let projection = DisplayProjection::parse(source);
+        let positions = &projection.editable_source_positions;
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(positions.iter().all(|&position| {
+            source.is_char_boundary(position)
+                && !(position > 0
+                    && position < source.len()
+                    && source.as_bytes()[position - 1] == b'\r'
+                    && source.as_bytes()[position] == b'\n')
+        }));
+        for (start, ending) in source.match_indices("\r\n") {
+            assert!(!positions.contains(&(start + 1)));
+            assert!(positions.contains(&(start + ending.len())));
+        }
+
+        let first_break_end = source.find("\r\n").unwrap() + 2;
+        assert!(positions.contains(&first_break_end));
+        assert!(projection.text.contains("before second"));
+        let code = projection
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+            .expect("fenced code block");
+        assert!(positions.contains(&code.source.start));
+        assert!(positions.contains(&code.source.end));
+        assert!(positions.contains(&source.len()));
+        assert_eq!(projection.source_len, source.len());
     }
 
     #[test]

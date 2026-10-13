@@ -36,8 +36,9 @@ endings, encoding, dirty state, or history.
 Native list bullets and ordered numbers are drawn in a gutter from the
 projection's source-ranged `List` and `ListItem` blocks; ordered markers honor
 the list start and item order, including nesting. Block quotes get a gutter
-rule. These presentation markers stay outside projected/source text, so raw
-editing retains the original list and quote punctuation. Tight list items keep
+rule. These presentation markers stay outside projected/source text. The active
+Live editing fragment reveals its original punctuation with source-affine positions;
+inactive fragments retain their projected presentation. Tight list items keep
 editable parent text before and after inline images; an image-first item keeps
 its list marker in the gutter, and nested or loose child blocks retain their
 own layout.

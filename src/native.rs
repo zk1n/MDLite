@@ -1,6 +1,12 @@
 //! Win32 owns the window; the UI-thread App owns documents and derived layouts.
-//! The boxed RefCell lives until the message loop exits. Modal dialog reentry
-//! uses try_borrow_mut, so no nested callback can alias a mutable App reference.
+//! WindowState lives until the message loop exits. Synchronous native reentry
+//! snapshots IME notifications outside App's borrow and drains them in order.
+
+mod editing;
+use editing::{
+    enter_edit, indentation_edit, line_start, logical_line_target, physical_line_starts,
+    word_target,
+};
 
 use mdlite::{
     document::{Document, Selection},
@@ -9,7 +15,12 @@ use mdlite::{
     table::{Table, TableAlignment, TableEdit, TableRect},
 };
 use std::{
-    cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, sync::Arc, time::Instant,
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use windows::{
@@ -63,6 +74,7 @@ struct Tab {
 }
 struct TextView {
     layout: IDWriteTextLayout,
+    text: Vec<u16>,
     map: Vec<usize>,
     before: Vec<usize>,
     x: f32,
@@ -192,18 +204,218 @@ struct App {
     layout_key: Option<(u64, u64, u32, bool)>,
     projection_cache: Option<(u64, u64, Arc<DisplayProjection>)>,
     parsed_tables: Vec<Arc<Table>>,
+    revealed_source: Option<Range<usize>>,
     dragging: bool,
     dragging_scroll: bool,
     preedit: String,
     composing: bool,
     ime_owner: Option<(u64, u64, usize, usize)>,
+    ime_affinity: BoundaryAffinity,
     ime_cursor: u32,
-    suppress_chars: Vec<u16>,
+    ime_attributes: Vec<u8>,
+    ime_last_result: Option<(String, Option<String>)>,
+    preferred_x: Option<f32>,
+    typing: bool,
+    last_typing: Option<Instant>,
+    pending_table_authoring: Option<(u64, usize)>,
+    close_after_composition: Option<(u32, WPARAM, LPARAM)>,
     pending_surrogate: Option<u16>,
     diagnostic: Option<PathBuf>,
     caret: (f32, f32, f32),
     native_caret: NativeCaretState,
     status: String,
+}
+
+// App is never mutably aliased. Only owned, synchronous notification snapshots
+// may be queued while a modal/native callback holds its RefCell borrow.
+struct WindowState {
+    app: RefCell<App>,
+    notifications: RefCell<VecDeque<(u64, NativeNotification)>>,
+    document_id: Cell<u64>,
+}
+impl WindowState {
+    fn new(app: App) -> Self {
+        let document_id = Cell::new(app.doc().id());
+        Self {
+            app: RefCell::new(app),
+            notifications: RefCell::new(VecDeque::new()),
+            document_id,
+        }
+    }
+}
+enum NativeNotification {
+    Start,
+    Update(ImeUpdate),
+    End,
+    FocusLost,
+}
+#[derive(Default)]
+struct ImeUpdate {
+    flags: u32,
+    result: Option<String>,
+    preedit: Option<String>,
+    attributes: Option<Vec<u8>>,
+    cursor: Option<u32>,
+}
+
+struct CompositionVisual {
+    layout: IDWriteTextLayout,
+    range: Range<u32>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    view_index: usize,
+    end_view_index: usize,
+    growth: f32,
+    row_bottom: f32,
+}
+
+// The current editor styles are the DirectWrite font/decorations below. Copy
+// runs, not individual characters, including the insertion point's font.
+unsafe fn copy_layout_styles(
+    from: &IDWriteTextLayout,
+    to: &IDWriteTextLayout,
+    source: Range<u32>,
+    destination: u32,
+    repeated_length: Option<u32>,
+) -> windows::core::Result<()> {
+    unsafe {
+        let mut position = source.start;
+        while position < source.end {
+            let mut end = source.end;
+            let mut run = DWRITE_TEXT_RANGE::default();
+            let mut weight = DWRITE_FONT_WEIGHT::default();
+            from.GetFontWeight(position, &mut weight, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            let mut style = DWRITE_FONT_STYLE::default();
+            from.GetFontStyle(position, &mut style, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            let mut size = 0.0;
+            from.GetFontSize(position, &mut size, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            let mut family_len = 0;
+            from.GetFontFamilyNameLength(position, &mut family_len, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            let mut family = vec![0; family_len as usize + 1];
+            from.GetFontFamilyName(position, &mut family, None)?;
+            let mut underline = windows::core::BOOL::default();
+            from.GetUnderline(position, &mut underline, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            let mut strike = windows::core::BOOL::default();
+            from.GetStrikethrough(position, &mut strike, Some(&mut run))?;
+            end = end.min(run.startPosition.saturating_add(run.length));
+            end = end.max(position + 1).min(source.end);
+            let range = DWRITE_TEXT_RANGE {
+                startPosition: destination + position - source.start,
+                length: repeated_length.unwrap_or(end - position),
+            };
+            to.SetFontWeight(weight, range)?;
+            to.SetFontStyle(style, range)?;
+            to.SetFontSize(size, range)?;
+            to.SetFontFamilyName(PCWSTR(family.as_ptr()), range)?;
+            to.SetUnderline(underline.as_bool(), range)?;
+            to.SetStrikethrough(strike.as_bool(), range)?;
+            position = end;
+        }
+        Ok(())
+    }
+}
+fn layout_caret(
+    layout: &IDWriteTextLayout,
+    position: u32,
+    trailing: bool,
+) -> Option<(f32, f32, f32)> {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut hit = DWRITE_HIT_TEST_METRICS::default();
+    unsafe {
+        layout
+            .HitTestTextPosition(position, trailing, &mut x, &mut y, &mut hit)
+            .ok()?;
+        let mut method = DWRITE_LINE_SPACING_METHOD::default();
+        let mut spacing = 0.0;
+        let mut baseline = 0.0;
+        layout
+            .GetLineSpacing(&mut method, &mut spacing, &mut baseline)
+            .ok()?;
+        // Editor formats use uniform native line spacing. Read that format
+        // instead of collecting all visual rows every time the caret moves.
+        Some((
+            x,
+            y,
+            if method == DWRITE_LINE_SPACING_METHOD_UNIFORM {
+                spacing
+            } else {
+                hit.height
+            },
+        ))
+    }
+}
+
+unsafe fn read_ime_update(hwnd: HWND, flags: u32) -> ImeUpdate {
+    unsafe {
+        let mut update = ImeUpdate {
+            flags,
+            ..Default::default()
+        };
+        if composition_is_cancelled(flags) {
+            return update;
+        }
+        let context = ImmGetContext(hwnd);
+        if context.0.is_null() {
+            return update;
+        }
+        let read = |kind: IME_COMPOSITION_STRING| -> Option<Vec<u8>> {
+            let length = ImmGetCompositionStringW(context, kind, None, 0);
+            if length < 0 {
+                return None;
+            }
+            let mut bytes = vec![0; length as usize];
+            if length > 0 {
+                let actual = ImmGetCompositionStringW(
+                    context,
+                    kind,
+                    Some(bytes.as_mut_ptr().cast()),
+                    length as u32,
+                );
+                if actual < 0 {
+                    return None;
+                }
+                bytes.truncate(actual as usize);
+            }
+            Some(bytes)
+        };
+        let text = |kind| {
+            read(kind).map(|bytes| {
+                String::from_utf16_lossy(
+                    &bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        if flags & GCS_RESULTSTR.0 != 0 {
+            update.result = text(GCS_RESULTSTR);
+        }
+        if flags & GCS_COMPSTR.0 != 0 {
+            update.preedit = text(GCS_COMPSTR);
+        }
+        if flags & (GCS_COMPATTR.0 | GCS_COMPSTR.0) != 0 {
+            update.attributes = read(GCS_COMPATTR);
+        }
+        if flags & GCS_CURSORPOS.0 != 0 {
+            let cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, None, 0);
+            if cursor >= 0 {
+                update.cursor = Some(cursor as u32);
+            }
+        }
+        let _ = ImmReleaseContext(hwnd, context);
+        update
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -291,7 +503,7 @@ pub fn run() -> windows::core::Result<()> {
             }
             i += 1;
         }
-        let mut app = Box::new(RefCell::new(App {
+        let mut app = Box::new(WindowState::new(App {
             hwnd: HWND::default(),
             graphics,
             tabs: Vec::new(),
@@ -311,13 +523,21 @@ pub fn run() -> windows::core::Result<()> {
             layout_key: None,
             projection_cache: None,
             parsed_tables: Vec::new(),
+            revealed_source: None,
             dragging: false,
             dragging_scroll: false,
             preedit: String::new(),
             composing: false,
             ime_owner: None,
+            ime_affinity: BoundaryAffinity::After,
             ime_cursor: 0,
-            suppress_chars: Vec::new(),
+            ime_attributes: Vec::new(),
+            ime_last_result: None,
+            preferred_x: None,
+            typing: false,
+            last_typing: None,
+            pending_table_authoring: None,
+            close_after_composition: None,
             pending_surrogate: None,
             diagnostic,
             caret: (LEFT, TOP, 28.0),
@@ -325,12 +545,12 @@ pub fn run() -> windows::core::Result<()> {
             status: String::new(),
         }));
         for path in paths.into_iter().take(6) {
-            app.get_mut().open_path(path);
+            app.app.get_mut().open_path(path);
         }
-        if app.get_mut().tabs.is_empty() {
-            app.get_mut().new_document();
+        if app.app.get_mut().tabs.is_empty() {
+            app.app.get_mut().new_document();
         }
-        let pointer = (&*app as *const RefCell<App>).cast();
+        let pointer = (&*app as *const WindowState).cast();
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("MDLiteRustEditor"),
@@ -345,7 +565,7 @@ pub fn run() -> windows::core::Result<()> {
             Some(instance.into()),
             Some(pointer),
         )?;
-        app.get_mut().hwnd = hwnd;
+        app.app.get_mut().hwnd = hwnd;
         let dark = windows::core::BOOL(1);
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -353,7 +573,7 @@ pub fn run() -> windows::core::Result<()> {
             (&dark as *const windows::core::BOOL).cast(),
             std::mem::size_of_val(&dark) as u32,
         );
-        app.get_mut().dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
+        app.app.get_mut().dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
         DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let mut message = MSG::default();
@@ -369,8 +589,6 @@ pub fn run() -> windows::core::Result<()> {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // SAFETY: called on the window owner thread; handles and COM resources
-    // remain owned by App, and borrowed buffers outlive each synchronous call.
     unsafe {
         if msg == WM_NCCREATE {
             let cs = &*(lp.0 as *const CREATESTRUCTW);
@@ -380,7 +598,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             PostQuitMessage(0);
             return LRESULT(0);
         }
-        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
         if msg == WM_NCDESTROY {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             return DefWindowProcW(hwnd, msg, wp, lp);
@@ -388,18 +606,91 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if pointer.is_null() {
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let Ok(mut app) = (*pointer).try_borrow_mut() else {
+        let state = &*pointer;
+        let notification = match msg {
+            WM_IME_STARTCOMPOSITION => Some(NativeNotification::Start),
+            WM_IME_COMPOSITION => Some(NativeNotification::Update(read_ime_update(
+                hwnd,
+                lp.0 as u32,
+            ))),
+            WM_IME_ENDCOMPOSITION => Some(NativeNotification::End),
+            WM_KILLFOCUS => Some(NativeNotification::FocusLost),
+            _ => None,
+        };
+        let Ok(mut app) = state.app.try_borrow_mut() else {
+            if let Some(notification) = notification {
+                state
+                    .notifications
+                    .borrow_mut()
+                    .push_back((state.document_id.get(), notification));
+                return LRESULT(0);
+            }
             if matches!(
                 msg,
-                WM_CLOSE | WM_COMMAND | WM_KEYDOWN | WM_CHAR | WM_LBUTTONDOWN | WM_DROPFILES
+                WM_CLOSE
+                    | WM_COMMAND
+                    | WM_KEYDOWN
+                    | WM_CHAR
+                    | WM_LBUTTONDOWN
+                    | WM_DROPFILES
+                    | WM_IME_REQUEST
             ) {
                 return LRESULT(0);
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
+        state.document_id.set(app.doc().id());
+        app.hwnd = hwnd;
+        let result = if let Some(notification) = notification {
+            app.native_notification(notification);
+            LRESULT(0)
+        } else if (msg == WM_CLOSE || (msg == WM_COMMAND && wp.0 & 0xffff == CMD_CLOSE))
+            && app.composing
+        {
+            if app.close_after_composition.is_none() {
+                app.close_after_composition = Some((msg, wp, lp));
+            }
+            if !app.complete_composition() {
+                app.close_after_composition = None;
+                app.status =
+                    "IMEの確定を完了できませんでした — 未保存本文と変換文字は保持しています".into();
+                app.refresh();
+            }
+            LRESULT(0)
+        } else {
+            dispatch_window_message(hwnd, msg, wp, lp, &mut app)
+        };
+        // Never hold the queue borrow over a callback. All owned lifecycle
+        // snapshots drain in delivery order before the next outer input event.
+        loop {
+            let next = state.notifications.borrow_mut().pop_front();
+            let Some((owner, notification)) = next else {
+                break;
+            };
+            if owner == app.doc().id() {
+                app.native_notification(notification);
+            }
+        }
+        state.document_id.set(app.doc().id());
+        result
+    }
+}
+
+unsafe fn dispatch_window_message(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    app: &mut App,
+) -> LRESULT {
+    unsafe {
         app.hwnd = hwnd;
         match msg {
             WM_CREATE => LRESULT(0),
+            value if value == WM_APP + 1 && app.diagnostic.is_some() => {
+                app.refresh();
+                LRESULT(1)
+            }
             WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -456,15 +747,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_SETFOCUS => {
                 app.native_caret = NativeCaretState::default();
                 app.refresh();
-                LRESULT(0)
-            }
-            WM_KILLFOCUS => {
-                if app.composing {
-                    let _ = app.cancel_composition();
-                }
-                let _ = DestroyCaret();
-                app.native_caret = NativeCaretState::default();
-                app.dragging = false;
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
@@ -544,29 +826,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 app.character(wp.0 as u16);
                 LRESULT(0)
             }
-            WM_IME_STARTCOMPOSITION => {
-                app.composing = true;
-                let selection = app.doc().selection();
-                app.ime_owner = Some((
-                    app.doc().id(),
-                    app.doc().revision(),
-                    selection.anchor,
-                    selection.head,
-                ));
-                app.preedit.clear();
-                app.ime_geometry();
-                LRESULT(0)
-            }
-            WM_IME_COMPOSITION => {
-                app.composition(lp.0 as u32);
-                app.refresh();
-                LRESULT(0)
-            }
-            WM_IME_ENDCOMPOSITION => {
-                app.clear_composition();
-                app.refresh();
-                LRESULT(0)
-            }
             WM_IME_CHAR => LRESULT(0),
             WM_IME_REQUEST => app.ime_request(wp.0 as u32, lp),
             WM_IME_SETCONTEXT => DefWindowProcW(
@@ -610,10 +869,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 LRESULT(0)
             }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
@@ -621,6 +876,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 impl App {
     fn live_insertion_point(&self, p: usize) -> usize {
+        if self
+            .revealed_source
+            .as_ref()
+            .is_some_and(|range| range.start <= p && p <= range.end)
+            || self
+                .projection_cache
+                .as_ref()
+                .is_some_and(|(id, revision, projection)| {
+                    (*id, *revision) == (self.doc().id(), self.doc().revision())
+                        && projection
+                            .editable_source_positions
+                            .binary_search(&p)
+                            .is_ok()
+                })
+        {
+            return p;
+        }
         let markers: Vec<_> = self
             .views
             .iter()
@@ -1050,14 +1322,38 @@ impl App {
             .iter()
             .map(|table| table.table.range.clone())
             .collect();
-        live_horizontal_step(
+        let token_target = live_horizontal_step(
             self.doc().source(),
             &self.visible_tokens,
             &tables,
             &self.literal_blocks,
             p,
             back,
-        )
+        );
+        let markers = self
+            .views
+            .iter()
+            .filter(|view| view.source.is_empty())
+            .map(|view| view.source.start)
+            .chain(self.projection_cache.iter().flat_map(|(_, _, projection)| {
+                projection.editable_source_positions.iter().copied()
+            }))
+            .filter(|point| {
+                !self
+                    .tables
+                    .iter()
+                    .any(|table| table.table.range.contains(point))
+                    || self
+                        .views
+                        .iter()
+                        .any(|view| view.source.is_empty() && view.source.start == *point)
+            });
+        let marker = markers
+            .filter(|&point| if back { point < p } else { point > p })
+            .min_by_key(|&point| point.abs_diff(p));
+        marker
+            .filter(|&point| token_target == p || point.abs_diff(p) < token_target.abs_diff(p))
+            .unwrap_or(token_target)
     }
     fn edit(&mut self, text: &str) {
         let selection = self.doc().selection();
@@ -1065,6 +1361,14 @@ impl App {
         self.edit_range(range, text);
     }
     fn edit_range(&mut self, range: Range<usize>, text: &str) {
+        let authoring_table = self.pending_table_authoring.is_some_and(|(id, start)| {
+            id == self.doc().id()
+                && self.tables.iter().any(|table| {
+                    table.table.range.start == start
+                        && range.start >= table.table.range.start
+                        && range.end <= table.table.range.end
+                })
+        });
         let range = if !self.tabs[self.active].raw && range.is_empty() {
             let p = self.live_insertion_point(range.start);
             p..p
@@ -1073,7 +1377,7 @@ impl App {
         };
         let mut replacement = text.to_owned();
         let mut gap_caret = None;
-        if !self.tabs[self.active].raw {
+        if !self.tabs[self.active].raw && !authoring_table {
             if range.is_empty()
                 && !replacement.is_empty()
                 && let Some(plan) = self.tables.windows(2).find_map(|tables| {
@@ -1119,7 +1423,13 @@ impl App {
                 return;
             }
         }
-        let plan = if self.tabs[self.active].raw {
+        let plan = if self.tabs[self.active].raw
+            || authoring_table
+            || self
+                .revealed_source
+                .as_ref()
+                .is_some_and(|source| source.start <= range.start && range.end <= source.end)
+        {
             Some(LiveEdit {
                 caret: range.start + replacement.len(),
                 range,
@@ -1143,14 +1453,18 @@ impl App {
     }
     fn apply_live_edit(&mut self, plan: LiveEdit) {
         let before_revision = self.doc().revision();
-        if let Err(e) = self.doc_mut().replace_range_with_selection(
-            plan.range,
-            &plan.replacement,
-            Selection {
-                anchor: plan.caret,
-                head: plan.caret,
-            },
-        ) {
+        let selection = Selection::caret(plan.caret);
+        let result = if self.typing {
+            self.doc_mut().replace_range_typing_with_selection(
+                plan.range,
+                &plan.replacement,
+                selection,
+            )
+        } else {
+            self.doc_mut()
+                .replace_range_with_selection(plan.range, &plan.replacement, selection)
+        };
+        if let Err(e) = result {
             self.status = e.to_string();
         }
         if self.doc().revision() != before_revision {
@@ -1195,13 +1509,6 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
-            if !self.suppress_chars.is_empty() {
-                if self.suppress_chars[0] == unit {
-                    self.suppress_chars.remove(0);
-                    return;
-                }
-                self.suppress_chars.clear();
-            }
             if self.composing {
                 return;
             }
@@ -1221,21 +1528,49 @@ impl App {
                 self.pending_surrogate = None;
                 String::from_utf16_lossy(&[unit])
             };
+            let now = Instant::now();
+            if self.last_typing.is_some_and(|previous| {
+                now.duration_since(previous) > std::time::Duration::from_secs(1)
+            }) {
+                self.doc_mut().break_undo_group();
+            }
+            self.last_typing = Some(now);
+            self.typing = true;
+            self.preferred_x = None;
+            let previous_tables: Vec<_> = self
+                .tables
+                .iter()
+                .map(|table| table.table.range.start)
+                .collect();
             self.edit(&text);
+            self.typing = false;
             self.after_input();
+            if !self.tabs[self.active].raw
+                && let Some(table) = self.tables.iter().find(|table| {
+                    !previous_tables.contains(&table.table.range.start)
+                        && table.table.range.end == self.doc().selection().head
+                        && table.table.rows.len() == 1
+                })
+            {
+                self.pending_table_authoring = Some((self.doc().id(), table.table.range.start));
+            }
         }
     }
     fn clear_composition(&mut self) {
+        self.doc_mut().break_undo_group();
         self.composing = false;
         self.ime_owner = None;
         self.preedit.clear();
         self.ime_cursor = 0;
+        self.ime_attributes.clear();
+        self.ime_last_result = None;
+        self.pending_surrogate = None;
     }
     unsafe fn cancel_composition(&mut self) -> bool {
         // SAFETY: the context is acquired/released on the owner thread. App's
-        // RefCell borrow remains held, so synchronous IMM callbacks cannot
-        // borrow another App reference. CPS_CANCEL produces no document edit;
-        // acknowledge success locally even if nested notifications were blocked.
+        // RefCell borrow remains held, so synchronous IMM callbacks snapshot
+        // into WindowState's separate queue. CPS_CANCEL produces no source edit;
+        // clear locally on success, then accept its idempotent end notification.
         unsafe {
             let context = ImmGetContext(self.hwnd);
             if context.0.is_null() {
@@ -1249,9 +1584,82 @@ impl App {
             cancelled
         }
     }
+    fn start_composition(&mut self) {
+        let selection = self.doc().selection();
+        let owner = (
+            self.doc().id(),
+            self.doc().revision(),
+            selection.anchor,
+            selection.head,
+        );
+        if self.composing
+            && !self.preedit.is_empty()
+            && self.ime_owner == Some(owner)
+            && self.ime_affinity == self.doc().selection_affinity()
+        {
+            return;
+        }
+        self.doc_mut().break_undo_group();
+        self.composing = true;
+        self.ime_owner = Some((
+            self.doc().id(),
+            self.doc().revision(),
+            selection.anchor,
+            selection.head,
+        ));
+        self.ime_affinity = self.doc().selection_affinity();
+        self.preedit.clear();
+        self.ime_attributes.clear();
+        self.ime_last_result = None;
+        self.ime_cursor = 0;
+        self.pending_surrogate = None;
+        self.preferred_x = None;
+    }
+    unsafe fn native_notification(&mut self, notification: NativeNotification) {
+        unsafe {
+            let updated = matches!(notification, NativeNotification::Update(_));
+            match notification {
+                NativeNotification::Start => self.start_composition(),
+                NativeNotification::Update(update) => self.apply_ime_update(update),
+                NativeNotification::End => {
+                    self.clear_composition();
+                    if let Some((msg, wp, lp)) = self.close_after_composition.take() {
+                        let _ = PostMessageW(Some(self.hwnd), msg, wp, lp);
+                    }
+                }
+                NativeNotification::FocusLost => {
+                    if self.composing {
+                        let _ = self.cancel_composition();
+                    }
+                    self.release_caret();
+                    self.dragging = false;
+                }
+            }
+            if updated {
+                self.after_input();
+            } else {
+                self.refresh();
+            }
+        }
+    }
+    unsafe fn complete_composition(&mut self) -> bool {
+        unsafe {
+            let context = ImmGetContext(self.hwnd);
+            if context.0.is_null() {
+                return false;
+            }
+            let completed = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0).as_bool();
+            let _ = ImmReleaseContext(self.hwnd, context);
+            completed
+        }
+    }
+    #[cfg(test)]
     unsafe fn composition(&mut self, flags: u32) {
-        // SAFETY: called on the window owner thread; handles and COM resources
-        // remain owned by App, and borrowed buffers outlive each synchronous call.
+        unsafe {
+            self.apply_ime_update(read_ime_update(self.hwnd, flags));
+        }
+    }
+    unsafe fn apply_ime_update(&mut self, update: ImeUpdate) {
         unsafe {
             let selection = self.doc().selection();
             let current = (
@@ -1260,47 +1668,34 @@ impl App {
                 selection.anchor,
                 selection.head,
             );
-            if self.ime_owner != Some(current) {
-                self.preedit.clear();
-                self.composing = false;
-                self.ime_owner = None;
+            if self.ime_owner != Some(current)
+                || self.ime_affinity != self.doc().selection_affinity()
+            {
+                self.clear_composition();
                 self.status = "古いIME通知は適用していません".into();
                 return;
             }
-            // IMM documents a notification with no GCS flags as cancellation.
-            // It has no result text to read or insert into the canonical source.
-            if composition_is_cancelled(flags) {
+            if composition_is_cancelled(update.flags) {
                 self.clear_composition();
                 return;
             }
-            let context = ImmGetContext(self.hwnd);
-            if context.0.is_null() {
-                return;
+            let fingerprint = update
+                .result
+                .as_ref()
+                .map(|result| (result.clone(), update.preedit.clone()));
+            let duplicate = fingerprint.is_some() && self.ime_last_result == fingerprint;
+            if update.result.is_none() && update.preedit.is_some() {
+                self.ime_last_result = None;
             }
-            let read = |kind: IME_COMPOSITION_STRING| {
-                let length = ImmGetCompositionStringW(context, kind, None, 0);
-                if length <= 0 {
-                    return String::new();
-                }
-                let mut utf16 = vec![0u16; length as usize / 2];
-                let result = ImmGetCompositionStringW(
-                    context,
-                    kind,
-                    Some(utf16.as_mut_ptr().cast()),
-                    length as u32,
-                );
-                if result < 0 {
-                    String::new()
-                } else {
-                    String::from_utf16_lossy(&utf16)
-                }
-            };
-            if flags & GCS_RESULTSTR.0 != 0 {
-                let committed = read(GCS_RESULTSTR);
+            if let Some(result) = update.result.filter(|_| !duplicate) {
                 self.preedit.clear();
-                if !committed.is_empty() {
-                    self.suppress_chars = committed.encode_utf16().collect();
-                    self.edit(&committed);
+                self.ime_attributes.clear();
+                self.ime_cursor = 0;
+                if !result.is_empty() {
+                    // GCS_RESULTSTR is the one result-insertion path. WM_IME_CHAR
+                    // is handled separately, without forwarding to WM_CHAR; no
+                    // text-valued suppression queue can eat later normal typing.
+                    self.edit(&result);
                     let selection = self.doc().selection();
                     self.ime_owner = Some((
                         self.doc().id(),
@@ -1308,21 +1703,24 @@ impl App {
                         selection.anchor,
                         selection.head,
                     ));
+                    self.ime_affinity = self.doc().selection_affinity();
                     self.after_input();
                 }
             }
-            if flags & GCS_COMPSTR.0 != 0 {
-                self.preedit = read(GCS_COMPSTR);
+            if let Some(preedit) = update.preedit {
+                self.preedit = preedit;
                 self.ime_cursor = self.preedit.encode_utf16().count() as u32;
+                self.ime_attributes.clear();
             }
-            if flags & GCS_CURSORPOS.0 != 0 {
-                let cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, None, 0);
-                if cursor >= 0 {
-                    self.ime_cursor =
-                        (cursor as u32).min(self.preedit.encode_utf16().count() as u32);
-                }
+            if let Some(attributes) = update.attributes {
+                self.ime_attributes = attributes;
             }
-            let _ = ImmReleaseContext(self.hwnd, context);
+            if let Some(cursor) = update.cursor {
+                self.ime_cursor = cursor.min(self.preedit.encode_utf16().count() as u32);
+            }
+            if fingerprint.is_some() {
+                self.ime_last_result = fingerprint;
+            }
             self.ime_geometry();
         }
     }
@@ -1345,9 +1743,42 @@ impl App {
                 }
                 return;
             }
-            self.suppress_chars.clear();
+            if let Some((id, start)) = self.pending_table_authoring
+                && id == self.doc().id()
+                && key == VK_RETURN.0
+                && !ctrl
+            {
+                let action = self
+                    .tables
+                    .iter()
+                    .find(|table| table.table.range.start == start)
+                    .and_then(|view| {
+                        let position = view.table.rows.first()?.cells.first()?.content_range.end;
+                        table_key_action(
+                            &view.table,
+                            self.doc().source(),
+                            position,
+                            TableKeyIntent::NextRow,
+                            self.table_body_boundaries(&view.table),
+                        )
+                    });
+                self.pending_table_authoring = None;
+                if let Some(action) = action {
+                    let _ = apply_table_key_action(self.doc_mut(), action);
+                    self.layout_key = None;
+                }
+                self.after_input();
+                return;
+            }
+            if ctrl || matches!(key, 0x08 | 0x09 | 0x0d | 0x1b | 0x21..=0x28 | 0x2e) {
+                self.pending_table_authoring = None;
+            }
+            if ctrl || matches!(key, 0x08 | 0x09 | 0x0d | 0x1b | 0x21..=0x28 | 0x2e) {
+                self.doc_mut().break_undo_group();
+                self.pending_surrogate = None;
+            }
             if let Some(redo) = history_shortcut(key, ctrl, shift) {
-                self.suppress_chars.push(key - 0x40);
+                self.preferred_x = None;
                 if redo {
                     self.doc_mut().redo();
                 } else {
@@ -1360,12 +1791,58 @@ impl App {
                 && self.active_cell().is_some()
                 && let Some(intent) = table_key_intent(key, ctrl, shift)
             {
+                self.preferred_x = None;
                 self.table_key(intent);
                 self.after_input();
                 return;
             }
             if ctrl {
+                self.preferred_x = None;
                 match key {
+                    0x25..=0x28 => {
+                        let selection = self.doc().selection();
+                        let target = if matches!(key, 0x25 | 0x27) {
+                            word_target(self.doc().source(), selection.head, key == 0x25)
+                        } else {
+                            logical_line_target(self.doc().source(), selection.head, key == 0x26)
+                        };
+                        if let Some(cell) = self.active_cell()
+                            && (matches!(key, 0x26 | 0x28)
+                                || target < cell.start
+                                || target > cell.end)
+                        {
+                            self.move_table(matches!(key, 0x25 | 0x26), matches!(key, 0x25 | 0x27));
+                            if shift {
+                                let head = self.doc().selection().head;
+                                let _ = self.doc_mut().set_selection(selection.anchor, head);
+                            }
+                            self.after_input();
+                            return;
+                        }
+                        let target = if self.tabs[self.active].raw {
+                            target
+                        } else {
+                            self.live_insertion_point(target)
+                        };
+                        let anchor = if shift { selection.anchor } else { target };
+                        let _ = self.doc_mut().set_selection(anchor, target);
+                    }
+                    0x08 | 0x2e => {
+                        let selection = self.doc().selection();
+                        if selection.is_caret() {
+                            let mut target =
+                                word_target(self.doc().source(), selection.head, key == 0x08);
+                            if let Some(cell) = self.active_cell() {
+                                target = target.clamp(cell.start, cell.end);
+                            }
+                            self.edit_range(
+                                target.min(selection.head)..target.max(selection.head),
+                                "",
+                            );
+                        } else {
+                            self.edit("");
+                        }
+                    }
                     0x24 | 0x23 => {
                         let source_target = if key == 0x24 {
                             0
@@ -1416,18 +1893,22 @@ impl App {
                 0x21 | 0x22 => {
                     let page = (self.animation_viewport() - TOP).max(FONT * 1.6);
                     let (x, y, _) = self.caret_location();
+                    let x = *self.preferred_x.get_or_insert(x);
                     let delta = if key == 0x21 { -page } else { page };
-                    let target = self.hit(x, y + delta);
+                    let (target, affinity) = self.hit_with_affinity(x, y + delta);
                     let anchor = if shift {
                         self.doc().selection().anchor
                     } else {
                         target
                     };
-                    let _ = self.doc_mut().set_selection(anchor, target);
+                    let _ = self
+                        .doc_mut()
+                        .set_selection_with_affinity(anchor, target, affinity);
                     self.scroll(delta);
                 }
                 0x23..=0x28 => self.move_caret(key, shift),
                 0x08 | 0x2e => {
+                    self.preferred_x = None;
                     let selection = self.doc().selection();
                     if selection.anchor == selection.head {
                         let p = selection.head;
@@ -1482,15 +1963,31 @@ impl App {
                     }
                 }
                 0x0d => {
-                    let newline = if self.doc().source().contains("\r\n") {
-                        "\r\n"
-                    } else {
-                        "\n"
-                    };
-                    self.edit(newline);
+                    self.preferred_x = None;
+                    let selection = self.doc().selection().range();
+                    if !self.tabs[self.active].raw
+                        && self.tables.iter().any(|table| {
+                            selection.start < table.table.range.end
+                                && selection.end > table.table.range.start
+                        })
+                    {
+                        self.status = "表をまたぐ編集はソース表示で行ってください".into();
+                        self.after_input();
+                        return;
+                    }
+                    let projection = self.cached_projection();
+                    let p = self.doc().selection().head;
+                    let literal = projection.blocks.iter().any(|block| {
+                        matches!(block.kind, BlockKind::Code { .. } | BlockKind::FrontMatter)
+                            && block.source.start <= p
+                            && p < block.source.end
+                    });
+                    let plan = enter_edit(self.doc().source(), self.doc().selection(), literal);
+                    self.apply_live_edit(plan);
                 }
                 0x09 => {
-                    self.edit("    ");
+                    self.preferred_x = None;
+                    self.indent(shift);
                 }
                 0x1b => {
                     self.dragging = false;
@@ -1523,31 +2020,80 @@ impl App {
             let _ = self.doc_mut().set_selection(target, target);
         }
     }
+    fn indent(&mut self, back: bool) {
+        let selection = self.doc().selection();
+        if self.active_cell().is_some() {
+            return;
+        }
+        if selection.is_caret() && !back {
+            self.edit("    ");
+            return;
+        }
+        let (range, replacement, after) = indentation_edit(self.doc().source(), selection, back);
+        if !self.tabs[self.active].raw
+            && self.tables.iter().any(|table| {
+                range.start < table.table.range.end && range.end > table.table.range.start
+            })
+        {
+            self.status = "表の構造はソース表示で編集できます".into();
+            return;
+        }
+        if let Err(error) = self
+            .doc_mut()
+            .replace_range_with_selection(range, &replacement, after)
+        {
+            self.status = error.to_string();
+        }
+        self.layout_key = None;
+    }
     fn move_caret(&mut self, key: u16, extend: bool) {
         let selection = self.doc().selection();
         let p = selection.head;
-        let mut target = match key {
-            0x25 => self.visible_step(p, true),
-            0x27 => self.visible_step(p, false),
+        if !extend && selection.anchor != p && matches!(key, 0x25 | 0x27) {
+            let target = if key == 0x25 {
+                selection.anchor.min(p)
+            } else {
+                selection.anchor.max(p)
+            };
+            let affinity = if target == p {
+                self.doc().selection_affinity()
+            } else {
+                BoundaryAffinity::After
+            };
+            let _ = self
+                .doc_mut()
+                .set_selection_with_affinity(target, target, affinity);
+            self.preferred_x = None;
+            return;
+        }
+        if !matches!(key, 0x26 | 0x28) {
+            self.preferred_x = None;
+        }
+        let (mut target, mut affinity) = match key {
+            0x25 => (self.visible_step(p, true), BoundaryAffinity::After),
+            0x27 => (self.visible_step(p, false), BoundaryAffinity::After),
             0x26 | 0x28 => {
-                let (x, y, h) = self.caret_location();
-                self.hit(x, y + if key == 0x26 { -h * 0.6 } else { h * 1.4 })
+                let (x, _, _) = self.caret_location();
+                let x = *self.preferred_x.get_or_insert(x);
+                self.vertical_target(x, key == 0x26)
             }
             0x24 | 0x23 => {
                 let (x, y, h) = self.caret_location();
                 let _ = x;
-                self.hit(if key == 0x24 { -10000.0 } else { 10000.0 }, y + h * 0.5)
+                self.hit_with_affinity(if key == 0x24 { -10000.0 } else { 10000.0 }, y + h * 0.5)
             }
-            _ => p,
+            _ => (p, self.doc().selection_affinity()),
         };
         if !self.tabs[self.active].raw
             && let Some(cell) = self.active_cell()
         {
             if key == 0x24 {
                 target = cell.start;
+                affinity = BoundaryAffinity::After;
             }
             if key == 0x23 {
                 target = cell.end;
+                affinity = BoundaryAffinity::Before;
             }
             if key == 0x25 && p == cell.start {
                 self.move_table(true, true);
@@ -1567,7 +2113,58 @@ impl App {
             }
         }
         let anchor = if extend { selection.anchor } else { target };
-        let _ = self.doc_mut().set_selection(anchor, target);
+        let _ = self
+            .doc_mut()
+            .set_selection_with_affinity(anchor, target, affinity);
+    }
+    fn vertical_target(&self, x: f32, back: bool) -> (usize, BoundaryAffinity) {
+        let (_, y, _) = self.caret_location();
+        let scroll = self.tabs[self.active].scroll;
+        // DirectWrite visual line metrics account for wrapping and heading
+        // heights; a guessed multiple of the current glyph height does not.
+        let mut rows = Vec::new();
+        for view in &self.views {
+            let mut count = 0;
+            unsafe {
+                let _ = view.layout.GetLineMetrics(None, &mut count);
+                let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+                if view
+                    .layout
+                    .GetLineMetrics(Some(&mut lines), &mut count)
+                    .is_ok()
+                {
+                    let mut top = view.y - scroll;
+                    for line in lines {
+                        rows.push((top, top + line.height));
+                        top += line.height;
+                    }
+                }
+            }
+        }
+        let current_top = rows
+            .iter()
+            .filter(|&&(top, bottom)| top <= y + 0.5 && y < bottom)
+            .map(|&(top, _)| top)
+            .max_by(f32::total_cmp)
+            .unwrap_or(y);
+        let destination = rows
+            .into_iter()
+            .filter(|&(top, _)| {
+                if back {
+                    top < current_top - 0.5
+                } else {
+                    top > current_top + 0.5
+                }
+            })
+            .min_by(|a, b| {
+                (a.0 - current_top)
+                    .abs()
+                    .total_cmp(&(b.0 - current_top).abs())
+            });
+        destination.map_or(
+            (self.doc().selection().head, self.doc().selection_affinity()),
+            |(top, bottom)| self.hit_with_affinity(x, (top + bottom) * 0.5),
+        )
     }
     unsafe fn after_input(&mut self) {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -1586,7 +2183,7 @@ impl App {
                     .table_scroll
                     .get(&key)
                     .unwrap_or(&0.0);
-                let caret_x = self.caret_location().0 - LEFT + current;
+                let caret_x = self.composition_caret().0 - LEFT + current;
                 let next = visible_table_offset(
                     current,
                     caret_x,
@@ -1603,11 +2200,11 @@ impl App {
             let mut client = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut client);
             let max = client.bottom as f32 / self.dpi - 45.0;
-            let y = self.caret.1;
+            let (_, y, height) = self.composition_caret();
             if y < TOP {
                 self.scroll(y - TOP);
-            } else if y + self.caret.2 > max {
-                self.scroll(y + self.caret.2 - max);
+            } else if y + height > max {
+                self.scroll(y + height - max);
             }
             self.refresh();
         }
@@ -1719,7 +2316,12 @@ impl App {
         if self.composing {
             return;
         }
+        self.doc_mut().break_undo_group();
         self.active = index;
+        self.doc_mut().break_undo_group();
+        self.last_typing = None;
+        self.preferred_x = None;
+        self.pending_table_authoring = None;
         self.projection_cache = None;
         self.parsed_tables.clear();
         self.views.clear();
@@ -1727,7 +2329,6 @@ impl App {
         self.clear_images();
         self.layout_key = None;
         self.pending_surrogate = None;
-        self.suppress_chars.clear();
     }
     unsafe fn dialog(&mut self, save: bool) -> Option<PathBuf> {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -1881,6 +2482,10 @@ impl App {
             if self.composing {
                 return;
             }
+            self.doc_mut().break_undo_group();
+            self.pending_surrogate = None;
+            self.preferred_x = None;
+            self.pending_table_authoring = None;
             match id {
                 CMD_NEW => self.new_document(),
                 CMD_OPEN => {
@@ -1988,7 +2593,19 @@ impl App {
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
             let (x, y, width) = geometry;
-            let (mut map, mut before) = mapping;
+            let reveal = table.is_none() && self.revealed_source.as_ref() == Some(&source);
+            let source_text = self.doc().source_shared();
+            let text = if reveal {
+                source_text[source.clone()].trim_end_matches(['\r', '\n'])
+            } else {
+                text
+            };
+            let (mut map, mut before) = if reveal {
+                let map = byte_map(text, source.start);
+                (map.clone(), map)
+            } else {
+                mapping
+            };
             let tokens = visible_tokens(text, &map, &before, self.doc().source());
             if let Some(start) = tokens
                 .iter()
@@ -2011,6 +2628,7 @@ impl App {
             let height = metrics.height.max(size * 1.6);
             self.views.push(TextView {
                 layout,
+                text: text.encode_utf16().collect(),
                 map,
                 before,
                 x,
@@ -2062,9 +2680,31 @@ impl App {
                 self.width.to_bits(),
                 self.tabs[self.active].raw,
             );
-            if self.layout_key == Some(key) {
+            let reveal = if self.tabs[self.active].raw {
+                None
+            } else {
+                let projection = self.cached_projection();
+                let head = self.doc().selection().head;
+                projection
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.kind,
+                            BlockKind::Paragraph
+                                | BlockKind::Heading { .. }
+                                | BlockKind::ListItem
+                                | BlockKind::ThematicBreak
+                        ) && block.source.start <= head
+                            && (head < block.source.end || head == self.doc().byte_len())
+                    })
+                    .min_by_key(|block| block.source.len())
+                    .map(|block| block.source.clone())
+            };
+            if self.layout_key == Some(key) && self.revealed_source == reveal {
                 return Ok(());
             }
+            self.revealed_source = reveal;
             self.views.clear();
             self.visible_tokens.clear();
             self.literal_blocks.clear();
@@ -2074,15 +2714,31 @@ impl App {
             let mut y = TOP;
             let width = (self.width - LEFT * 2.0 - 12.0).max(50.0);
             if self.tabs[self.active].raw {
-                let map = byte_map(&source, 0);
-                y += self.push_view(
-                    &source,
-                    (map.clone(), map),
-                    0..source.len(),
-                    (LEFT, y, width),
-                    FONT,
-                    None,
-                )?;
+                let mut start = 0;
+                for line in source.split_inclusive('\n') {
+                    let text = line.trim_end_matches(['\r', '\n']);
+                    let map = byte_map(text, start);
+                    y += self.push_view(
+                        text,
+                        (map.clone(), map),
+                        start..start + line.len(),
+                        (LEFT, y, width),
+                        FONT,
+                        None,
+                    )?;
+                    start += line.len();
+                }
+                if source.is_empty() || source.ends_with('\n') {
+                    let eof = source.len();
+                    y += self.push_view(
+                        "",
+                        (vec![eof], vec![eof]),
+                        eof..eof,
+                        (LEFT, y, width),
+                        FONT,
+                        None,
+                    )?;
+                }
             } else {
                 let projection = self.cached_projection();
                 self.literal_blocks = projection
@@ -2339,11 +2995,19 @@ impl App {
                         view.thematic_break = matches!(block.kind, BlockKind::ThematicBreak);
                     }
                     if let Some(view) = self.views.last() {
-                        Self::apply_projection_styles(
-                            &view.layout,
-                            &projection,
-                            block.display_utf16.clone(),
-                        )?;
+                        if self.revealed_source.as_ref() == Some(&view.source) {
+                            self.apply_source_styles(
+                                &view.layout,
+                                &projection,
+                                view.source.clone(),
+                            )?;
+                        } else {
+                            Self::apply_projection_styles(
+                                &view.layout,
+                                &projection,
+                                block.display_utf16.clone(),
+                            )?;
+                        }
                     }
                     if let Some(view) = self.views.last_mut() {
                         let mut metrics = DWRITE_TEXT_METRICS::default();
@@ -2371,11 +3035,12 @@ impl App {
                 self.push_view("", (vec![0], vec![0]), 0..0, (LEFT, y, width), FONT, None)?;
                 y += FONT * 1.6;
             }
-            if self
-                .views
-                .last()
-                .is_some_and(|v| v.source.end < source.len())
-                || (!source.is_empty() && source.ends_with('\n'))
+            if !self.tabs[self.active].raw
+                && (self
+                    .views
+                    .last()
+                    .is_some_and(|v| v.source.end < source.len())
+                    || (!source.is_empty() && source.ends_with('\n')))
             {
                 let eof = source.len();
                 self.push_view(
@@ -2388,16 +3053,172 @@ impl App {
                 )?;
                 y += FONT * 1.6;
             }
+            if !self.tabs[self.active].raw {
+                y = self.layout_source_markers(&source, y, width)?;
+            }
+            self.views
+                .sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
             self.height = y + 40.0;
             self.layout_key = Some(key);
-            if !self.tabs[self.active].raw {
-                let selection = self.doc().selection();
-                if selection.anchor == selection.head {
-                    let boundary = self.live_insertion_point(selection.head);
-                    let _ = self.doc_mut().set_selection(boundary, boundary);
+            Ok(())
+        }
+    }
+    unsafe fn apply_source_styles(
+        &self,
+        layout: &IDWriteTextLayout,
+        projection: &DisplayProjection,
+        source: Range<usize>,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            for run in &projection.runs {
+                let start = run.source.start.max(source.start);
+                let end = run.source.end.min(source.end);
+                if start >= end {
+                    continue;
+                }
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: self.doc().source()[source.start..start]
+                        .encode_utf16()
+                        .count() as u32,
+                    length: self.doc().source()[start..end].encode_utf16().count() as u32,
+                };
+                for kind in &run.kinds {
+                    use mdlite::projection::InlineKind;
+                    match kind {
+                        InlineKind::Strong => {
+                            layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?
+                        }
+                        InlineKind::Emphasis => {
+                            layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range)?
+                        }
+                        InlineKind::Code => layout.SetFontFamilyName(w!("Cascadia Mono"), range)?,
+                        InlineKind::Link { .. } => layout.SetUnderline(true, range)?,
+                        InlineKind::Strikethrough => layout.SetStrikethrough(true, range)?,
+                        _ => {}
+                    }
                 }
             }
             Ok(())
+        }
+    }
+    unsafe fn layout_source_markers(
+        &mut self,
+        source: &str,
+        mut bottom: f32,
+        width: f32,
+    ) -> windows::core::Result<f32> {
+        unsafe {
+            let mut markers: Vec<_> = physical_line_starts(source)
+                .into_iter()
+                .filter(|&p| {
+                    let end = source[p..]
+                        .find(['\r', '\n'])
+                        .map_or(source.len(), |offset| p + offset);
+                    source[p..end].trim().is_empty()
+                        && !self
+                            .tables
+                            .iter()
+                            .any(|table| table.table.range.contains(&p))
+                        && !self
+                            .views
+                            .iter()
+                            .any(|view| view.map.contains(&p) && !view.source.is_empty())
+                })
+                .collect();
+            // A source position after a closing fence is distinct from the last
+            // literal line even if the code block source range encloses both.
+            markers.extend(
+                self.literal_blocks
+                    .iter()
+                    .flat_map(|range| [range.start, range.end])
+                    .filter(|&p| source.is_char_boundary(p)),
+            );
+            markers.sort_unstable();
+            markers.dedup();
+            for p in markers {
+                if self
+                    .views
+                    .iter()
+                    .any(|view| view.source.is_empty() && view.source.start == p)
+                {
+                    continue;
+                }
+                let next = self
+                    .views
+                    .iter()
+                    .filter(|view| view.source.start >= p)
+                    .map(|view| view.y)
+                    .min_by(f32::total_cmp);
+                let y = next.unwrap_or(bottom);
+                let height = FONT * 1.6;
+                for view in &mut self.views {
+                    if view.y >= y {
+                        view.y += height;
+                    }
+                }
+                for image in &mut self.images {
+                    if image.y >= y {
+                        image.y += height;
+                    }
+                }
+                for table in &mut self.tables {
+                    if table.y >= y {
+                        table.y += height;
+                    }
+                }
+                self.push_view("", (vec![p], vec![p]), p..p, (LEFT, y, width), FONT, None)?;
+                bottom += height;
+            }
+            let p = self.doc().selection().head;
+            if !self
+                .tables
+                .iter()
+                .any(|table| table.table.range.contains(&p))
+                && !self
+                    .views
+                    .iter()
+                    .any(|view| view.map.contains(&p) || view.before.contains(&p))
+            {
+                let start = line_start(source, p);
+                let end = source[start..]
+                    .find(['\r', '\n'])
+                    .map_or(source.len(), |offset| start + offset);
+                let y = self
+                    .views
+                    .iter()
+                    .filter(|view| view.source.start >= start)
+                    .map(|view| view.y)
+                    .min_by(f32::total_cmp)
+                    .unwrap_or(bottom);
+                let height = FONT * 1.6;
+                for view in &mut self.views {
+                    if view.y >= y {
+                        view.y += height;
+                    }
+                }
+                for image in &mut self.images {
+                    if image.y >= y {
+                        image.y += height;
+                    }
+                }
+                for table in &mut self.tables {
+                    if table.y >= y {
+                        table.y += height;
+                    }
+                }
+                let text = &source[start..end];
+                let map = byte_map(text, start);
+                self.push_view(
+                    text,
+                    (map.clone(), map),
+                    start..end,
+                    (LEFT, y, width),
+                    FONT,
+                    None,
+                )?;
+                bottom += height;
+            }
+            Ok(bottom)
         }
     }
     unsafe fn layout_list_item_fragments(
@@ -2827,10 +3648,14 @@ impl App {
             let source = self.doc().source_shared();
             let marker = if let Some(previous) = self.tables.last() {
                 table_gap_marker(&source, previous.table.range.end, table.range.start)
-            } else if source[..table.range.start].trim().is_empty()
-                && physical_line_endings(&source[..table.range.start]) >= 2
-            {
-                Some(0)
+            } else if source[..table.range.start].trim().is_empty() {
+                Some(
+                    if physical_line_endings(&source[..table.range.start]) >= 2 {
+                        0
+                    } else {
+                        table.range.start
+                    },
+                )
             } else {
                 None
             };
@@ -3001,7 +3826,10 @@ impl App {
             let viewport = r.bottom as f32 / self.dpi - 32.0;
             let scroll = self.tabs[self.active].scroll;
             let page = (viewport - TOP).max(1.0);
-            let content = (self.height - TOP).max(page);
+            let composition = self.composition_visual();
+            let content = (self.height + composition.as_ref().map_or(0.0, |visual| visual.growth)
+                - TOP)
+                .max(page);
             if content > page {
                 let thumb = (page * page / content).max(28.0);
                 let y = TOP + (page - thumb) * scroll / (content - page);
@@ -3019,12 +3847,31 @@ impl App {
             let selection = self.doc().selection();
             let a = selection.anchor.min(selection.head);
             let b = selection.anchor.max(selection.head);
-            for view in &self.views {
-                let y = view.y - scroll;
-                if y + view.height < TOP || y > viewport {
+            for (index, view) in self.views.iter().enumerate() {
+                if composition.as_ref().is_some_and(|visual| {
+                    index > visual.view_index && index <= visual.end_view_index
+                }) {
                     continue;
                 }
-                if a < b {
+                let growth = composition.as_ref().map_or(0.0, |visual| {
+                    if view.y >= visual.row_bottom - 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                let y = view.y - scroll + growth;
+                let row_growth = composition.as_ref().map_or(0.0, |visual| {
+                    if view.table.is_some() && (view.y - scroll - visual.y).abs() < 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                if y + view.height + row_growth < TOP || y > viewport {
+                    continue;
+                }
+                if a < b && !self.composing {
                     let start = view.map.partition_point(|&p| p < a);
                     let end = view.map.partition_point(|&p| p < b);
                     if end > start {
@@ -3056,7 +3903,12 @@ impl App {
                 }
                 if view.table.is_some() {
                     t.DrawRectangle(
-                        &rect(view.x - 6.0, y - 3.0, view.width + 12.0, view.height + 6.0),
+                        &rect(
+                            view.x - 6.0,
+                            y - 3.0,
+                            view.width + 12.0,
+                            view.height + row_growth + 6.0,
+                        ),
                         &border,
                         1.0,
                         None,
@@ -3089,15 +3941,80 @@ impl App {
                         None,
                     );
                 }
-                t.DrawTextLayout(
-                    point(view.x, y),
-                    &view.layout,
-                    &text,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                );
+                if let Some(visual) = composition
+                    .as_ref()
+                    .filter(|visual| visual.view_index == index)
+                {
+                    let clip_height = visual.height;
+                    t.PushAxisAlignedClip(
+                        &rect(visual.x, visual.y, visual.width, clip_height),
+                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    );
+                    for (range, targeted) in
+                        composition_attribute_ranges(&self.ime_attributes, visual.range.clone())
+                    {
+                        let mut count = 0;
+                        let _ = visual.layout.HitTestTextRange(
+                            range.start,
+                            range.end - range.start,
+                            visual.x,
+                            visual.y,
+                            None,
+                            &mut count,
+                        );
+                        let mut hits = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
+                        visual.layout.HitTestTextRange(
+                            range.start,
+                            range.end - range.start,
+                            visual.x,
+                            visual.y,
+                            Some(&mut hits),
+                            &mut count,
+                        )?;
+                        for hit in hits {
+                            if targeted {
+                                t.FillRectangle(
+                                    &rect(hit.left, hit.top, hit.width, hit.height),
+                                    &selected,
+                                );
+                            }
+                            t.DrawLine(
+                                point(hit.left, hit.top + hit.height - 1.0),
+                                point(hit.left + hit.width, hit.top + hit.height - 1.0),
+                                &muted,
+                                if targeted { 2.0 } else { 1.0 },
+                                None,
+                            );
+                        }
+                    }
+                    t.DrawTextLayout(
+                        point(visual.x, visual.y),
+                        &visual.layout,
+                        &text,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                    t.PopAxisAlignedClip();
+                } else {
+                    t.DrawTextLayout(
+                        point(view.x, y),
+                        &view.layout,
+                        &text,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
+                }
             }
             for image in &self.images {
-                let y = image.y - scroll;
+                if self.composing && a < image.source.end && b > image.source.start {
+                    continue;
+                }
+                let y = image.y - scroll
+                    + composition.as_ref().map_or(0.0, |visual| {
+                        if image.y >= visual.row_bottom - 0.1 {
+                            visual.growth
+                        } else {
+                            0.0
+                        }
+                    });
                 if y + image.height < TOP || y > viewport {
                     continue;
                 }
@@ -3132,25 +4049,6 @@ impl App {
                 if a < image.source.end && b > image.source.start {
                     t.DrawRectangle(&r, &selected, 3.0, None);
                 }
-            }
-            if !self.preedit.is_empty() {
-                let layout = self.text_layout(
-                    &self.preedit,
-                    self.caret_view()
-                        .map(|v| self.composition_width(v, self.caret.0))
-                        .unwrap_or(1.0),
-                    FONT,
-                )?;
-                let (x, y, h) = self.caret;
-                t.FillRectangle(&rect(x, y, 250.0, h), &selected);
-                t.DrawTextLayout(point(x, y), &layout, &text, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                t.DrawLine(
-                    point(x, y + h - 2.0),
-                    point(x + 200.0, y + h - 2.0),
-                    &text,
-                    1.0,
-                    None,
-                );
             }
             t.PopAxisAlignedClip();
             let format = self.tabs[self.active]
@@ -3203,13 +4101,33 @@ impl App {
     }
     fn caret_view(&self) -> Option<&TextView> {
         let byte = self.doc().selection().head;
+        self.source_view(byte)
+    }
+    fn source_view(&self, byte: usize) -> Option<&TextView> {
+        if byte == self.doc().selection().head
+            && self.doc().selection_affinity() == BoundaryAffinity::Before
+            && let Some(view) = self
+                .views
+                .iter()
+                .filter(|view| !view.source.is_empty() && view.before.contains(&byte))
+                .min_by_key(|view| view.source.len())
+        {
+            return Some(view);
+        }
         self.views
             .iter()
             .find(|view| view.source.is_empty() && view.source.start == byte)
             .or_else(|| {
                 self.views
                     .iter()
-                    .find(|view| view.source.start <= byte && byte <= view.source.end)
+                    .filter(|view| view.map.contains(&byte) || view.before.contains(&byte))
+                    .min_by_key(|view| view.source.len())
+            })
+            .or_else(|| {
+                self.views
+                    .iter()
+                    .filter(|view| view.source.start <= byte && byte <= view.source.end)
+                    .min_by_key(|view| view.source.len())
             })
     }
     fn caret_location(&self) -> (f32, f32, f32) {
@@ -3221,14 +4139,18 @@ impl App {
                 .map
                 .partition_point(|&p| p < byte)
                 .min(view.map.len().saturating_sub(1));
-            let (mut x, mut y) = (0.0, 0.0);
-            let mut h = DWRITE_HIT_TEST_METRICS::default();
-            unsafe {
-                let _ = view
-                    .layout
-                    .HitTestTextPosition(u as u32, false, &mut x, &mut y, &mut h);
+            let trailing = self.doc().selection_affinity() == BoundaryAffinity::Before && u > 0;
+            let position = if trailing {
+                view.before
+                    .partition_point(|&p| p < byte)
+                    .min(view.text.len())
+                    .saturating_sub(1)
+            } else {
+                u
+            };
+            if let Some((x, y, height)) = layout_caret(&view.layout, position as u32, trailing) {
+                return (view.x + x, view.y + y - scroll, height);
             }
-            return (view.x + x, view.y + y - scroll, h.height.max(FONT * 1.6));
         }
         (LEFT, TOP, FONT * 1.6)
     }
@@ -3279,6 +4201,7 @@ impl App {
     fn composition_position(&self, utf16: u32) -> Option<(f32, f32, f32)> {
         let selection = self.doc().selection();
         if !self.composing
+            || self.ime_affinity != self.doc().selection_affinity()
             || self.ime_owner
                 != Some((
                     self.doc().id(),
@@ -3300,33 +4223,113 @@ impl App {
             return None;
         }
         mdlite::coordinates::utf16_to_byte(&self.preedit, utf16 as usize).ok()?;
-        let byte = selection.head;
-        let view = self.caret_view()?;
-        let position = view
-            .map
-            .partition_point(|&p| p < byte)
-            .min(view.map.len().checked_sub(1)?);
-        let (mut x, mut y) = (0.0, 0.0);
-        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
-        unsafe {
-            view.layout
-                .HitTestTextPosition(position as u32, false, &mut x, &mut y, &mut metrics)
-                .ok()?;
-            let origin = (view.x + x, view.y + y - self.tabs[self.active].scroll);
-            if self.preedit.is_empty() {
-                return Some((origin.0, origin.1, metrics.height));
-            }
-            let layout = self
-                .text_layout(&self.preedit, self.composition_width(view, origin.0), FONT)
-                .ok()?;
-            layout
-                .HitTestTextPosition(utf16, false, &mut x, &mut y, &mut metrics)
-                .ok()?;
-            Some((origin.0 + x, origin.1 + y, metrics.height))
-        }
+        let visual = self.composition_visual()?;
+        let trailing = self.preedit.is_empty()
+            && selection.is_caret()
+            && self.ime_affinity == BoundaryAffinity::Before
+            && visual.range.start > 0;
+        let position = if trailing {
+            visual.range.start - 1
+        } else {
+            visual.range.start + utf16
+        };
+        let (x, y, height) = layout_caret(&visual.layout, position, trailing)?;
+        Some((visual.x + x, visual.y + y, height))
     }
-    fn composition_width(&self, view: &TextView, x: f32) -> f32 {
-        (view.x + view.width - x).max(1.0)
+    fn composition_visual(&self) -> Option<CompositionVisual> {
+        if !self.composing {
+            return None;
+        }
+        let selection = self.doc().selection();
+        if self.ime_owner
+            != Some((
+                self.doc().id(),
+                self.doc().revision(),
+                selection.anchor,
+                selection.head,
+            ))
+            || self.ime_affinity != self.doc().selection_affinity()
+        {
+            return None;
+        }
+        let range = selection.range();
+        let view = self.source_view(range.start)?;
+        let end_view = if range.is_empty() {
+            view
+        } else {
+            self.source_view(range.end)?
+        };
+        let view_index = self
+            .views
+            .iter()
+            .position(|candidate| std::ptr::eq(view, candidate))?;
+        let end_view_index = self
+            .views
+            .iter()
+            .position(|candidate| std::ptr::eq(end_view, candidate))?;
+        let start = view
+            .map
+            .partition_point(|&p| p < range.start)
+            .min(view.text.len());
+        let end = end_view
+            .before
+            .partition_point(|&p| p < range.end)
+            .min(end_view.text.len());
+        let preedit: Vec<_> = self.preedit.encode_utf16().collect();
+        let mut text = Vec::with_capacity(start + preedit.len() + end_view.text.len() - end);
+        text.extend_from_slice(&view.text[..start]);
+        text.extend_from_slice(&preedit);
+        text.extend_from_slice(&end_view.text[end..]);
+        unsafe {
+            // A single transient layout reflows the prefix, preedit and suffix
+            // together. Its inherited format shares the committed baseline,
+            // line spacing, fallback, width and wrapping policy.
+            let format = view.layout.cast::<IDWriteTextFormat>().ok()?;
+            let layout = self
+                .graphics
+                .write
+                .CreateTextLayout(&text, &format, view.width, 100000.0)
+                .ok()?;
+            copy_layout_styles(&view.layout, &layout, 0..start as u32, 0, None).ok()?;
+            copy_layout_styles(
+                &end_view.layout,
+                &layout,
+                end as u32..end_view.text.len() as u32,
+                (start + preedit.len()) as u32,
+                None,
+            )
+            .ok()?;
+            if !preedit.is_empty() {
+                let at = if start == view.text.len() {
+                    start.saturating_sub(1)
+                } else {
+                    start
+                } as u32;
+                // Copy the insertion character's font onto the whole preedit.
+                copy_layout_styles(
+                    &view.layout,
+                    &layout,
+                    at..at + 1,
+                    start as u32,
+                    Some(preedit.len() as u32),
+                )
+                .ok()?;
+            }
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics).ok()?;
+            Some(CompositionVisual {
+                layout,
+                range: start as u32..(start + preedit.len()) as u32,
+                x: view.x,
+                y: view.y - self.tabs[self.active].scroll,
+                width: view.width,
+                height: metrics.height.max(view.height),
+                view_index,
+                end_view_index,
+                growth: metrics.height.max(view.height) - (end_view.y + end_view.height - view.y),
+                row_bottom: end_view.y + end_view.height,
+            })
+        }
     }
     fn composition_caret(&self) -> (f32, f32, f32) {
         self.composition_position(self.ime_cursor)
@@ -3383,9 +4386,14 @@ impl App {
             let mut r = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut r);
             let page = (r.bottom as f32 / self.dpi - TOP - 32.0).max(1.0);
+            let height = self.height
+                + self
+                    .composition_visual()
+                    .as_ref()
+                    .map_or(0.0, |visual| visual.growth);
             let scroll = self.tabs[self.active]
                 .scroll
-                .clamp(0.0, (self.height - TOP - page).max(0.0));
+                .clamp(0.0, (height - TOP - page).max(0.0));
             self.tabs[self.active].scroll = scroll;
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             self.sync_animations();
@@ -3417,7 +4425,11 @@ impl App {
             self.layout_key = None;
         }
     }
+    #[cfg(test)]
     fn hit(&self, x: f32, y: f32) -> usize {
+        self.hit_with_affinity(x, y).0
+    }
+    fn hit_with_affinity(&self, x: f32, y: f32) -> (usize, BoundaryAffinity) {
         let y = y + self.tabs[self.active].scroll;
         if let Some(image) = self
             .images
@@ -3425,9 +4437,9 @@ impl App {
             .find(|image| image_contains_point(image, x, y))
         {
             return if y < image.y + image.height / 2.0 {
-                image.source.start
+                (image.source.start, BoundaryAffinity::After)
             } else {
-                image.source.end
+                (image.source.end, BoundaryAffinity::After)
             };
         }
         let Some(view) = self.views.iter().min_by(|a, b| {
@@ -3450,7 +4462,7 @@ impl App {
             };
             distance(a).total_cmp(&distance(b))
         }) else {
-            return 0;
+            return (0, BoundaryAffinity::After);
         };
         let mut trailing = windows::core::BOOL::default();
         let mut inside = windows::core::BOOL::default();
@@ -3476,7 +4488,14 @@ impl App {
             &view.map
         };
         let byte = *positions.get(u).unwrap_or(&view.source.end);
-        snap(self.doc().rope(), byte, false)
+        (
+            snap(self.doc().rope(), byte, false),
+            if trailing.as_bool() {
+                BoundaryAffinity::Before
+            } else {
+                BoundaryAffinity::After
+            },
+        )
     }
     fn toggle_task_at(&mut self, x: f32, y: f32) -> bool {
         if self.composing || self.tabs[self.active].raw {
@@ -3542,13 +4561,18 @@ impl App {
         if self.composing {
             return;
         }
-        let byte = self.hit(x, y);
+        let (byte, affinity) = self.hit_with_affinity(x, y);
+        self.preferred_x = None;
+        self.pending_table_authoring = None;
+        self.pending_surrogate = None;
         let anchor = if extend {
             self.doc().selection().anchor
         } else {
             byte
         };
-        let _ = self.doc_mut().set_selection(anchor, byte);
+        let _ = self
+            .doc_mut()
+            .set_selection_with_affinity(anchor, byte, affinity);
     }
     fn diagnostic(&self) {
         let Some(path) = &self.diagnostic else {
@@ -3561,6 +4585,11 @@ impl App {
         let active_input_profile = active_input_profile_diagnostic();
         let ime_open_status = ime_open_status_diagnostic(self.hwnd);
         let data = serde_json::json!({"document_id":self.doc().id(),"revision":self.doc().revision(),"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
+        let mut data = data;
+        data["selection_affinity"] =
+            serde_json::json!(format!("{:?}", self.doc().selection_affinity()));
+        let (x, y, height) = self.composition_caret();
+        data["composition_caret"] = serde_json::json!({"x": x, "y": y, "height": height});
         if let Ok(data) = serde_json::to_vec_pretty(&data) {
             let _ = std::fs::write(path, data);
         }
@@ -3636,6 +4665,25 @@ fn composition_is_cancelled(flags: u32) -> bool {
         | GCS_RESULTREADSTR.0
         | GCS_RESULTSTR.0;
     flags & gcs_flags == 0
+}
+fn composition_attribute_ranges(attributes: &[u8], range: Range<u32>) -> Vec<(Range<u32>, bool)> {
+    let mut runs: Vec<(Range<u32>, bool)> = Vec::new();
+    for position in range.clone() {
+        let attribute = attributes
+            .get((position - range.start) as usize)
+            .copied()
+            .unwrap_or(ATTR_INPUT as u8);
+        let targeted = matches!(
+            attribute as u32,
+            ATTR_TARGET_CONVERTED | ATTR_TARGET_NOTCONVERTED
+        );
+        if let Some((previous, _)) = runs.last_mut().filter(|(_, target)| *target == targeted) {
+            previous.end = position + 1;
+        } else {
+            runs.push((position..position + 1, targeted));
+        }
+    }
+    runs
 }
 
 fn ime_open_status_diagnostic(hwnd: HWND) -> serde_json::Value {
@@ -4221,14 +5269,22 @@ fn live_horizontal_step(
     p: usize,
     back: bool,
 ) -> usize {
-    if let Some(plan) = line_ending_delete(source, tokens, tables, literal_blocks, p, back)
-        && !plan.range.is_empty()
+    // Navigation is independent of editing protection: a protected fence EOL
+    // must not turn a movement key into a no-op.
+    if let Some(range) = adjacent_line_ending(source, p, back)
+        && !tables
+            .iter()
+            .any(|table| range.start >= table.start && range.end <= table.end)
+        && !literal_blocks.iter().any(|block| {
+            range.start >= block.start
+                && range.end <= block.end
+                && !tokens
+                    .iter()
+                    .flat_map(|token| token.spans.iter())
+                    .any(|span| span.start <= range.start && span.end >= range.end)
+        })
     {
-        return if back {
-            plan.range.start
-        } else {
-            plan.range.end
-        };
+        return if back { range.start } else { range.end };
     }
     if back {
         tokens
@@ -4266,14 +5322,19 @@ fn live_edit(
     // Replace visible spelling spans while copying hidden gaps verbatim.
     // The entire bounded result is one document transaction; caret stays at
     // the inserted text, before any retained closing delimiters or destinations.
-    if selection.is_empty() {
+    if selection.is_empty()
+        || source
+            .get(selection.clone())?
+            .chars()
+            .all(char::is_whitespace)
+    {
         return Some(LiveEdit {
             caret: selection.start + text.len(),
             range: selection,
             replacement: text.to_owned(),
         });
     }
-    let mut spans: Vec<_> = selected_token(tokens, selection)
+    let mut spans: Vec<_> = selected_token(tokens, selection.clone())
         .flat_map(|token| token.spans.iter().cloned())
         .collect();
     spans.sort_by_key(|span| span.start);
@@ -4288,18 +5349,43 @@ fn live_edit(
             merged.push(span);
         }
     }
-    let start = merged.first()?.start;
-    let end = merged.last()?.end;
+    let mut start = merged.first()?.start;
+    let mut end = merged.last()?.end;
+    if selection.start < start
+        && source
+            .get(selection.start..start)?
+            .chars()
+            .all(char::is_whitespace)
+    {
+        start = selection.start;
+    }
+    if end < selection.end
+        && source
+            .get(end..selection.end)?
+            .chars()
+            .all(char::is_whitespace)
+    {
+        end = selection.end;
+    }
     let mut replacement = String::new();
     let mut cursor = start;
     for (index, span) in merged.iter().enumerate() {
-        replacement.push_str(source.get(cursor..span.start)?);
+        let gap = source.get(cursor..span.start)?;
+        // Selected paragraph whitespace is source content, not a Markdown
+        // delimiter. Retaining it made a multi-paragraph replacement keep
+        // invisible blank lines between the replacement and surviving suffix.
+        if !gap.chars().all(char::is_whitespace) {
+            replacement.push_str(gap);
+        }
         if index == 0 {
             replacement.push_str(text);
         }
         cursor = span.end;
     }
-    replacement.push_str(source.get(cursor..end)?);
+    let tail = source.get(cursor..end)?;
+    if !tail.chars().all(char::is_whitespace) {
+        replacement.push_str(tail);
+    }
     Some(LiveEdit {
         range: start..end,
         replacement,
@@ -4513,6 +5599,844 @@ unsafe fn write_clipboard(hwnd: HWND, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct EditorFixture {
+        state: Box<WindowState>,
+        hwnd: HWND,
+    }
+    impl EditorFixture {
+        fn new(source: &str, raw: bool) -> Self {
+            let mut app = composing_test_app(source);
+            app.clear_composition();
+            app.tabs[0].raw = raw;
+            app.tabs[0].scroll = 0.0;
+            app.hwnd = hidden_test_window_size(450, 480);
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            let hwnd = app.hwnd;
+            let fixture = Self {
+                state: Box::new(WindowState::new(app)),
+                hwnd,
+            };
+            unsafe {
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWLP_USERDATA,
+                    (&*fixture.state as *const WindowState) as isize,
+                );
+            }
+            fixture
+        }
+        fn message(&self, msg: u32, value: usize) {
+            unsafe {
+                window_proc(self.hwnd, msg, WPARAM(value), LPARAM(0));
+            }
+        }
+    }
+    impl Drop for EditorFixture {
+        fn drop(&mut self) {
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+    }
+    #[test]
+    fn editor_reentrant_end_is_queued_then_input_and_commands_resume() {
+        let fixture = EditorFixture::new("body", false);
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_composition();
+            app.preedit = "かな".into();
+            fixture.message(WM_IME_ENDCOMPOSITION, 0);
+            assert!(app.composing);
+            assert_eq!(fixture.state.notifications.borrow().len(), 1);
+        }
+        fixture.message(WM_NULL, 0);
+        assert!(!fixture.state.app.borrow().composing);
+        fixture.message(WM_KEYDOWN, VK_END.0 as usize);
+        fixture.message(WM_KEYDOWN, VK_RETURN.0 as usize);
+        fixture.message(WM_CHAR, '次' as usize);
+        assert_eq!(fixture.state.app.borrow().doc().source(), "body\n次");
+        fixture.message(WM_COMMAND, CMD_RAW);
+        assert!(fixture.state.app.borrow().tabs[0].raw);
+    }
+    #[test]
+    fn editor_close_waits_for_result_and_real_end_without_discarding_unsaved_source() {
+        let fixture = EditorFixture::new("unsaved body", false);
+        let before = fixture.state.app.borrow().doc().source().to_owned();
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_composition();
+            app.preedit = "未確定".into();
+            app.close_after_composition = Some((WM_CLOSE, WPARAM(0), LPARAM(0)));
+            fixture.state.notifications.borrow_mut().push_back((
+                app.doc().id(),
+                NativeNotification::Update(ImeUpdate {
+                    flags: GCS_RESULTSTR.0,
+                    result: Some("確定".into()),
+                    ..Default::default()
+                }),
+            ));
+            fixture.message(WM_IME_ENDCOMPOSITION, 0);
+            assert_eq!(app.doc().source(), before);
+            assert!(app.composing);
+        }
+        fixture.message(WM_NULL, 0);
+        let app = fixture.state.app.borrow();
+        assert_eq!(app.doc().source(), format!("確定{before}"));
+        assert!(!app.composing);
+        assert!(app.doc().is_dirty());
+        assert_eq!(app.doc().undo_count(), 1);
+        assert_eq!(app.close_after_composition, None);
+        drop(app);
+        // Only inspect the owned window queue; do not dispatch the close to an
+        // unsaved-prompt dialog in a hidden fixture. Visible acceptance owns it.
+        let mut message = MSG::default();
+        unsafe {
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(fixture.hwnd),
+                    WM_CLOSE,
+                    WM_CLOSE,
+                    PM_REMOVE
+                )
+                .as_bool()
+            );
+        }
+        assert_eq!(message.message, WM_CLOSE);
+        assert!(unsafe { IsWindow(Some(fixture.hwnd)).as_bool() });
+    }
+    #[test]
+    fn editor_result_next_preedit_empty_update_duplicate_and_normal_same_character() {
+        let fixture = EditorFixture::new("a日本語b", false);
+        let mut app = fixture.state.app.borrow_mut();
+        app.doc_mut().set_selection(1, 10).unwrap();
+        app.start_composition();
+        let before_undo = app.doc().undo_count();
+        for _ in 0..2 {
+            unsafe {
+                app.apply_ime_update(ImeUpdate {
+                    flags: GCS_RESULTSTR.0 | GCS_COMPSTR.0 | GCS_CURSORPOS.0,
+                    result: Some("確".into()),
+                    preedit: Some("次".into()),
+                    cursor: Some(1),
+                    ..Default::default()
+                });
+            }
+        }
+        assert_eq!(app.doc().source(), "a確b");
+        assert_eq!(app.doc().undo_count(), before_undo + 1);
+        assert!(app.composing);
+        assert_eq!(app.preedit, "次");
+        unsafe {
+            app.apply_ime_update(ImeUpdate {
+                flags: GCS_COMPSTR.0,
+                preedit: Some(String::new()),
+                ..Default::default()
+            });
+        }
+        assert!(app.composing, "empty preedit is not an end notification");
+        app.clear_composition();
+        unsafe {
+            app.character('確' as u16);
+        }
+        assert_eq!(
+            app.doc().source(),
+            "a確確b",
+            "normal typing equal to the commit is not swallowed"
+        );
+        unsafe {
+            app.key_with_modifiers(0x5a, true, false);
+        }
+        assert_eq!(app.doc().source(), "a確b");
+        unsafe {
+            app.key_with_modifiers(0x5a, true, false);
+        }
+        assert_eq!(app.doc().source(), "a日本語b");
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: 1,
+                head: 10
+            }
+        );
+    }
+    #[test]
+    fn editor_live_authoring_heading_delimiters_enter_undo_and_followup() {
+        let fixture = EditorFixture::new("", false);
+        for unit in "## asdkl".encode_utf16() {
+            fixture.message(WM_CHAR, unit as usize);
+        }
+        {
+            let app = fixture.state.app.borrow();
+            assert_eq!(app.doc().source(), "## asdkl");
+            assert_eq!(app.doc().selection(), Selection::caret(8));
+            assert_eq!(app.doc().undo_count(), 1);
+            assert!(
+                app.projection_cache
+                    .as_ref()
+                    .unwrap()
+                    .2
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.kind, BlockKind::Heading { level: 2 }))
+            );
+        }
+        fixture.message(WM_KEYDOWN, VK_RETURN.0 as usize);
+        fixture.message(WM_KEYDOWN, VK_RETURN.0 as usize);
+        for unit in "**日本語**".encode_utf16() {
+            fixture.message(WM_CHAR, unit as usize);
+        }
+        let mut app = fixture.state.app.borrow_mut();
+        let expected = "## asdkl\n\n**日本語**";
+        assert_eq!(app.doc().source(), expected);
+        assert_eq!(app.doc().selection(), Selection::caret(expected.len()));
+        let selection = app.doc().selection();
+        unsafe {
+            app.key_with_modifiers(0x5a, true, false);
+            app.key_with_modifiers(0x59, true, false);
+        }
+        assert_eq!(app.doc().source(), expected);
+        assert_eq!(app.doc().selection(), selection);
+        unsafe {
+            app.character('続' as u16);
+        }
+        assert_eq!(app.doc().source(), format!("{expected}続"));
+    }
+    #[test]
+    fn editor_visual_rows_keep_preferred_x_across_short_line() {
+        let fixture = EditorFixture::new("abcdefghijk\nx\nabcdefghijk", true);
+        let mut app = fixture.state.app.borrow_mut();
+        app.doc_mut().set_selection(8, 8).unwrap();
+        let x = app.caret_location().0;
+        app.move_caret(VK_DOWN.0, false);
+        assert_eq!(app.doc().selection().head, 13);
+        app.move_caret(VK_DOWN.0, false);
+        assert!((app.caret_location().0 - x).abs() < 1.0);
+        assert_eq!(app.doc().selection().head, 22);
+        app.move_caret(VK_UP.0, true);
+        assert_eq!(app.doc().selection().anchor, 22);
+        app.move_caret(VK_UP.0, true);
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: 22,
+                head: 8
+            }
+        );
+    }
+    #[test]
+    fn editor_wrapped_end_keeps_trailing_row_and_undo_visual_side() {
+        for raw in [false, true] {
+            let fixture = EditorFixture::new(&"word ".repeat(45), raw);
+            fixture.message(WM_KEYDOWN, VK_END.0 as usize);
+            let mut app = fixture.state.app.borrow_mut();
+            let view = &app.views[0];
+            let mut count = 0;
+            let mut lines = vec![DWRITE_LINE_METRICS::default(); 100];
+            unsafe {
+                view.layout
+                    .GetLineMetrics(Some(&mut lines), &mut count)
+                    .unwrap();
+            }
+            assert!(count > 1);
+            assert_eq!(app.doc().selection().head, lines[0].length as usize);
+            let (_, y, _) = app.caret_location();
+            assert!(
+                y < view.y + lines[0].height,
+                "End source {} drawn at y={y}, next row begins {}",
+                app.doc().selection().head,
+                view.y + lines[0].height
+            );
+            let before = app.caret_location();
+            let selection = app.doc().selection();
+            unsafe {
+                app.character('x' as u16);
+                app.key_with_modifiers(0x5a, true, false);
+            }
+            assert_eq!(app.doc().selection(), selection);
+            assert_eq!(app.caret_location(), before);
+            app.move_caret(VK_DOWN.0, false);
+            assert!(app.caret_location().1 > before.1);
+            app.move_caret(VK_UP.0, false);
+            assert_eq!(app.caret_location(), before);
+            app.start_composition();
+            assert_eq!(app.composition_position(0).unwrap(), before);
+            app.doc_mut()
+                .set_selection_with_affinity(
+                    selection.anchor,
+                    selection.head,
+                    BoundaryAffinity::After,
+                )
+                .unwrap();
+            assert!(
+                app.composition_position(0).is_none(),
+                "same offset with a different side is a stale IME owner"
+            );
+            app.clear_composition();
+            app.select_at(10000.0, TOP + FONT * 0.5, false);
+            assert_eq!(app.doc().selection().head, lines[0].length as usize);
+            assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::Before);
+            assert_eq!(app.caret_location(), before);
+        }
+    }
+    #[test]
+    fn editor_enter_continuation_exit_code_indent_and_shift_tab() {
+        for (source, literal, expected) in [
+            ("- item", false, "- item\n- "),
+            ("9. item", false, "9. item\n10. "),
+            ("> - [x] item", false, "> - [x] item\n> - [ ] "),
+            ("> quoted", false, "> quoted\n> "),
+            ("- ", false, ""),
+            ("> ", false, ""),
+            ("    let x = 1;", true, "    let x = 1;\n    "),
+        ] {
+            let mut doc = Document::new(1, source.into());
+            doc.set_selection(source.len(), source.len()).unwrap();
+            let plan = enter_edit(source, doc.selection(), literal);
+            apply_plan(&mut doc, plan);
+            assert_eq!(doc.source(), expected);
+            assert!(doc.undo());
+            assert_eq!(doc.source(), source);
+        }
+        let fixture = EditorFixture::new("    first\n    次", false);
+        let mut app = fixture.state.app.borrow_mut();
+        let end = app.doc().byte_len();
+        app.doc_mut().set_selection(end, 0).unwrap();
+        unsafe {
+            app.key_with_modifiers(VK_TAB.0, false, true);
+        }
+        assert_eq!(app.doc().source(), "first\n次");
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: "first\n次".len(),
+                head: 0
+            }
+        );
+    }
+    #[test]
+    fn editor_transient_layout_preserves_heading_baseline_styles_and_suffix_reflow() {
+        let fixture = EditorFixture::new("## abc 日本語 suffix", false);
+        let mut app = fixture.state.app.borrow_mut();
+        let p = "## abc ".len();
+        app.doc_mut().set_selection(p, p).unwrap();
+        app.start_composition();
+        app.preedit = "長い変換文字列".repeat(10);
+        app.ime_cursor = 2;
+        let visual = app.composition_visual().unwrap();
+        let view = app.caret_view().unwrap();
+        let mut source_size = 0.0;
+        let mut transient_size = 0.0;
+        unsafe {
+            view.layout
+                .GetFontSize(p as u32, &mut source_size, None)
+                .unwrap();
+            visual
+                .layout
+                .GetFontSize(visual.range.start, &mut transient_size, None)
+                .unwrap();
+        }
+        assert_eq!(source_size, transient_size);
+        assert!(source_size > FONT);
+        assert!(visual.height > view.height);
+        let position = app.composition_position(app.ime_cursor).unwrap();
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut hit = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            visual
+                .layout
+                .HitTestTextPosition(
+                    visual.range.start + app.ime_cursor,
+                    false,
+                    &mut x,
+                    &mut y,
+                    &mut hit,
+                )
+                .unwrap();
+        }
+        assert_eq!(position.0, visual.x + x);
+        assert_eq!(position.1, visual.y + y);
+        assert!(position.2 >= hit.height);
+        assert_eq!(app.doc().source(), "## abc 日本語 suffix");
+        assert_eq!(
+            composition_attribute_ranges(
+                &[
+                    ATTR_INPUT as u8,
+                    ATTR_TARGET_CONVERTED as u8,
+                    ATTR_TARGET_CONVERTED as u8
+                ],
+                7..10
+            ),
+            vec![(7..8, false), (8..10, true)]
+        );
+    }
+    #[test]
+    fn editor_transient_font_and_baseline_match_paragraph_emphasis_code_and_table() {
+        for source in [
+            "plain 日本語 tail",
+            "## head 日本語",
+            "**bold 日本語**",
+            "*italic 日本語*",
+            "`code 日本語`",
+            "```rust\n日本語\n```",
+            "| H |\n|---|\n| 日本語 tail |",
+        ] {
+            let fixture = EditorFixture::new(source, false);
+            let mut app = fixture.state.app.borrow_mut();
+            let p = source.find("日本語").unwrap();
+            app.doc_mut().set_selection(p, p).unwrap();
+            unsafe {
+                app.after_input();
+            }
+            let committed = app.caret_location();
+            app.start_composition();
+            app.preedit = "かな😀".into();
+            let visual = app.composition_visual().unwrap();
+            let view = app.caret_view().unwrap();
+            let original = view.map.partition_point(|&byte| byte < p) as u32;
+            unsafe {
+                let mut old_weight = DWRITE_FONT_WEIGHT::default();
+                let mut new_weight = DWRITE_FONT_WEIGHT::default();
+                view.layout
+                    .GetFontWeight(original, &mut old_weight, None)
+                    .unwrap();
+                visual
+                    .layout
+                    .GetFontWeight(visual.range.start, &mut new_weight, None)
+                    .unwrap();
+                assert_eq!(old_weight, new_weight, "font weight {source}");
+                let mut old_style = DWRITE_FONT_STYLE::default();
+                let mut new_style = DWRITE_FONT_STYLE::default();
+                view.layout
+                    .GetFontStyle(original, &mut old_style, None)
+                    .unwrap();
+                visual
+                    .layout
+                    .GetFontStyle(visual.range.start, &mut new_style, None)
+                    .unwrap();
+                assert_eq!(old_style, new_style, "font style {source}");
+                let mut old_family = [0; 64];
+                let mut new_family = [0; 64];
+                view.layout
+                    .GetFontFamilyName(original, &mut old_family, None)
+                    .unwrap();
+                visual
+                    .layout
+                    .GetFontFamilyName(visual.range.start, &mut new_family, None)
+                    .unwrap();
+                assert_eq!(old_family, new_family, "font family {source}");
+            }
+            let position = app.composition_position(0).unwrap();
+            assert_eq!(position.1, committed.1, "baseline {source}");
+            assert_eq!(position.2, committed.2, "line height {source}");
+            assert_eq!(app.doc().source(), source);
+        }
+    }
+    #[test]
+    fn editor_transient_selection_replaces_across_paragraph_views_from_range_start() {
+        let fixture = EditorFixture::new("first paragraph\n\nsecond paragraph\n\nafter", false);
+        let mut app = fixture.state.app.borrow_mut();
+        let first = 6;
+        let last = app.doc().source().find("paragraph\n\nafter").unwrap();
+        app.doc_mut().set_selection(first, last).unwrap();
+        unsafe {
+            app.after_input();
+        }
+        app.start_composition();
+        app.preedit = "変換".into();
+        let visual = app.composition_visual().unwrap();
+        assert_eq!(visual.x, app.source_view(first).unwrap().x);
+        assert_eq!(visual.y, app.source_view(first).unwrap().y);
+        assert!(visual.end_view_index > visual.view_index);
+        assert!(visual.growth < 0.0);
+        let before = app.doc().source().to_owned();
+        unsafe {
+            app.apply_ime_update(ImeUpdate {
+                flags: GCS_RESULTSTR.0,
+                result: Some("変換".into()),
+                ..Default::default()
+            });
+        }
+        app.clear_composition();
+        assert_eq!(
+            app.doc().source(),
+            format!("{}変換{}", &before[..first], &before[last..])
+        );
+        assert!(app.doc_mut().undo());
+        unsafe {
+            app.after_input();
+        }
+        assert_eq!(app.doc().source(), before);
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: first,
+                head: last
+            }
+        );
+    }
+    #[test]
+    fn editor_source_composition_copies_affected_line_and_preserves_crlf_eof() {
+        let source = format!("{}\r\n日本語\r\n", "before\r\n".repeat(800));
+        let fixture = EditorFixture::new(&source, true);
+        let mut app = fixture.state.app.borrow_mut();
+        let p = source.find("日本語").unwrap() + 3;
+        app.doc_mut().set_selection(p, p).unwrap();
+        app.start_composition();
+        app.preedit = "かな".into();
+        let visual = app.composition_visual().unwrap();
+        let view = app.source_view(p).unwrap();
+        assert_eq!(view.text.len(), 3);
+        assert_eq!(visual.range, 1..3);
+        assert_eq!(app.doc().source(), source);
+        app.clear_composition();
+        let eof = source.len();
+        app.doc_mut().set_selection(eof, eof).unwrap();
+        assert_eq!(app.source_view(eof).unwrap().map, vec![eof]);
+        assert_eq!(
+            app.views
+                .iter()
+                .filter(|view| view.source.is_empty() && view.source.start == eof)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn editor_live_blank_selection_replacement_delete_and_undo_keep_exact_endpoints() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("{eol}{eol}text{eol}{eol}");
+            let fixture = EditorFixture::new(&source, false);
+            let mut app = fixture.state.app.borrow_mut();
+            let end = 2 * eol.len();
+            app.doc_mut().set_selection(end, 0).unwrap();
+            unsafe {
+                app.character('次' as u16);
+            }
+            assert_eq!(app.doc().source(), format!("次text{eol}{eol}"));
+            unsafe {
+                app.key_with_modifiers(0x5a, true, false);
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(
+                app.doc().selection(),
+                Selection {
+                    anchor: end,
+                    head: 0
+                }
+            );
+            unsafe {
+                app.key_with_modifiers(VK_DELETE.0, false, false);
+            }
+            assert_eq!(app.doc().source(), format!("text{eol}{eol}"));
+            let last = app.doc().byte_len();
+            app.doc_mut()
+                .set_selection(last - 2 * eol.len(), last)
+                .unwrap();
+            unsafe {
+                app.key_with_modifiers(VK_BACK.0, false, false);
+            }
+            assert_eq!(app.doc().source(), "text");
+        }
+    }
+    #[test]
+    fn editor_control_table_arrows_select_rows_and_words_without_entering_pipes() {
+        let source = "| H | J |\n|---|---|\n| one two | 日本語 |\n| last | 次 |\n\nafter";
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let table = Arc::clone(&app.tables[0].table);
+        let first = table.rows[1].cells[0].content_range.start;
+        app.doc_mut().set_selection(first, first).unwrap();
+        unsafe {
+            app.key_with_modifiers(VK_DOWN.0, true, true);
+        }
+        assert_eq!(
+            app.doc().selection(),
+            Selection {
+                anchor: first,
+                head: table.rows[2].cells[0].content_range.start
+            }
+        );
+        unsafe {
+            app.key_with_modifiers(VK_UP.0, true, true);
+        }
+        assert_eq!(app.doc().selection(), Selection::caret(first));
+        let end = table.rows[1].cells[0].content_range.end;
+        app.doc_mut().set_selection(end, end).unwrap();
+        unsafe {
+            app.key_with_modifiers(VK_RIGHT.0, true, false);
+        }
+        assert_eq!(
+            app.doc().selection().head,
+            table.rows[1].cells[1].content_range.start
+        );
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().undo_count(), 0);
+        unsafe {
+            app.key_with_modifiers(VK_HOME.0, true, false);
+        }
+        assert_eq!(app.doc().selection(), Selection::caret(0));
+        assert_eq!(app.caret_view().unwrap().source, 0..0);
+    }
+    #[test]
+    fn editor_live_fence_boundaries_blank_lines_and_eof_round_trip_without_snap() {
+        for eol in ["\n", "\r\n"] {
+            let source =
+                format!("before{eol}{eol}```rust{eol}let source = \"Markdown\";{eol}```{eol}{eol}");
+            let fixture = EditorFixture::new(&source, false);
+            let mut app = fixture.state.app.borrow_mut();
+            let outside = source.rfind("```").unwrap() + 3 + eol.len();
+            app.doc_mut().set_selection(outside, outside).unwrap();
+            unsafe {
+                app.after_input();
+            }
+            assert_eq!(app.doc().selection().head, outside);
+            assert_eq!(app.caret_view().unwrap().map[0], outside);
+            for unit in "## asdkl".encode_utf16() {
+                unsafe {
+                    app.character(unit);
+                }
+            }
+            assert_eq!(
+                app.doc().source(),
+                format!("{}## asdkl{}", &source[..outside], &source[outside..])
+            );
+            assert!(
+                app.projection_cache
+                    .as_ref()
+                    .unwrap()
+                    .2
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.kind, BlockKind::Heading { level: 2 }))
+            );
+            assert!(app.doc_mut().undo());
+            unsafe {
+                app.after_input();
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(app.doc().selection(), Selection::caret(outside));
+            app.doc_mut().set_selection(0, 0).unwrap();
+            let mut visited = std::collections::HashSet::new();
+            while app.doc().selection().head < source.len() {
+                let p = app.doc().selection().head;
+                assert!(visited.insert(p), "right-arrow stalled at {p}");
+                app.move_caret(VK_RIGHT.0, false);
+                unsafe {
+                    app.after_input();
+                }
+            }
+            assert!(visited.contains(&outside));
+            let mut visited = std::collections::HashSet::new();
+            while app.doc().selection().head > 0 {
+                let p = app.doc().selection().head;
+                assert!(visited.insert(p), "left-arrow stalled at {p}");
+                app.move_caret(VK_LEFT.0, false);
+                unsafe {
+                    app.after_input();
+                }
+            }
+            assert_eq!(app.doc().source(), source);
+        }
+    }
+    #[test]
+    fn editor_home_end_page_control_lines_unicode_selection_and_idle_group() {
+        for raw in [false, true] {
+            let source = "日本語 e\u{301} 👩‍💻 🇯🇵\r\n\r\nnext line\r\nlast";
+            let fixture = EditorFixture::new(source, raw);
+            let mut app = fixture.state.app.borrow_mut();
+            let next = source.find("next").unwrap();
+            unsafe {
+                app.key_with_modifiers(VK_DOWN.0, true, true);
+                assert_eq!(app.doc().selection().anchor, 0);
+                assert_eq!(app.doc().selection().head, source.find("\r\n").unwrap() + 2);
+                app.key_with_modifiers(VK_DOWN.0, true, true);
+                assert_eq!(app.doc().selection().head, next);
+                app.key_with_modifiers(VK_UP.0, true, true);
+                assert_eq!(app.doc().selection().anchor, 0);
+                assert_eq!(app.doc().selection().head, source.find("\r\n").unwrap() + 2);
+                app.key_with_modifiers(VK_END.0, true, true);
+                assert_eq!(
+                    app.doc().selection(),
+                    Selection {
+                        anchor: 0,
+                        head: source.len()
+                    }
+                );
+                app.key_with_modifiers(VK_HOME.0, true, false);
+                assert_eq!(app.doc().selection(), Selection::caret(0));
+                app.key_with_modifiers(VK_NEXT.0, false, true);
+                assert!(app.doc().selection().head > 0);
+                assert_eq!(app.doc().selection().anchor, 0);
+                app.key_with_modifiers(VK_PRIOR.0, false, false);
+                assert!(app.doc().selection().is_caret());
+            }
+            app.doc_mut().set_selection(next + 4, next + 4).unwrap();
+            unsafe {
+                app.after_input();
+                app.key_with_modifiers(VK_HOME.0, false, false);
+            }
+            assert_eq!(app.doc().selection().head, next);
+            unsafe {
+                app.key_with_modifiers(VK_END.0, false, false);
+            }
+            assert_eq!(app.doc().selection().head, source.find("\r\nlast").unwrap());
+            let boundaries: Vec<_> = source
+                .grapheme_indices(true)
+                .map(|(p, _)| p)
+                .chain(Some(source.len()))
+                .collect();
+            for &p in &boundaries {
+                for back in [false, true] {
+                    assert!(
+                        boundaries.contains(&word_target(source, p, back)),
+                        "word move split grapheme at {p}"
+                    );
+                }
+            }
+        }
+        let fixture = EditorFixture::new("", false);
+        let mut app = fixture.state.app.borrow_mut();
+        unsafe {
+            app.character('a' as u16);
+            app.character('b' as u16);
+        }
+        assert_eq!(app.doc().undo_count(), 1);
+        app.last_typing = Some(Instant::now() - std::time::Duration::from_secs(2));
+        unsafe {
+            app.character('c' as u16);
+        }
+        assert_eq!(app.doc().undo_count(), 2);
+        unsafe {
+            app.key_with_modifiers(0x5a, true, false);
+        }
+        assert_eq!(app.doc().source(), "ab");
+        unsafe {
+            app.character('x' as u16);
+        }
+        assert_eq!(app.doc().source(), "abx");
+        assert_eq!(app.doc().redo_count(), 0);
+    }
+    #[test]
+    fn editor_typed_markdown_transitions_keep_source_caret_and_code_literal() {
+        for source in [
+            "*italic*",
+            "**bold**",
+            "`code`",
+            "[label](https://example.invalid)",
+            "> quote",
+            "- item",
+            "---",
+            "```rust\n## literal\n```",
+            "| A | B |\n|---|---|",
+        ] {
+            let fixture = EditorFixture::new("", false);
+            let mut app = fixture.state.app.borrow_mut();
+            for character in source.chars() {
+                if character == '\n' {
+                    unsafe {
+                        app.key_with_modifiers(VK_RETURN.0, false, false);
+                    }
+                } else {
+                    for unit in character.encode_utf16(&mut [0; 2]).iter().copied() {
+                        unsafe {
+                            app.character(unit);
+                        }
+                    }
+                }
+            }
+            assert_eq!(app.doc().source(), source, "source authoring {source}");
+            assert_eq!(
+                app.doc().selection().head,
+                source.len(),
+                "caret authoring {source}"
+            );
+            if source.starts_with("```") {
+                assert!(
+                    !app.projection_cache
+                        .as_ref()
+                        .unwrap()
+                        .2
+                        .blocks
+                        .iter()
+                        .any(|block| matches!(block.kind, BlockKind::Heading { .. }))
+                );
+            }
+        }
+        let fixture = EditorFixture::new("", false);
+        let mut app = fixture.state.app.borrow_mut();
+        for character in "| A | B |\n|---|---|".chars() {
+            unsafe {
+                if character == '\n' {
+                    app.key_with_modifiers(VK_RETURN.0, false, false);
+                } else {
+                    app.character(character as u16);
+                }
+            }
+        }
+        unsafe {
+            app.key_with_modifiers(VK_RETURN.0, false, false);
+        }
+        assert!(app.active_cell().is_some());
+        for unit in "one".encode_utf16() {
+            unsafe {
+                app.character(unit);
+            }
+        }
+        unsafe {
+            app.key_with_modifiers(VK_TAB.0, false, false);
+        }
+        for unit in "two".encode_utf16() {
+            unsafe {
+                app.character(unit);
+            }
+        }
+        let table = Table::parse(app.doc().source(), 0..app.doc().byte_len()).unwrap();
+        assert_eq!(
+            app.doc().source()[table.rows[1].cells[0].content_range.clone()].trim(),
+            "one"
+        );
+        assert_eq!(
+            app.doc().source()[table.rows[1].cells[1].content_range.clone()].trim(),
+            "two"
+        );
+    }
+    #[test]
+    fn editor_control_arrows_extend_and_delete_unicode_words() {
+        let mut app = composing_test_app("alpha　日本語 beta");
+        app.clear_composition();
+        app.tabs[0].raw = true;
+        unsafe {
+            app.key_with_modifiers(VK_RIGHT.0, true, true);
+            assert_eq!(
+                app.doc().selection(),
+                Selection {
+                    anchor: 0,
+                    head: "alpha　".len()
+                }
+            );
+            app.key_with_modifiers(VK_DELETE.0, true, false);
+            assert_eq!(app.doc().source(), "日本語 beta");
+            app.key_with_modifiers(VK_END.0, true, false);
+            app.key_with_modifiers(VK_BACK.0, true, false);
+            assert_eq!(app.doc().source(), "日本語 ");
+        }
+    }
+    #[test]
+    fn editor_arrow_collapses_selection_without_an_extra_step() {
+        let mut app = composing_test_app("a日本語b");
+        app.clear_composition();
+        app.tabs[0].raw = true;
+        app.doc_mut().set_selection(1, 10).unwrap();
+        app.move_caret(VK_LEFT.0, false);
+        assert_eq!(app.doc().selection(), Selection::caret(1));
+        app.doc_mut().set_selection(10, 1).unwrap();
+        app.move_caret(VK_RIGHT.0, false);
+        assert_eq!(app.doc().selection(), Selection::caret(10));
+    }
     fn composing_test_app(source: &str) -> App {
         let mut doc = Document::new(1, source.into());
         doc.replace_selection("x").unwrap();
@@ -4550,13 +6474,21 @@ mod tests {
             layout_key: None,
             projection_cache: None,
             parsed_tables: Vec::new(),
+            revealed_source: None,
             dragging: false,
             dragging_scroll: false,
             preedit: "かな".into(),
             composing: true,
             ime_owner: Some((1, 2, selection.anchor, selection.head)),
+            ime_affinity: BoundaryAffinity::After,
             ime_cursor: 2,
-            suppress_chars: Vec::new(),
+            ime_attributes: Vec::new(),
+            ime_last_result: None,
+            preferred_x: None,
+            typing: false,
+            last_typing: None,
+            pending_table_authoring: None,
+            close_after_composition: None,
             pending_surrogate: None,
             diagnostic: None,
             caret: (LEFT, TOP, 28.0),
@@ -5419,7 +7351,13 @@ mod tests {
                 app.ensure_layout().unwrap();
             }
             assert!(app.views.iter().all(|view| !view.thematic_break));
-            assert_eq!(app.views[0].source, 0..source.len());
+            assert_eq!(app.views.first().unwrap().source.start, 0);
+            assert_eq!(app.views.last().unwrap().source.end, source.len());
+            assert!(
+                app.views
+                    .windows(2)
+                    .all(|views| views[0].source.end == views[1].source.start)
+            );
             assert!((rule_start..rule_start + syntax.len()).all(|byte| {
                 app.visible_tokens
                     .iter()
@@ -5589,14 +7527,14 @@ mod tests {
             app.dragging = true;
             let before = document_state(app.doc());
             let owner = app.ime_owner;
-            let app = RefCell::new(app);
+            let app = WindowState::new(app);
             SetWindowLongPtrW(
                 window.0,
                 GWLP_USERDATA,
-                (&app as *const RefCell<App>) as isize,
+                (&app as *const WindowState) as isize,
             );
             window_proc(window.0, WM_KILLFOCUS, WPARAM(0), LPARAM(0));
-            let app = app.borrow();
+            let app = app.app.borrow();
             assert!(app.composing);
             assert_eq!(app.preedit, "かな");
             assert_eq!(app.ime_owner, owner);

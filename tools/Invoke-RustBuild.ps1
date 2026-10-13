@@ -14,7 +14,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain unavailable through mise.' }
     Write-Output $RustVersion
     if ($RustVersion -notmatch '^rustc 1\.99\.0\s') {
-        throw 'This experiment requires the recorded Rust 1.99.0 toolchain. Do not update or reinstall automatically.'
+        throw 'MDLite requires the recorded Rust 1.99.0 toolchain. Do not update or reinstall automatically.'
     }
     $BuildArgs = @('exec','--','cargo','build','--locked','--target-dir',$TargetDirectory)
     if ($Configuration -eq 'Release') { $BuildArgs += '--release' }

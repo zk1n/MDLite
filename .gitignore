@@ -3,17 +3,8 @@
 /out/
 /dist/
 /.cache/
+# Existing ignored local build material remains private.
 /.vs/
-/cmake-build-*/
-/vcpkg_installed/
-CMakeUserPresets.json
-CMakeCache.txt
-CMakeFiles/
-*.user
-*.suo
-*.VC.db
-*.VC.opendb
-*.obj
 *.pdb
 *.ilk
 
@@ -37,7 +28,7 @@ CMakeFiles/
 *.pem
 *.dmp
 
-# Rust experiment artifacts and private task inputs
+# Rust build artifacts and private task inputs
 /target/
 /.codex-runtime/
 /samples/

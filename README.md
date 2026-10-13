@@ -4,8 +4,8 @@
 
 ## 状態
 
-`experiment/rust-rewrite`はWindows 11 x64向けのRust編集基盤試験版です。
-正式採用、C++版への統合、公開バイナリのリリースは行っていません。
+`develop`をWindows 11 x64向けのRust開発主線とします。
+製品全体の受入と公開バイナリのリリースは別の判断です。
 実装と試験の範囲は[受入記録](docs/rust-acceptance.md)を参照してください。
 
 ## 開発方針
@@ -13,8 +13,9 @@
 通常のテキスト編集時の省メモリと操作性を重視し、Live Markdown、
 Workspace操作、検索・置換、ノート作成支援を提供する予定です。
 
-C++版は`develop`に保全し、Rust試験版は確認した初期`main`から分岐しています。
-この試験では`main`と`develop`を更新せず、実験branchだけを配送します。
+移行前のC++版は`cpp-archive/pre-rust-20261013`とGit履歴に保全します。
+現行treeはRust専用です。今後の作業branchは`develop`から切ります。
+`main`、tag、公開Releaseは今回の移行対象に含めません。
 
 ## 開発・起動
 
@@ -48,8 +49,11 @@ Ctrl+Shift+ZもRedoです。本文と履歴はcropの共有Ropeを使い、parse
 未実装のExplorer、Workspace検索、Calendar、Git UI、autosaveや復旧を
 有効な機能として表示しません。Workspace保存境界と製品全体の要求は
 [受入記録](docs/rust-acceptance.md)に保持しています。
+[製品要件とUI方針](docs/product-requirements.md)にも未移植機能の要求を残します。
 
 [部品選定と責務](docs/rust-architecture.md)、[依存ライセンス](docs/dependencies.md)。
+
+Editorのキー操作とLiveでの原文境界は[操作仕様](docs/editor-operations.md)に記録します。
 
 起動中のアプリを保全する必要がある場合は、buildの`-TargetDirectory`で
 別の出力先、`-EvidenceDirectory`で別の検証記録先を指定できます。

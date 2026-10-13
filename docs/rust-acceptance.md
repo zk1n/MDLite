@@ -1,132 +1,39 @@
-# Rust試験版の受入記録
+# Rust Editor受入記録
 
-## 2026-10-13 crop・Markdown改修
+Rust開発の主線はdevelop。旧実装の正確なdevelop tipは
+`cpp-archive/pre-rust-20261013`とGit履歴に保持する。
+開発主線の選択は、全製品・全入力機器の受入合格を意味しない。
 
-本文の編集正本をcrop 0.4.3へ統合し、履歴はCOW snapshotを使用する。
-解析・保存API用の連続文字列、projection、表解析は文書ID／revisionに結び付ける。
-採用構文と原文編集の扱いは[Markdown方言](markdown-dialect.md)、保持データと
-crop iteratorの回避理由は[設計](rust-architecture.md)に記録する。
+## Editorの確認対象
 
-最終ソースaggregateは`c303c87856f3e531bc38df7d9ff99ea766f67dda040c4acc73031d4d7370b519`。
-通常のDebug／Releaseで、それぞれ55 library＋48 native＝103 tests、fmt、ClippyがPASS。
-実装者・Rootとは別のSol Highによるcorrectness reviewの4件のP2を修正し、同じreviewerの
-修正部分の再確認がPASSした。Ponytailの複雑性確認は別に実施した。
+入力→原文→selection→layout→次の入力を一つの契約として確認する。
+本文はcrop Rope一つ。表示更新は本文、encoding、dirty、履歴を変更しない。
 
-| 対象 | 実装・確認結果 | 確認範囲と限界 |
+| 項目 | 今回の契約 | 確認状態 |
 |---|---|---|
-| 本文・履歴 | 唯一のRope、atomic範囲編集、saved state、Undo／Redo分岐、共有snapshot | ランダム編集を独立String期待値と照合。chunk跨ぎ、RI、ZWJ、結合文字、CRLF、UTF-16途中を試験。履歴nodeの正確なbytesは未測定 |
-| 保存 | UTF-8／BOM、Windows CP932、元bytes、外部変更・変換不能時の保護 | 純粋I/OとRope経由の保存を試験。最終Releaseの所有fixtureでWM_CHAR編集、Raw／Live、保存、切替、通常closeもPASS |
-| 入力 | Ctrl+Z／Shift+Z／Y振り分け、composition優先、後続control文字抑制 | native履歴経路を試験。実際の物理key／OS shortcut送信の一式とは区別 |
-| IME位置 | 要求UTF-16位置を実DirectWrite layoutからscreen pixelへ変換 | 所有する非表示Win32 windowで先頭／途中／末尾、複数行、emoji、表offset、scroll、DPI、無効size／owner／境界を試験。実MS IME候補UI・取消・再変換は未確認 |
-| Markdown | 明示4 flags、全15 flagsの採否、裸リンク、表、チェック、list／quote／rule、safe HTML／Front Matter | 画像前後の親本文、style後の高さ、画像のhit／damage、表末尾EOLを含む回帰を試験。公開仕様の完全conformanceは主張しない |
-| 画像 | 入力・寸法・展開量の上限、SVG構造／外部参照拒否、可視域中心decode、推定cache予算 | 5形式の正常・不正・過大入力、失敗保護、所有する非表示windowでupload／再利用／全owner evictionを確認。codec scratch／COM overheadの厳密な総量は未測定 |
-| 通常デバッグ | 最終DebugでIDEのStart Debugging、実CodeLLDB child／native window／fixture／EXE hashを確認 | IDE Stopと所有windowだけのcloseまでPASS。物理F5、synthetic F5送信はNOT_RUN |
-| 配送・採用 | experiment refだけを通常配送する。main／developを保持 | 実際のcommit／remote OID／HANDOFF readbackはlocal HANDOFFに記録。Rust正式採用と全製品のHuman受入は別判断 |
+| 入力・IME | 実preedit範囲、本文とのbaseline、通知順序、終了後の通常入力 | 最終実装・検証中 |
+| 移動・選択 | Unicode、Ctrl/Shift、preferred x、空行・EOF・block境界 | 最終実装・検証中 |
+| Live執筆 | 未完成Markdownから成立・修正、code内literal、表保護 | 最終実装・検証中 |
+| Undo/Redo | 原文と向き付きselection、保存点、typing/IME編集単位 | 最終実装・検証中 |
+| 回帰 | BOM/CP932/CRLF、保存失敗、画像・表・未保存文書 | 最終実装・検証中 |
+| 終了 | composition終了、保存/破棄/Cancel、失敗時本文保持 | 最終実装・検証中 |
+| 通常開発 | 最終develop Debug/Release、tests、fmt、Clippy、通常起動 | 最終実装・検証中 |
+| review | 実装者のPonytailと別Agentのcorrectness review | 最終実装・検証中 |
 
-### 今回の資源・応答確認
+以前の試験結果と失敗記録はGit履歴に保持する。過去のPASSは今回の
+連続操作・IME・GUIの証明へ転用しない。各経路の最終状態を別々に記録する。
 
-**50MBは望ましい目安であり、今回の必達・合否条件ではない。**
-以下は一回の小さな同条件比較で、旧visible／focused測定や完成製品の総資源保証とは別である。
-同じfixture・画像、1／6文書、client 1084×761、outer 1100×800、96 DPI、ATOK閉、
-opt-in診断で、所有する非表示windowにWM_PAINTを送り実アプリを計測した。
-前後のgeometry／profile／open state／fixture bytesと通常終了を照合した。
+## 検証の境界
 
-| 文書数 | 前 Working Set bytes | 後 Working Set bytes | 前 private bytes | 後 private bytes |
-|---:|---:|---:|---:|---:|
-| 1 | 26,132,480 | 25,223,168 | 9,994,240 | 9,695,232 |
-| 6 | 25,350,144 | 25,305,088 | 10,006,528 | 9,904,128 |
-
-本文・履歴・解析だけの別probeは、144,384-byte文書6件に各100編集、全Undo／Redo、
-全projection保持を行った。同じ論理byte位置を使い、旧版はStringのlen、新版はRopeの
-byte_lenを参照し、長さ取得のための不要なparser用コピーを行わない。
-
-| 6文書合計の処理 | 前 µs | 後 µs |
-|---|---:|---:|
-| 600編集 | 724 | 898 |
-| Undo | 382 | 490 |
-| Redo | 493 | 114 |
-| 全体解析 | 35,074 | 35,482 |
-| selection／同revision読み取り | 12 | 27 |
-
-全projection／履歴保持時のprivate bytesは25,657,344→27,181,056。
-COW履歴と連続read bufferを持つ構造上の増加はあるが、共有node／allocatorの内訳は未測定で、
-この差を特定部品の実測costとは断定しない。短い計測の揺らぎもあり、広い性能保証とは扱わない。
-Working Set trim、数字を下げるための機能無効化、renderer刷新は行っていない。
-
-### 未確認・禁止・scope外
-
-OS clipboardの読み取り・列挙・書込み・backup／restore・消去、Ctrl+C／X／V、画像貼付けは
-明示禁止のため実施していない。純粋TSV／DIB payload試験をOS統合の証拠にしない。
-実MS IME候補・取消・再変換はNOT_RUN。今回の所有processで確認したprofileはATOK閉であり、
-入力profileを変更しない境界を維持した。これは実IMEの開発側確認の未実施で、Human受入済みとは扱わない。
-物理typematic／F5、別monitor／実DPI、Narrator、主観的UI受入も未確認。
-今回のnative API／所有fixture／IDE commandのPASSをそれらへ転用しない。
-Explorer／Calendar／Git／検索の全移植、autosave／復旧の完成、Rust正式採用、main／develop統合、
-tag／Releaseはscope外。依存advisory確認の制約と保守終了通知は[依存説明](dependencies.md)に残す。
-
-## 以前の編集基盤試験の履歴
-
-以下は以前のsource／EXE／旧50MB必達条件での記録をそのまま保持したもの。
-今回ソースのPASSや今回の完了条件へ読み替えない。
-
-この記録は、機械検証、GUIで確認できた範囲、未完了の受入項目を分けて示す。
-最後にbuild/test/fmt/Clippyを完了したproduct checkpointのsource aggregateは
-`6a408c1b3a5156c45d4e160d20514f73680a0abaa19230472b2c7726af8e3847`。
-Debug EXE SHA-256は `f82c2fd9bdfbb98d6497ff69e8ec72ef78b0f34a9ba03ad402c7c2dc481f74c3`、
-Release EXEは `16ed729a46e374746c28252b78f29eabd32de12639e8f073b222be58c0db0600`。
-両構成で33 library + 33 native = 66 tests、build、fmt、ClippyがPASS。source aggregateはbuild scriptと同じ入力集合から再計算し、両EXEは実ファイルから再hashして受領書と一致した。
-
-現在のproduct GUI試行はこのsource aggregate／Release EXEに紐づく。R1のfocused画面確認、R5/R6の一部操作、R3の合成keydown反復、別試行の実MS IMEコア証明、R9の測定を確認したが、それぞれ未実施・BLOCKEDの項目が残る。各runのFAILを保持し、全体PASSとは扱わない。F5はapp起動前に停止したため、product GUI proofではない。前回のIME候補取消失敗runも保持しており、そのrunでは候補popupを確認できなかった。Microsoft IMEの段階確認では一度目のSpaceが変換、二度目がcandidate UI要求となるため、当該失敗だけでnative candidate cancellationの不具合を証明したとは扱わない。
-
-native focus-loss P2とGUI helperのstage-aware cancellation／R9 geometry gateは、それぞれのscoped reviewでPASSした。最終の独立current-source correctness reviewも割り当てられたscopeでPASSし、新たなcode blockerはなく、過去のP2 findingsは解消済み。このreview結果は全体受入を意味しない。別の現source R7 toolbar supplementではCancel／No経路がPASSしたが、先行Ctrl+W runのBLOCKED reportは保持する。F5は未完了、R9 Working Set目標はFAILである。Git配送とHANDOFFの実施状況はこの文書で先取りせず、repository-local HANDOFFの検証済み記録を参照する。
-現在のfocused試験ではclipboardを未操作またはSkipClipboardとした。過去事故でoriginal formatsは失われ回復不能のため、追加clipboard操作は禁止する。
-Rustの正式採用とHuman受入は別の判断であり、機械検証や部分的GUI PASSだけからは決定しない。
-
-| ID | 対象 | 実装 | 現在の検証 |
-|---|---|---|---|
-| R0 | main基点、C++保全、環境再利用 | 実験branch、独立C++ checkout | 開始時のmain／develop ref、差分、既存Rust probeとmise環境を確認済み。終了時ref、remote readback、配送は未完了 |
-| R1 | 日本語、見出し、表、画像、Front MatterのLive編集 | native view、projection | 最新sourceのRelease focused runで日本語、表、画像sourceとnative editorを確認。R1 checkはPASS。これは全編集要求の完了を意味しない |
-| R2 | 原文／表示分離、Unicode、改行、encoding、外部変更 | document、coordinates、storage | 最新sourceのDebug／Release各66 tests、fmt、Clippy PASS。native focus-loss P2のscoped recheck PASS。独立correctness reviewは割り当てscopeでPASS、新しいcode blockerなし。全体GUI受入は別 |
-| R3 | repeat中のcaret、残像、selection、hit test | DirectWrite layout、Win32 caret | 最新Releaseで4枚の実desktop frameを取得し、240ms間隔のOS合成SendInput KEYDOWN後に3箇所以上のcaret／selection位置を確認。R3 PASS、source/history不変。物理typematicは未確認 |
-| R4 | 英字、実IME、Undo/Redo、OS clipboard | transaction、IMM adapter | 別supplementで実MS IMEを選択したOS合成入力 `にほんご` → `日本語`、Enter commit 1049 bytes（base 1040 bytes）、1 transactionを確認。Undo/Redo/Undoはclean baseへ一致。候補popup associationはBLOCKED。過去の二度Escape timeout reportは保持し、settled preeditからの追加Escape 1回によるsource/history-pure cleanupだけを別途確認。これは通常の三段階取消契約を証明しない。physical IME／reconversionは未確認。clipboardは未操作 |
-| R5 | 表操作、境界、矩形TSV、表内scroll | table、native view | table、行／列挿入、alignment、header-only boundary、表内scrollはPASS。矩形copy／TSV paste／overflow rejectはBLOCKED、矩形cutはNOT_RUN |
-| R6 | 5形式画像、挿入、resize、安全なSVG | assets、native view | 最新sourceでPNG/JPEG/GIF/WebP/SVGとcorrupt PNG、GIF/WebP animation、前後の通常入力、resize、file import/failureを確認。clipboard pasteはBLOCKED |
-| R7 | 切替、閉じる、通知の寿命 | native owner、文書ID／revision | 先行Ctrl+W runはowned confirmation dialogが出ず、2 tabsとdirty test documentが残りBLOCKEDのまま記録。別の前段toolbar visibility-wait BLOCKED reportも保持し、製品不具合の証明とは扱わない。別の現source toolbar supplementは、Cancelでdirtyなfake `x`／document 2を保持し、Noでその文書だけを破棄してclean base document 1を保持した後、normal closeまでPASS。先行reportは変更していない。switch／notification lifetime一式は未受入 |
-| R8 | Debug/Release、test/fmt/clippy、F5 | Cargo、VS Code、build script | 最新sourceでDebug／Release各66 tests、fmt、Clippy、build PASS。最終F5試行はUI状態が不十分なためconfiguration確認／prelaunch／F5送信前に停止しNOT_RUN。過去のF5 PASSは別source／EXE。物理F5とHuman受入も未確認 |
-| R9 | 同条件C++比較、資源、部品選定 | 設計ADR、測定対象 | 最新Releaseで1／6文書を測定し、geometry／DPI／foreground比較はPASS、50,000,000-byte Working Set目標はFAIL。値と条件は下記。renderer-only Software／DEFAULT比較のprivate-memory差は設計記録に残すが、focused appのFAILを置き換えない |
-| R10 | 実験branch同期、HANDOFF | 既存Git／HANDOFF導線 | experiment refの配送、実OID、remote readback、HANDOFF生成／upload結果はこの表では先取りしない。実際の結果はrepository-local HANDOFFの検証済み記録を参照する |
-
-### R7 toolbar supplement
-
-現sourceの別試行では、Cancelを押したowned `#32770` dialog後も、dirtyなfake `x` のdocument 2、2 tabs、revision 1、undo 1／redo 0、selection 1が保持された。次のtoolbar closeで表示したowned dialogのNoを選ぶとtest document 2だけが破棄され、original 1040-byte clean document 1はrevision 0、undo 0、redo 0のまま保持された。owned appはnormal closeした。このtoolbar経路はOS合成操作でPASSだが、先行Ctrl+W runのBLOCKED結果はそのまま残す。物理操作、keyboard、IME、clipboard操作やHuman acceptanceは主張しない。
-
-### R9 focused Release測定
-
-RustとC++は同じ1／6文書fixture pathを使用。両者のnormal visible client areaは1084×761、96 DPI、exact foreground HWND／PID gateを満たした。window screen positionは異なる。C++の6 tab countは11回の一時的なWM_NULL応答失敗後に確認できた。RustはATOK、C++ IME observerはUNKNOWN。両アプリはnormal closeし、source／EXEは測定前後で安定。各CPU値は5秒のone-core idle sampleであり、一般的な性能保証ではない。
-
-| 実行版 | 文書数 | Working Set bytes | Private bytes | Peak Working Set bytes | idle CPU %（one core、5秒） |
-|---|---:|---:|---:|---:|---:|
-| Rust | 1 | 58,150,912 | 28,811,264 | 58,404,864 | 1.561 |
-| Rust | 6 | 57,442,304 | 27,807,744 | 57,520,128 | 1.249 |
-| C++ | 1 | 54,636,544 | 16,367,616 | 71,036,928 | 63.116 |
-| C++ | 6 | 57,618,432 | 20,566,016 | 79,196,160 | 70.582 |
-
-Rustの両Working Set値が固定50,000,000-byte目標を超えるため、R9 budgetはFAIL。目標を上げず、Working Set trimも行わない。
-
-## 採用勧告
-
-既存の機械検証はRust試験を続ける材料になるが、実アプリでの最終受入には至っていない。
-最新sourceのbuild/test/fmt/ClippyはPASSであり、割り当てられたscopeの独立current-source correctness reviewもPASSしたが、GUI受入は部分的である。R3と実MS IMEのcore edit transactionは確認した一方、IME candidate associationはBLOCKED、R7のCtrl+W／switch／notification経路とF5は未完了、R9 Working Set budgetはFAIL。
-clipboard original formatsは回復不能で、追加操作は禁止。Rustの正式採用とC++統合はHuman判断として保留する。
-完成製品の機能群は後続作業とし、対応表から削除しない。
-
-DirectWrite／Direct2D、Markdown parser、image／SVG decoderは既存libraryやOS機能を使う。
-source mapping、編集transaction、table editing、文書lifecycleはMDLiteが維持する中核コードとして残る。
-詳しくは[Rust編集基盤の試験設計](rust-architecture.md)。
+OS clipboardの読み取り・列挙・書き込み・backup/restore/clearは行わない。
+Ctrl+C/X/Vと画像貼付けのOS統合は検証対象外。純粋payload試験はOS統合の証拠ではない。
+入力profileやdefault IME、global設定を変更せず、所有fixture/processだけを使う。
+合成window通知、OS合成キー、実IME、物理typematic、Human受入を区別する。
+50MBは望ましい目安であり、機能削除やworking-set trimを行う合否gateではない。
 
 ## 製品全体への対応
 
-このTaskで編集基盤を試験し、次の製品要求を削除しない。
+今回のEditor範囲外の要求を削除しない。承認UIと元仕様の要求を維持する。
 
 | 元仕様 | 今回の責務／後続 |
 |---|---|
@@ -149,11 +56,4 @@ source mapping、編集transaction、table editing、文書lifecycleはMDLiteが
 | R-17 Performance | 今回のRelease編集基盤のみ実測。完成製品の保証としない |
 | R-18 Large files | 自動機能削除を行わず、今回の測定・試験限界を明記 |
 | R-19 Development | Cargo／F5の再現経路と実行確認範囲を今回記録 |
-| R-20 Public Git | 実験refだけ二つのremoteへ配送。正式採用・develop統合はHuman判断 |
-
-## C++と正式移行
-
-C++の過去PASSをRustへ転用しない。比較は同じ6文書とassetsを一つのWorkspaceに置き、同じVMとRelease条件で行う。
-今回のC++ 1／6文書比較はgeometry、DPI、foreground条件を揃えた試行として成立したが、Rustは固定Working Set目標を超えている。測定は短い限定条件で、C++ IME profileはUNKNOWN、RustはATOK、screen positionも異なるため一般性能や完全同条件の結論へ広げない。将来の正式移行は、developだけに存在する旧C++ファイルを
-明示的な通常commitで整理してから検証する必要がある。main起点branchのmergeだけでは旧ファイルは自動削除されない。
-今回この移行は実施しない。
+| R-20 Public Git | Rust専用developを両remoteへ配送。main、tag、Releaseは別指示 |

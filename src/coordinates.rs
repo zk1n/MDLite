@@ -45,6 +45,15 @@ impl fmt::Display for CoordinateError {
 
 impl std::error::Error for CoordinateError {}
 
+/// Select which side owns a source boundary with two valid visual positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryAffinity {
+    /// Resolve toward the preceding source text.
+    Before,
+    /// Resolve toward the following source text.
+    After,
+}
+
 /// Zero-based source line and UTF-16 column, excluding line-ending bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineColumn {

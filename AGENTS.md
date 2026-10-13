@@ -1,12 +1,15 @@
-# MDLite Rust experiment
+# MDLite Rust development
 
 Read `.codex/routing-entry.md` and its shared canonical routing references at
 task start. Use actual runtime model/effort; do not copy shared configuration.
 
-This experiment starts at the verified initial `main` and stays on
-`experiment/rust-rewrite`. Preserve C++ `develop` and `main`. Deliver only this
-experiment ref to the existing `origin` and `github`, without force, tags,
-releases, or automatic merges. Formal Rust adoption requires Human judgment.
+`develop` is the Rust development line. Preserve the previous C++ develop tip
+on `cpp-archive/pre-rust-20261013` and in Git history; do not retain its
+implementation or build/launch/test configuration in the current tree.
+Integrate with ordinary history-preserving merges and deliver authorized refs
+to the existing `origin` and `github` without force. Preserve `main`; tags and
+public releases require a separate instruction. Rust development adoption does
+not establish complete product or Human acceptance.
 
 Markdown source is canonical. Presentation must not rewrite source, encoding,
 line endings, dirty state, or history. Preserve unsaved text on failures and

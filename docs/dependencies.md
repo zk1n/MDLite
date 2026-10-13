@@ -1,4 +1,4 @@
-# Rust試験版のCargo依存ライセンス
+# Rust版のCargo依存ライセンス
 
 最終lockの `cargo metadata --format-version 1 --locked --offline` から生成した宣言値。
 各crateの実際の採用版とactive featuresを照合する。ライセンス本文・NOTICEの完全な配布監査ではない。

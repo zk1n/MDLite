@@ -1,6 +1,7 @@
-# Rust編集基盤の試験設計
+# Rust編集基盤の設計
 
-Windows 11 x64用の試験版。Rust正式採用とC++版への統合は未決定。
+Windows 11 x64用。Rustをdevelopの開発主線とする。
+旧実装は保管branchとGit履歴に保持し、現行treeはRust専用とする。
 Markdown原文を永続正本とし、表示は派生データとする。
 
 | 責務 | 使用する部品 | MDLiteで実装する部分 |
@@ -74,7 +75,7 @@ viewの解放を管理する。CP932はWindowsの変換を使いbest-fitを拒�
 [Windows文字変換](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte)。
 
 旧測定の50,000,000 bytes目標は履歴として保持する。今回の望ましい目安を薄いshellの値で完成製品の保証に
-しない。採用可否、C++比較、GUI証拠と未検証範囲は受入記録に残す。
+しない。GUI証拠と未検証範囲は受入記録に残す。
 
 
 ## crop本文と派生データの所有
@@ -82,7 +83,7 @@ viewの解放を管理する。CP932はWindowsの変換を使いbest-fitを拒�
 `Document::source`の編集正本は`crop::Rope`一つである。挿入・削除・置換は
 checked byte rangeを検証し、COW candidateへ適用してselectionも検証した後だけ
 公開する。不正境界・範囲・selectionやrevision枯渇では本文、dirty、履歴は変わらない。
-履歴はbefore/after Rope snapshot、selection、saved-state identityを保持し、Undo/Redoは
+履歴はbefore/after Rope snapshot、selectionと境界affinity、saved-state identityを保持し、Undo/Redoは
 共有treeの切替を行う。全文Stringによる第二編集engineやdelta文字列の再適用はない。
 Undo後の編集でRedoを破棄し、saved-stateへ戻るとcleanになる。履歴は文書closeで解放し、
 現時点では履歴件数に上限を設けない。cropの共有nodeの正確な保持bytesは計測していない。
@@ -125,7 +126,8 @@ DirectWrite用UTF-16や短い描画ラベルは外部API向けの派生入力で
 番号はlist startと同depthのsibling順に従い、tight/loose・複数段落・複数行・nested itemで
 同itemの番号を重複しない。tight itemがnested listを含む場合、その前の親本文も描画する。
 引用はindentとnative gutterの縦線を使う。gutterはsource/view mapに入れず、表示だけで
-source、dirty、Undo、selectionを変更しない。marker記法の直接編集はraw modeを使う。
+source、dirty、Undo、selectionを変更しない。Liveの編集対象では原文の記法を
+source位置に対応して表示し、その場で入力・修正する。表構造の明示Source操作は別契約とする。
 code blockは既存InlineKind::CodeのDirectWrite stylingでCascadia Monoを指定し、OS font
 fallbackを維持する。所有hidden windowでlabel layout、code family、source/history不変性を
 確認するが、実際のfontの外観やphysical GUI受入とは区別する。
@@ -148,6 +150,13 @@ clientからscreen pixelへ変換する。解決できないqueryには0を返�
 への代替を成功応答にしない。先頭/途中/末尾、改行、emoji、表offset、scroll、DPI、
 不正sizeとstale ownerの試験は純粋計算とowned hidden Win32 windowで行う。
 実MS IME候補UIやphysical keyboardの受入とは分ける。
+
+同期IMM/focus通知はAppのmutable borrow中にも所有snapshotとして順序を保ち、
+外側callbackの処理後に適用する。二重mutable参照や通知の破棄で再入を解決しない。
+preeditは対象viewの前半・未確定文字・後半を含む一時DirectWrite layoutで整形し、
+本文のfont/styleとbaselineを共有する。背景・下線・caret・query位置はその実測範囲を使う。
+原文selectionはlayout更新で書き換えず、空行・EOF・fence境界の原文位置も保持する。
+通常の連続挿入は狭いtyping groupとし、移動・command・IME・改行・保存・idleで区切る。
 
 画像layoutはbounded metadata probeで寸法だけを取得し、decode/uploadは可視範囲と
 前後一viewportのlookaheadに限定する。512 MiBのaggregate cache保持予算を設け、

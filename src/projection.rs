@@ -1,0 +1,1236 @@
+//! A source-backed display projection for Markdown editing.
+//!
+//! The parser output is transient presentation data. Every run and block
+//! retains UTF-8 source byte ranges, and the boundary map translates the
+//! editor's UTF-16 display positions without serializing or normalizing source.
+
+use std::ops::Range;
+
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryAffinity {
+    /// Resolve a collapsed display boundary toward the preceding source text.
+    Before,
+    /// Resolve a collapsed display boundary toward the following source text.
+    After,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    Paragraph,
+    Heading {
+        level: u8,
+    },
+    List {
+        ordered: Option<u64>,
+    },
+    ListItem,
+    Quote,
+    Code {
+        fenced: bool,
+        language: Option<String>,
+    },
+    FrontMatter,
+    Table,
+    Image {
+        destination: String,
+        title: Option<String>,
+        width: Option<u32>,
+    },
+    ThematicBreak,
+    Raw,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionBlock {
+    pub kind: BlockKind,
+    pub source: Range<usize>,
+    /// UTF-16 offsets into `DisplayProjection::text`.
+    pub display_utf16: Range<usize>,
+    /// Nesting depth among projected block elements.
+    pub depth: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineKind {
+    Text,
+    Strong,
+    Emphasis,
+    Strikethrough,
+    Superscript,
+    Subscript,
+    Code,
+    Link {
+        destination: String,
+        title: Option<String>,
+    },
+    Image {
+        destination: String,
+        title: Option<String>,
+    },
+    Html,
+    Math,
+    FootnoteReference,
+    TaskMarker {
+        checked: bool,
+    },
+    TableSeparator,
+    Break,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionRun {
+    /// UTF-16 offsets into `DisplayProjection::text`.
+    pub display_utf16: Range<usize>,
+    /// Source bytes that produced this run. Escapes and entities map to their
+    /// full raw spelling, including a backslash or entity delimiters.
+    pub source: Range<usize>,
+    /// Active inline formatting and semantic tags for this run.
+    pub kinds: Vec<InlineKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceBoundary {
+    pub before: usize,
+    pub after: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayProjection {
+    /// Rendered text with table cells separated by tabs and rows by newlines.
+    pub text: String,
+    pub blocks: Vec<ProjectionBlock>,
+    pub runs: Vec<ProjectionRun>,
+    /// Index `n` corresponds to UTF-16 display boundary `n`.
+    pub boundaries: Vec<SourceBoundary>,
+    pub source_len: usize,
+    source_boundary_bits: Vec<u64>,
+    source_spans: Vec<SourceProjectionSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceProjectionSpan {
+    source: Range<usize>,
+    display_utf16: Range<usize>,
+}
+
+impl DisplayProjection {
+    pub fn parse(source: &str) -> Self {
+        let mut builder = ProjectionBuilder::new(source);
+        let parser = Parser::new_ext(source, Options::all()).into_offset_iter();
+        for (event, range) in parser {
+            builder.process(event, range);
+        }
+        builder.finish()
+    }
+
+    /// Convert a display UTF-16 boundary to its nearest source byte boundary.
+    /// Hidden Markdown syntax creates a pair of valid choices; `affinity`
+    /// selects the preceding or following side. An offset inside a surrogate
+    /// pair resolves to the owning source character on the requested side.
+    pub fn source_byte_at_utf16(
+        &self,
+        display_utf16: usize,
+        affinity: BoundaryAffinity,
+    ) -> Option<usize> {
+        let boundary = self.boundaries.get(display_utf16)?;
+        Some(match affinity {
+            BoundaryAffinity::Before => boundary.before,
+            BoundaryAffinity::After => boundary.after,
+        })
+    }
+
+    /// Convert a source byte boundary to the nearest UTF-16 display boundary.
+    /// Source positions inside hidden Markdown collapse to that syntax's
+    /// display boundary. Invalid UTF-8 offsets are rejected.
+    pub fn utf16_at_source_byte(
+        &self,
+        source_byte: usize,
+        affinity: BoundaryAffinity,
+    ) -> Option<usize> {
+        if source_byte > self.source_len || !self.is_source_char_boundary(source_byte) {
+            return None;
+        }
+        if let Some(span) = self
+            .source_spans
+            .iter()
+            .find(|span| source_byte > span.source.start && source_byte < span.source.end)
+        {
+            return Some(match affinity {
+                BoundaryAffinity::Before => span.display_utf16.start,
+                BoundaryAffinity::After => span.display_utf16.end,
+            });
+        }
+        let mut nearest = None;
+        let mut nearest_distance = usize::MAX;
+        for (display, boundary) in self.boundaries.iter().enumerate() {
+            let selected = match affinity {
+                BoundaryAffinity::Before => boundary.before,
+                BoundaryAffinity::After => boundary.after,
+            };
+            if selected == source_byte {
+                return Some(display);
+            }
+            if source_byte >= boundary.before.min(boundary.after)
+                && source_byte <= boundary.before.max(boundary.after)
+            {
+                return Some(display);
+            }
+            let distance = selected.abs_diff(source_byte);
+            if distance < nearest_distance {
+                nearest = Some(display);
+                nearest_distance = distance;
+            }
+        }
+        nearest
+    }
+
+    fn is_source_char_boundary(&self, source_byte: usize) -> bool {
+        self.source_boundary_bits
+            .get(source_byte / 64)
+            .is_some_and(|word| word & (1 << (source_byte % 64)) != 0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EndTag {
+    Paragraph,
+    Heading,
+    List,
+    ListItem,
+    Quote,
+    Code,
+    FrontMatter,
+    Table,
+    Image,
+    Raw,
+    Footnote,
+}
+
+#[derive(Clone, Debug)]
+struct OpenBlock {
+    kind: BlockKind,
+    end_tag: EndTag,
+    source_start: usize,
+    display_start: usize,
+    depth: usize,
+}
+
+struct ProjectionBuilder<'a> {
+    source: &'a str,
+    text: String,
+    display_utf16: usize,
+    source_cursor: usize,
+    boundaries: Vec<SourceBoundary>,
+    blocks: Vec<ProjectionBlock>,
+    runs: Vec<ProjectionRun>,
+    source_spans: Vec<SourceProjectionSpan>,
+    open_blocks: Vec<OpenBlock>,
+    inline_stack: Vec<InlineKind>,
+    table_rows: usize,
+    table_cells: usize,
+    in_table: bool,
+}
+
+impl<'a> ProjectionBuilder<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            text: String::new(),
+            display_utf16: 0,
+            source_cursor: 0,
+            boundaries: vec![SourceBoundary {
+                before: 0,
+                after: 0,
+            }],
+            blocks: Vec::new(),
+            runs: Vec::new(),
+            source_spans: Vec::new(),
+            open_blocks: Vec::new(),
+            inline_stack: Vec::new(),
+            table_rows: 0,
+            table_cells: 0,
+            in_table: false,
+        }
+    }
+
+    fn process(&mut self, event: Event<'_>, range: Range<usize>) {
+        match event {
+            Event::Start(tag) => self.start_tag(&tag, range),
+            Event::End(tag) => self.end_tag(&tag, range),
+            Event::Text(value) => {
+                let kinds = self.current_kinds();
+                if self.in_literal_context() {
+                    self.append_literal(&value, range, kinds, '\n');
+                } else {
+                    self.append_visible(&value, range, kinds);
+                }
+            }
+            Event::Code(value) => {
+                let mut kinds = self.current_kinds();
+                kinds.push(InlineKind::Code);
+                self.append_inline_code(&value, range, kinds);
+            }
+            Event::Html(value) | Event::InlineHtml(value) => {
+                if !self.append_image_width_comment(&value, &range) {
+                    let mut kinds = self.current_kinds();
+                    kinds.push(InlineKind::Html);
+                    self.append_literal(&value, range, kinds, '\n');
+                }
+            }
+            Event::InlineMath(value) | Event::DisplayMath(value) => {
+                let mut kinds = self.current_kinds();
+                kinds.push(InlineKind::Math);
+                self.append_literal(&value, range, kinds, '\n');
+            }
+            Event::FootnoteReference(label) => {
+                let mut kinds = self.current_kinds();
+                kinds.push(InlineKind::FootnoteReference);
+                self.append_visible(&label, range, kinds);
+            }
+            Event::SoftBreak => {
+                self.append_visible(" ", range, vec![InlineKind::Break]);
+            }
+            Event::HardBreak => {
+                self.append_visible("\n", range, vec![InlineKind::Break]);
+            }
+            Event::Rule => {
+                self.hidden(&range);
+                self.blocks.push(ProjectionBlock {
+                    kind: BlockKind::ThematicBreak,
+                    source: range,
+                    display_utf16: self.display_utf16..self.display_utf16,
+                    depth: self.open_blocks.len(),
+                });
+            }
+            Event::TaskListMarker(checked) => {
+                let mut kinds = self.current_kinds();
+                kinds.push(InlineKind::TaskMarker { checked });
+                let visible = if checked { "☑" } else { "☐" };
+                self.append_visible(visible, range, kinds);
+            }
+        }
+    }
+
+    fn start_tag(&mut self, tag: &Tag<'_>, range: Range<usize>) {
+        match tag {
+            Tag::Paragraph => self.open_block(BlockKind::Paragraph, EndTag::Paragraph, &range),
+            Tag::Heading { level, .. } => self.open_block(
+                BlockKind::Heading {
+                    level: heading_level(level),
+                },
+                EndTag::Heading,
+                &range,
+            ),
+            Tag::List(start) => {
+                self.open_block(BlockKind::List { ordered: *start }, EndTag::List, &range)
+            }
+            Tag::Item => self.open_block(BlockKind::ListItem, EndTag::ListItem, &range),
+            Tag::BlockQuote(_) => self.open_block(BlockKind::Quote, EndTag::Quote, &range),
+            Tag::CodeBlock(kind) => {
+                let (fenced, language) = code_block_info(kind);
+                self.open_block(BlockKind::Code { fenced, language }, EndTag::Code, &range);
+                self.inline_stack.push(InlineKind::Code);
+            }
+            Tag::MetadataBlock(_) => {
+                self.open_block(BlockKind::FrontMatter, EndTag::FrontMatter, &range)
+            }
+            Tag::Table(_) => {
+                self.in_table = true;
+                self.table_rows = 0;
+                self.table_cells = 0;
+                self.open_block(BlockKind::Table, EndTag::Table, &range);
+            }
+            Tag::TableHead | Tag::TableRow => self.start_table_row(&range),
+            Tag::TableCell => self.start_table_cell(&range),
+            Tag::HtmlBlock => self.open_block(BlockKind::Raw, EndTag::Raw, &range),
+            Tag::FootnoteDefinition(_) => self.open_block(BlockKind::Raw, EndTag::Footnote, &range),
+            Tag::Emphasis => self.push_inline(InlineKind::Emphasis),
+            Tag::Strong => self.push_inline(InlineKind::Strong),
+            Tag::Strikethrough => self.push_inline(InlineKind::Strikethrough),
+            Tag::Superscript => self.push_inline(InlineKind::Superscript),
+            Tag::Subscript => self.push_inline(InlineKind::Subscript),
+            Tag::Link {
+                dest_url, title, ..
+            } => self.push_inline(InlineKind::Link {
+                destination: dest_url.to_string(),
+                title: nonempty(title.as_ref()),
+            }),
+            Tag::Image {
+                dest_url, title, ..
+            } => {
+                let destination = dest_url.to_string();
+                let title = nonempty(title.as_ref());
+                self.open_block(
+                    BlockKind::Image {
+                        destination: destination.clone(),
+                        title: title.clone(),
+                        width: None,
+                    },
+                    EndTag::Image,
+                    &range,
+                );
+                self.push_inline(InlineKind::Image { destination, title });
+            }
+            _ => self.hidden(&range),
+        }
+    }
+
+    fn end_tag(&mut self, tag: &TagEnd, range: Range<usize>) {
+        match tag {
+            TagEnd::Emphasis => self.pop_inline(&InlineKind::Emphasis, &range),
+            TagEnd::Strong => self.pop_inline(&InlineKind::Strong, &range),
+            TagEnd::Strikethrough => self.pop_inline(&InlineKind::Strikethrough, &range),
+            TagEnd::Superscript => self.pop_inline(&InlineKind::Superscript, &range),
+            TagEnd::Subscript => self.pop_inline(&InlineKind::Subscript, &range),
+            TagEnd::Link => {
+                self.pop_inline_matching(|kind| matches!(kind, InlineKind::Link { .. }), &range)
+            }
+            TagEnd::Image => {
+                self.pop_inline_matching(|kind| matches!(kind, InlineKind::Image { .. }), &range);
+                self.close_block(&EndTag::Image, &range);
+            }
+            TagEnd::CodeBlock => {
+                self.pop_inline(&InlineKind::Code, &range);
+                self.close_block(&EndTag::Code, &range);
+            }
+            TagEnd::Table => {
+                self.close_block(&EndTag::Table, &range);
+                self.in_table = false;
+            }
+            TagEnd::TableCell => self.hidden(&range),
+            TagEnd::HtmlBlock => self.close_block(&EndTag::Raw, &range),
+            TagEnd::FootnoteDefinition => self.close_block(&EndTag::Footnote, &range),
+            _ => {
+                if let Some(end_tag) = end_tag_for_block(tag) {
+                    self.close_block(&end_tag, &range);
+                } else {
+                    self.hidden(&range);
+                }
+            }
+        }
+    }
+
+    fn open_block(&mut self, kind: BlockKind, end_tag: EndTag, range: &Range<usize>) {
+        self.open_blocks.push(OpenBlock {
+            kind,
+            end_tag,
+            source_start: range.start,
+            display_start: self.display_utf16,
+            depth: self.open_blocks.len(),
+        });
+    }
+
+    fn close_block(&mut self, end_tag: &EndTag, range: &Range<usize>) {
+        self.hidden(range);
+        let Some(index) = self
+            .open_blocks
+            .iter()
+            .rposition(|open| &open.end_tag == end_tag)
+        else {
+            return;
+        };
+        let open = self.open_blocks.remove(index);
+        self.blocks.push(ProjectionBlock {
+            kind: open.kind,
+            source: open.source_start..range.end.max(open.source_start),
+            display_utf16: open.display_start..self.display_utf16,
+            depth: open.depth,
+        });
+    }
+
+    fn push_inline(&mut self, kind: InlineKind) {
+        self.inline_stack.push(kind);
+    }
+
+    fn pop_inline(&mut self, kind: &InlineKind, range: &Range<usize>) {
+        self.pop_inline_matching(|current| current == kind, range);
+    }
+
+    fn pop_inline_matching(&mut self, matches: impl Fn(&InlineKind) -> bool, range: &Range<usize>) {
+        self.hidden(range);
+        if let Some(index) = self.inline_stack.iter().rposition(matches) {
+            self.inline_stack.remove(index);
+        }
+    }
+
+    fn start_table_row(&mut self, range: &Range<usize>) {
+        if self.table_rows > 0 {
+            self.append_synthetic("\n", range.start);
+        }
+        self.table_rows += 1;
+        self.table_cells = 0;
+    }
+
+    fn start_table_cell(&mut self, range: &Range<usize>) {
+        if self.table_cells > 0 {
+            self.append_synthetic("\t", range.start);
+        }
+        self.table_cells += 1;
+    }
+
+    fn current_kinds(&self) -> Vec<InlineKind> {
+        if self.inline_stack.is_empty() {
+            vec![InlineKind::Text]
+        } else {
+            self.inline_stack.clone()
+        }
+    }
+
+    fn in_literal_context(&self) -> bool {
+        self.inline_stack.contains(&InlineKind::Code)
+            || self.open_blocks.iter().any(|block| {
+                matches!(
+                    block.kind,
+                    BlockKind::Code { .. } | BlockKind::FrontMatter | BlockKind::Raw
+                )
+            })
+    }
+
+    fn append_visible(&mut self, visible: &str, range: Range<usize>, kinds: Vec<InlineKind>) {
+        if range.start > range.end || range.end > self.source.len() {
+            self.append_synthetic(visible, self.source_cursor);
+            return;
+        }
+        let range = include_escape_prefix(self.source, range);
+        let raw = self.source.get(range.clone()).unwrap_or_default();
+        let tokens = align_visible_tokens(raw, range.start, visible);
+        self.append_tokens(visible, range, kinds, tokens);
+    }
+
+    fn append_literal(
+        &mut self,
+        visible: &str,
+        range: Range<usize>,
+        kinds: Vec<InlineKind>,
+        newline: char,
+    ) {
+        if range.start > range.end || range.end > self.source.len() {
+            self.append_synthetic(visible, self.source_cursor);
+            return;
+        }
+        let raw = self.source.get(range.clone()).unwrap_or_default();
+        let tokens = align_literal_tokens(raw, range.start, visible, newline);
+        self.append_tokens(visible, range, kinds, tokens);
+    }
+
+    fn append_inline_code(&mut self, visible: &str, range: Range<usize>, kinds: Vec<InlineKind>) {
+        if range.start > range.end || range.end > self.source.len() {
+            self.append_synthetic(visible, self.source_cursor);
+            return;
+        }
+        let tokens = inline_code_tokens(self.source, range.clone(), visible);
+        self.append_tokens(visible, range.clone(), kinds, tokens);
+        // Inline code has no Start/End events, so collapse the closing
+        // backtick delimiter here after mapping each literal content scalar.
+        self.hidden(&range);
+    }
+
+    fn append_tokens(
+        &mut self,
+        visible: &str,
+        range: Range<usize>,
+        kinds: Vec<InlineKind>,
+        tokens: Vec<(String, Range<usize>)>,
+    ) {
+        let display_start = self.display_utf16;
+        let mut source_start = range.start;
+        let mut source_end = range.end;
+        if !tokens.is_empty() {
+            source_start = tokens.first().map_or(range.start, |token| token.1.start);
+            source_end = tokens.last().map_or(range.end, |token| token.1.end);
+            for (text, source_range) in tokens {
+                self.append_chunk(&text, source_range);
+            }
+        } else if !visible.is_empty() {
+            self.append_chunk(visible, range.clone());
+        }
+        if self.display_utf16 > display_start {
+            self.runs.push(ProjectionRun {
+                display_utf16: display_start..self.display_utf16,
+                source: source_start..source_end,
+                kinds,
+            });
+        } else {
+            self.hidden(&range);
+        }
+    }
+
+    fn append_synthetic(&mut self, text: &str, source_anchor: usize) {
+        if text.is_empty() {
+            return;
+        }
+        let anchor = source_anchor.min(self.source.len());
+        self.set_current_boundary(self.source_cursor, anchor);
+        let display_start = self.display_utf16;
+        self.text.push_str(text);
+        let units = text.encode_utf16().count();
+        for _ in 0..units {
+            self.boundaries.push(SourceBoundary {
+                before: anchor,
+                after: anchor,
+            });
+        }
+        self.display_utf16 += units;
+        self.source_cursor = anchor;
+        self.runs.push(ProjectionRun {
+            display_utf16: display_start..self.display_utf16,
+            source: self.source_cursor..self.source_cursor,
+            kinds: vec![InlineKind::TableSeparator],
+        });
+    }
+
+    fn append_chunk(&mut self, text: &str, source: Range<usize>) {
+        if text.is_empty() {
+            return;
+        }
+        let display_start = self.display_utf16;
+        let start = source.start.min(self.source.len());
+        let end = source.end.min(self.source.len()).max(start);
+        self.set_current_boundary(
+            self.source_cursor,
+            visible_source_start(self.source.get(start..end).unwrap_or_default(), start),
+        );
+        let scalar_count = text.chars().count();
+        for (scalar_index, character) in text.chars().enumerate() {
+            self.text.push(character);
+            for _ in 1..character.len_utf16() {
+                self.boundaries.push(SourceBoundary {
+                    before: start,
+                    after: end,
+                });
+            }
+            let is_final_scalar = scalar_index + 1 == scalar_count;
+            self.boundaries.push(if is_final_scalar {
+                SourceBoundary {
+                    before: end,
+                    after: end,
+                }
+            } else {
+                SourceBoundary {
+                    before: start,
+                    after: end,
+                }
+            });
+            self.display_utf16 += character.len_utf16();
+        }
+        if self.source.get(start..end) != Some(text) {
+            self.source_spans.push(SourceProjectionSpan {
+                source: start..end,
+                display_utf16: display_start..self.display_utf16,
+            });
+        }
+        self.source_cursor = end;
+    }
+
+    fn set_current_boundary(&mut self, before: usize, after: usize) {
+        if let Some(boundary) = self.boundaries.last_mut() {
+            boundary.before = boundary.before.min(before);
+            boundary.after = boundary.after.max(after);
+        }
+    }
+
+    fn hidden(&mut self, range: &Range<usize>) {
+        if range.start > range.end || range.end > self.source.len() {
+            return;
+        }
+        self.set_current_boundary(self.source_cursor, range.end);
+    }
+
+    fn append_image_width_comment(&mut self, html: &str, range: &Range<usize>) -> bool {
+        let Some(width) = parse_image_width_comment(html) else {
+            return false;
+        };
+        let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+            matches!(block.kind, BlockKind::Image { .. })
+                && block.source.end <= range.start
+                && self
+                    .source
+                    .get(block.source.end..range.start)
+                    .is_some_and(|gap| gap.chars().all(char::is_whitespace))
+        }) else {
+            return false;
+        };
+        if let BlockKind::Image {
+            width: image_width, ..
+        } = &mut block.kind
+        {
+            *image_width = Some(width);
+        }
+        block.source.end = range.end;
+        self.hidden(range);
+        true
+    }
+
+    fn finish(mut self) -> DisplayProjection {
+        for open in self.open_blocks.drain(..) {
+            self.blocks.push(ProjectionBlock {
+                kind: open.kind,
+                source: open.source_start..self.source.len(),
+                display_utf16: open.display_start..self.display_utf16,
+                depth: open.depth,
+            });
+        }
+        if let Some(boundary) = self.boundaries.last_mut() {
+            boundary.before = boundary.before.min(self.source_cursor);
+            boundary.after = boundary.after.max(self.source.len());
+        }
+        self.blocks.sort_by(|left, right| {
+            left.source
+                .start
+                .cmp(&right.source.start)
+                .then_with(|| right.source.end.cmp(&left.source.end))
+        });
+        DisplayProjection {
+            text: self.text,
+            blocks: self.blocks,
+            runs: self.runs,
+            boundaries: self.boundaries,
+            source_len: self.source.len(),
+            source_boundary_bits: source_boundary_bits(self.source),
+            source_spans: self.source_spans,
+        }
+    }
+}
+
+fn end_tag_for_block(tag: &TagEnd) -> Option<EndTag> {
+    match tag {
+        TagEnd::Paragraph => Some(EndTag::Paragraph),
+        TagEnd::Heading(_) => Some(EndTag::Heading),
+        TagEnd::List(_) => Some(EndTag::List),
+        TagEnd::Item => Some(EndTag::ListItem),
+        TagEnd::BlockQuote(_) => Some(EndTag::Quote),
+        TagEnd::MetadataBlock(_) => Some(EndTag::FrontMatter),
+        _ => None,
+    }
+}
+
+fn heading_level(level: &HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn code_block_info(kind: &CodeBlockKind<'_>) -> (bool, Option<String>) {
+    match kind {
+        CodeBlockKind::Fenced(info) => {
+            let language = info
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            (true, language)
+        }
+        CodeBlockKind::Indented => (false, None),
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn parse_image_width_comment(html: &str) -> Option<u32> {
+    let html = html.trim();
+    let body = html.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
+    let width = body.strip_prefix("mdlite-width:")?.trim().parse().ok()?;
+    (width > 0).then_some(width)
+}
+
+fn source_boundary_bits(source: &str) -> Vec<u64> {
+    let mut bits = vec![0; source.len() / 64 + 1];
+    for (byte, _) in source
+        .char_indices()
+        .chain(std::iter::once((source.len(), '\0')))
+    {
+        bits[byte / 64] |= 1 << (byte % 64);
+    }
+    bits
+}
+
+fn align_visible_tokens(raw: &str, base: usize, visible: &str) -> Vec<(String, Range<usize>)> {
+    if visible.is_empty() {
+        return Vec::new();
+    }
+    align_tokens(source_tokens(raw, base), base..base + raw.len(), visible)
+}
+
+fn align_literal_tokens(
+    raw: &str,
+    base: usize,
+    visible: &str,
+    newline: char,
+) -> Vec<(String, Range<usize>)> {
+    if visible.is_empty() {
+        return Vec::new();
+    }
+    align_tokens(
+        literal_source_tokens(raw, base, newline),
+        base..base + raw.len(),
+        visible,
+    )
+}
+
+fn align_tokens(
+    raw_tokens: Vec<(String, Range<usize>)>,
+    fallback_range: Range<usize>,
+    visible: &str,
+) -> Vec<(String, Range<usize>)> {
+    let mut visible_offset = 0;
+    let mut mapped = Vec::new();
+    for (token, range) in raw_tokens {
+        if visible[visible_offset..].starts_with(&token) {
+            visible_offset += token.len();
+            mapped.push((token, range));
+            if visible_offset == visible.len() {
+                break;
+            }
+        }
+    }
+    if visible_offset < visible.len() {
+        // Parser-normalized whitespace and uncommon entity forms still get a
+        // deterministic source anchor. Common characters, escapes and HTML
+        // entities above retain their exact individual source spans.
+        mapped.push((visible[visible_offset..].to_owned(), fallback_range));
+    }
+    mapped
+}
+
+fn include_escape_prefix(source: &str, range: Range<usize>) -> Range<usize> {
+    if range.start > range.end || range.end > source.len() {
+        return range;
+    }
+    let Some(first) = source
+        .get(range.start..range.end)
+        .and_then(|text| text.chars().next())
+    else {
+        return range;
+    };
+    if !first.is_ascii_punctuation() || first == '\\' {
+        return range;
+    }
+    let mut start = range.start;
+    while start > 0 && source.as_bytes().get(start - 1) == Some(&b'\\') {
+        start -= 1;
+    }
+    let slash_count = range.start - start;
+    if slash_count.is_multiple_of(2) {
+        range
+    } else {
+        start..range.end
+    }
+}
+
+fn visible_source_start(raw: &str, source_start: usize) -> usize {
+    let Some(escaped) = raw.strip_prefix('\\') else {
+        return source_start;
+    };
+    if escaped
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_punctuation())
+    {
+        source_start + 1
+    } else {
+        source_start
+    }
+}
+
+fn literal_source_tokens(raw: &str, base: usize, newline: char) -> Vec<(String, Range<usize>)> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let Some(rest) = raw.get(offset..) else {
+            break;
+        };
+        if rest.starts_with("\r\n") {
+            tokens.push((newline.to_string(), base + offset..base + offset + 2));
+            offset += 2;
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        let end = offset + character.len_utf8();
+        if matches!(character, '\r' | '\n') {
+            tokens.push((newline.to_string(), base + offset..base + end));
+        } else {
+            tokens.push((character.to_string(), base + offset..base + end));
+        }
+        offset = end;
+    }
+    tokens
+}
+
+// pulldown-cmark emits one space for each CR or LF scalar in inline code,
+// including both bytes of a CRLF pair; keep that event text and map each space
+// to its corresponding source scalar.
+fn inline_code_source_tokens(raw: &str, base: usize) -> Vec<(String, Range<usize>)> {
+    raw.char_indices()
+        .map(|(offset, character)| {
+            let end = offset + character.len_utf8();
+            let value = if matches!(character, '\r' | '\n') {
+                " ".to_owned()
+            } else {
+                character.to_string()
+            };
+            (value, base + offset..base + end)
+        })
+        .collect()
+}
+
+fn inline_code_tokens(
+    source: &str,
+    range: Range<usize>,
+    visible: &str,
+) -> Vec<(String, Range<usize>)> {
+    let Some(raw) = source.get(range.clone()) else {
+        return Vec::new();
+    };
+    let opening = raw.bytes().take_while(|byte| *byte == b'`').count();
+    let closing = raw.bytes().rev().take_while(|byte| *byte == b'`').count();
+    let has_delimiters = opening > 0 && opening == closing && opening + closing <= raw.len();
+    let content_start = range.start + usize::from(has_delimiters) * opening;
+    let content_end = range.end - usize::from(has_delimiters) * closing;
+    let content = source.get(content_start..content_end).unwrap_or_default();
+    let mut tokens = inline_code_source_tokens(content, content_start);
+    let normalized: String = tokens.iter().map(|(text, _)| text.as_str()).collect();
+    if normalized.starts_with(' ')
+        && normalized.ends_with(' ')
+        && normalized.chars().any(|character| character != ' ')
+    {
+        if tokens.first().is_some_and(|(text, _)| text == " ") {
+            tokens.remove(0);
+        }
+        if tokens.last().is_some_and(|(text, _)| text == " ") {
+            tokens.pop();
+        }
+    }
+    let normalized: String = tokens.iter().map(|(text, _)| text.as_str()).collect();
+    if normalized == visible {
+        tokens
+    } else {
+        align_tokens(tokens, content_start..content_end, visible)
+    }
+}
+
+fn source_tokens(raw: &str, base: usize) -> Vec<(String, Range<usize>)> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let Some(rest) = raw.get(offset..) else {
+            break;
+        };
+        if rest.starts_with('\\') {
+            let after_slash = offset + 1;
+            if let Some(character) = raw.get(after_slash..).and_then(|tail| tail.chars().next())
+                && character.is_ascii_punctuation()
+            {
+                let end = after_slash + character.len_utf8();
+                tokens.push((character.to_string(), base + offset..base + end));
+                offset = end;
+                continue;
+            }
+        }
+        if rest.starts_with('&')
+            && let Some((decoded, end)) = entity_at(raw, offset)
+        {
+            tokens.push((decoded, base + offset..base + end));
+            offset = end;
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        let end = offset + character.len_utf8();
+        tokens.push((character.to_string(), base + offset..base + end));
+        offset = end;
+    }
+    tokens
+}
+
+fn entity_at(raw: &str, start: usize) -> Option<(String, usize)> {
+    let rest = raw.get(start..)?;
+    let mut end = start + 1;
+    for character in rest[1..].chars().take(40) {
+        if !(character.is_ascii_alphanumeric() || matches!(character, '#' | ';')) {
+            break;
+        }
+        end += character.len_utf8();
+        if character == ';' {
+            break;
+        }
+    }
+    if end == start + 1 {
+        return None;
+    }
+    let candidate = raw.get(start..end)?;
+    let decoded = Parser::new(candidate).find_map(|event| match event {
+        Event::Text(text) => Some(text.to_string()),
+        _ => None,
+    })?;
+    (decoded != candidate).then_some((decoded, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projects_blocks_inline_formatting_and_image_metadata_without_changing_source() {
+        let source = "---\ntitle: 日本語\n---\n\n# **見出し**\n\n> 引用\n\n- 項目\n\n```rust\nlet x = 1;\n```\n\n![猫](cat.png)<!-- mdlite-width:320 -->";
+        let projection = DisplayProjection::parse(source);
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::FrontMatter)
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Heading { level: 1 })
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Quote)
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::List { ordered: None })
+        );
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+        );
+        let image = projection
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Image { .. }))
+            .expect("image block");
+        assert!(
+            matches!(&image.kind, BlockKind::Image { destination, width: Some(320), .. } if destination == "cat.png")
+        );
+        assert_eq!(
+            &source[image.source.clone()],
+            "![猫](cat.png)<!-- mdlite-width:320 -->"
+        );
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Strong))
+        );
+        assert!(projection.text.contains("見出し"));
+        assert!(!projection.text.contains("mdlite-width"));
+        assert_eq!(
+            source,
+            "---\ntitle: 日本語\n---\n\n# **見出し**\n\n> 引用\n\n- 項目\n\n```rust\nlet x = 1;\n```\n\n![猫](cat.png)<!-- mdlite-width:320 -->"
+        );
+    }
+
+    #[test]
+    fn maps_utf16_unicode_escapes_entities_and_hidden_markdown_with_affinity() {
+        let source = "# **A😺** &amp; [日本](docs/a.md)";
+        let projection = DisplayProjection::parse(source);
+        assert_eq!(projection.text, "A😺 & 日本");
+        assert_eq!(
+            projection.boundaries.len(),
+            projection.text.encode_utf16().count() + 1
+        );
+        let a_start = source.find('A').expect("A");
+        assert_eq!(
+            projection.source_byte_at_utf16(0, BoundaryAffinity::Before),
+            Some(0)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(0, BoundaryAffinity::After),
+            Some(a_start)
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(a_start, BoundaryAffinity::After),
+            Some(0)
+        );
+        let emoji_start = source.find("😺").expect("emoji");
+        assert!(
+            projection
+                .utf16_at_source_byte(emoji_start + 1, BoundaryAffinity::After)
+                .is_none()
+        );
+
+        let amp_display_end = 5;
+        let entity_start = source.find("&amp;").expect("entity");
+        assert_eq!(
+            projection.source_byte_at_utf16(amp_display_end, BoundaryAffinity::After),
+            Some(entity_start + "&amp;".len())
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(entity_start + 2, BoundaryAffinity::Before),
+            Some(4)
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(entity_start + 2, BoundaryAffinity::After),
+            Some(5)
+        );
+        assert!(projection.runs.iter().any(|run| {
+            run.source == (entity_start..entity_start + "&amp;".len())
+                && run.display_utf16 == (4..5)
+        }));
+        let label_start = source.find("日本").expect("label");
+        assert_eq!(
+            projection.utf16_at_source_byte(label_start, BoundaryAffinity::After),
+            Some(6)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(3, BoundaryAffinity::Before),
+            Some(source.find("😺").expect("emoji") + "😺".len())
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(3, BoundaryAffinity::After),
+            Some(source.find("** &amp;").expect("closing strong") + 2)
+        );
+        let label_end = label_start + "日本".len();
+        assert_eq!(
+            projection.source_byte_at_utf16(8, BoundaryAffinity::Before),
+            Some(label_end)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(8, BoundaryAffinity::After),
+            Some(source.len())
+        );
+    }
+
+    #[test]
+    fn projects_table_cells_with_source_affine_separators_and_keeps_malformed_source_literal() {
+        let source = "before\n| **h** | b |\n| --- | --- |\n| a\\|b | &amp; |\n\nafter";
+        let projection = DisplayProjection::parse(source);
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Table)
+        );
+        assert!(projection.text.contains("h\tb\na|b\t&"));
+        assert!(
+            projection
+                .runs
+                .iter()
+                .any(|run| run.kinds.contains(&InlineKind::Strong))
+        );
+        let displayed_pipe = projection.text.find("a|b").expect("visible pipe") + 1;
+        let source_escape = source.find("a\\|b").expect("escaped pipe") + 1;
+        assert_eq!(
+            projection.source_byte_at_utf16(displayed_pipe, BoundaryAffinity::Before),
+            Some(source_escape)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(displayed_pipe, BoundaryAffinity::After),
+            Some(source_escape + 1)
+        );
+        let displayed_amp_end = projection.text.find('&').expect("entity") + 1;
+        let source_amp_end = source.find("&amp;").expect("source entity") + "&amp;".len();
+        assert_eq!(
+            projection.source_byte_at_utf16(displayed_amp_end, BoundaryAffinity::Before),
+            Some(source_amp_end)
+        );
+        let escape_start = source.find("a\\|b").expect("escaped cell") + 1;
+        let escaped_run = projection
+            .runs
+            .iter()
+            .find(|run| run.display_utf16.start == displayed_pipe)
+            .expect("escaped text run");
+        assert_eq!(escaped_run.source, escape_start..escape_start + 3);
+        let malformed = "| heading | other |\n| --- |\n| value | other |";
+        let malformed_projection = DisplayProjection::parse(malformed);
+        assert!(malformed_projection.text.contains("heading"));
+        assert!(
+            !malformed_projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Table)
+        );
+        assert_eq!(malformed_projection.source_len, malformed.len());
+    }
+
+    #[test]
+    fn inline_and_block_code_and_front_matter_keep_escape_and_entity_spelling_literal() {
+        let inline_source = "`a\\*b &amp;`";
+        let inline = DisplayProjection::parse(inline_source);
+        assert_eq!(inline.text, "a\\*b &amp;");
+        let inline_run = inline
+            .runs
+            .iter()
+            .find(|run| run.kinds.contains(&InlineKind::Code))
+            .expect("inline code run");
+        assert_eq!(inline_run.source, 1..inline_source.len() - 1);
+        let inline_star = inline.text.find('*').expect("literal star");
+        let source_star = inline_source.find('*').expect("source star");
+        assert_eq!(
+            inline.source_byte_at_utf16(inline_star, BoundaryAffinity::After),
+            Some(source_star)
+        );
+        assert_eq!(
+            inline.utf16_at_source_byte(source_star, BoundaryAffinity::After),
+            Some(inline_star)
+        );
+
+        let fenced_source = "```txt\na\\*b &amp;\n```";
+        let fenced = DisplayProjection::parse(fenced_source);
+        assert!(fenced.text.contains("a\\*b &amp;"));
+        let fenced_star = fenced.text.find('*').expect("fenced literal star");
+        assert_eq!(
+            fenced.source_byte_at_utf16(fenced_star, BoundaryAffinity::After),
+            Some(fenced_source.find('*').expect("fenced source star"))
+        );
+
+        let front_matter_source = "---\nvalue: a\\* &amp;\n---\n# body";
+        let front_matter = DisplayProjection::parse(front_matter_source);
+        assert!(front_matter.text.contains("a\\* &amp;"));
+        let front_matter_amp = front_matter.text.find("&amp;").expect("literal entity");
+        assert_eq!(
+            front_matter.source_byte_at_utf16(front_matter_amp, BoundaryAffinity::After),
+            Some(front_matter_source.find("&amp;").expect("source entity"))
+        );
+    }
+
+    #[test]
+    fn inline_code_crlf_spaces_map_to_their_source_scalars() {
+        let source = "`a\r\nb`";
+        let projection = DisplayProjection::parse(source);
+        assert_eq!(projection.text, "a  b");
+        let space = 1;
+        let newline_start = source.find("\r\n").expect("CRLF");
+        assert_eq!(
+            projection.source_byte_at_utf16(space, BoundaryAffinity::Before),
+            Some(newline_start)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(space + 1, BoundaryAffinity::Before),
+            Some(newline_start + 1)
+        );
+        assert_eq!(
+            projection.source_byte_at_utf16(space + 2, BoundaryAffinity::Before),
+            Some(newline_start + 2)
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(newline_start, BoundaryAffinity::Before),
+            Some(space)
+        );
+        assert_eq!(
+            projection.utf16_at_source_byte(newline_start + 1, BoundaryAffinity::Before),
+            Some(space + 1)
+        );
+    }
+}

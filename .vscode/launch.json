@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "MDLite Rust Debug",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/mdlite.exe",
+      "args": ["${workspaceFolder}/samples/rust-editor/editor.md"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "MDLite: Rust Debug build"
+    },
+    {
+      "name": "MDLite Rust Release",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/release/mdlite.exe",
+      "args": ["${workspaceFolder}/samples/rust-editor/editor.md"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "MDLite: Rust Release build"
+    }
+  ]
+}

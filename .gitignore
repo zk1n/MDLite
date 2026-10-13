@@ -36,3 +36,8 @@ CMakeFiles/
 *.key
 *.pem
 *.dmp
+
+# Rust experiment artifacts and private task inputs
+/target/
+/.codex-runtime/
+/samples/

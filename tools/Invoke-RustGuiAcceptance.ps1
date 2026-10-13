@@ -96,6 +96,15 @@ public static class MdliteRustAcceptanceNative
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint threadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern short VkKeyScanExW(char character, IntPtr keyboardLayout);
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int virtualKey);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int GetClassNameW(IntPtr window, StringBuilder className, int capacity);
 
@@ -131,6 +140,27 @@ public static class MdliteRustAcceptanceNative
         uint actualProcessId;
         GetWindowThreadProcessId(window, out actualProcessId);
         return actualProcessId == expectedProcessId;
+    }
+
+    public static IntPtr OwnedWindowKeyboardLayout(IntPtr window, uint expectedProcessId)
+    {
+        if (!IsOwnedWindow(window, expectedProcessId))
+            return IntPtr.Zero;
+        uint actualProcessId;
+        uint threadId = GetWindowThreadProcessId(window, out actualProcessId);
+        if (threadId == 0 || actualProcessId != expectedProcessId)
+            return IntPtr.Zero;
+        return GetKeyboardLayout(threadId);
+    }
+
+    public static short MapAsciiCharacter(char character, IntPtr keyboardLayout)
+    {
+        return VkKeyScanExW(character, keyboardLayout);
+    }
+
+    public static bool CapsLockIsOn()
+    {
+        return (GetKeyState(0x14) & 1) != 0;
     }
 
     private static bool IsOwnedForeground(IntPtr expectedWindow, uint expectedProcessId)
@@ -198,6 +228,7 @@ $script:ProcessId = [uint32]0
 $script:DiagnosticPath = $null
 $script:PromptOpen = $false
 $script:ReportPath = $null
+$script:ForegroundLogPath = $null
 $script:ImeInitialOpen = $null
 $script:ImeProfile = $null
 $script:ImeRestorePending = $false
@@ -218,9 +249,13 @@ $script:Report = [ordered]@{
     hwnd = $null
     visible = $null
     dpi = $null
+    foreground_log_path = $null
+    foreground_acquired_utc = $null
     active_input_profile = $null
     ime_open_status = $null
-    input_delivery = 'Visible Release app; text uses Unicode SendInput; keys and modifiers use virtual-key SendInput through the normal window message loop.'
+    input_delivery = 'Visible Release app; ASCII uses current-layout virtual-key SendInput; Japanese packet text is a separate Unicode path; commands and modifiers use virtual keys through the normal window message loop.'
+    ascii_keyboard_layout = $null
+    ascii_caps_lock_on = $null
     ime_status = 'PENDING'
     ime_open_initial = $null
     ime_open_restored = $null
@@ -288,15 +323,55 @@ function Assert-OwnedWindow([IntPtr]$Window) {
     }
 }
 
-function Set-OwnedForeground {
-    Assert-OwnedWindow $script:WindowHandle
-    if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $script:WindowHandle) {
-        [void][MdliteRustAcceptanceNative]::SetForegroundWindow($script:WindowHandle)
+function Set-OwnedForeground(
+    [IntPtr]$Window = $script:WindowHandle,
+    [int]$WaitMs = 5000
+) {
+    Assert-OwnedWindow $Window
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
+    $activationLogged = $false
+    do {
+        Assert-OwnedWindow $Window
+        $foreground = [MdliteRustAcceptanceNative]::GetForegroundWindow()
+        [uint32]$foregroundProcessId = 0
+        if ($foreground -ne [IntPtr]::Zero) {
+            [void][MdliteRustAcceptanceNative]::GetWindowThreadProcessId(
+                $foreground, [ref]$foregroundProcessId)
+        }
+        if ($foreground -eq $Window -and $foregroundProcessId -eq $script:ProcessId) {
+            if ($activationLogged) {
+                $confirmed = 'FOREGROUND_CONFIRMED pid={0} hwnd=0x{1:X} foreground_pid={2} foreground_hwnd=0x{3:X}' -f
+                    $script:ProcessId, $Window.ToInt64(), $foregroundProcessId, $foreground.ToInt64()
+                Write-Host $confirmed
+                if (-not [string]::IsNullOrWhiteSpace($script:ForegroundLogPath)) {
+                    [IO.File]::AppendAllText(
+                        $script:ForegroundLogPath, $confirmed + [Environment]::NewLine,
+                        [Text.UTF8Encoding]::new($false))
+                }
+            }
+            if ($null -eq $script:Report.foreground_acquired_utc) {
+                $script:Report.foreground_acquired_utc = [DateTime]::UtcNow.ToString('o')
+            }
+            return
+        }
+        if (-not $activationLogged) {
+            $required = 'FOREGROUND_REQUIRED pid={0} hwnd=0x{1:X}' -f
+                $script:ProcessId, $Window.ToInt64()
+            Write-Host $required
+            if (-not [string]::IsNullOrWhiteSpace($script:ForegroundLogPath)) {
+                [IO.File]::AppendAllText(
+                    $script:ForegroundLogPath, $required + [Environment]::NewLine,
+                    [Text.UTF8Encoding]::new($false))
+            }
+            $activationLogged = $true
+        }
+        [void][MdliteRustAcceptanceNative]::SetForegroundWindow($Window)
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "The verified owned HWND did not become foreground within $WaitMs ms."
+        }
         Start-Sleep -Milliseconds 100
-    }
-    if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $script:WindowHandle) {
-        throw 'The visible Release window did not become the foreground input target.'
-    }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The verified owned HWND did not become foreground within $WaitMs ms."
 }
 
 function Send-Key(
@@ -304,7 +379,7 @@ function Send-Key(
     [int]$VirtualKey,
     [uint16[]]$Modifiers = @()
 ) {
-    Assert-OwnedWindow $TargetWindow
+    Set-OwnedForeground -Window $TargetWindow
     $expected = 2 + (2 * $Modifiers.Length)
     $sent = [MdliteRustAcceptanceNative]::SendVirtualKey(
         $TargetWindow, $script:ProcessId, [uint16]$VirtualKey, $Modifiers)
@@ -313,13 +388,68 @@ function Send-Key(
     }
 }
 
-function Send-Text([string]$Text) {
+function Send-UnicodeText([string]$Text) {
     Set-OwnedForeground
     $expected = 2 * $Text.Length
     $sent = [MdliteRustAcceptanceNative]::SendUnicodeText(
         $script:WindowHandle, $script:ProcessId, $Text)
     if ($sent -ne $expected) {
         throw "SendInput delivered $sent of $expected Unicode key events to the verified owned foreground window."
+    }
+}
+
+function Send-Ascii([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    Set-OwnedForeground
+    $keyboardLayout = [MdliteRustAcceptanceNative]::OwnedWindowKeyboardLayout(
+        $script:WindowHandle, $script:ProcessId)
+    if ($keyboardLayout -eq [IntPtr]::Zero) {
+        throw 'The exact owned window did not expose its current keyboard layout.'
+    }
+    $capsLockOn = [MdliteRustAcceptanceNative]::CapsLockIsOn()
+    if ($null -eq $script:Report.ascii_caps_lock_on) {
+        $script:Report.ascii_caps_lock_on = $capsLockOn
+        $script:Report.ascii_keyboard_layout = '0x{0:X}' -f $keyboardLayout.ToInt64()
+    } elseif ([bool]$script:Report.ascii_caps_lock_on -ne $capsLockOn -or
+              [string]$script:Report.ascii_keyboard_layout -cne ('0x{0:X}' -f $keyboardLayout.ToInt64())) {
+        throw 'The observed CapsLock state or owned-window keyboard layout changed during ASCII input.'
+    }
+
+    $mappedKeys = @()
+    foreach ($character in $Text.ToCharArray()) {
+        $code = [int]$character
+        if ($code -lt 0x20 -or $code -gt 0x7e) {
+            throw 'Send-Ascii accepts printable ASCII characters only.'
+        }
+        $mapped = [MdliteRustAcceptanceNative]::MapAsciiCharacter($character, $keyboardLayout)
+        if ($mapped -eq -1) {
+            throw ('The current keyboard layout cannot produce ASCII U+{0:X4}.' -f $code)
+        }
+        $shiftState = ([int]$mapped -shr 8) -band 0xff
+        if (($shiftState -band 0xfe) -ne 0) {
+            throw ('ASCII U+{0:X4} requires Ctrl/Alt in the current layout; refusing that mapping.' -f $code)
+        }
+        $isLetter = ($code -ge 0x41 -and $code -le 0x5a) -or
+                    ($code -ge 0x61 -and $code -le 0x7a)
+        if ($capsLockOn -and $isLetter) { $shiftState = $shiftState -bxor 1 }
+        [uint16[]]$modifiers = @()
+        if ($shiftState -band 1) { $modifiers = [uint16[]]@(0x10) }
+        $mappedKeys += [pscustomobject]@{
+            virtual_key = [int]([int]$mapped -band 0xff)
+            modifiers = $modifiers
+        }
+    }
+
+    foreach ($key in $mappedKeys) {
+        $currentLayout = [MdliteRustAcceptanceNative]::OwnedWindowKeyboardLayout(
+            $script:WindowHandle, $script:ProcessId)
+        if ($currentLayout -ne $keyboardLayout) {
+            throw 'The owned-window keyboard layout changed during ASCII input; no profile switch was requested.'
+        }
+        if ([MdliteRustAcceptanceNative]::CapsLockIsOn() -ne $capsLockOn) {
+            throw 'CapsLock changed during ASCII input; the harness did not modify it.'
+        }
+        Send-Key $script:WindowHandle $key.virtual_key $key.modifiers
     }
 }
 
@@ -335,20 +465,84 @@ function Assert-SelectionBoundary($State) {
     }
 }
 
-function Read-Diagnostic {
+function Read-Diagnostic([int]$MessageTimeoutMs = 1000) {
     Assert-OwnedWindow $script:WindowHandle
+    $previousWriteUtc = $null
+    try {
+        if (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf) {
+            $previousWriteUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
+        }
+    } catch [IO.IOException] {
+        throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
+    }
     $messageResult = [IntPtr]::Zero
     $sent = [MdliteRustAcceptanceNative]::SendMessageTimeoutW(
         $script:WindowHandle, [uint32]$DiagnosticRefreshMessage,
         [IntPtr]::Zero, [IntPtr]::Zero, [uint32]$SMTO_ABORTIFHUNG,
-        [uint32]1000, [ref]$messageResult)
-    if (-not $sent -or $messageResult.ToInt64() -ne 1) {
-        throw 'The opt-in read-only diagnostic refresh did not complete on the owned window.'
+        [uint32]$MessageTimeoutMs, [ref]$messageResult)
+    Assert-OwnedWindow $script:WindowHandle
+    if (-not $sent) {
+        throw [TimeoutException]::new('SendMessageTimeout did not complete.')
     }
-    if (-not (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf)) {
-        throw 'The owned process did not produce its diagnostic snapshot.'
+    if ($messageResult.ToInt64() -ne 1) {
+        throw [TimeoutException]::new('WM_APP+1 returned LRESULT 0; the owner-thread refresh was deferred.')
     }
-    $state = [IO.File]::ReadAllText($script:DiagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $writeUtc = $null
+    try {
+        if (-not (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf)) {
+            throw [TimeoutException]::new('WM_APP+1 returned 1 but no diagnostic snapshot file exists yet.')
+        }
+        $writeUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
+    } catch [IO.IOException] {
+        throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
+    }
+    if ($null -ne $previousWriteUtc -and $writeUtc -le $previousWriteUtc) {
+        throw [TimeoutException]::new('WM_APP+1 returned 1 but the diagnostic snapshot timestamp did not advance.')
+    }
+    try {
+        $json = [IO.File]::ReadAllText($script:DiagnosticPath, [Text.Encoding]::UTF8)
+    } catch [IO.IOException] {
+        throw [TimeoutException]::new(('Transient diagnostic snapshot I/O: ' + $_.Exception.Message), $_.Exception)
+    }
+    try {
+        $state = $json | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw [TimeoutException]::new(('Diagnostic snapshot JSON is not complete yet: ' + $_.Exception.Message), $_.Exception)
+    }
+    if ($null -eq $state) {
+        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; object is unavailable.')
+    }
+    $sourceProperty = $state.PSObject.Properties['source']
+    $selectionProperty = $state.PSObject.Properties['selection']
+    if ($null -eq $sourceProperty -or $null -eq $selectionProperty -or
+        $null -eq $sourceProperty.Value -or $null -eq $selectionProperty.Value) {
+        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source or selection is unavailable.')
+    }
+    $selection = $selectionProperty.Value
+    if ($sourceProperty.Value -isnot [string]) {
+        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source is not a string.')
+    }
+    foreach ($name in @('source', 'selection', 'revision', 'dirty', 'undo_count', 'redo_count', 'raw', 'tables', 'ime', 'caret', 'native_caret')) {
+        $property = $state.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            throw [TimeoutException]::new("Diagnostic snapshot is incomplete; missing '$name'.")
+        }
+    }
+    foreach ($name in @('anchor', 'head')) {
+        $property = $selection.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            throw [TimeoutException]::new("Diagnostic selection is incomplete; missing '$name'.")
+        }
+        if ($property.Value -isnot [int] -and $property.Value -isnot [long]) {
+            throw [TimeoutException]::new("Diagnostic selection is incomplete; '$name' is not an integer.")
+        }
+    }
+    foreach ($name in @('active', 'preedit', 'open_status')) {
+        $property = $state.ime.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            throw [TimeoutException]::new("Diagnostic IME state is incomplete; missing '$name'.")
+        }
+    }
     Assert-SelectionBoundary $state
     return $state
 }
@@ -359,12 +553,23 @@ function Wait-Diagnostic(
     [int]$WaitMs = $TimeoutMs
 ) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
+    $attempts = 0
+    $lastResponse = 'no diagnostic request completed'
     do {
-        $state = Read-Diagnostic
-        if (& $Condition $state) { return $state }
-        Start-Sleep -Milliseconds 60
+        $attempts++
+        $remainingMs = [Math]::Max(1, [Math]::Min(1000, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+        try {
+            $state = Read-Diagnostic $remainingMs
+            $lastResponse = 'WM_APP+1 returned 1; fresh valid snapshot revision={0}, selection={1}..{2}, dirty={3}; condition false' -f
+                $state.revision, $state.selection.anchor, $state.selection.head, $state.dirty
+            if (& $Condition $state) { return $state }
+        } catch [TimeoutException] {
+            $lastResponse = $_.Exception.Message
+        }
+        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 60 }
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw ('Timed out after ' + $WaitMs + ' ms waiting for ' + $Description + '.')
+    throw ('Timed out after ' + $WaitMs + ' ms waiting for ' + $Description +
+        ' (' + $attempts + ' attempts; last observer response: ' + $lastResponse + ').')
 }
 
 function Wait-Document(
@@ -424,7 +629,7 @@ function Wait-ImeOpenState([bool]$ExpectedOpen, [string]$ExpectedSource) {
 function Restore-ImeOpenState {
     if (-not $script:ImeRestorePending -or $script:ImeRestoreAttempted) { return }
     $script:ImeRestoreAttempted = $true
-    $state = Read-Diagnostic
+    $state = Wait-Diagnostic { param($value) $true } 'fresh diagnostic before IME restoration'
     if (-not (Test-SameInputProfile $state)) {
         throw 'The observed input profile changed during the app-local IME check; no profile-switching key was sent.'
     }
@@ -456,7 +661,7 @@ function Restore-ImeOpenState {
 }
 
 function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedHead) {
-    $state = Read-Diagnostic
+    $state = Wait-Diagnostic { param($value) $true } 'fresh diagnostic before IME acceptance'
     $profile = $state.active_input_profile
     $open = $state.ime.open_status
     $profileDescription = if ($null -eq $profile) { 'unavailable' } else { [string]$profile.description }
@@ -512,7 +717,7 @@ function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedH
                 [int]$value.selection.head -eq $ExpectedHead
             } 'real configured IME composition after virtual-key romaji'
         } catch {
-            $observed = Read-Diagnostic
+            $observed = Wait-Diagnostic { param($value) $true } 'fresh diagnostic after IME composition attempt'
             if ($observed.source -ceq $ExpectedSource -and -not [bool]$observed.ime.active) {
                 $script:Report.ime_status = "BLOCKED: active profile '$profileDescription' and app-local IME ON were observed, but virtual-key 'ka' produced no native composition/preedit; no other profile was selected."
                 return $observed
@@ -601,7 +806,7 @@ function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedH
 
 function Switch-ToSource([string]$ExpectedSource) {
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        $state = Read-Diagnostic
+        $state = Wait-Diagnostic { param($value) $true } 'fresh diagnostic while selecting a fixture tab'
         if ($state.source -ceq $ExpectedSource) { return $state }
         if ([int]$state.tabs -ne 2) { throw 'The owned fixture process no longer has exactly two tabs.' }
         Set-OwnedForeground
@@ -670,6 +875,8 @@ try {
     [void][IO.Directory]::CreateDirectory($runDirectory)
     $script:ReportPath = Join-Path $runDirectory 'result.json'
     $script:DiagnosticPath = Join-Path $runDirectory 'diagnostic.json'
+    $script:ForegroundLogPath = Join-Path $runDirectory 'foreground.log'
+    $script:Report.foreground_log_path = $script:ForegroundLogPath
     $blankPath = Join-Path $runDirectory 'synthetic-empty.md'
     $structuredPath = Join-Path $runDirectory 'synthetic-editor.md'
 
@@ -724,7 +931,7 @@ try {
     if (-not $script:Report.visible -or $script:Report.dpi -le 0) {
         throw 'The exact owned native window was not visible or did not report a valid DPI.'
     }
-    Set-OwnedForeground
+    Set-OwnedForeground -WaitMs 60000
 
     $initial = Wait-Diagnostic {
         param($state)
@@ -746,7 +953,7 @@ try {
     Send-Key $script:WindowHandle 0x24 ([uint16[]]@(0x11))
     $tableStart = $structuredSource.IndexOf('left', [StringComparison]::Ordinal)
     $tableEnd = $tableStart + 4
-    $state = Read-Diagnostic
+    $state = Wait-Diagnostic { param($value) $true } 'fresh table-caret diagnostic'
     for ($step = 0; $step -lt 8 -and
         -not ([int]$state.selection.anchor -eq [int]$state.selection.head -and
               [int]$state.selection.head -ge $tableStart -and
@@ -778,7 +985,7 @@ try {
     Add-Observation 'Tab selects the whole destination cell' $state
 
     $editedTableSource = $structuredSource.Remove($rightStart, $rightEnd - $rightStart).Insert($rightStart, 'X')
-    Send-Text 'X'
+    Send-Ascii 'X'
     $editedEnd = $rightStart + 1
     $state = Wait-Document $editedTableSource $editedEnd $editedEnd $true
     if ([int]$state.tables -ne 1) { throw 'Typing in a table cell changed the table count.' }
@@ -814,7 +1021,7 @@ try {
     $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedStructured)
     $state = Wait-Document $expectedStructured $sourceEnd $sourceEnd $true
     Add-Observation 'repeated Enter preserves the next blank line' $state
-    Send-Text '## asdkl'
+    Send-Ascii '## asdkl'
     $expectedStructured += '## asdkl'
     $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedStructured)
     $state = Wait-Document $expectedStructured $sourceEnd $sourceEnd $true
@@ -832,7 +1039,7 @@ try {
         throw 'The empty synthetic fixture did not start clean at source offset zero.'
     }
     Add-Observation 'empty document starts at source offset zero' $state
-    Send-Text 'alpha beta'
+    Send-Ascii 'alpha beta'
     $state = Wait-Document 'alpha beta' 10 10 $true
     if ([int]$state.undo_count -le 0) { throw 'Normal text input did not create document history.' }
     Add-Observation 'normal text input in empty document' $state
@@ -870,7 +1077,7 @@ try {
     if ($selected -cne 'beta') { throw "Ctrl+Shift+Left selected '$selected' instead of the expected final word." }
     Add-Observation 'Ctrl+Shift+Left with virtual-key modifiers' $state
 
-    Send-Text 'gamma'
+    Send-Ascii 'gamma'
     $state = Wait-Document 'alpha gamma' 11 11 $true
     Add-Observation 'replace selected word' $state
     $beforeUndoCount = [int]$state.undo_count
@@ -889,16 +1096,16 @@ try {
     $state = Wait-Document 'alpha gamma' 11 11 $true
     Add-Observation 'Ctrl+Y restores replacement' $state
 
-    Send-Text 'かな'
+    Send-UnicodeText 'かな'
     $state = Wait-Document 'alpha gammaかな' 17 17 $true
-    Add-Observation 'Japanese Unicode text (not IME composition)' $state
+    Add-Observation 'Japanese Unicode packet text (separate from IME composition)' $state
     Set-OwnedForeground
     Send-Key $script:WindowHandle 0x0D
     $expectedBlank = 'alpha gammaかな' + $newline
     $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedBlank)
     $state = Wait-Document $expectedBlank $sourceEnd $sourceEnd $true
     Add-Observation 'Enter in empty-document scenario' $state
-    Send-Text '## heading'
+    Send-Ascii '## heading'
     $expectedBlank += '## heading'
     $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedBlank)
     $state = Wait-Document $expectedBlank $sourceEnd $sourceEnd $true
@@ -911,7 +1118,7 @@ try {
         $value.source -ceq $expectedBlank -and [bool]$value.raw
     } 'Ctrl+E Source mode switch'
     Add-Observation 'Ctrl+E enters Source mode' $state
-    Send-Text '!'
+    Send-Ascii '!'
     $expectedBlank += '!'
     $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedBlank)
     $state = Wait-Diagnostic {
@@ -937,7 +1144,7 @@ try {
         throw 'The configured IME acceptance path returned without PASS or a concrete BLOCKED reason.'
     }
     $imeOriginalSource = $expectedBlank
-    $state = Read-Diagnostic
+    $state = Wait-Diagnostic { param($value) $true } 'fresh diagnostic after IME acceptance'
     $imePassed = ([string]$script:Report.ime_status).StartsWith('PASS:', [StringComparison]::Ordinal)
     if ($imePassed) {
         if (-not $state.source.StartsWith($imeOriginalSource, [StringComparison]::Ordinal) -or

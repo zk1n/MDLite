@@ -472,6 +472,61 @@ fn visible_table_offset(current: f32, caret_x: f32, viewport: f32, content: f32)
     offset.clamp(0.0, (content - viewport).max(0.0))
 }
 
+fn startup_window_state(
+    graphics: Graphics,
+    diagnostic: Option<PathBuf>,
+    paths: Vec<PathBuf>,
+) -> WindowState {
+    let mut app = App {
+        hwnd: HWND::default(),
+        graphics,
+        tabs: Vec::new(),
+        active: 0,
+        next_id: 1,
+        views: Vec::new(),
+        visible_tokens: Vec::new(),
+        literal_blocks: Vec::new(),
+        tables: Vec::new(),
+        images: Vec::new(),
+        image_cache: HashMap::new(),
+        minimized: false,
+        animation_timer_armed: false,
+        height: 0.0,
+        width: 900.0,
+        dpi: 1.0,
+        layout_key: None,
+        projection_cache: None,
+        parsed_tables: Vec::new(),
+        revealed_source: None,
+        dragging: false,
+        dragging_scroll: false,
+        preedit: String::new(),
+        composing: false,
+        ime_owner: None,
+        ime_affinity: BoundaryAffinity::After,
+        ime_cursor: 0,
+        ime_attributes: Vec::new(),
+        ime_last_result: None,
+        preferred_x: None,
+        typing: false,
+        last_typing: None,
+        pending_table_authoring: None,
+        close_after_composition: None,
+        pending_surrogate: None,
+        diagnostic,
+        caret: (LEFT, TOP, 28.0),
+        native_caret: NativeCaretState::default(),
+        status: String::new(),
+    };
+    for path in paths.into_iter().take(6) {
+        app.open_path(path);
+    }
+    if app.tabs.is_empty() {
+        app.new_document();
+    }
+    WindowState::new(app)
+}
+
 pub fn run() -> windows::core::Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -503,53 +558,7 @@ pub fn run() -> windows::core::Result<()> {
             }
             i += 1;
         }
-        let mut app = Box::new(WindowState::new(App {
-            hwnd: HWND::default(),
-            graphics,
-            tabs: Vec::new(),
-            active: 0,
-            next_id: 1,
-            views: Vec::new(),
-            visible_tokens: Vec::new(),
-            literal_blocks: Vec::new(),
-            tables: Vec::new(),
-            images: Vec::new(),
-            image_cache: HashMap::new(),
-            minimized: false,
-            animation_timer_armed: false,
-            height: 0.0,
-            width: 900.0,
-            dpi: 1.0,
-            layout_key: None,
-            projection_cache: None,
-            parsed_tables: Vec::new(),
-            revealed_source: None,
-            dragging: false,
-            dragging_scroll: false,
-            preedit: String::new(),
-            composing: false,
-            ime_owner: None,
-            ime_affinity: BoundaryAffinity::After,
-            ime_cursor: 0,
-            ime_attributes: Vec::new(),
-            ime_last_result: None,
-            preferred_x: None,
-            typing: false,
-            last_typing: None,
-            pending_table_authoring: None,
-            close_after_composition: None,
-            pending_surrogate: None,
-            diagnostic,
-            caret: (LEFT, TOP, 28.0),
-            native_caret: NativeCaretState::default(),
-            status: String::new(),
-        }));
-        for path in paths.into_iter().take(6) {
-            app.app.get_mut().open_path(path);
-        }
-        if app.app.get_mut().tabs.is_empty() {
-            app.app.get_mut().new_document();
-        }
+        let mut app = Box::new(startup_window_state(graphics, diagnostic, paths));
         let pointer = (&*app as *const WindowState).cast();
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -757,7 +766,13 @@ unsafe fn dispatch_window_message(
                     let mut left = LEFT;
                     for (id, _, width) in TOOLBAR {
                         if x >= left && x < left + width {
-                            app.command(id);
+                            if id == CMD_CLOSE {
+                                // The same queued command enters WindowState's
+                                // completion/end gate as menu/window Close.
+                                let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(id), LPARAM(0));
+                            } else {
+                                app.command(id);
+                            }
                             break;
                         }
                         left += width;
@@ -889,6 +904,10 @@ impl App {
                             .editable_source_positions
                             .binary_search(&p)
                             .is_ok()
+                        && self
+                            .views
+                            .iter()
+                            .any(|view| view.map.contains(&p) || view.before.contains(&p))
                 })
         {
             return p;
@@ -905,6 +924,37 @@ impl App {
             &markers,
             self.views.first().and_then(|v| v.map.first()).copied(),
         )
+    }
+    fn live_word_point(&self, origin: usize, target: usize, back: bool) -> usize {
+        // Nearest-point resolution is appropriate for insertion, but can snap
+        // a word movement back into its origin inside a hidden delimiter gap.
+        // Resolve toward the requested direction using actual visible/source-
+        // affine endpoints, without exposing the interior of hidden spelling.
+        self.visible_tokens
+            .iter()
+            .flat_map(|token| {
+                token
+                    .spans
+                    .first()
+                    .map(|span| span.start)
+                    .into_iter()
+                    .chain(token.spans.last().map(|span| span.end))
+            })
+            .chain(
+                self.views
+                    .iter()
+                    .filter(|view| view.source.is_empty())
+                    .map(|view| view.source.start),
+            )
+            .filter(|&point| {
+                if back {
+                    point < origin && point <= target
+                } else {
+                    point > origin && point >= target
+                }
+            })
+            .min_by_key(|&point| point.abs_diff(target))
+            .unwrap_or(origin)
     }
     fn animation_viewport(&self) -> f32 {
         let mut client = RECT::default();
@@ -1380,6 +1430,36 @@ impl App {
         if !self.tabs[self.active].raw && !authoring_table {
             if range.is_empty()
                 && !replacement.is_empty()
+                && range.start == 0
+                && self
+                    .views
+                    .iter()
+                    .any(|view| view.source.is_empty() && view.source.start == 0)
+                && let Some(table) = self.tables.first()
+                && self.doc().source()[..table.table.range.start]
+                    .trim()
+                    .is_empty()
+            {
+                let missing = 2usize.saturating_sub(physical_line_endings(
+                    &self.doc().source()[..table.table.range.start],
+                ));
+                if missing > 0 {
+                    let newline = if self.doc().source().contains("\r\n") {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    };
+                    let plan = LiveEdit {
+                        range,
+                        caret: replacement.len(),
+                        replacement: format!("{replacement}{}", newline.repeat(missing)),
+                    };
+                    self.apply_live_edit(plan);
+                    return;
+                }
+            }
+            if range.is_empty()
+                && !replacement.is_empty()
                 && let Some(plan) = self.tables.windows(2).find_map(|tables| {
                     table_gap_insertion(
                         &tables[0].table,
@@ -1821,6 +1901,8 @@ impl App {
                         }
                         let target = if self.tabs[self.active].raw {
                             target
+                        } else if matches!(key, 0x25 | 0x27) {
+                            self.live_word_point(selection.head, target, key == 0x25)
                         } else {
                             self.live_insertion_point(target)
                         };
@@ -3649,13 +3731,7 @@ impl App {
             let marker = if let Some(previous) = self.tables.last() {
                 table_gap_marker(&source, previous.table.range.end, table.range.start)
             } else if source[..table.range.start].trim().is_empty() {
-                Some(
-                    if physical_line_endings(&source[..table.range.start]) >= 2 {
-                        0
-                    } else {
-                        table.range.start
-                    },
-                )
+                Some(0)
             } else {
                 None
             };
@@ -5599,6 +5675,28 @@ unsafe fn write_clipboard(hwnd: HWND, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_test_graphics() -> Graphics {
+        unsafe {
+            Graphics {
+                factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).unwrap(),
+                write: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap(),
+                target: None,
+            }
+        }
+    }
+
+    fn startup_fixture_path(index: usize) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mdlite-startup-{}-{nonce}-{index}.md",
+            std::process::id()
+        ))
+    }
+
     struct EditorFixture {
         state: Box<WindowState>,
         hwnd: HWND,
@@ -5641,6 +5739,305 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn review_leading_table_home_is_visible_and_accepts_before_table_typing() {
+        for source in [
+            "| H |\n|---|\n| cell |\n",
+            "| left | right |\n| --- | --- |\n| cell | value |\n\n```rust\nlet source = \"Markdown\";\n## asdkl\n```\n\n",
+            "   | H |\n   |---|\n   | cell |\n",
+        ] {
+            let fixture = EditorFixture::new(source, false);
+            let mut app = fixture.state.app.borrow_mut();
+            let original_table = app.doc().source()[app.tables[0].table.range.clone()].to_owned();
+            unsafe {
+                app.key_with_modifiers(VK_HOME.0, true, false);
+            }
+            assert_eq!(app.doc().selection(), Selection::caret(0));
+            assert!(
+                app.source_view(0).is_some(),
+                "document start needs actual source geometry"
+            );
+            unsafe {
+                app.character('前' as u16);
+            }
+            assert_eq!(app.doc().source(), format!("前\n\n{source}"));
+            assert_eq!(app.doc().selection(), Selection::caret("前".len()));
+            assert_eq!(app.tables.len(), 1);
+            assert_eq!(
+                &app.doc().source()[app.tables[0].table.range.clone()],
+                original_table
+            );
+            assert_eq!(app.caret_view().unwrap().source.start, 0);
+            assert!(app.caret_location().1 < app.tables[0].y);
+            unsafe {
+                app.key_with_modifiers(0x5a, true, false);
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(app.doc().selection(), Selection::caret(0));
+            assert!(!app.doc().is_dirty());
+            assert_eq!(app.caret_view().unwrap().source, 0..0);
+        }
+    }
+    #[test]
+    fn review_live_control_word_crosses_fences_with_progress_and_selection() {
+        let mut projected = composing_test_app("e*́* next");
+        projected.visible_tokens = projected_tokens(projected.doc().source());
+        assert_eq!(
+            projected.live_word_point(0, 1, false),
+            "e*́".len(),
+            "word motion must use whole visible grapheme endpoints across hidden style spans"
+        );
+        let fixture = EditorFixture::new("```\nx\n```\n", false);
+        let mut app = fixture.state.app.borrow_mut();
+        unsafe {
+            app.key_with_modifiers(VK_RIGHT.0, true, true);
+        }
+        assert!(
+            app.doc().selection().head > 0,
+            "CtrlRight must not snap back to zero"
+        );
+        assert_eq!(app.doc().selection().anchor, 0);
+        let mut previous = 0;
+        while app.doc().selection().head < app.doc().byte_len() {
+            let p = app.doc().selection().head;
+            assert!(p > previous, "CtrlRight stalled at {p}");
+            previous = p;
+            unsafe {
+                app.key_with_modifiers(VK_RIGHT.0, true, true);
+            }
+        }
+        while app.doc().selection().head > 0 {
+            let p = app.doc().selection().head;
+            unsafe {
+                app.key_with_modifiers(VK_LEFT.0, true, true);
+            }
+            assert!(app.doc().selection().head < p, "CtrlLeft stalled at {p}");
+        }
+        assert_eq!(app.doc().source(), "```\nx\n```\n");
+        assert_eq!(app.doc().undo_count(), 0);
+        drop(app);
+        for source in [
+            "```\n日本語 e\u{301} 👩‍💻\n```\n",
+            "```\r\nx\r\n```\r\n",
+            "**日本語** next",
+        ] {
+            let fixture = EditorFixture::new(source, false);
+            let mut app = fixture.state.app.borrow_mut();
+            let boundaries: Vec<_> = source
+                .grapheme_indices(true)
+                .map(|(p, _)| p)
+                .chain(Some(source.len()))
+                .collect();
+            let mut steps = 0;
+            while app.doc().selection().head < source.len() {
+                let previous = app.doc().selection().head;
+                unsafe {
+                    app.key_with_modifiers(VK_RIGHT.0, true, false);
+                }
+                assert!(
+                    app.doc().selection().head > previous,
+                    "forward stall {source} at {previous}"
+                );
+                assert!(boundaries.contains(&app.doc().selection().head));
+                steps += 1;
+                assert!(steps <= boundaries.len());
+            }
+            while app.doc().selection().head > 0 {
+                let previous = app.doc().selection().head;
+                unsafe {
+                    app.key_with_modifiers(VK_LEFT.0, true, false);
+                }
+                assert!(
+                    app.doc().selection().head < previous,
+                    "backward stall {source} at {previous}"
+                );
+                assert!(boundaries.contains(&app.doc().selection().head));
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(app.doc().undo_count(), 0);
+        }
+    }
+    #[test]
+    fn review_actual_toolbar_click_posts_close_command_during_composition() {
+        let fixture = EditorFixture::new("unsaved", false);
+        unsafe {
+            SetWindowPos(
+                fixture.hwnd,
+                None,
+                0,
+                0,
+                900,
+                480,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.layout_key = None;
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            app.start_composition();
+            app.preedit = "かな".into();
+        }
+        let x = LEFT
+            + TOOLBAR
+                .iter()
+                .take(5)
+                .map(|(_, _, width)| width)
+                .sum::<f32>()
+            + 10.0;
+        unsafe {
+            window_proc(
+                fixture.hwnd,
+                WM_LBUTTONDOWN,
+                WPARAM(0),
+                LPARAM((x as isize) | (12 << 16)),
+            );
+        }
+        let mut message = MSG::default();
+        unsafe {
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(fixture.hwnd),
+                    WM_COMMAND,
+                    WM_COMMAND,
+                    PM_REMOVE
+                )
+                .as_bool(),
+                "toolbar close must use the shared command path"
+            );
+        }
+        assert_eq!(message.wParam.0, CMD_CLOSE);
+        struct DetachedContext(HWND, HIMC);
+        impl Drop for DetachedContext {
+            fn drop(&mut self) {
+                unsafe {
+                    ImmAssociateContext(self.0, self.1);
+                }
+            }
+        }
+        let _context = DetachedContext(fixture.hwnd, unsafe {
+            ImmAssociateContext(fixture.hwnd, HIMC::default())
+        });
+        unsafe {
+            window_proc(
+                fixture.hwnd,
+                message.message,
+                message.wParam,
+                message.lParam,
+            );
+        }
+        let app = fixture.state.app.borrow();
+        assert!(app.composing);
+        assert_eq!(app.preedit, "かな");
+        assert_eq!(app.doc().source(), "unsaved");
+        assert!(
+            app.status.contains("IMEの確定を完了できませんでした"),
+            "queued toolbar command must reach completion gate"
+        );
+        assert!(app.close_after_composition.is_none());
+        assert_eq!(app.doc().undo_count(), 0);
+    }
+    #[test]
+    fn review_toolbar_pending_close_resumes_only_after_result_and_real_end() {
+        let fixture = EditorFixture::new("unsaved", false);
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_composition();
+            app.preedit = "かな".into();
+            // Isolate the already-completed IMM request state; no real IME or
+            // dialog is driven by this synthetic owned lifecycle test.
+            app.close_after_composition = Some((WM_COMMAND, WPARAM(CMD_CLOSE), LPARAM(0)));
+            fixture.state.notifications.borrow_mut().push_back((
+                app.doc().id(),
+                NativeNotification::Update(ImeUpdate {
+                    flags: GCS_RESULTSTR.0,
+                    result: Some("確定".into()),
+                    ..Default::default()
+                }),
+            ));
+            fixture.message(WM_IME_ENDCOMPOSITION, 0);
+            assert!(app.composing);
+            assert_eq!(app.doc().source(), "unsaved");
+        }
+        fixture.message(WM_NULL, 0);
+        let mut message = MSG::default();
+        unsafe {
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(fixture.hwnd),
+                    WM_COMMAND,
+                    WM_COMMAND,
+                    PM_REMOVE
+                )
+                .as_bool()
+            );
+        }
+        assert_eq!(message.wParam.0, CMD_CLOSE);
+        let app = fixture.state.app.borrow();
+        assert_eq!(app.doc().source(), "確定unsaved");
+        assert!(app.doc().is_dirty());
+        assert_eq!(app.doc().undo_count(), 1);
+        assert!(!app.composing);
+        assert!(app.close_after_composition.is_none());
+        // The posted normal CMD_CLOSE is intentionally not dispatched to the
+        // unsaved dialog; visible Save/No/Cancel acceptance remains Root-owned.
+        assert!(unsafe { IsWindow(Some(fixture.hwnd)).as_bool() });
+    }
+    #[test]
+    fn startup_initializer_creates_default_document_before_window_state() {
+        let state = startup_window_state(startup_test_graphics(), None, Vec::new());
+        assert_eq!(state.document_id.get(), 1);
+        assert!(state.notifications.borrow().is_empty());
+        let app = state.app.borrow();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.doc().id(), 1);
+        assert!(app.doc().source().is_empty());
+        assert!(app.doc().is_dirty());
+        assert_eq!(app.doc().undo_count(), 0);
+        assert_eq!(app.doc().redo_count(), 0);
+        assert_eq!(app.next_id, 2);
+    }
+
+    #[test]
+    fn startup_initializer_opens_multiple_synthetic_files_before_window_state() {
+        let first = startup_fixture_path(1);
+        let second = startup_fixture_path(2);
+        std::fs::write(&first, "# first\n").unwrap();
+        std::fs::write(&second, "## second\n").unwrap();
+
+        let state = startup_window_state(
+            startup_test_graphics(),
+            None,
+            vec![first.clone(), second.clone()],
+        );
+        assert_eq!(state.document_id.get(), 2);
+        assert!(state.notifications.borrow().is_empty());
+        {
+            let app = state.app.borrow();
+            assert_eq!(app.tabs.len(), 2);
+            assert_eq!(app.active, 1);
+            assert_eq!(app.tabs[0].doc.id(), 1);
+            assert_eq!(app.tabs[0].doc.source(), "# first\n");
+            assert!(!app.tabs[0].doc.is_dirty());
+            assert_eq!(app.tabs[0].doc.undo_count(), 0);
+            assert_eq!(app.tabs[1].doc.id(), 2);
+            assert_eq!(app.tabs[1].doc.source(), "## second\n");
+            assert!(!app.tabs[1].doc.is_dirty());
+            assert_eq!(app.tabs[1].doc.undo_count(), 0);
+            assert_eq!(app.next_id, 3);
+        }
+        drop(state);
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
     #[test]
     fn editor_reentrant_end_is_queued_then_input_and_commands_resume() {
         let fixture = EditorFixture::new("body", false);

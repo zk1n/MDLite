@@ -34,10 +34,31 @@ public static class MdliteRustAcceptanceNative
         public UIntPtr dwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HARDWAREINPUT
+    {
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
+    }
+
     [StructLayout(LayoutKind.Explicit)]
     private struct INPUTUNION
     {
+        [FieldOffset(0)] public MOUSEINPUT mi;
         [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public HARDWAREINPUT hi;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -45,6 +66,16 @@ public static class MdliteRustAcceptanceNative
     {
         public uint type;
         public INPUTUNION data;
+    }
+
+    public static int AssertInputLayout()
+    {
+        int expected = IntPtr.Size == 8 ? 40 : 28;
+        int actual = Marshal.SizeOf(typeof(INPUT));
+        if (actual != expected)
+            throw new InvalidOperationException(
+                "Win32 INPUT layout mismatch: expected " + expected + " bytes, got " + actual + ".");
+        return actual;
     }
 
     [DllImport("user32.dll")]
@@ -160,6 +191,7 @@ public static class MdliteRustAcceptanceNative
 }
 '@
 
+$InputSizeBytes = [MdliteRustAcceptanceNative]::AssertInputLayout()
 $script:Process = $null
 $script:WindowHandle = [IntPtr]::Zero
 $script:ProcessId = [uint32]0
@@ -181,6 +213,7 @@ $script:Report = [ordered]@{
     source_tree_sha256_after = $null
     git_head = $null
     harness_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    input_size_bytes = $InputSizeBytes
     pid = $null
     hwnd = $null
     visible = $null
@@ -731,34 +764,34 @@ try {
               [int]$state.selection.head -le $tableEnd)) {
         throw 'Keyboard navigation did not reach the first table cell within the bounded steps.'
     }
-    $firstCellCaret = [int]$state.selection.head
+    $rightStart = $structuredSource.IndexOf('right', [StringComparison]::Ordinal)
+    $rightEnd = $rightStart + 'right'.Length
     Set-OwnedForeground
     Send-Key $script:WindowHandle 0x09
     $state = Wait-Diagnostic {
         param($value)
         $value.source -ceq $structuredSource -and
-        [int]$value.selection.head -gt $firstCellCaret -and
-        [int]$value.selection.anchor -eq [int]$value.selection.head
+        [int]$value.selection.anchor -eq $rightStart -and
+        [int]$value.selection.head -eq $rightEnd
     } 'Tab navigation to the next table cell'
     if ([int]$state.tables -ne 1) { throw 'Tab navigation changed the table count.' }
-    Add-Observation 'Tab moves between table cells' $state
+    Add-Observation 'Tab selects the whole destination cell' $state
 
-    $tableInsertAt = [int]$state.selection.head
-    $editedTableSource = $structuredSource.Insert($tableInsertAt, 'X')
+    $editedTableSource = $structuredSource.Remove($rightStart, $rightEnd - $rightStart).Insert($rightStart, 'X')
     Send-Text 'X'
-    $editedEnd = $tableInsertAt + 1
+    $editedEnd = $rightStart + 1
     $state = Wait-Document $editedTableSource $editedEnd $editedEnd $true
     if ([int]$state.tables -ne 1) { throw 'Typing in a table cell changed the table count.' }
-    Add-Observation 'edit table cell through normal input' $state
+    Add-Observation 'replace selected table cell through normal input' $state
     Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))
-    $state = Wait-Document $structuredSource $tableInsertAt $tableInsertAt $false
+    $state = Wait-Document $structuredSource $rightStart $rightEnd $false
     if ([int]$state.tables -ne 1) { throw 'Undo did not restore the original table structure.' }
-    Add-Observation 'table cell Undo restores saved source' $state
+    Add-Observation 'table cell Undo restores source and selected range' $state
     Send-Key $script:WindowHandle 0x59 ([uint16[]]@(0x11))
     $state = Wait-Document $editedTableSource $editedEnd $editedEnd $true
     Add-Observation 'table cell Redo restores edit' $state
     Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))
-    $state = Wait-Document $structuredSource $tableInsertAt $tableInsertAt $false
+    $state = Wait-Document $structuredSource $rightStart $rightEnd $false
 
     Set-OwnedForeground
     Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
@@ -903,6 +936,26 @@ try {
     if ([string]$script:Report.ime_status -eq 'PENDING') {
         throw 'The configured IME acceptance path returned without PASS or a concrete BLOCKED reason.'
     }
+    $imeOriginalSource = $expectedBlank
+    $state = Read-Diagnostic
+    $imePassed = ([string]$script:Report.ime_status).StartsWith('PASS:', [StringComparison]::Ordinal)
+    if ($imePassed) {
+        if (-not $state.source.StartsWith($imeOriginalSource, [StringComparison]::Ordinal) -or
+            $state.source.Length -le $imeOriginalSource.Length) {
+            throw 'The configured IME PASS result did not leave a committed suffix in the active source.'
+        }
+    } elseif ($state.source -cne $imeOriginalSource) {
+        throw 'The IME BLOCKED path changed the source unexpectedly.'
+    }
+    $expectedBlank = [string]$state.source
+    $sourceEnd = [Text.Encoding]::UTF8.GetByteCount($expectedBlank)
+    if ([int]$state.selection.anchor -ne $sourceEnd -or
+        [int]$state.selection.head -ne $sourceEnd -or
+        -not [bool]$state.dirty -or [bool]$state.ime.active -or
+        -not [string]::IsNullOrEmpty([string]$state.ime.preedit)) {
+        throw 'Post-IME source, caret, dirty, or composition state is not ready for the close/save check.'
+    }
+    Add-Observation 'post-IME source and caret baseline for close/save' $state
 
     Assert-OwnedWindow $script:WindowHandle
     $closeResult = [IntPtr]::Zero

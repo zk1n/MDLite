@@ -1,15 +1,16 @@
 # 製品要件とUI方針
 
-Rust開発への移行で製品要件を削除しない。ここに記載する未移植機能は
-予定された要求であり、現在使える機能とは区別する。
-実装状況は[受入記録](rust-acceptance.md)を参照する。
+Rust開発への移行で製品要件を削除しない。ここに記載する操作・安全条件を維持する。
+現在のsource接続とslice証拠は[実装・検証表](ui-feature-parity.md)、対象buildのvisible/Human受入は
+[受入記録](rust-acceptance.md)を参照する。Workspaceのidentity/lease/別process起動契約は
+[Workspace操作](workspace-operations.md)に記録する。
 
 ## Workspaceと画面
 
 Activity Barと既存のアイコン体系を維持する。中央は文書tabと一つの
 native Live Markdown編集面。左上はExplorer/Searchの排他的な表示先、
 左下はCalendar、右側はOutline/Gitとする。補助操作で中央編集面を奪わない。
-承認UIを撤回せず、全面レイアウトの移植はEditor改修と別に進める。
+承認UIを維持し、native shellのcommand routeは実装・検証表に記録する。
 
 paneは折り畳み・復元できる。DIPで初期寸法を定義し、client幅から
 editorの最小幅を先に確保する。狭幅でも負の幅や画面外の操作領域を作らない。
@@ -52,14 +53,16 @@ Outlineの階層移動は子見出しを含む原文範囲と一つのUndo単位
 code/Front Matter内の見出し風文字列はOutlineへ含めない。
 Quick Openと検索結果の移動に別Editorへの切替を要求しない。
 
-## 保存・復旧・その他の後続要求
+## 保存・復旧・追加機能の要求
 
 UTF-8/BOM、CP932、LF/CRLFと混在改行、外部変更、保存失敗を保護する。
-autosaveとWorkspace復旧は後続の要求として保持する。復旧本文は
+autosaveとWorkspace復旧のsource経路は実装済みで、visible/再起動受入は別に確認する。復旧本文は
 `.mdlite/.state`、破棄可能cacheは`.mdlite/.cache`に置き、AppDataへ本文を保存しない。
 
 Template、Dairy/Memo/MeetingとCalendar、Git UI、Workspace trust、設定GUI、
-変更可能keybinding、compact window、診断と手動更新を後続へ保持する。
+変更可能keybinding、compact window、診断と手動更新のnative routeを接続する。実装接続だけで
+GUI受入を確定せず、slice証拠と未確認条件を[実装・検証表](ui-feature-parity.md)に分けて記録する。
 祝日は同梱データと明示したlocal取込みを基準にし、通常起動や月移動で通信しない。
-壊れた取込みは既知データを維持する。未移植機能を有効なボタンとして表示しない。
+壊れた取込みは既知データを維持する。Git/storage外部実行はTrustと明示確認を通し、
+任意process launch UIを追加しない。
 公開配布の署名・checksum・timestampとRelease受入は別の作業とする。

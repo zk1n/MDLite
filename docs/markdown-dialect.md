@@ -115,3 +115,16 @@ also explicitly absent.
 - [`pulldown-cmark` 0.13.4 `Parser`](https://docs.rs/pulldown-cmark/0.13.4/pulldown_cmark/struct.Parser.html) documents parser construction and source offsets.
 - [GFM 0.29 task list items](https://github.github.com/gfm/#task-list-items-extension), [autolinks](https://github.github.com/gfm/#autolinks-extension), and [raw HTML](https://github.github.com/gfm/#raw-html) define the published extension behavior used here.
 - [`linkify` 0.11.0](https://docs.rs/linkify/0.11.0/linkify/) provides candidate URL/email spans and punctuation handling; MDLite applies narrower GFM checks before creating a source-mapped link run.
+
+## 旧画像tagの限定互換
+
+旧文書の、引用符付き `src` と任意の `alt` / `title` / 数値 `width` だけを持つ
+単独またはinlineの `<img ...>` を、非実行の画像参照として読む。
+XMLとして妥当な属性escapeを要求し、namespace・イベント・style・子要素等の属性拡張は受け付けない。
+それ以外のraw HTMLは従来どおりliteral表示であり、scriptを実行しない。
+幅操作は既存の属性値または `mdlite-width` 注釈だけを変更し、無操作では表記を変換しない。
+文書からのSVG取込み・SVG画像解決、remote画像の取得は行わない。
+共有UI iconのdecoderは文書の画像取込みとは別に扱う。
+
+生成する画像pathは空白・括弧・`#`・`%`等をpercent escapeし、local解決時に一度だけdecodeする。
+画像assetのbytesを幅変更や表示操作で変更しない。

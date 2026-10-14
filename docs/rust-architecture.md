@@ -44,6 +44,19 @@ Rustで書かれた既存editorアプリを、そのまま組込みlibraryとは
 [DirectWrite hit test](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Graphics/DirectWrite/struct.IDWriteTextLayout.html)、
 [egui TextEdit](https://docs.rs/egui/latest/egui/widgets/text_edit/struct.TextEdit.html)。
 
+## Workspace ownership and external execution
+
+`WorkspaceIdentity` combines the canonical root with physical directory identity. `instance::claim`
+holds a local named-mutex lease in `Persistence`; a duplicate activation targets only a window whose
+canonical executable matches `current_exe`. Opening a different Workspace starts that same executable
+with the selected root. The lease itself writes no Workspace files. See [Workspace operations](workspace-operations.md)
+for state ownership and [implementation status](ui-feature-parity.md) for source/build slices.
+
+Git and storage adapters use `ProcessRequest`/`process::run` for explicit trusted operations. Windows
+children enter an owned Job Object before resume; request timeout, cancellation, and per-stream retained
+output are bounded. This execution API serves those operations without adding an arbitrary-process UI.
+GUI, real storage service, and physical-input acceptance remain in the acceptance record.
+
 ## 適合を実アプリで確認する境界
 
 IMMは未確定文字を原文・履歴から分離し、確定文字だけを一操作で適用する。

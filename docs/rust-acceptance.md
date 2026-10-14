@@ -1,5 +1,13 @@
 # Rust Editor受入記録
 
+2026-10-14のUI・周辺機能再実装は[実装・検証表](ui-feature-parity.md)へ記録する。
+以下の既存Editor結果は、その対象source/EXEに限る履歴であり、新UIのGUI合格へ流用しない。
+追加分の最終sourceはDebug/Releaseともcore 139 + native 146 = 285 tests、fmt、Clippyと
+独立correctness reviewがPASS。対象source/EXE/harness hashは上記対応表に記載する。
+最終Releaseは所有window/実行体を確認したがforeground gateで入力前に停止し、GUI操作はBLOCKED。
+以前のDebug smokeはsource変更によりidentityが失効しており、今回の合格には流用しない。
+PrintWindowはDirect2D内容を取得できないため、承認UIとの比較証拠には使わない。
+
 Rust開発の主線はdevelop。旧実装の正確なdevelop tipは
 `cpp-archive/pre-rust-20261013`とGit履歴に保持する。
 開発主線の選択は、全製品・全入力機器の受入合格を意味しない。

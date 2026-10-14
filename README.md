@@ -10,8 +10,10 @@
 
 ## 開発方針
 
-通常のテキスト編集時の省メモリと操作性を重視し、Live Markdown、
-Workspace操作、検索・置換、ノート作成支援を提供する予定です。
+通常のテキスト編集時の省メモリと操作性を重視します。Live Markdown、Workspace操作、
+検索・置換、ノート作成支援にはcurrent sourceのnative routeがあります。Workspaceのlease、
+duplicate notification、別Workspace起動の契約は[Workspace操作](docs/workspace-operations.md)、
+要件ごとの接続と未確認範囲は[実装・検証表](docs/ui-feature-parity.md)を参照してください。
 
 移行前のC++版は`cpp-archive/pre-rust-20261013`とGit履歴に保全します。
 現行treeはRust専用です。今後の作業branchは`develop`から切ります。
@@ -46,10 +48,12 @@ Ctrl+Shift+ZもRedoです。本文と履歴はcropの共有Ropeを使い、parse
 に採用構文、原文の扱い、対応範囲を記載します。
 表操作と画像の比率固定resizeは対象のコンテキスト操作から行います。
 
-未実装のExplorer、Workspace検索、Calendar、Git UI、autosaveや復旧を
-有効な機能として表示しません。Workspace保存境界と製品全体の要求は
-[受入記録](docs/rust-acceptance.md)に保持しています。
-[製品要件とUI方針](docs/product-requirements.md)にも未移植機能の要求を残します。
+Explorer、Workspace検索、Calendar、Git、autosave/recoveryのnative source routeは接続されています。
+Workspaceのphysical-identity lease、重複起動通知、別Workspaceのprocess launchと保存境界は
+[Workspace操作](docs/workspace-operations.md)に記録します。実装接続とvisible受入は分け、
+今回のbuildで未実施のGUI操作・独立review・配送条件は[受入記録](docs/rust-acceptance.md)に残します。
+[実装・検証表](docs/ui-feature-parity.md)はslice単位の接続状態と未確認範囲を示し、
+[製品要件とUI方針](docs/product-requirements.md)は受入待ちの要求を保持します。
 
 [部品選定と責務](docs/rust-architecture.md)、[依存ライセンス](docs/dependencies.md)。
 

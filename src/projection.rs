@@ -309,7 +309,9 @@ impl<'a> ProjectionBuilder<'a> {
                 self.append_inline_code(&value, range, kinds);
             }
             Event::Html(value) | Event::InlineHtml(value) => {
-                if !self.append_image_width_comment(&value, &range) {
+                if !self.append_image_width_comment(&value, &range)
+                    && !self.append_legacy_image(&value, &range)
+                {
                     let mut kinds = self.current_kinds();
                     kinds.push(InlineKind::Html);
                     self.append_literal(&value, range, kinds, '\n');
@@ -815,6 +817,47 @@ impl<'a> ProjectionBuilder<'a> {
         }
         block.source.end = range.end;
         self.hidden(range);
+        true
+    }
+
+    fn append_legacy_image(&mut self, html: &str, range: &Range<usize>) -> bool {
+        if self.inline_stack.contains(&InlineKind::Code)
+            || self.open_blocks.iter().any(|b| {
+                matches!(b.kind, BlockKind::Code { .. } | BlockKind::FrontMatter)
+                    || b.end_tag == EndTag::Footnote
+            })
+        {
+            return false;
+        }
+        let Some(image) = crate::image_reference::parse_legacy(html) else {
+            return false;
+        };
+        let kind = BlockKind::Image {
+            destination: image.destination.clone(),
+            title: image.title.clone(),
+            width: image.width,
+        };
+        let raw = self
+            .open_blocks
+            .last_mut()
+            .filter(|b| b.end_tag == EndTag::Raw && b.source_start == range.start);
+        let standalone = raw.is_some();
+        if let Some(raw) = raw {
+            raw.kind = kind;
+        } else {
+            self.open_block(kind, EndTag::Image, range);
+        }
+        self.append_visible(
+            &image.alt,
+            range.clone(),
+            vec![InlineKind::Image {
+                destination: image.destination,
+                title: image.title,
+            }],
+        );
+        if !standalone {
+            self.close_block(&EndTag::Image, range);
+        }
         true
     }
 

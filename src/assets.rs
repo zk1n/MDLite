@@ -34,6 +34,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 /// Remote destinations are never resolved or downloaded.
 pub fn local_image_path(document_dir: &Path, destination: &str) -> io::Result<PathBuf> {
+    let destination = crate::navigation::percent_decode(destination).map_err(invalid)?;
     if destination.contains("://")
         || destination.starts_with("//")
         || destination.starts_with("\\\\")
@@ -42,7 +43,13 @@ pub fn local_image_path(document_dir: &Path, destination: &str) -> io::Result<Pa
     {
         return Err(invalid("ローカル画像のみ表示できます"));
     }
-    let path = Path::new(destination);
+    let path = Path::new(&destination);
+    if path
+        .extension()
+        .is_some_and(|s| s.eq_ignore_ascii_case("svg"))
+    {
+        return Err(invalid("文書内のSVG画像は表示できません"));
+    }
     if path.is_absolute() {
         return Err(invalid("画像には文書からの相対パスを使用してください"));
     }
@@ -675,6 +682,9 @@ pub fn import_file(
         .and_then(|v| v.to_str())
         .ok_or_else(|| invalid("画像拡張子が必要です"))?
         .to_ascii_lowercase();
+    if extension == "svg" {
+        return Err(invalid("SVG画像は取込みできません"));
+    }
     let max_input_bytes = import_input_limit(&extension)?;
     drop(decode(source_path)?);
     let source = File::open(source_path)?;
@@ -837,7 +847,8 @@ fn import_reader(
         }
         relative.push("assets");
         relative.push(path.file_name().unwrap());
-        let link = relative.to_string_lossy().replace('\\', "/");
+        let link =
+            crate::image_reference::encode_path(&relative.to_string_lossy().replace('\\', "/"));
         return Ok(ImportedImage {
             path,
             markdown: format!("![画像]({link})"),

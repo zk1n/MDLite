@@ -3,7 +3,7 @@
 use std::{
     fmt,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -105,6 +105,27 @@ impl FileSnapshot {
     pub fn open(path: impl AsRef<Path>) -> Result<LoadedFile, StorageError> {
         let path = fs::canonicalize(path)?;
         let bytes = fs::read(&path)?;
+        Self::from_bytes(path, bytes)
+    }
+
+    /// A background scanner must cap the actual read, including files that grow
+    /// after metadata inspection. Normal document opening keeps its own contract.
+    pub fn open_bounded(path: impl AsRef<Path>, limit: u64) -> Result<LoadedFile, StorageError> {
+        let path = fs::canonicalize(path)?;
+        let mut bytes = Vec::new();
+        fs::File::open(&path)?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds scanner read limit",
+            )));
+        }
+        Self::from_bytes(path, bytes)
+    }
+
+    fn from_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<LoadedFile, StorageError> {
         let (source, format, cp932_reencodable) = decode_file(&bytes)?;
         Ok(LoadedFile {
             source,
@@ -161,6 +182,17 @@ impl FileSnapshot {
 
     pub const fn format(&self) -> FileFormat {
         self.format
+    }
+
+    /// Fingerprint of the originally opened bytes, never refreshed from disk.
+    /// Recovery uses it to avoid adopting later external edits as a save baseline.
+    pub fn baseline_sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&self.original_bytes))
+    }
+
+    pub fn baseline_byte_len(&self) -> usize {
+        self.original_bytes.len()
     }
 
     /// Save to the original path only if its current bytes still match the snapshot.

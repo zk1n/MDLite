@@ -71,3 +71,9 @@ window終了、文書close、IDE Stopの証拠を区別する。
 
 OS clipboard統合と物理入力・実IMEの検証状態は[受入記録](rust-acceptance.md)
 に別々に記録する。機械試験のPASSだけでHuman受入を主張しない。
+
+## Workspace lifecycle
+
+同一physical Workspaceのprocess lease、現在のexecutableに限定した既存window通知、
+別Workspaceを開くcurrent-executable launchは[Workspace操作](workspace-operations.md)に記録する。
+source connectionだけではvisible操作やduplicate-window受入の証拠にならない。

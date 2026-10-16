@@ -26,3 +26,14 @@
 未実施のphysical長押し/F5、MS IME全matrix、別monitor/DPI、Narrator/touchpad、本人の操作感、
 禁止中clipboard、実storageサービスは、機械試験のPASSへ含めない。最終結果は対象buildとともに
 受入記録/HANDOFFへ転記する。
+
+## 新規の限定回帰とGitBook対象章
+
+| GitBook対象章 | Rust節へ加える内容 | 記録する限定回帰 |
+|---|---|---|
+| 編集とMarkdown | 入力通知順序、fallback layout、通常close gate | 合成IME終了通知の次の入力が本文・selection・Undoへ反映されること、測定したfallback高が次段落と重ならないこと、closeが通常終了gateを通ること。native回帰の結果であり、連続GUI/実IME受入ではない。 |
+| 日次ノートとカレンダー | 日付セル内のイベント表示 | 合成fixtureでイベントmarkerが所属するcell内に収まること。 |
+| 製品概要と画面操作 | native child redraw、Feature/Git/Explorer/settingsのowner-draw | control identityに対応する描画先、空captionの安全なno-op、日本語captionの正確な文字数経路。native GDI回帰であり、最終画面のGUI確認ではない。 |
+| 構成と検証の境界 | source／EXE／harnessの対応、借用中の再描画、機械・GUI・IMEの証拠 | 修正前の失敗と限定回帰を保持し、最終buildの実測結果と未確認条件を分ける。 |
+
+章名は2026年10月15日の現行GitBookと照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから記入する。根拠source commitは未確定。

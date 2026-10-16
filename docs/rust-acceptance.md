@@ -1,5 +1,20 @@
 # Rust Editor受入記録
 
+## 入力・描画回復の現状（2026-10-15）
+
+以下はV5候補に対する記録。現在は借用中のWM_PAINT消失を修正しており、V5のbuild/testはそのsourceに限る履歴となる。新しい候補でGUI受入と最終検証が終わるまでは、Editor復旧完了とは扱わない。
+下段の従来の受入結果は当時のsource/buildに限る履歴であり、今回の最終候補へ引き継がない。
+
+| 範囲 | 現在の証拠 | 状態・境界 |
+|---|---|---|
+| Debug/Release候補 | V5 builder source SHA256 `79b43f41cf0263a874003ed557b5704fae5f416475d237021ebe2a0d51d98ddf`。Debug EXE SHA256 `d52c724bd923ab41559c5254fa4e9b3a1d678d672f0819e5bfd10570c61da3be`、Release EXE SHA256 `46b33c093af25f6bb2bf49bedd8f79500f056622c2a62b1ae90fec6f61a1d52c` | V5 build PASS。source commitは未確定。V3/V4のbuild結果は履歴であり、今回の最終候補には使わない。 |
+| 限定回帰 | 合成IME終了通知後の最初の通常入力、測定したfallback layout高、遅延child redraw要求の保持・消費、通常close gate、owner-drawの空/日本語caption経路 | 対応する限定native回帰はPASS。可視GUIのchild描画や一連の実入力を証明しない。Dairyの表示名・directory semanticsは既存契約として維持。元のcommand label assertionを対象とするtestはPASS。 |
+| 最終機械検証 | V5 Debug: core 139 + native 154 = 293 tests PASS。Release: core 139 + native 154 = 293 tests PASS。全targetのDebug/Release strict ClippyとfmtもPASS。 | 最終V5機械検証PASS。 |
+| 可視画面 | V5の空文書/no-workspace windowでsettled screenを観測。native child labelsとNoWorkspace textは見える一方、parent D2D領域は白く、合成文書sourceはempty・revision 0のまま。 | 描画原因を調査中。画面観測であり、Editor動作や全体GUI受入のPASSではない。現時点でproduction source変更なし。 |
+| 連続GUI/実IME | V5 runはforegroundとfresh diagnosticsを取得し、case入力前のinitial screen framesも観測。その後、harnessのevidence assemblyがcase入力前にE01 HARNESS_FAILUREとなり、operationsは0。失敗runのharness SHA256 `3e94064310bbaf9ad6dbab9531f505af52bd9d2f40411a00db960b7b60fc5a33`。修正後harness SHA256 `ca8b478bbccdb3d51a9205052713648888374ab2105e20b20209307461e16698`はGUI未実行。 | GUI/IMEの動作assertionは実行されず、連続受入はNOT_RUN。initial/settled screen framesは診断用であり、全体受入の証拠にしない。 |
+| 最終review/F5 | 最終候補への独立correctness review再確認と通常VS Code経由のDebug/F5 | NOT_RUN。以前のsource reviewとroute preflightはこの結果に代えない。 |
+| 完了・配送 | Human/physical acceptance、Git統合、HANDOFF | NOT_RUN。 |
+
 2026-10-14のUI・周辺機能再実装は[実装・検証表](ui-feature-parity.md)へ記録する。
 以下の既存Editor結果は、その対象source/EXEに限る履歴であり、新UIのGUI合格へ流用しない。
 追加分の最終sourceはDebug/Releaseともcore 139 + native 146 = 285 tests、fmt、Clippyと

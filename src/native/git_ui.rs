@@ -45,6 +45,7 @@ const OPEN_CONFLICT: usize = 6022;
 const UPLOAD: usize = 6023;
 const STORAGE_CONFIG: usize = 6024;
 const CONFLICTS: usize = 6025;
+const GIT_PANE_HOST: usize = 6508;
 const SUMMARY: usize = 6500;
 const FILES: usize = 6501;
 const DIFF_TEXT: usize = 6502;
@@ -220,6 +221,41 @@ impl Drop for GitPane {
         }
     }
 }
+impl GitPane {
+    pub(super) unsafe fn owner_draw_button(
+        &self,
+        owner: HWND,
+        message_id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> Option<shell::OwnerDrawState> {
+        let controls = self.controls.as_ref()?;
+        let id = item.CtlID as usize;
+        if owner == HWND::default() || item.CtlType != ODT_BUTTON || message_id != id {
+            return None;
+        }
+        let button = controls
+            .buttons
+            .iter()
+            .find(|(control_id, hwnd)| *control_id == id && *hwnd == item.hwndItem)
+            .map(|(_, hwnd)| *hwnd)
+            .or_else(|| {
+                (id == EXECUTE && item.hwndItem == controls.execute).then_some(controls.execute)
+            })
+            .or_else(|| {
+                (id == INPUT_CANCEL && item.hwndItem == controls.input_cancel)
+                    .then_some(controls.input_cancel)
+            })?;
+        if button == HWND::default()
+            || unsafe { GetParent(controls.host).unwrap_or_default() } != owner
+            || unsafe { GetDlgCtrlID(controls.host) as usize } != GIT_PANE_HOST
+            || unsafe { GetParent(button).unwrap_or_default() } != controls.host
+            || unsafe { GetDlgCtrlID(button) as usize } != id
+        {
+            return None;
+        }
+        Some(unsafe { shell::owner_draw_state(shell::text_of(button), item) })
+    }
+}
 fn find_git() -> PathBuf {
     std::env::var_os("PATH")
         .and_then(|paths| {
@@ -360,7 +396,7 @@ impl App {
                 main,
                 w!("STATIC"),
                 "Git pane",
-                6508,
+                GIT_PANE_HOST,
                 WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             );
             SetWindowLongPtrW(
@@ -368,7 +404,7 @@ impl App {
                 GWL_EXSTYLE,
                 GetWindowLongPtrW(host, GWL_EXSTYLE) | WS_EX_CONTROLPARENT.0 as isize,
             );
-            let _ = SetWindowSubclass(host, Some(pane_proc), 6508, main.0 as usize);
+            let _ = SetWindowSubclass(host, Some(pane_proc), GIT_PANE_HOST, main.0 as usize);
             let parent = host;
             let summary = shell::control(
                 parent,
@@ -515,29 +551,27 @@ impl App {
         };
         unsafe {
             let show = body.is_some() && self.shell.enabled;
+            let prompting = self.git_ui.prompt.is_some();
+            let remote_needed = self
+                .git_ui
+                .prompt
+                .is_some_and(|id| [FETCH, PULL, PUSH].contains(&id));
             let all = [
-                c.host,
-                c.summary,
-                c.files,
-                c.diff,
-                c.input,
-                c.remote,
-                c.input_label,
-                c.execute,
-                c.input_cancel,
+                (c.host, show),
+                (c.summary, show),
+                (c.files, show && !prompting),
+                (c.diff, show && !prompting),
+                (c.input, show && prompting),
+                (c.remote, show && remote_needed),
+                (c.input_label, show && prompting),
+                (c.execute, show && prompting),
+                (c.input_cancel, show && prompting),
             ];
-            for h in all {
-                let _ = ShowWindow(h, if show { SW_SHOW } else { SW_HIDE });
+            for (h, visible) in all {
+                let _ = shell::show_child_control(h, visible);
             }
             for (_, h) in &c.buttons {
-                let _ = ShowWindow(
-                    *h,
-                    if show && self.git_ui.prompt.is_none() {
-                        SW_SHOW
-                    } else {
-                        SW_HIDE
-                    },
-                );
+                let _ = shell::show_child_control(*h, show && self.git_ui.prompt.is_none());
             }
             if !show {
                 return;
@@ -574,7 +608,18 @@ impl App {
                     },
                     self.dpi,
                 );
-                let _ = EnableWindow(*h, self.git_enabled(*id));
+                shell::enable_owner_button(
+                    shell::OwnerButtonPaint {
+                        recipient: self.shell.main_window,
+                        parent: c.host,
+                        parent_id: Some(GIT_PANE_HOST),
+                        child: *h,
+                        id: *id,
+                        tokens: self.shell.tokens,
+                        label: shell::text_of(*h),
+                    },
+                    self.git_enabled(*id),
+                );
             }
             let content_y = y + if self.git_ui.prompt.is_some() {
                 66.
@@ -583,8 +628,6 @@ impl App {
             };
             let remaining = (r.y + r.height - content_y - 4.).max(1.);
             if self.git_ui.prompt.is_some() {
-                let _ = ShowWindow(c.files, SW_HIDE);
-                let _ = ShowWindow(c.diff, SW_HIDE);
                 position(
                     c.input_label,
                     Rect {
@@ -635,15 +678,7 @@ impl App {
                     },
                     self.dpi,
                 );
-                let remote_needed = self
-                    .git_ui
-                    .prompt
-                    .is_some_and(|id| [FETCH, PULL, PUSH].contains(&id));
-                let _ = ShowWindow(c.remote, if remote_needed { SW_SHOW } else { SW_HIDE });
             } else {
-                for h in [c.input, c.remote, c.input_label, c.execute, c.input_cancel] {
-                    let _ = ShowWindow(h, SW_HIDE);
-                }
                 let files_height = (remaining * 0.43).max(26.);
                 position(
                     c.files,
@@ -1796,6 +1831,9 @@ impl App {
         if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_ESCAPE.0 as usize {
             if self.git_ui.prompt.is_some() {
                 self.git_close_prompt();
+                unsafe {
+                    self.refresh();
+                }
             } else if self.git_ui.worker.is_some()
                 && let Some(cancel) = &self.git_ui.cancellation
             {
@@ -1907,25 +1945,68 @@ unsafe extern "system" fn pane_proc(
             let _ = RemoveWindowSubclass(hwnd, Some(pane_proc), id);
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
-        if matches!(
-            msg,
-            WM_COMMAND | WM_DRAWITEM | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC
-        ) {
-            return shell::send(HWND(data as *mut _), msg, wp, lp);
+        let main = HWND(data as *mut _);
+        if id != GIT_PANE_HOST
+            || main == HWND::default()
+            || GetParent(hwnd).unwrap_or_default() != main
+            || GetDlgCtrlID(hwnd) as usize != GIT_PANE_HOST
+        {
+            return DefSubclassProc(hwnd, msg, wp, lp);
+        }
+        match msg {
+            WM_COMMAND if lp.0 != 0 => {
+                let child = HWND(lp.0 as *mut _);
+                let child_id = wp.0 & 0xffff;
+                if git_host_child(hwnd, child, child_id) {
+                    return shell::send(main, msg, wp, lp);
+                }
+            }
+            WM_DRAWITEM if lp.0 != 0 => {
+                let item = &*(lp.0 as *const DRAWITEMSTRUCT);
+                let child_id = item.CtlID as usize;
+                if item.CtlType == ODT_BUTTON
+                    && wp.0 == child_id
+                    && is_git_owner_draw_id(child_id)
+                    && git_host_child(hwnd, item.hwndItem, child_id)
+                {
+                    return shell::send(main, msg, wp, lp);
+                }
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC if lp.0 != 0 => {
+                return shell::send(main, msg, wp, lp);
+            }
+            _ => {}
         }
         DefSubclassProc(hwnd, msg, wp, lp)
     }
 }
+fn is_git_control_id(id: usize) -> bool {
+    COMMANDS.iter().any(|(command_id, ..)| *command_id == id)
+        || matches!(
+            id,
+            SUMMARY | FILES | DIFF_TEXT | INPUT | REMOTE | INPUT_LABEL | EXECUTE | INPUT_CANCEL
+        )
+}
+fn is_git_owner_draw_id(id: usize) -> bool {
+    matches!(
+        id,
+        REFRESH | STAGE | UNSTAGE | CANCEL | EXECUTE | INPUT_CANCEL
+    )
+}
+unsafe fn git_host_child(host: HWND, child: HWND, id: usize) -> bool {
+    child != HWND::default()
+        && is_git_control_id(id)
+        && unsafe { GetParent(child).unwrap_or_default() } == host
+        && unsafe { GetDlgCtrlID(child) as usize } == id
+}
 fn position(hwnd: HWND, r: Rect, dpi: f32) {
     unsafe {
-        let _ = SetWindowPos(
+        let _ = shell::position_child_control(
             hwnd,
-            None,
             (r.x * dpi).round() as i32,
             (r.y * dpi).round() as i32,
             (r.width * dpi).round().max(1.) as i32,
             (r.height * dpi).round().max(1.) as i32,
-            SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
 }
@@ -2048,6 +2129,232 @@ mod tests {
             unsafe {
                 let _ = DestroyWindow(self.0);
             }
+        }
+    }
+    #[test]
+    fn native_git_control_visibility_has_no_transient_shows_and_tracks_prompt_and_pane() {
+        struct Counts {
+            transitions: Cell<usize>,
+        }
+        unsafe extern "system" fn spy(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                // Hidden descendants need not receive WINDOWPOSCHANGED for a
+                // local visibility change. Direct ShowWindow notifications
+                // (lParam0) remain distinct from parent show/hide propagation.
+                if msg == WM_SHOWWINDOW && lp.0 == 0 {
+                    let counts = &*(data as *const Counts);
+                    counts.transitions.set(counts.transitions.get() + 1);
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let mut app = super::super::tests::composing_test_app("original😀\n");
+        let counts = Box::new(Counts {
+            transitions: Cell::new(0),
+        });
+        // Counts outlive all subclassed children, including failure cleanup.
+        let window = OwnedWindow(super::super::tests::hidden_test_window_size(1100, 700));
+        let foreground = unsafe { GetForegroundWindow() };
+        app.hwnd = window.0;
+        app.shell.main_window = window.0;
+        app.shell.enabled = true;
+        app.shell.panels[PanelId::Git as usize].1 = Rect {
+            x: 760.,
+            y: 350.,
+            width: 260.,
+            height: 340.,
+        };
+        app.clear_composition();
+        app.git_init();
+        let source = app.doc().source().to_owned();
+        let document = (
+            app.doc().id(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        let c = app.git_ui.controls.as_ref().unwrap();
+        let controls = [
+            c.host,
+            c.summary,
+            c.files,
+            c.diff,
+            c.input,
+            c.remote,
+            c.input_label,
+            c.execute,
+            c.input_cancel,
+        ];
+        let buttons: Vec<_> = c.buttons.iter().map(|(_, hwnd)| *hwnd).collect();
+        for hwnd in controls.iter().chain(&buttons) {
+            unsafe {
+                let mut pid = 0;
+                GetWindowThreadProcessId(*hwnd, Some(&mut pid));
+                assert_eq!(pid, std::process::id());
+                assert!(IsChild(window.0, *hwnd).as_bool());
+                assert!(
+                    SetWindowSubclass(
+                        *hwnd,
+                        Some(spy),
+                        0xF19,
+                        (&*counts as *const Counts) as usize,
+                    )
+                    .as_bool()
+                );
+            }
+        }
+        for (prompt, pane_visible) in [
+            (None, true),
+            (Some(COMMIT), true),
+            (Some(FETCH), true),
+            (Some(PULL), true),
+            (Some(PUSH), true),
+            (Some(STORAGE_CONFIG), true),
+            (Some(CREATE), true),
+            (None, true),
+            (Some(FETCH), false),
+            (None, false),
+            (Some(COMMIT), true),
+            (None, true),
+        ] {
+            let prompt_visible = prompt.is_some();
+            let remote = prompt.is_some_and(|id| [FETCH, PULL, PUSH].contains(&id));
+            // Independent final-state oracle, including the other Git buttons.
+            let expected = [
+                pane_visible,
+                pane_visible,
+                pane_visible && !prompt_visible,
+                pane_visible && !prompt_visible,
+                pane_visible && prompt_visible,
+                pane_visible && remote,
+                pane_visible && prompt_visible,
+                pane_visible && prompt_visible,
+                pane_visible && prompt_visible,
+            ];
+            let expected: Vec<_> = expected
+                .into_iter()
+                .chain(buttons.iter().map(|_| pane_visible && !prompt_visible))
+                .collect();
+            let handles: Vec<_> = controls.iter().chain(&buttons).copied().collect();
+            let before: Vec<_> = handles
+                .iter()
+                .map(|h| unsafe { GetWindowLongPtrW(*h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 })
+                .collect();
+            let needed = before.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            app.git_ui.prompt = prompt;
+            app.shell.panels[PanelId::Git as usize].1.width = if pane_visible { 260. } else { 0. };
+            counts.transitions.set(0);
+            app.git_sync();
+            let actual: Vec<_> = handles
+                .iter()
+                .map(|h| unsafe { GetWindowLongPtrW(*h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 })
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "final visibility: {prompt:?}, pane={pane_visible}"
+            );
+            println!(
+                "git visibility prompt={prompt:?} pane={pane_visible} actual_transitions={} required={needed}",
+                counts.transitions.get()
+            );
+            assert_eq!(
+                counts.transitions.get(),
+                needed,
+                "transient native visibility changes"
+            );
+            counts.transitions.set(0);
+            app.git_sync();
+            assert_eq!(
+                counts.transitions.get(),
+                0,
+                "unchanged native sync must not show/hide"
+            );
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(
+                (
+                    app.doc().id(),
+                    app.doc().revision(),
+                    app.doc().selection(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count()
+                ),
+                document
+            );
+            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+            assert!(!app.git_job_busy());
+        }
+    }
+    #[test]
+    fn git_owner_draw_requires_registered_child_and_reaches_shell_renderer() {
+        let mut app = super::super::tests::composing_test_app("text");
+        let window = OwnedWindow(super::super::tests::hidden_test_window_size(1100, 700));
+        let other_window = OwnedWindow(super::super::tests::hidden_test_window_size(240, 80));
+        app.hwnd = window.0;
+        app.shell.main_window = window.0;
+        app.shell.enabled = true;
+        app.composing = false;
+        app.git_init();
+
+        let controls = app.git_ui.controls.as_ref().unwrap();
+        let button = controls
+            .buttons
+            .iter()
+            .find(|(id, _)| *id == REFRESH)
+            .unwrap()
+            .1;
+        let dc = unsafe { GetDC(Some(window.0)) };
+        assert!(!dc.0.is_null());
+        let mut item = DRAWITEMSTRUCT {
+            CtlType: ODT_BUTTON,
+            CtlID: REFRESH as u32,
+            itemID: u32::MAX,
+            hwndItem: button,
+            hDC: dc,
+            rcItem: RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 24,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { app.git_ui.owner_draw_button(window.0, REFRESH, &item) }
+                .unwrap()
+                .label,
+            "更新"
+        );
+        assert!(unsafe { app.git_ui.owner_draw_button(other_window.0, REFRESH, &item) }.is_none());
+        assert!(unsafe { app.git_ui.owner_draw_button(window.0, STAGE, &item) }.is_none());
+        item.CtlType = ODT_LISTBOX;
+        assert!(unsafe { app.git_ui.owner_draw_button(window.0, REFRESH, &item) }.is_none());
+        item.CtlType = ODT_BUTTON;
+        item.hwndItem = other_window.0;
+        assert!(unsafe { app.git_ui.owner_draw_button(window.0, REFRESH, &item) }.is_none());
+        item.hwndItem = button;
+        assert_eq!(
+            unsafe {
+                app.shell_window_message(
+                    window.0,
+                    WM_DRAWITEM,
+                    WPARAM(REFRESH),
+                    LPARAM((&item as *const DRAWITEMSTRUCT) as isize),
+                )
+            },
+            Some(LRESULT(1))
+        );
+        unsafe {
+            ReleaseDC(Some(window.0), dc);
         }
     }
     #[test]

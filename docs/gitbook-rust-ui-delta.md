@@ -5,14 +5,19 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
-## Rev3の文字重なり修正と未統合境界
+## Rev3の文字重なり修正と確認範囲
 
 主画面のパレット／Git host自身のcaption描画を切り分け、名前と入力・通知を保った
 native container描画に変更した。Searchの明示queryラベルは維持した。
 直接関係するCompactの描画配送・clip・パレット子部品の色通知も確認したが、
-最終候補でもCompactパレットの初回／再表示は未合格である。
-作業branchの未完了checkpointとして記録し、developへ統合しない。
-この差分をGitBookの公開受入へ反映していない。候補ごとの機械試験・実画面・残件は
+当初のCompact採取では文字欠落を観測した。後続の通常操作・受動撮影では初回／再表示とも
+見出しと複数行を読めることを確認した。旧採取のFAILと再表示の撮影制限は受入記録に保持する。
+10月18日の同一EXEでの再試行では文書／Workspaceの実結果移動と主画面のパレット・window操作を
+追加確認した。後続runでは各切替先を実画面で確認する10往復・20切替のnav送信区間432.990秒を記録した。
+準備時のquery再入力を含む観測窓561.880秒とは分けている。
+以前の即時frameの旧表示／Git白化を保持し、確認済み範囲は受入記録に限定する。
+今回必須の代表条件の確認と、全IME／DPI matrix・物理入力・全製品Human受入を区別する。
+開発線の通常統合とGitBook反映は最終HANDOFFの実結果で確認する。候補ごとの機械試験・実画面・残件は
 [受入記録](rust-acceptance.md)と最終HANDOFFを参照する。
 
 ## Rev2の限定差分と未完了境界
@@ -75,4 +80,4 @@ GitBookの公開仕様へ受入済みとして反映しない。
 | 製品概要と画面操作 | native child redraw、Feature/Git/Explorer/settingsのowner-draw | control identityに対応する描画先、空captionの安全なno-op、日本語captionの正確な文字数経路。native GDI回帰であり、最終画面のGUI確認ではない。 |
 | 構成と検証の境界 | source／EXE／harnessの対応、借用中の再描画、機械・GUI・IMEの証拠 | 修正前の失敗と限定回帰を保持し、最終buildの実測結果と未確認条件を分ける。 |
 
-章名は2026年10月15日の現行GitBookと照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから記入する。根拠source commitは未確定。
+章名は2026年10月18日の現行GitBookでも照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから反映する。Rev3製品source commitは`6d84d8c9762fa8857e141deb82ff38d8f9b27f78`。統合・公開の実結果は最終HANDOFFに記録する。

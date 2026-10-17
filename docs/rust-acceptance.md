@@ -1,6 +1,6 @@
 # Rust Editor受入記録
 
-## 文字重なり修正と実画面受入（Rev3・未完了checkpoint）
+## 文字重なり修正と実画面受入（Rev3）
 
 Task `20261017-mdlite-ui-surface-recovery` Revision 3は、作業branchの
 `f6354c8db7eb362c262c063c1db0d726c38ddc5e`から継続した。
@@ -13,8 +13,9 @@ Compactからのパレットにも描画を配送する局所回帰を追加し�
 別Agentのread-only correctness reviewで見つかったCompact配送漏れは修正し、
 最終差分の再確認に追加指摘はない。実装者のPonytail確認とは別のreviewである。
 Compactの既存不具合も基準EXEで再現した。子領域clipとパレット子部品の色通知を
-直接の関連範囲として修正したが、最終EXEの初回／再表示では見出し・query・一覧文字が
-欠ける。局所描画試験のPASSを実画面合格にせず、この修正手法の反復を止めた。
+直接の関連範囲として修正したが、その時の初回／再表示の採取では見出し・非選択行の文字が
+欠けた。局所描画試験のPASSを実画面合格にせず、この修正手法の反復を止めた。
+後続の追加refreshを送らない通常操作の観測は、下記run07として区別する。
 
 固定Release EXEは`24719c6a1b5dedf793e56a212e607fe6fb2ed53b304a3c40da7d7733a98053c9`、
 source集約は`ded5523f1f338c2ef78b671166f07c8fabe17fbc42f72074609092cb2e403459`。
@@ -27,17 +28,17 @@ build入力資材・機械試験・操作記録・Git結合情報は最終HANDOF
 main／Compact描画・色・再入・文書不変の回帰1件を加えた。
 mise／Cargoは通常環境、試験子processだけ合成AppDataを使い、全試験processの終了を確認した。
 Debug EXEは`6d121c62bc32d10bc9d2b1ad2d72b18aa9a44f6174f6a18aa87f80a8ac3bccdf`。
-これらの機械試験はCompactの実画面FAILや未確認のA〜Eを合格にしない。
+機械試験だけで実画面を合格にせず、以下の同一EXEでの操作証拠を別に確認した。
 
 | Rev3必須項目／対応 | 最終候補の状態 |
 |---|---|
-| A・文字重なり | PARTIAL。主画面NoWorkspaceパレット／Gitの局所確認PASS。全表示操作は未確認。CompactパレットはFAIL。 |
-| B・C01 結果移動 | NOT_RUN／BLOCKED。最終候補のquery入力・結果選択前に前面化で停止。Rev2の文書Next限定結果を転記しない。 |
-| C・C03 10往復／60秒以上 | NOT_RUN／BLOCKED。前面化できず操作未実施。過去の静止撮影・9操作を10往復に数えない。 |
-| D・C02／C04 パレット／window | 主画面一連操作はNOT_RUN／BLOCKED。局所表示のみ確認。Compact初回／再表示FAIL。 |
-| E・C05 入力／実IME／編集保存 | NOT_RUN／BLOCKED。最終候補では入力未実施。旧EXEのUnicode5回PASSや実IME結果を転記しない。 |
+| A・文字重なり | PASS（観測した96 DPIの範囲）。主画面の初回／再表示／切替／resizeと、後続10往復の対象領域を確認。Compactも通常の初回／再表示で見出しと複数行が読めた。旧採取の欠落／白化は保持し、全frame・遷移性能の保証にはしない。 |
+| B・C01 結果移動 | PASS。10月18日の検証出力付き合成Workspaceで文書4結果から `[313,319)`、Workspace 2ファイル5結果からsecond.mdの `[8,14)` へ実結果選択で移動。全タブの原文・dirty・revision・履歴は基準どおり。 |
+| C・C03 10往復／60秒以上 | PASS（後続run06の観測範囲）。各切替先clientを確認する10往復・20実表示切替のnav送信区間は432.990秒。query再入力の準備操作も含む観測窓は561.880秒で、両scope・詳細／置換開閉と全6タブ照合を記録。旧2往復と855.2秒の内部状態上10往復は別履歴。 |
+| D・C02／C04 パレット／window | 主画面96 DPIでExplorer／Search背面、保存実行、無効理由、Esc・外側クリック、開閉両状態のresize・最小化復帰、狭幅drawerを確認。追加のCompact初回／再表示も後続の受動観測で読めた。 |
+| E・C05 入力／実IME／編集保存 | 必須代表を確認。Unicode初回入力5新規起動、編集→Undo→Redo→通常保存→再読込、ATOKとMicrosoft IMEの検索／パレット／本文の代表的実入力を確認。全matrix・物理入力・Human受入へ拡張しない。 |
 
-主画面の追加採取では、最初のhelper import不足を修正後、入力helperが前面化前の
+最初の主画面追加採取では、helper import不足を修正後、入力helperが前面化前の
 foreground条件で送信前に停止した。この方法の反復を止め、既存Orcaのrestoreと
 window操作に切り替えたが、対象のnative foregroundを確認できなかった。
 Orcaの操作は未検証のsynthetic結果で、query／control入力は送っていない。
@@ -45,7 +46,127 @@ Orcaの操作は未検証のsynthetic結果で、query／control入力は送っ�
 所有PIDは通常終了し、fixture／合成領域の復元・未変更を記録した。
 これは製品の検索・IME・保存FAILを示す試験ではなく、実行前のGUI採取blockerである。
 
-必須未確認とCompactのFAILを残した作業branch checkpointであり、developへ統合しない。
+10月18日、本人から前面化への操作干渉の可能性と再試行の指示があり、同じ最終EXEで再開した。
+前面化は成立し、NoWorkspaceの文書検索結果移動と、通常のWorkspace起動から別文書への
+実結果移動を確認した。ただし通常起動の子windowは検証用出力を引き継がず、そのwindowの
+未保存タブに対し、保全指示に反して「保存しない」が送信された。画面は空表示だったが、
+厳密な原文・revision・履歴は未取得なので、このcaseの本文不変・無損失は合格にしない。
+
+既存の`--diagnostic-path`で同じ合成Workspaceを起動した新しいcaseでは、入力前に全3タブを
+取得した。editor.mdとsecond.mdはファイル一致・保存済み・revision／履歴0、無題タブは
+厳密に空の原文・dirty=true・revision／履歴0だった。この基準に対し文書とWorkspaceの実結果を
+UIから選び直し、UTF-8 byte offsetと原文・dirty・revision・Undo／Redoを確認した。
+移動によるactive document／選択の意図した変更を、表示操作の不変条件と混同しない。
+後者の新caseを、先に閉じたwindowの未取得状態の代わりにはしない。
+
+Cでは、対象詳細がWorkspace scope限定であることと、詳細表示中はquery／置換欄が
+隠れる条件を確認して別の有効な操作手順を一度試した。追加区間では置換欄を閉じる
+操作後の条件が成立せず、追加完了往復は0だった。置換文字・置換実行は送っていない。
+閉じる操作の原因は未確定であり、10往復・20切替・60秒の受入を満たさない。
+表示操作後の全タブ原文・dirty・revision・履歴は基準どおりで、本文focusのための
+クリックによる選択位置変更は意図した操作として別に記録した。
+新caseの厳密に空だった無題タブは新規ファイルへ通常保存し、0 bytes／空hashを照合した。
+全タブ保存済みのWorkspace windowを通常終了し、NoWorkspace windowを元の寸法へ復元した。
+
+その後、Eで「操作直後の診断は未変化でも後続で完了した」という新観測を得た。
+別担当の限定確認では、既存click helperは入力数確認後100ms待つだけで、置換欄の可視／focusの
+完了を待たないことが分かった。旧Cの148ms単発判定とは異なる検証として、表示・focusの
+完了条件を待つ一度の開閉を別caseで確認した。各1クリックで開174ms／閉149msに完了し、
+原文・選択・dirty・revision・履歴は不変だった。これは旧失敗原因の確定でも10往復の合格でもない。
+
+この新しい完了観測方式で別の合成Workspace caseを進め、nav送信20回と内部状態上の10往復を
+855.2秒の区間に記録した。文書／Workspace検索、query再入力、対象詳細／置換の代表開閉と
+操作中のframe採取を含む。補助観測を早く終了したround3は、後続の実Explorer表示を確認した
+時点で到達を記録した。Taskに5秒性能条件はなく、5秒以内の完了はUNKNOWNのまま保持した。
+しかし中盤／最終のSearch frameにはExplorerのような古い領域が残り、最終切替frameには
+Git欄の白い矩形があった。後の最終Explorer frameは正常だったが、代表frameの不一致を
+打ち消さない。送信数・内部stateの一致を実画面C03の合格へ変換しない。
+active文書の原文・選択・dirty・revision・履歴は不変で、入力前は全4タブの基準を取得した。
+終端の他タブ再訪はExplorer focusからのCtrl+Tabが進まず一部未確認である。
+これらの新しい描画事実は、既存のclip／色修正の反復とは別の原因確認へ渡した。
+
+別Agentの描画経路確認では、診断refresh後の内部状態更新と実際のWM_PAINTは別であり、
+短い間隔のread-backは画面完了を保証しなかった。追加の1切替では、クリック後74.536msの
+client画像はExplorerのまま、49.342秒後の画像はSearchのquery・結果を表示していた。
+間の完了時刻は未観測で、最初の5秒以内の完了や遅延原因は確定しない。
+即時画像をSearchとした担当の記述は、Rootと別Agentの画像照合で訂正した。
+後半5枚のSearch画像は同一hashだった。この結果だけで持続する描画欠落や修正必要性は
+確定せず、先の10往復を実画面合格へ昇格させるものでもない。
+
+その後は各切替先のclient画像を実際に確認してから次のnavを送る方法で、同じ最終EXEの
+run06に10往復・20回の実表示切替を記録した。query再入力は準備中のUTC18:59:54頃に一度だけ
+実施し、18:59:56.830の画像で「編集」を確認した。19:01:05.598に実Explorer基準画面を確認後、
+19:01:23.690〜19:08:36.679のnav送信区間432.990秒で、query保持・両scope・対象詳細／置換欄の
+代表開閉を確認した。この区間内に再入力を繰り返したとは扱わない。
+再入力前の基準画像18:59:16.532から最後のExplorer画像19:08:38.412までの観測窓は561.880秒。
+これは連続した入力の実働時間ではない。
+数えた全切替先が読める状態で、本文の置換は実行していない。遷移の性能保証や未撮影の全frameの
+保証ではない。終了時は実本文focusから全6タブを再訪し、原文・clean・revision／履歴を照合した。
+
+主画面のパレットでは、Search背面で「保存」を絞り込んで実行し、保存完了と閉鎖を確認した。
+Workspace未指定の復旧候補には無効理由が表示された。Esc後は検索欄へfocusが戻り、
+次のRight入力で本文は変わらなかった。外側クリックで閉じた場合も本文・選択・履歴に
+クリックの通り抜けはなかった。Explorer背面からも候補入力・無効理由・Esc後のnav復帰を確認した。
+パレット開閉それぞれでresizeと最小化復帰、770×650の狭幅Search drawerを確認し、
+元の1100×800へ戻した。実行は96 DPIに限り、他DPIの合格にはしない。
+配送する追加画面はtarget client内のcaptureを使い、他windowが端に写るraw画像はlocalだけに保持する。
+
+Eの初回入力は同じ最終EXEの5新規processで、ExplorerからSearchを開いてquery欄5602へ
+Unicodeの「Markdown」を一括入力した。queryとcaret 8/8、原文hash・文書選択・dirty・revision・
+Undo／Redoの不変を各回で確認し、通常終了した。旧EXEの5回合格を転記していない。
+別の合成本文ではMicrosoft IMEの通常key入力から候補「日本語」を選んで確定した。
+Undoで元本文へ、Redoで確定後本文へ戻り、処理完了後の原文・選択・履歴を確認した。
+操作直後の診断が未変化でも後続状態が変わったため、短い固定待ちだけで失敗とはしない。
+明示したSave前にもdisk一致・cleanへの変化を観測したが、その保存原因は未特定である。
+その後Fileの通常Saveを実行し、61 bytesのUTF-8・BOMなし・LF 2／CRLF 0を本文hashと照合した。
+通常パレットの「ディスクから再読込み」と所有確認ダイアログの「はい」で再読込し、
+保存本文一致・clean・選択0/0・revision／Undo／Redo 0への初期化を確認した。
+
+実IMEはATOKの検索欄で通常keyによる候補表示・取消・「日本語」確定と、パレットで
+composition中の最初のEscによるIME取消、次のEscによるパレット閉鎖・検索欄focus復帰・次入力を確認した。
+Microsoft IMEは検索欄の候補表示・取消とかな確定、パレットの「日本語」変換確定・取消、
+本文の取消・「日本語」変換確定を確認した。検索欄のかな確定を漢字確定へ読み替えない。
+追加の代表試験では入力前提未成立の試行があり、既知の切替・入力状態確認後のATOK本文でも
+preedit／候補が発生せず、原文は変わらなかった。追加受入0の手段反復を止め、
+この時点ではATOKパレット確定・本文代表とMicrosoft IME検索欄の明示漢字確定が未確認だった。
+入力方式・受信欄・実確定文字・取消／終了優先順はHANDOFFの今回集約に限定する。
+追加の限定コード確認では、ATOK本文試験で記録したfocus ID100は本文でなくcommand buttonだった。
+profile有効、IME open、composition中は別の状態であり、mainのIMM状態をnative query欄へ転記しない。
+この試行を有効な本文変換試験にしたり、preeditなしを製品FAILとしたりしない。
+
+外部PowerShellのIMM読取は別threadのcontextを取得できない場合があり、利用可能IMEの必須判定に
+した条件を訂正した（[IMMのthread制約](https://learn.microsoft.com/en-us/windows/win32/intl/developing-ime-aware-multiple-thread-applications)）。本文は所有UI threadの診断と実候補、native Edit欄は実focus・候補表示・
+確定後queryで観測する。UnicodeによるLatin文字入力は実IME試験でなくcontrol入力として保持し、
+Undo後の原文・revision・redoを記録した。IMEが閉じた状態の通常仮想キー入力も変換合格にはしない。
+所有threadのATOK有効・open=trueと本文HWNDへのfocusを確認後、OS合成の通常仮想キーnihongoから
+「にほんご」のpreeditとATOK候補を観測し、取消の本文／履歴不変と「日本語」確定を確認した。
+focus click後の実基準はUTF-8位置5で、9 bytesの確定後は14。初期位置51を維持したとはしない。
+確定本文61 bytesを通常保存後、新規committed-body.mdへSave Asしてhash
+`1cfc8885209ab210e84b83370166d76589916a00f02aa7703ee4fb4a0be04460`を照合した。
+パレットEdit150でもATOK実候補から日本語を確定し、閉鎖後の有効focus／次入力で本文不変を確認した。
+Microsoft IME検索欄では正しいprofile・focus・日本語modeで通常仮想キーとSpaceを送ったが、
+観測時には候補・確定queryが見えず、ATOKへ戻した後のqueryは日本語になっていた。
+処理時点と確定元を特定できないため、入力欠落のFAILにもMicrosoft IME漢字確定PASSにもせず未確認とする。
+
+後続run06では、Microsoft IME profile・日本語modeとSearch Edit5602のfocusを入力前に確認し、
+通常keyのNIHONGOから「にほんご」と候補1「日本語」を実画面で観測した。候補が既に出ていたため
+Spaceは送らず、Tabで選択・Enterで確定し、query「日本語」と候補閉鎖を確認した。
+composition終了後の診断で本文hash・clean・revision／Undo／Redoは基準どおりだった。
+これは先の出所不明なqueryの読み替えではなく、受信欄と操作を特定した別の代表確認である。
+
+Compactの追加判断では、旧採取は毎回WM_APP+1のrefreshとcontrol読取りをpixel撮影前に送り、
+同じ表示を静観した後続frameがなかったことを別Agentが確認した。主画面の即時／後続表示の
+違いを新たな根拠として、同じEXEで通常Ctrl+Kの後にrefresh・control polling・入力・強制再描画を
+加えない一度の観測を行った。run07の初回は直後にはパレットがなく、約1秒後から55秒後まで
+見出しと複数の非選択行が読めた。queryは意図どおり空だった。
+一度閉じて再表示した場合も後続client画像は読めた。ただし撮影helperがCtrl+K送信後に失敗し、
+再表示の即時／1秒画像と正確なkey送信時刻は未取得である。再試行や描画の強制は行っていない。
+閉鎖後の主画面も本文が読め、原文hash・clean・revision／履歴0・ATOK closedを保って通常終了した。
+旧採取のFAILを消したり、samplingが原因だったと確定したりはせず、通常操作で読めるという
+追加の受入証拠として扱う。製品コードはこの再試行中に変更していない。
+
+今回必須A〜Eは上記の観測範囲で確認した。全IME／DPI matrix・物理手入力・全製品Human受入は
+別の未確認である。開発線の通常統合・Git配送と最終結合情報は、最終HANDOFFの実際のOIDを正本とする。
 W01／W03、E08、pin／unpin、全DPI／IME matrix・物理入力・Human受入は別の残件として保持する。
 以下のRev2以前の証拠は、それぞれのbuildに限定した履歴である。
 

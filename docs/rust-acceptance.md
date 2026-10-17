@@ -1,5 +1,48 @@
 # Rust Editor受入記録
 
+## 検索初回入力・表示復旧継続のcheckpoint（2026-10-17・Rev2未完了）
+
+Task `20261017-mdlite-ui-surface-recovery` Rev2は、下記Rev1の保存commit
+`69beb0998981f1b1914e3257e915357544e6dc1b`から継続した。view切替時の先回りした
+editorへのfocus移動を削除し、実際に部品を隠す既存経路のfocus／子孫判定を維持した。
+queryの選択準備をfocus前に行う順序は維持し、選択messageの抑止や入力の低速化はしていない。
+承認された導入済みRust 1.99.1へProject内のpinと厳密なbuild検査を整合した。
+
+一時診断では、文字順が正しいUnicode入力の途中に、`GetMessage`が戻る前の同期経路から
+遅い`EM_SETSEL(0,0)`が届くことを確認した。callerにMSCTF／text-input frameworkが含まれるが、
+送信元processやIMEの責任を特定した意味ではない。通常key対照、変更前buildとの対照、
+実測した検索入口からeditorへの中間移動だけを省く一因子実験を経て、上記局所修正を行った。
+一時診断と入口111専用の実験分岐は製品から除去した。
+
+最終候補のsource集約は`18c0fbc137368721a55aa2b89381809846883b40d657bb29111c12b6be130148`、
+診断なしRelease EXEは`daf66dbffa432f805a42dfba6649d062e66992e046ab3d85218a9e9b7b4674bd`。
+compile-timeのSVG等は補足manifestで照合し、wrapperの集約単独を全資材の固定とはしない。
+focused native 2件とfmtはPASS、別担当のread-only correctness reviewに残指摘なし。
+最終機械試験はDebug／Release各通常345件と専用可視2件がPASS、失敗0。
+fmtと両profileのstrict ClippyもPASS。mise／Cargoは通常環境で実行し、
+Cargoが報告したtest EXEだけを子processの合成AppDataで逐次実行した。
+最終Debug EXEは`d67154ac05f07b4f1921cdabb7d9909571a11a5d40d454a05c638d2e0059e354`。
+検証後のsource／Release EXE／harness一致とprocess不在を確認した。
+Git配送・HANDOFFの実績は最終HANDOFFへ結び付ける。
+
+| 行 | Rev2候補で確認した範囲と残件 |
+|---|---|
+| C01 | PARTIAL。文書内の実結果選択で原文位置へ移動し、source／revision／dirty不変を確認。Searchのqueryと詳細・置換の表示操作を確認したが、Workspace結果選択を混ぜた10往復は未完了。無効な前後移動を強制実行していない。 |
+| C02 | Rev1の限定PASSを保持。今回のSearch Escとeditor復帰はパレットの再確認とは別であり、最終候補でのパレット変更経路の代表確認は未完了。 |
+| C03 | PARTIAL。静止画面だけの55.58秒記録は操作中の受入から除外。続く2,700 frames／146.40秒の記録は平均54.24ms・最大83ms間隔で、9件の操作を記録したが必要な10往復は未確認。抽出frameのquery・button・captionは読めるが、全区間の白化解消とは扱わない。OS scrollbarの明るい帯は別に分類した。 |
+| C04 | Rev1の96 DPI限定PASSを保持。今回のresize補助APIは利用できず、操作を送っていない。最終候補の代表resize／復帰確認は未完了。 |
+| C05 | 初回Unicode入力の必須5 fresh processは5/5 PASS。全回で`Markdown`、caret 8、query focus、本文・revision・dirty・選択不変を確認。Ctrl+F、通常key、途中選択の置換・削除も観測した。最終候補の実IME・Undo／Redo・保存再open等を含むC05全体は未完了。 |
+
+query設定の補助操作ではCtrl+Aの全選択を観測できず、shortcutの扱いは未確認として残す。
+Home／Shift+Endによる全選択後の入力は、固定150ms後に途中の一文字だけを観測したが、
+追加入力なしの後続読取りでは全文に到達していた。到達時間は測れていない。
+固定待ちの途中観測を文字欠落と断定せず、既存の意味的な完了待ちを使う。
+これらを初回入力5/5や実IME・Human受入の代用にしない。
+
+C01／C03と必須代表確認が残るため、作業branchのcheckpointとして保存し、developへ統合しない。
+W01／W03、E08、pin／unpin、物理入力・全IME／DPI matrix・Human受入は独立した残件を維持する。
+下記Rev1のFAIL／PARTIALとbuild境界は履歴であり、Rev2候補へ付け替えない。
+
 ## 検索・コマンド表示復旧のcheckpoint（2026-10-17・未完了）
 
 Task `20261017-mdlite-ui-surface-recovery` Rev1、基準develop `48555ea840abd4fcb17ba1601eeb4f67ec9ad209`。

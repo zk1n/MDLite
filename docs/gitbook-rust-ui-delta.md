@@ -5,7 +5,16 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
-## 検索・コマンド表示復旧の反映対象
+## Rev2の限定差分と未完了境界
+
+検索viewを開く際の不要なeditor経由のfocus移動を削除し、非表示にする部品の既存focus保護を維持した。
+診断なし最終候補で初回Unicode入力は5 fresh process連続PASS。query選択準備の順序は維持し、
+選択messageの遮断や入力を遅らせる処置は追加していない。
+一方、C01のWorkspace結果選択混在、C03の操作を覆う連続観測、最終候補の一部代表確認は未完了。
+作業branchのcheckpointに留め、develop統合や公開仕様の受入済み更新は行わない。
+buildと実画面の境界は[受入記録](rust-acceptance.md)と最終HANDOFFで示す。
+
+## Rev1の検索・コマンド表示復旧の反映対象（履歴）
 
 Task `20261017-mdlite-ui-surface-recovery` Rev1の局所差分。2026年10月17日の
 `product-ui`／`architecture-verification`限定更新を基準とし、旧C++節の履歴は維持する。

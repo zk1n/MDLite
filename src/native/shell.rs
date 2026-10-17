@@ -747,13 +747,8 @@ impl App {
         self.shell.search_mode()
     }
     pub(super) fn set_search_pane_active(&mut self, active: bool) {
-        // Move focus before hiding the old view. Search's open path then gives
-        // its query priority; Explorer keeps its existing selection and state.
-        if self.shell.search != active {
-            unsafe {
-                let _ = SetFocus(Some(self.editing_window()));
-            }
-        }
+        // The visibility helper hands off focus only from controls being hidden.
+        // Search's open path then prepares and focuses its visible input.
         self.shell.search = active;
         self.show_panel(PanelId::Explorer);
     }

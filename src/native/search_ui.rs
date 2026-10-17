@@ -3201,6 +3201,81 @@ mod tests {
     }
 
     #[test]
+    fn search_view_focus_moves_only_when_the_focused_control_is_hidden() {
+        let window = super::super::tests::hidden_test_window_size(1100, 793);
+        let mut app = super::super::tests::composing_test_app("synthetic source");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        unsafe {
+            app.features_init();
+            app.search_init();
+            app.ensure_layout().unwrap();
+            let activity = shell::control(window, w!("BUTTON"), "Search", 111, WINDOW_STYLE(0));
+            let editor =
+                shell::control(window, w!("EDIT"), "retained editor", 8008, WINDOW_STYLE(0));
+            let explorer = GetDlgItem(Some(window), 4690).unwrap();
+            let query = app.search_ui.controls.query;
+
+            // These controls remain visible across both logical views. Opening
+            // Search must not visit the editor before its input takes focus.
+            for retained in [activity, window, editor] {
+                let _ = SetFocus(Some(retained));
+                app.set_search_pane_active(true);
+                assert_eq!(GetFocus(), retained);
+                app.set_search_pane_active(false);
+                assert_eq!(GetFocus(), retained);
+            }
+
+            let _ = SetFocus(Some(explorer));
+            app.set_search_pane_active(true);
+            assert_eq!(GetFocus(), window);
+            assert_eq!(
+                GetWindowLongPtrW(explorer, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            let _ = SetFocus(Some(query));
+            app.set_search_pane_active(false);
+            assert_eq!(GetFocus(), window);
+            assert_eq!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+
+            // Ctrl+F's document-search command also opens from the old view's
+            // focused child. This hidden host uses the editor fallback on close.
+            let _ = SetFocus(Some(explorer));
+            assert!(app.search_command(CMD_DOCUMENT_SEARCH));
+            assert_eq!(GetFocus(), query);
+            assert_ne!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            for unit in "ab".encode_utf16() {
+                shell::send(query, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+            }
+            assert_eq!(shell::text_of(query), "ab");
+            assert!(app.search_command(CMD_CLOSE));
+            assert_eq!(GetFocus(), window);
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn search_view_excludes_explorer_controls_and_preserves_query_and_document() {
         let window = super::super::tests::hidden_test_window_size(1100, 793);
         let mut app = super::super::tests::composing_test_app("synthetic source");

@@ -630,10 +630,9 @@ const PROFILE_FIELDS: [&str; 7] = [
     "重複時の動作",
     "入力: id|名前|required|初期値",
 ];
-const EXPLORER_BUTTONS: [usize; 10] = [4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009];
+const EXPLORER_BUTTONS: [usize; 3] = [4001, 4002, 4011];
 const CALENDAR_BUTTONS: [usize; 8] = [4020, 4021, 4022, 4023, 4024, 4025, 4026, 4027];
 const CALENDAR_OPERATIONS_BUTTON: usize = 4090;
-const OUTLINE_BUTTONS: [usize; 3] = [4040, 4041, 4042];
 const PROFILE_BUTTONS: [usize; 6] = [4080, 4081, 4082, 4083, 4084, 4088];
 const FORM_BUTTONS: [usize; 3] = [4085, 4086, 4087];
 
@@ -748,9 +747,13 @@ impl FeaturePanes {
 
             let mut commands = Vec::new();
             commands.extend(EXPLORER_BUTTONS.map(|command| (command, PanelId::Explorer)));
-            commands.extend(CALENDAR_BUTTONS.map(|command| (command, PanelId::Calendar)));
+            commands.extend(
+                CALENDAR_BUTTONS
+                    .into_iter()
+                    .filter(|command| matches!(command, 4020..=4022))
+                    .map(|command| (command, PanelId::Calendar)),
+            );
             commands.push((CALENDAR_OPERATIONS_BUTTON, PanelId::Calendar));
-            commands.extend(OUTLINE_BUTTONS.map(|command| (command, PanelId::Outline)));
             commands.extend(PROFILE_BUTTONS.map(|command| (command, PanelId::Calendar)));
             commands.extend(FORM_BUTTONS.map(|command| (command, PanelId::Calendar)));
             for (index, (command, panel)) in commands.into_iter().enumerate() {
@@ -873,9 +876,9 @@ impl FeaturePanes {
                 self.controls.explorer_list,
                 Rect {
                     x: explorer.x + 2.,
-                    y: explorer.y + 56.,
+                    y: explorer.y + 32.,
                     width: (explorer.width - 4.).max(0.),
-                    height: (explorer.height - 60.).max(0.),
+                    height: (explorer.height - 36.).max(0.),
                 },
             );
             let _ = shell::send(
@@ -1029,11 +1032,6 @@ impl FeaturePanes {
                 &CALENDAR_BUTTONS[..],
                 layout.calendar.unwrap_or_default(),
             ),
-            (
-                PanelId::Outline,
-                &OUTLINE_BUTTONS[..],
-                layout.outline.unwrap_or_default(),
-            ),
         ] {
             let compact_calendar = panel == PanelId::Calendar
                 && rect.height < CALENDAR_COMPACT_HEIGHT
@@ -1051,7 +1049,7 @@ impl FeaturePanes {
             let columns = if compact_calendar {
                 1
             } else if panel == PanelId::Explorer {
-                5
+                commands.len().clamp(1, 2)
             } else {
                 4
             };
@@ -1128,10 +1126,14 @@ impl FeaturePanes {
 
     fn button_visible(&self, command: usize, panel: PanelId, form: Option<FormMode>) -> bool {
         if panel == PanelId::Explorer {
-            return matches!(command, 4000..=4009);
+            return if self.workspace.is_some() {
+                matches!(command, 4001 | 4002)
+            } else {
+                command == 4011
+            };
         }
         if panel == PanelId::Outline {
-            return matches!(command, 4040..=4042);
+            return false;
         }
         if panel != PanelId::Calendar {
             return false;
@@ -1149,7 +1151,7 @@ impl FeaturePanes {
         if self.profiles.manager_open {
             return matches!(command, 4080..=4084 | 4088);
         }
-        matches!(command, 4020..=4027 | CALENDAR_OPERATIONS_BUTTON)
+        matches!(command, 4020..=4022 | CALENDAR_OPERATIONS_BUTTON)
     }
 
     fn synchronize(&mut self, snapshot: FeatureSnapshot) {
@@ -1522,7 +1524,10 @@ impl FeaturePanes {
                 continue;
             };
             match panel {
-                PanelId::Explorer => self.draw_explorer(app, target, body, &foreground)?,
+                PanelId::Explorer if !app.search_pane_active() => {
+                    self.draw_explorer(app, target, body, &foreground)?
+                }
+                PanelId::Explorer => {}
                 PanelId::Calendar => self.draw_calendar(
                     app,
                     target,
@@ -2615,7 +2620,6 @@ struct FeatureControlLayout {
     editor: Rect,
     explorer: Option<Rect>,
     calendar: Option<Rect>,
-    outline: Option<Rect>,
     form: Option<FormMode>,
 }
 
@@ -2629,9 +2633,12 @@ impl FeatureControlLayout {
                 width: app.editor_width(),
                 height: (app.editor_bottom() - app.editor_top()).max(0.),
             },
-            explorer: app.feature_panel_rect(PanelId::Explorer),
+            explorer: if app.search_pane_active() {
+                None
+            } else {
+                app.feature_panel_rect(PanelId::Explorer)
+            },
             calendar: app.feature_panel_rect(PanelId::Calendar),
-            outline: app.feature_panel_rect(PanelId::Outline),
             form: app.features.form.as_ref().map(|form| form.mode),
         }
     }
@@ -3050,6 +3057,26 @@ impl App {
 
     pub(super) unsafe fn features_control(&mut self, id: usize, notification: u16) -> bool {
         unsafe {
+            if self.search_pane_active()
+                && (id == EXPLORER_LIST
+                    || (id == PROMPT_EDIT
+                        && self.features.form.as_ref().is_some_and(|form| {
+                            matches!(
+                                form.mode,
+                                FormMode::NewFile | FormMode::NewFolder | FormMode::Rename
+                            )
+                        }))
+                    || self
+                        .features
+                        .controls
+                        .buttons
+                        .iter()
+                        .any(|(control_id, _, _, panel)| {
+                            *control_id == id && *panel == PanelId::Explorer
+                        }))
+            {
+                return true;
+            }
             if id == QUICK_OPEN_LIST {
                 if notification == LBN_SELCHANGE as u16 || notification == LBN_DBLCLK as u16 {
                     let selected = shell::send(
@@ -3199,6 +3226,7 @@ impl App {
                 return true;
             }
             if message.message == WM_KEYDOWN
+                && !self.search_pane_active()
                 && self.features.controls.explorer_list != HWND::default()
                 && GetFocus() == self.features.controls.explorer_list
                 && !self.feature_ime_active()
@@ -5095,6 +5123,7 @@ fn localized_label(command: usize, label: &str) -> String {
         4007 => "パス".to_owned(),
         4008 => "表示".to_owned(),
         4009 => "上へ".to_owned(),
+        4011 => "Workspaceを開く…".to_owned(),
         4020 => "前月".to_owned(),
         4021 => "次月".to_owned(),
         4022 => "今日".to_owned(),
@@ -5823,15 +5852,11 @@ mod tests {
                 editor: Rect::default(),
                 explorer: None,
                 calendar: Some(body),
-                outline: None,
                 form: None,
             };
             let buttons = features.toolbar_layout(&controls);
             let compact = body_height < CALENDAR_COMPACT_HEIGHT;
-            assert_eq!(
-                buttons.len(),
-                if compact { 1 } else { CALENDAR_BUTTONS.len() }
-            );
+            assert_eq!(buttons.len(), if compact { 1 } else { 3 });
             let layout = calendar_layout(body_height);
             let month = Rect {
                 x: 8.0,
@@ -5865,7 +5890,7 @@ mod tests {
                 assert!(buttons.values().all(|button| button.y == 3.0));
             } else {
                 assert!(buttons.values().any(|button| button.y == 3.0));
-                assert!(buttons.values().any(|button| button.y == 29.0));
+                assert!(buttons.values().all(|button| button.y == 3.0));
             }
         }
         assert!(!CALENDAR_BUTTONS.contains(&4007));
@@ -5925,7 +5950,6 @@ mod tests {
             editor: Rect::default(),
             explorer: None,
             calendar: Some(panel),
-            outline: None,
             form: None,
         };
         let buttons = features.toolbar_layout(&controls);

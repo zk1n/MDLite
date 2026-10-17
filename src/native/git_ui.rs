@@ -397,7 +397,7 @@ impl App {
                 w!("STATIC"),
                 "Git pane",
                 GIT_PANE_HOST,
-                WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                WS_CLIPCHILDREN | WS_CLIPSIBLINGS | shell::CONTAINER_STYLE,
             );
             SetWindowLongPtrW(
                 host,

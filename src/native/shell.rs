@@ -7,6 +7,7 @@ use mdlite::{
 use windows::Win32::UI::Controls::*;
 
 pub(super) const PALETTE: usize = 100;
+pub(super) const CONTAINER_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x000d); // SS_OWNERDRAW
 const SETTINGS: usize = 101;
 const COMPACT: usize = 102;
 const RETURN: usize = 103;
@@ -312,6 +313,58 @@ pub(super) struct Tokens {
     pub heading: D2D1_COLOR_F,
     pub code_background: D2D1_COLOR_F,
 }
+
+// Native controls ask their parent for colors synchronously, including while
+// layout owns App. Own the brush with these paint-only inputs across reentry.
+pub(super) struct ControlColors {
+    pub(super) tokens: Tokens,
+    brush: HBRUSH,
+}
+impl ControlColors {
+    fn new(tokens: Tokens) -> Self {
+        Self {
+            tokens,
+            brush: unsafe { CreateSolidBrush(rgb(tokens.panel)) },
+        }
+    }
+    pub(super) unsafe fn paint(&self, wp: WPARAM) -> LRESULT {
+        unsafe {
+            let dc = HDC(wp.0 as *mut _);
+            SetTextColor(dc, rgb(self.tokens.foreground));
+            SetBkColor(dc, rgb(self.tokens.panel));
+            LRESULT(self.brush.0 as isize)
+        }
+    }
+    // Named STATIC hosts are containers, not visible labels. Keep their native
+    // names while drawing only the panel background, including during reentry.
+    pub(super) unsafe fn draw_container(
+        &self,
+        owner: HWND,
+        id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> bool {
+        unsafe {
+            if owner == HWND::default()
+                || item.CtlType != ODT_STATIC
+                || item.CtlID as usize != id
+                || GetParent(item.hwndItem).ok() != Some(owner)
+                || GetDlgCtrlID(item.hwndItem) as usize != id
+                || GetWindowLongPtrW(item.hwndItem, GWL_STYLE) as u32 & 0x1f != CONTAINER_STYLE.0
+            {
+                return false;
+            }
+            FillRect(item.hDC, &item.rcItem, self.brush);
+            true
+        }
+    }
+}
+impl Drop for ControlColors {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.brush.into());
+        }
+    }
+}
 impl Default for Tokens {
     fn default() -> Self {
         Self {
@@ -333,6 +386,8 @@ enum Splitter {
     Height(PanelId),
 }
 struct PaletteState {
+    host: HWND,
+    font: HFONT,
     label: HWND,
     query: HWND,
     list: HWND,
@@ -343,6 +398,16 @@ struct PaletteState {
     selection: Selection,
     affinity: BoundaryAffinity,
     composing: Box<Cell<bool>>,
+}
+impl Drop for PaletteState {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(Some(self.host)).as_bool() {
+                let _ = DestroyWindow(self.host);
+            }
+            let _ = DeleteObject(self.font.into());
+        }
+    }
 }
 pub(super) struct NativeShell {
     pub enabled: bool,
@@ -372,7 +437,7 @@ pub(super) struct NativeShell {
     pub(super) external_change_docs: std::collections::HashSet<u64>,
     main_target: Option<ID2D1HwndRenderTarget>,
     compact_target: Option<ID2D1HwndRenderTarget>,
-    brush: HBRUSH,
+    colors: Rc<ControlColors>,
     tooltip_text: Vec<Vec<u16>>,
 }
 impl Default for NativeShell {
@@ -405,17 +470,8 @@ impl Default for NativeShell {
             external_change_docs: std::collections::HashSet::new(),
             main_target: None,
             compact_target: None,
-            brush: HBRUSH::default(),
+            colors: Rc::new(ControlColors::new(Tokens::default())),
             tooltip_text: Vec::new(),
-        }
-    }
-}
-impl Drop for NativeShell {
-    fn drop(&mut self) {
-        if self.brush != HBRUSH::default() {
-            unsafe {
-                let _ = DeleteObject(self.brush.into());
-            }
         }
     }
 }
@@ -499,6 +555,7 @@ pub(super) unsafe fn control(
             PCWSTR(wide(label).as_ptr()),
             WS_CHILD
                 | WS_VISIBLE
+                | WS_CLIPSIBLINGS
                 | if class.to_string().is_ok_and(|s| s == "STATIC") {
                     WINDOW_STYLE(0)
                 } else {
@@ -572,6 +629,42 @@ unsafe fn child_control_state(hwnd: HWND) -> Option<([i32; 4], bool)> {
     }
 }
 
+unsafe extern "system" fn palette_host_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _: usize,
+    owner: usize,
+) -> LRESULT {
+    unsafe {
+        if matches!(
+            msg,
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+        ) && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool()
+        {
+            let owner = HWND(owner as *mut _);
+            let pointer = GetWindowLongPtrW(owner, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(owner)
+                && GetParent(hwnd).ok() == Some(owner)
+            {
+                let colors = state.control_colors.borrow().clone();
+                if let Some(colors) = colors {
+                    return colors.paint(wp);
+                }
+            }
+        }
+        if matches!(
+            msg,
+            WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+        ) {
+            return SendMessageW(HWND(owner as *mut _), msg, Some(wp), Some(lp));
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
 pub(super) unsafe fn position_child_control(
     hwnd: HWND,
     x: i32,
@@ -599,6 +692,9 @@ pub(super) unsafe fn show_child_control(hwnd: HWND, visible: bool) -> windows::c
     unsafe {
         if child_control_state(hwnd).is_some_and(|(_, shown)| shown == visible) {
             return windows::core::BOOL(i32::from(visible));
+        }
+        if !visible && (GetFocus() == hwnd || IsChild(hwnd, GetFocus()).as_bool()) {
+            let _ = SetFocus(Some(GetAncestor(hwnd, GA_ROOT)));
         }
         ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE })
     }
@@ -691,6 +787,8 @@ impl App {
         self.shell.search_mode()
     }
     pub(super) fn set_search_pane_active(&mut self, active: bool) {
+        // The visibility helper hands off focus only from controls being hidden.
+        // Search's open path then prepares and focuses its visible input.
         self.shell.search = active;
         self.show_panel(PanelId::Explorer);
     }
@@ -1124,6 +1222,7 @@ impl App {
                     },
                 );
             }
+            self.position_palette();
         }
     }
     pub(super) unsafe fn apply_shell_settings(&mut self, settings: EffectiveSettings) {
@@ -1184,10 +1283,12 @@ impl App {
                 tokens.code_background = tokens.background;
             }
             self.shell.tokens = tokens;
-            if self.shell.brush != HBRUSH::default() {
-                let _ = DeleteObject(self.shell.brush.into());
+            self.shell.colors = Rc::new(ControlColors::new(tokens));
+            let pointer =
+                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
+            if !pointer.is_null() && (&*pointer).owns_paint_surface(self.shell.main_window) {
+                *(&*pointer).control_colors.borrow_mut() = Some(Rc::clone(&self.shell.colors));
             }
-            self.shell.brush = CreateSolidBrush(rgb(tokens.panel));
             let dark = windows::core::BOOL(i32::from(!light));
             let _ = DwmSetWindowAttribute(
                 self.shell.main_window,
@@ -1471,6 +1572,16 @@ impl App {
                     }
                     let item = &*(lp.0 as *const DRAWITEMSTRUCT);
                     let id = item.CtlID as usize;
+                    if (hwnd == self.shell.main_window || hwnd == self.shell.compact_window)
+                        && self.shell.colors.draw_container(hwnd, wp.0, item)
+                    {
+                        return Some(LRESULT(1));
+                    }
+                    if hwnd == self.shell.main_window
+                        && super::search_ui::draw_owned_button(hwnd, wp.0, item, self.shell.tokens)
+                    {
+                        return Some(LRESULT(1));
+                    }
                     if hwnd == self.shell.main_window
                         && let Some(state) = self.features.owner_draw_button(hwnd, wp.0, item)
                     {
@@ -1502,13 +1613,10 @@ impl App {
                     self.draw_shell_button(item);
                     Some(LRESULT(1))
                 }
-                WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC
+                WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
                     if hwnd == self.shell.main_window =>
                 {
-                    let dc = HDC(wp.0 as *mut _);
-                    SetTextColor(dc, rgb(self.shell.tokens.foreground));
-                    SetBkColor(dc, rgb(self.shell.tokens.panel));
-                    Some(LRESULT(self.shell.brush.0 as isize))
+                    Some(self.shell.colors.paint(wp))
                 }
                 WM_SETTINGCHANGE | WM_THEMECHANGED => {
                     self.apply_shell_settings(self.shell.settings.clone());
@@ -1720,6 +1828,46 @@ impl App {
             let Ok(menu) = CreatePopupMenu() else {
                 return;
             };
+            // Keep low-frequency operations beside the content they act on.
+            // All commands still use the existing registry and safety guards.
+            let operations: Vec<_> = if id == PanelId::Explorer && self.search_pane_active() {
+                super::search_ui::COMMANDS
+                    .iter()
+                    .map(|entry| Command::Search(entry.0))
+                    .collect()
+            } else if id == PanelId::Git {
+                super::git_ui::COMMANDS
+                    .iter()
+                    .map(|entry| Command::Git(entry.0))
+                    .collect()
+            } else {
+                super::features::COMMANDS
+                    .iter()
+                    .filter(|entry| match id {
+                        PanelId::Explorer => (4000..=4011).contains(&entry.0),
+                        PanelId::Calendar => {
+                            (4020..=4028).contains(&entry.0) || (4080..=4088).contains(&entry.0)
+                        }
+                        PanelId::Outline => (4040..=4042).contains(&entry.0),
+                        _ => false,
+                    })
+                    .map(|entry| Command::Feature(entry.0))
+                    .collect()
+            };
+            for operation in operations {
+                let enabled = self.command_enabled(operation);
+                let label = self.command_label(operation);
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING | if enabled { MF_ENABLED } else { MF_GRAYED },
+                    operation.id(),
+                    PCWSTR(wide(&label).as_ptr()),
+                );
+            }
+            if id == PanelId::Explorer && !self.search_pane_active() {
+                let _ = AppendMenuW(menu, MF_STRING, CMD_WORKSPACE, w!("Workspaceを開く…"));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             for (i, label) in [
                 "折畳み / 展開",
                 "非表示",
@@ -1746,6 +1894,10 @@ impl App {
             )
             .0;
             let _ = DestroyMenu(menu);
+            if command >= 1000 || command as usize == CMD_WORKSPACE {
+                self.command(command as usize);
+                return;
+            }
             match command {
                 1 => {
                     let panel = self.shell.layout.get_mut(id);
@@ -1910,57 +2062,65 @@ impl App {
     }
     pub(super) unsafe fn open_palette(&mut self) {
         unsafe {
-            if self.shell.palette.is_some() || self.composing {
+            if let Some(p) = &self.shell.palette {
+                let _ = SetFocus(Some(p.query));
+                return;
+            }
+            if self.composing {
                 return;
             }
             let focus = GetFocus();
             self.release_caret();
-            let label = control(self.hwnd, w!("STATIC"), "コマンド検索", 0, WINDOW_STYLE(0));
-            let query = control(
+            let host = control(
                 self.hwnd,
+                w!("STATIC"),
+                "コマンドパレット",
+                0,
+                WS_BORDER | WS_CLIPCHILDREN | CONTAINER_STYLE | WINDOW_STYLE(0x0100), // SS_NOTIFY
+            );
+            let _ = SetWindowLongPtrW(host, GWL_EXSTYLE, WS_EX_CONTROLPARENT.0 as isize);
+            let _ = SetWindowSubclass(host, Some(palette_host_proc), 1, self.hwnd.0 as usize);
+            let label = control(
+                host,
+                w!("STATIC"),
+                "コマンド検索 · Escで閉じる",
+                0,
+                WINDOW_STYLE(0),
+            );
+            let query = control(
+                host,
                 w!("EDIT"),
                 "",
                 QUERY,
                 WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             );
             let list = control(
-                self.hwnd,
+                host,
                 w!("LISTBOX"),
                 "コマンド候補",
                 RESULTS,
                 WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
             );
-            let width = (self.width - 32.).clamp(120., 560.);
-            let x = ((self.width - width) / 2. * self.dpi) as i32;
-            let _ = SetWindowPos(
-                label,
-                Some(HWND_TOP),
-                x,
-                (32. * self.dpi) as i32,
-                (width * self.dpi) as i32,
-                (16. * self.dpi) as i32,
-                SWP_SHOWWINDOW,
-            );
-            let _ = SetWindowPos(
-                query,
-                Some(HWND_TOP),
-                x,
-                (48. * self.dpi) as i32,
-                (width * self.dpi) as i32,
-                (30. * self.dpi) as i32,
-                SWP_SHOWWINDOW,
-            );
-            let _ = SetWindowPos(
+            let mut font_data = LOGFONTW {
+                lfHeight: -(16. * self.dpi) as i32,
+                ..Default::default()
+            };
+            let face = wide("Segoe UI");
+            font_data.lfFaceName[..face.len()].copy_from_slice(&face);
+            let font = CreateFontIndirectW(&font_data);
+            for child in [label, query, list] {
+                send(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
+            send(
                 list,
-                Some(HWND_TOP),
-                x,
-                (78. * self.dpi) as i32,
-                (width * self.dpi) as i32,
-                ((self.editor_bottom() - 90.).clamp(44., 280.) * self.dpi) as i32,
-                SWP_SHOWWINDOW,
+                LB_SETITEMHEIGHT,
+                WPARAM(0),
+                LPARAM((24. * self.dpi) as isize),
             );
             let composing = track_control_ime(query);
             self.shell.palette = Some(PaletteState {
+                host,
+                font,
                 label,
                 query,
                 list,
@@ -1972,8 +2132,76 @@ impl App {
                 affinity: self.doc().selection_affinity(),
                 composing,
             });
+            self.position_palette();
             self.filter_palette();
             let _ = SetFocus(Some(query));
+        }
+    }
+    unsafe fn position_palette(&self) {
+        unsafe {
+            let Some(p) = &self.shell.palette else {
+                return;
+            };
+            let mut client = RECT::default();
+            if GetClientRect(
+                GetParent(p.host).unwrap_or(self.shell.main_window),
+                &mut client,
+            )
+            .is_err()
+            {
+                return;
+            }
+            let dpi = self.dpi.max(0.1);
+            let margin = (12. * dpi) as i32;
+            let width = (client.right - 2 * margin).max(1).min((600. * dpi) as i32);
+            let top = ((40. * dpi) as i32).min((client.bottom - 1).max(0));
+            let height = (client.bottom - top - margin)
+                .max(1)
+                .min((380. * dpi) as i32);
+            let _ = SetWindowPos(
+                p.host,
+                Some(HWND_TOP),
+                (client.right - width) / 2,
+                top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let pad = (8. * dpi) as i32;
+            let inner = (width - 2 * pad - 2).max(0);
+            let label_h = ((24. * dpi) as i32).min((height - 2 * pad).max(0));
+            let query_h = ((30. * dpi) as i32).min((height - 2 * pad - label_h).max(0));
+            let _ = position_child_control(p.label, pad, pad, inner, label_h);
+            let _ = position_child_control(p.query, pad, pad + label_h, inner, query_h);
+            let list_y = pad + label_h + query_h + (6. * dpi) as i32;
+            let _ = position_child_control(
+                p.list,
+                pad,
+                list_y,
+                inner,
+                (height - list_y - pad - 2).max(0),
+            );
+        }
+    }
+    pub(super) unsafe fn focus_palette_after_main_activation(&mut self, owner: HWND) -> bool {
+        unsafe {
+            let Some(p) = &self.shell.palette else {
+                return false;
+            };
+            if owner != self.shell.main_window
+                || GetFocus() != owner
+                || GetParent(p.host).ok() != Some(owner)
+                || GetParent(p.query).ok() != Some(p.host)
+                || !IsWindowVisible(p.host).as_bool()
+                || !IsWindowVisible(p.query).as_bool()
+                || !IsWindowEnabled(p.query).as_bool()
+            {
+                return false;
+            }
+            let query = p.query;
+            self.release_caret();
+            let _ = SetFocus(Some(query));
+            GetFocus() == query
         }
     }
     unsafe fn filter_palette(&mut self) {
@@ -1990,11 +2218,12 @@ impl App {
                 .collect();
             send(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
             for c in &commands {
+                let label = self.command_label(*c);
                 send(
                     list,
                     LB_ADDSTRING,
                     WPARAM(0),
-                    LPARAM(wide(&self.command_label(*c)).as_ptr() as isize),
+                    LPARAM(wide(&label).as_ptr() as isize),
                 );
             }
             send(list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
@@ -2006,9 +2235,8 @@ impl App {
             let Some(p) = self.shell.palette.take() else {
                 return;
             };
-            let _ = DestroyWindow(p.label);
-            let _ = DestroyWindow(p.query);
-            let _ = DestroyWindow(p.list);
+            let _ = SetFocus(Some(self.editing_window()));
+            let _ = ShowWindow(p.host, SW_HIDE);
             if cancel && p.document == self.doc().id() && p.revision == self.doc().revision() {
                 let _ = self.doc_mut().set_selection_with_affinity(
                     p.selection.anchor,
@@ -2016,11 +2244,18 @@ impl App {
                     p.affinity,
                 );
             }
-            let _ = SetFocus(Some(if p.focus == HWND::default() {
-                self.editing_window()
-            } else {
+            let focus = if IsWindow(Some(p.focus)).as_bool()
+                && IsWindowVisible(p.focus).as_bool()
+                && IsWindowEnabled(p.focus).as_bool()
+                && (p.focus == self.shell.main_window
+                    || IsChild(self.shell.main_window, p.focus).as_bool())
+            {
                 p.focus
-            }));
+            } else {
+                self.editing_window()
+            };
+            let _ = SetFocus(Some(focus));
+            drop(p);
             self.refresh();
         }
     }
@@ -2060,7 +2295,7 @@ impl App {
         }
         Some(self.hwnd)
     }
-    pub(super) fn shell_message(&self, msg: &MSG) -> bool {
+    pub(super) fn shell_message(&mut self, msg: &MSG) -> bool {
         unsafe {
             let root = GetAncestor(msg.hwnd, GA_ROOT);
             let owner = if root == HWND::default() {
@@ -2068,6 +2303,62 @@ impl App {
             } else {
                 root
             };
+            if let Some(p) = &self.shell.palette {
+                let inside = msg.hwnd == p.host || IsChild(p.host, msg.hwnd).as_bool();
+                let pointer_down = matches!(
+                    msg.message,
+                    WM_LBUTTONDOWN
+                        | WM_RBUTTONDOWN
+                        | WM_MBUTTONDOWN
+                        | WM_LBUTTONDBLCLK
+                        | WM_RBUTTONDBLCLK
+                        | WM_MBUTTONDBLCLK
+                ) || (msg.hwnd != owner
+                    && matches!(
+                        msg.message,
+                        WM_NCLBUTTONDOWN
+                            | WM_NCRBUTTONDOWN
+                            | WM_NCMBUTTONDOWN
+                            | WM_NCLBUTTONDBLCLK
+                            | WM_NCRBUTTONDBLCLK
+                            | WM_NCMBUTTONDBLCLK
+                    ));
+                if pointer_down && !inside && GetParent(p.host).ok() == Some(owner) {
+                    let target = if msg.hwnd == self.shell.main_window {
+                        let x = msg.lParam.0 as u16 as i16 as f32 / self.dpi;
+                        let y = (msg.lParam.0 >> 16) as u16 as i16 as f32 / self.dpi;
+                        if self.shell.editor.contains(x, y) {
+                            self.editing_window()
+                        } else {
+                            self.shell
+                                .panels
+                                .iter()
+                                .find(|(_, rect)| rect.contains(x, y))
+                                .and_then(|(id, _)| self.shell.headers.get(*id as usize))
+                                .copied()
+                                .unwrap_or(HWND::default())
+                        }
+                    } else {
+                        msg.hwnd
+                    };
+                    self.close_palette(true);
+                    if IsWindowVisible(target).as_bool()
+                        && IsWindowEnabled(target).as_bool()
+                        && (target == owner || IsChild(owner, target).as_bool())
+                    {
+                        let _ = SetFocus(Some(target));
+                    }
+                    return true;
+                }
+                if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+                    && !p.composing.get()
+                    && msg.wParam.0 as u16 == VK_ESCAPE.0
+                    && GetParent(p.host).ok() == Some(owner)
+                {
+                    self.close_palette(true);
+                    return true;
+                }
+            }
             if let Some(p) = &self.shell.palette
                 && msg.hwnd == p.query
             {
@@ -2145,15 +2436,6 @@ impl App {
                 && (msg.hwnd == p.query || msg.hwnd == p.list)
             {
                 match msg.wParam.0 as u16 {
-                    v if v == VK_ESCAPE.0 => {
-                        let _ = PostMessageW(
-                            Some(owner),
-                            WM_COMMAND,
-                            WPARAM(PALETTE_CANCEL),
-                            LPARAM(0),
-                        );
-                        return true;
-                    }
                     v if v == VK_RETURN.0 => {
                         let _ = PostMessageW(
                             Some(owner),
@@ -2161,6 +2443,10 @@ impl App {
                             WPARAM(PALETTE_EXECUTE),
                             LPARAM(0),
                         );
+                        return true;
+                    }
+                    v if v == VK_TAB.0 => {
+                        let _ = SetFocus(Some(if msg.hwnd == p.query { p.list } else { p.query }));
                         return true;
                     }
                     v if v == VK_DOWN.0 || v == VK_UP.0 => {
@@ -2218,7 +2504,7 @@ impl App {
                 WINDOW_EX_STYLE::default(),
                 w!("MDLiteRustEditor"),
                 PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW,
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 placement.x,
                 placement.y,
                 placement.width.min(800) as i32,
@@ -2641,6 +2927,96 @@ mod tests {
         app.composing = true;
         assert!(!app.command_enabled(Command::Source));
         assert!(!app.command_enabled(Command::Palette));
+    }
+    #[test]
+    fn shell_palette_host_bounds_dismissal_and_invalid_focus_are_owned() {
+        let window = super::super::tests::hidden_test_window_size(1100, 793);
+        let mut app = super::super::tests::composing_test_app("selected 😀 text");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+        );
+        unsafe {
+            app.ensure_layout().unwrap();
+            for width in [1086, 700, 1500, 450] {
+                let _ = SetWindowPos(
+                    window,
+                    None,
+                    0,
+                    0,
+                    width,
+                    793,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                app.open_palette();
+                let p = app.shell.palette.as_ref().unwrap();
+                assert_eq!(GetParent(p.query).unwrap(), p.host);
+                assert_eq!(GetParent(p.list).unwrap(), p.host);
+                assert_ne!(
+                    GetWindowLongPtrW(p.host, GWL_STYLE) as u32 & WS_CLIPCHILDREN.0,
+                    0
+                );
+                let host = p.host;
+                let query = p.query;
+                let list = p.list;
+                app.position_palette();
+                let (bounds, _) = child_control_state(host).unwrap();
+                let mut client = RECT::default();
+                GetClientRect(window, &mut client).unwrap();
+                assert!(bounds[0] >= 0 && bounds[1] >= 0);
+                assert!(bounds[0] + bounds[2] <= client.right);
+                assert!(bounds[1] + bounds[3] <= client.bottom);
+                // Any owned surface's Escape dismisses; no key reaches the editor.
+                let escape = MSG {
+                    hwnd: window,
+                    message: WM_KEYDOWN,
+                    wParam: WPARAM(VK_ESCAPE.0 as usize),
+                    ..Default::default()
+                };
+                assert!(app.shell_message(&escape));
+                assert!(app.shell.palette.is_none());
+                for child in [host, query, list] {
+                    assert!(!IsWindow(Some(child)).as_bool());
+                }
+                app.open_palette();
+                let outside = MSG {
+                    hwnd: window,
+                    message: WM_LBUTTONDOWN,
+                    ..Default::default()
+                };
+                assert!(app.shell_message(&outside));
+                assert!(app.shell.palette.is_none());
+            }
+            let previous = control(window, w!("EDIT"), "previous", 8000, WINDOW_STYLE(0));
+            let _ = SetFocus(Some(previous));
+            app.open_palette();
+            DestroyWindow(previous).unwrap();
+            app.close_palette(true);
+            let scroller = control(window, w!("LISTBOX"), "outside scroll", 8001, WS_VSCROLL);
+            app.open_palette();
+            let scrollbar_click = MSG {
+                hwnd: scroller,
+                message: WM_NCLBUTTONDOWN,
+                wParam: WPARAM(HTVSCROLL as usize),
+                ..Default::default()
+            };
+            assert!(app.shell_message(&scrollbar_click));
+            assert!(app.shell.palette.is_none());
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection()
+            ),
+            before
+        );
     }
     #[test]
     fn shell_palette_query_cancel_and_native_ime_keep_document_selection() {

@@ -69,6 +69,7 @@ const CONTROL_IGNORE: usize = 5610;
 const CONTROL_HIDDEN: usize = 5611;
 const CONTROL_RESULTS: usize = 5612;
 const CONTROL_STATUS: usize = 5613;
+const CONTROL_REPLACEMENT_TOGGLE: usize = 5614;
 
 // EDIT limits are UTF-16 code units. This leaves enough room for every literal
 // query within the core's 8 MiB UTF-8 cap; regex validation stays in build_query.
@@ -165,8 +166,8 @@ struct SearchControls {
     scope_workspace: HWND,
     query_label: HWND,
     query: HWND,
-    replacement_label: HWND,
     replacement: HWND,
+    replacement_toggle: HWND,
     case_sensitive: HWND,
     regex: HWND,
     word: HWND,
@@ -181,9 +182,6 @@ struct SearchControls {
     previous: HWND,
     replace_one: HWND,
     replace_document_all: HWND,
-    replace_workspace: HWND,
-    journals: HWND,
-    restore: HWND,
     cancel: HWND,
     close: HWND,
     results: HWND,
@@ -239,6 +237,7 @@ pub(super) struct SearchPane {
     initialized: bool,
     scope: Scope,
     details_open: bool,
+    replacement_open: bool,
     journal_mode: bool,
     journals: Vec<JournalInfo>,
     selected_journal: Option<usize>,
@@ -269,6 +268,7 @@ impl Default for SearchPane {
             initialized: false,
             scope: Scope::Document,
             details_open: false,
+            replacement_open: false,
             journal_mode: false,
             journals: Vec::new(),
             selected_journal: None,
@@ -314,8 +314,8 @@ impl SearchControls {
             self.scope_workspace,
             self.query_label,
             self.query,
-            self.replacement_label,
             self.replacement,
+            self.replacement_toggle,
             self.case_sensitive,
             self.regex,
             self.word,
@@ -330,9 +330,6 @@ impl SearchControls {
             self.previous,
             self.replace_one,
             self.replace_document_all,
-            self.replace_workspace,
-            self.journals,
-            self.restore,
             self.cancel,
             self.close,
             self.results,
@@ -437,8 +434,15 @@ impl SearchPane {
             self.controls.owner = owner;
             let multiline_style = WINDOW_STYLE(0x0004 | 0x0040 | 0x1000 | 0x0020_0000);
             let checkbox_style = WINDOW_STYLE(0x0003);
-            let button =
-                |label, id| shell::control(owner, w!("BUTTON"), label, id, WINDOW_STYLE(0));
+            let button = |label, id| {
+                shell::control(
+                    owner,
+                    w!("BUTTON"),
+                    label,
+                    id,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                )
+            };
             let label = |text, id| shell::control(owner, w!("STATIC"), text, id, WINDOW_STYLE(0));
 
             self.controls.scope_document = button("文書", CONTROL_SCOPE_DOCUMENT);
@@ -447,7 +451,7 @@ impl SearchPane {
             self.controls.query =
                 shell::control(owner, w!("EDIT"), "", CONTROL_QUERY, multiline_style);
             self.query_composing = Some(shell::track_control_ime(self.controls.query));
-            self.controls.replacement_label = label("置換", 5621);
+            self.controls.replacement_toggle = button("置換 ▼", CONTROL_REPLACEMENT_TOGGLE);
             self.controls.replacement =
                 shell::control(owner, w!("EDIT"), "", CONTROL_REPLACEMENT, multiline_style);
             self.replacement_composing = Some(shell::track_control_ime(self.controls.replacement));
@@ -494,9 +498,6 @@ impl SearchPane {
             self.controls.previous = button("前", CMD_PREVIOUS);
             self.controls.replace_one = button("一致を置換", CMD_REPLACE_ONE);
             self.controls.replace_document_all = button("文書すべて", CMD_REPLACE_DOCUMENT_ALL);
-            self.controls.replace_workspace = button("Workspace置換", CMD_REPLACE_WORKSPACE);
-            self.controls.journals = button("journal", CMD_OPEN_JOURNALS);
-            self.controls.restore = button("復旧", CMD_RESTORE_JOURNAL);
             self.controls.cancel = button("中止", CMD_CANCEL_OPERATION);
             self.controls.close = button("×", CMD_CLOSE);
             self.controls.results = shell::control(
@@ -539,6 +540,13 @@ impl SearchPane {
                 LPARAM(0),
             );
             for hwnd in self.controls.all() {
+                let mut class = [0u16; 32];
+                let len = GetClassNameW(hwnd, &mut class);
+                if String::from_utf16_lossy(&class[..len as usize]) == "Button"
+                    && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & 0xf == BS_AUTOCHECKBOX as u32
+                {
+                    let _ = SetWindowSubclass(hwnd, Some(search_button_proc), 1, owner.0 as usize);
+                }
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             self.initialized = true;
@@ -567,16 +575,23 @@ impl SearchPane {
             let visible = app.search_pane_active() && area.width > 0.0 && area.height > 0.0;
             let dpi = app.dpi.max(0.1);
             let position = |hwnd: HWND, r: Rect| {
+                let bottom = area.y + area.height;
+                let y = r.y.min(bottom);
                 let _ = shell::position_child_control(
                     hwnd,
                     (r.x * dpi) as i32,
-                    (r.y * dpi) as i32,
+                    (y * dpi) as i32,
                     (r.width.max(0.0) * dpi) as i32,
-                    (r.height.max(0.0) * dpi) as i32,
+                    (r.height.min((bottom - y).max(0.)).max(0.0) * dpi) as i32,
                 );
             };
             let show = |hwnd: HWND, state: bool| {
-                let _ = shell::show_child_control(hwnd, state);
+                let mut bounds = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut bounds);
+                let _ = shell::show_child_control(
+                    hwnd,
+                    state && bounds.bottom > bounds.top && bounds.right > bounds.left,
+                );
             };
             let left = area.x + 5.0;
             let width = (area.width - 10.0).max(0.0);
@@ -594,6 +609,7 @@ impl SearchPane {
             );
             show(self.controls.close, visible);
             y += button_h + gap;
+            let details_view = self.details_open && self.scope == Scope::Workspace;
             let scope_w = (width - gap) * 0.5;
             for (hwnd, rect) in [
                 (
@@ -619,6 +635,7 @@ impl SearchPane {
                 show(hwnd, visible);
             }
             y += button_h + gap;
+            let content_start = y;
 
             let label_h = 16.0;
             position(
@@ -630,7 +647,7 @@ impl SearchPane {
                     height: label_h,
                 },
             );
-            show(self.controls.query_label, visible);
+            show(self.controls.query_label, visible && !details_view);
             y += label_h;
             let query_h = (area.height * 0.13)
                 .clamp(36.0, 58.0)
@@ -644,35 +661,12 @@ impl SearchPane {
                     height: query_h,
                 },
             );
-            show(self.controls.query, visible);
+            show(self.controls.query, visible && !details_view);
             y += query_h + gap;
 
-            position(
-                self.controls.replacement_label,
-                Rect {
-                    x: left,
-                    y,
-                    width,
-                    height: label_h,
-                },
-            );
-            show(self.controls.replacement_label, visible);
-            y += label_h;
             let replacement_h = (area.height * 0.10)
                 .clamp(28.0, 48.0)
                 .min((area.height * 0.20).max(1.0));
-            position(
-                self.controls.replacement,
-                Rect {
-                    x: left,
-                    y,
-                    width,
-                    height: replacement_h,
-                },
-            );
-            show(self.controls.replacement, visible);
-            y += replacement_h + gap;
-
             let option_w = (width - 2.0 * gap) / 3.0;
             for (index, hwnd) in [
                 self.controls.case_sensitive,
@@ -691,11 +685,20 @@ impl SearchPane {
                         height: button_h,
                     },
                 );
-                show(hwnd, visible);
+                show(hwnd, visible && !details_view);
             }
             y += button_h + gap;
+            if details_view {
+                y = content_start;
+            }
             let details_label = if self.details_open {
                 "対象詳細 ▲"
+            } else if !shell::text_of(self.controls.include).is_empty()
+                || !shell::text_of(self.controls.exclude).is_empty()
+                || checked(self.controls.hidden)
+                || !checked(self.controls.respect_ignore)
+            {
+                "対象詳細 ▼ · 設定あり"
             } else {
                 "対象詳細 ▼"
             };
@@ -714,7 +717,9 @@ impl SearchPane {
                 self.controls.details,
                 visible && self.scope == Scope::Workspace,
             );
-            y += button_h + gap;
+            if self.scope == Scope::Workspace {
+                y += button_h + gap;
+            }
 
             if self.details_open && self.scope == Scope::Workspace {
                 let detail_h = (area.height * 0.08).clamp(22.0, 38.0);
@@ -776,10 +781,66 @@ impl SearchPane {
                 show(self.controls.hidden, false);
             }
 
-            let action_w = (width - 3.0 * gap) / 4.0;
+            let action_w = (width - gap) / 2.0;
+            for (index, hwnd) in [self.controls.next, self.controls.previous]
+                .into_iter()
+                .enumerate()
+            {
+                position(
+                    hwnd,
+                    Rect {
+                        x: left + index as f32 * (action_w + gap),
+                        y,
+                        width: action_w,
+                        height: button_h,
+                    },
+                );
+                show(hwnd, visible && self.scope == Scope::Document);
+            }
+            if self.scope == Scope::Document {
+                y += button_h + gap;
+            }
+            position(
+                self.controls.replacement_toggle,
+                Rect {
+                    x: left,
+                    y,
+                    width,
+                    height: button_h,
+                },
+            );
+            let _ = SetWindowTextW(
+                self.controls.replacement_toggle,
+                PCWSTR(
+                    wide(if self.replacement_open {
+                        "置換 ▲"
+                    } else {
+                        "置換 ▼"
+                    })
+                    .as_ptr(),
+                ),
+            );
+            show(self.controls.replacement_toggle, visible && !details_view);
+            if !details_view {
+                y += button_h + gap;
+            }
+            position(
+                self.controls.replacement,
+                Rect {
+                    x: left,
+                    y,
+                    width,
+                    height: replacement_h,
+                },
+            );
+            show(
+                self.controls.replacement,
+                visible && self.replacement_open && !details_view,
+            );
+            if self.replacement_open && !details_view {
+                y += replacement_h + gap;
+            }
             for (index, hwnd) in [
-                self.controls.next,
-                self.controls.previous,
                 self.controls.replace_one,
                 self.controls.replace_document_all,
             ]
@@ -795,36 +856,29 @@ impl SearchPane {
                         height: button_h,
                     },
                 );
-                show(hwnd, visible && self.scope == Scope::Document);
-            }
-            y += button_h + gap;
-            for (index, hwnd) in [
-                self.controls.replace_workspace,
-                self.controls.journals,
-                self.controls.restore,
-                self.controls.cancel,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                position(
+                show(
                     hwnd,
-                    Rect {
-                        x: left + index as f32 * (action_w + gap),
-                        y,
-                        width: action_w,
-                        height: button_h,
-                    },
+                    visible && self.replacement_open && self.scope == Scope::Document,
                 );
-                let show_control = visible
-                    && match index {
-                        0 => self.scope == Scope::Workspace && !self.journal_mode,
-                        1 | 2 => self.scope == Scope::Workspace,
-                        _ => self.operation.is_some(),
-                    };
-                show(hwnd, show_control);
             }
-            y += button_h + gap;
+            if self.replacement_open && self.scope == Scope::Document {
+                y += button_h + gap;
+            }
+            // Workspace replacement and journals live in the header menu and
+            // palette. Keep only the active operation's cancellation inline.
+            position(
+                self.controls.cancel,
+                Rect {
+                    x: left,
+                    y,
+                    width,
+                    height: button_h,
+                },
+            );
+            show(self.controls.cancel, visible && self.operation.is_some());
+            if self.operation.is_some() {
+                y += button_h + gap;
+            }
             let status_h = 38.0f32.min(area.height * 0.1);
             let list_y = y + gap;
             let list_h = (area.y + area.height - status_h - list_y).max(0.0);
@@ -872,9 +926,6 @@ impl SearchPane {
                 (self.controls.previous, CMD_PREVIOUS),
                 (self.controls.replace_one, CMD_REPLACE_ONE),
                 (self.controls.replace_document_all, CMD_REPLACE_DOCUMENT_ALL),
-                (self.controls.replace_workspace, CMD_REPLACE_WORKSPACE),
-                (self.controls.journals, CMD_OPEN_JOURNALS),
-                (self.controls.restore, CMD_RESTORE_JOURNAL),
                 (self.controls.cancel, CMD_CANCEL_OPERATION),
                 (self.controls.close, CMD_CLOSE),
             ] {
@@ -907,7 +958,22 @@ impl SearchPane {
         self.inputs_dirty = true;
         self.position_controls(app);
         unsafe {
-            let _ = SetFocus(Some(self.controls.query));
+            self.focus_search_input();
+        }
+    }
+
+    unsafe fn focus_search_input(&self) {
+        let input = if self.details_open && self.scope == Scope::Workspace {
+            self.controls.include
+        } else {
+            self.controls.query
+        };
+        unsafe {
+            let length = shell::text_of(input).encode_utf16().count();
+            let _ = shell::send(input, EM_SETSEL, WPARAM(length), LPARAM(length as isize));
+            // Publish focus only after the initial caret is prepared. The
+            // first native character must not race a later selection reset.
+            let _ = SetFocus(Some(input));
         }
     }
 
@@ -1527,6 +1593,7 @@ impl SearchPane {
             });
             let range = selection.anchor.min(selection.head)..selection.anchor.max(selection.head);
             if !range.is_empty()
+                && shell::text_of(self.controls.query).is_empty()
                 && let Some(selected) = app.doc().source().get(range)
                 && selected.len() <= search::MAX_LITERAL_QUERY_BYTES
             {
@@ -1546,17 +1613,10 @@ impl SearchPane {
         self.journal_mode = false;
         self.inputs_dirty = true;
         app.set_search_pane_active(true);
-        unsafe {
-            let _ = SetFocus(Some(self.controls.query));
-            let length = shell::text_of(self.controls.query).encode_utf16().count();
-            let _ = shell::send(
-                self.controls.query,
-                EM_SETSEL,
-                WPARAM(length),
-                LPARAM(length as isize),
-            );
-        }
         self.position_controls(app);
+        unsafe {
+            self.focus_search_input();
+        }
     }
 
     fn close_scope(&mut self, app: &mut App) {
@@ -1585,7 +1645,12 @@ impl SearchPane {
                 );
             }
             unsafe {
-                if snapshot.hwnd != HWND::default() && IsWindow(Some(snapshot.hwnd)).as_bool() {
+                if IsWindow(Some(snapshot.hwnd)).as_bool()
+                    && IsWindowVisible(snapshot.hwnd).as_bool()
+                    && IsWindowEnabled(snapshot.hwnd).as_bool()
+                    && (snapshot.hwnd == app.shell.main_window
+                        || IsChild(app.shell.main_window, snapshot.hwnd).as_bool())
+                {
                     let _ = SetFocus(Some(snapshot.hwnd));
                 } else {
                     let _ = SetFocus(Some(app.editing_window()));
@@ -1597,6 +1662,13 @@ impl SearchPane {
 
     unsafe fn control(&mut self, app: &mut App, id: usize, notification: u16) -> bool {
         unsafe {
+            if !app.search_pane_active() {
+                return self
+                    .controls
+                    .all()
+                    .iter()
+                    .any(|hwnd| GetDlgCtrlID(*hwnd) == id as i32);
+            }
             if notification == EN_CHANGE as u16 {
                 match id {
                     CONTROL_QUERY => {
@@ -1650,6 +1722,16 @@ impl SearchPane {
                 CONTROL_DETAILS => {
                     self.details_open = !self.details_open;
                     self.position_controls(app);
+                    self.focus_search_input();
+                }
+                CONTROL_REPLACEMENT_TOGGLE => {
+                    self.replacement_open = !self.replacement_open;
+                    self.position_controls(app);
+                    if self.replacement_open {
+                        let _ = SetFocus(Some(self.controls.replacement));
+                    } else {
+                        self.focus_search_input();
+                    }
                 }
                 CMD_DOCUMENT_SEARCH => self.open_scope(app, Scope::Document),
                 CMD_WORKSPACE_SEARCH => self.open_scope(app, Scope::Workspace),
@@ -1678,6 +1760,18 @@ impl SearchPane {
         let focus = unsafe { GetFocus() };
         if self.is_composing() || app.feature_ime_active() {
             return false;
+        }
+        if key == VK_TAB.0 && self.controls.all().contains(&focus) {
+            unsafe {
+                if let Ok(next) = GetNextDlgTabItem(
+                    self.controls.owner,
+                    Some(focus),
+                    GetKeyState(VK_SHIFT.0 as i32) < 0,
+                ) {
+                    let _ = SetFocus(Some(next));
+                }
+            }
+            return true;
         }
         let edit_focused = [
             self.controls.query,
@@ -2334,10 +2428,12 @@ impl SearchPane {
         self.set_status(format!(
             "置換中… {closed_file_count} closed files / {replacement_count} matches"
         ));
-        unsafe {
-            let _ = SetFocus(Some(self.controls.cancel));
-        }
         self.position_controls(app);
+        unsafe {
+            if IsWindowVisible(self.controls.cancel).as_bool() {
+                let _ = SetFocus(Some(self.controls.cancel));
+            }
+        }
         thread::spawn(move || {
             let result = replace::apply_closed_replacements(&workspace, &plan, &open_paths, || {
                 cancel.load(Ordering::Relaxed)
@@ -2520,10 +2616,12 @@ impl SearchPane {
             operation.phase = OperationPhase::RecoveryRestore;
         }
         self.set_status("journal復旧中… 中止は安全なfile境界で反映します");
-        unsafe {
-            let _ = SetFocus(Some(self.controls.cancel));
-        }
         self.position_controls(app);
+        unsafe {
+            if IsWindowVisible(self.controls.cancel).as_bool() {
+                let _ = SetFocus(Some(self.controls.cancel));
+            }
+        }
         thread::spawn(move || {
             let result = Workspace::open(root)
                 .map_err(|error| error.to_string())
@@ -2689,6 +2787,111 @@ impl SearchPane {
             }
             _ => None,
         }
+    }
+}
+
+// Preserve native checkbox input/check semantics. Paint only this Search surface
+// from the same borrow-independent colors as its parent, including reentry.
+unsafe extern "system" fn search_button_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _: usize,
+    owner: usize,
+) -> LRESULT {
+    unsafe {
+        if matches!(msg, WM_PAINT | WM_ERASEBKGND) {
+            let pointer =
+                GetWindowLongPtrW(HWND(owner as *mut _), GWLP_USERDATA) as *const WindowState;
+            let colors = if !pointer.is_null() {
+                (&*pointer).control_colors.borrow().clone()
+            } else {
+                None
+            };
+            let tokens = colors
+                .as_ref()
+                .map(|colors| colors.tokens)
+                .unwrap_or_default();
+            let mut bounds = RECT::default();
+            let _ = GetClientRect(hwnd, &mut bounds);
+            if msg == WM_ERASEBKGND {
+                let brush = CreateSolidBrush(shell::rgb(tokens.panel));
+                FillRect(HDC(wp.0 as *mut _), &bounds, brush);
+                let _ = DeleteObject(brush.into());
+                return LRESULT(1);
+            }
+            let mut paint = PAINTSTRUCT::default();
+            BeginPaint(hwnd, &mut paint);
+            let checkbox =
+                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & 0xf == BS_AUTOCHECKBOX as u32;
+            let mut label = shell::text_of(hwnd);
+            if checkbox {
+                label = match GetDlgCtrlID(hwnd) as usize {
+                    CONTROL_CASE => "Aa".into(),
+                    CONTROL_REGEX => ".*".into(),
+                    _ => label,
+                };
+                label = format!("{} {label}", if checked(hwnd) { "☑" } else { "☐" });
+            }
+            let mut cursor = POINT::default();
+            let _ = GetCursorPos(&mut cursor);
+            let _ = ScreenToClient(hwnd, &mut cursor);
+            let state = shell::OwnerDrawState {
+                label,
+                enabled: IsWindowEnabled(hwnd).as_bool(),
+                hovered: cursor.x >= 0
+                    && cursor.y >= 0
+                    && cursor.x < bounds.right
+                    && cursor.y < bounds.bottom,
+                pressed: shell::send(hwnd, BM_GETSTATE, WPARAM(0), LPARAM(0)).0
+                    & BST_PUSHED as isize
+                    != 0,
+                focused: GetFocus() == hwnd,
+            };
+            let item = DRAWITEMSTRUCT {
+                hwndItem: hwnd,
+                hDC: paint.hdc,
+                rcItem: bounds,
+                ..Default::default()
+            };
+            shell::draw_owner_button(tokens, &item, &state);
+            let _ = EndPaint(hwnd, &paint);
+            return LRESULT(0);
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
+pub(super) unsafe fn draw_owned_button(
+    recipient: HWND,
+    message_id: usize,
+    item: &DRAWITEMSTRUCT,
+    tokens: shell::Tokens,
+) -> bool {
+    unsafe {
+        if item.CtlType != ODT_BUTTON
+            || item.CtlID as usize != message_id
+            || !matches!(
+                message_id,
+                CMD_NEXT
+                    ..=CMD_CANCEL_OPERATION
+                        | CONTROL_SCOPE_DOCUMENT
+                        | CONTROL_SCOPE_WORKSPACE
+                        | CONTROL_DETAILS
+                        | CONTROL_REPLACEMENT_TOGGLE
+            )
+            || item.hwndItem == HWND::default()
+            || !IsWindow(Some(item.hwndItem)).as_bool()
+            || GetParent(item.hwndItem).ok() != Some(recipient)
+            || GetDlgCtrlID(item.hwndItem) as usize != message_id
+            || GetWindowLongPtrW(item.hwndItem, GWL_STYLE) as u32 & 0xf != BS_OWNERDRAW as u32
+        {
+            return false;
+        }
+        let state = shell::owner_draw_state(shell::text_of(item.hwndItem), item);
+        shell::draw_owner_button(tokens, item, &state);
+        true
     }
 }
 
@@ -2977,6 +3180,224 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "system" fn late_selection_input(
+        hwnd: HWND,
+        message: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+        _: usize,
+        state: usize,
+    ) -> LRESULT {
+        unsafe {
+            if message == EM_SETSEL && GetFocus() == hwnd {
+                (*(state as *const Cell<bool>)).set(true);
+                // Model the next native character arriving after focus is
+                // observable but before a late initial selection is applied.
+                shell::send(hwnd, WM_CHAR, WPARAM('X' as usize), LPARAM(0));
+            }
+            DefSubclassProc(hwnd, message, wp, lp)
+        }
+    }
+
+    #[test]
+    fn search_view_focus_moves_only_when_the_focused_control_is_hidden() {
+        let window = super::super::tests::hidden_test_window_size(1100, 793);
+        let mut app = super::super::tests::composing_test_app("synthetic source");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        unsafe {
+            app.features_init();
+            app.search_init();
+            app.ensure_layout().unwrap();
+            let activity = shell::control(window, w!("BUTTON"), "Search", 111, WINDOW_STYLE(0));
+            let editor =
+                shell::control(window, w!("EDIT"), "retained editor", 8008, WINDOW_STYLE(0));
+            let explorer = GetDlgItem(Some(window), 4690).unwrap();
+            let query = app.search_ui.controls.query;
+
+            // These controls remain visible across both logical views. Opening
+            // Search must not visit the editor before its input takes focus.
+            for retained in [activity, window, editor] {
+                let _ = SetFocus(Some(retained));
+                app.set_search_pane_active(true);
+                assert_eq!(GetFocus(), retained);
+                app.set_search_pane_active(false);
+                assert_eq!(GetFocus(), retained);
+            }
+
+            let _ = SetFocus(Some(explorer));
+            app.set_search_pane_active(true);
+            assert_eq!(GetFocus(), window);
+            assert_eq!(
+                GetWindowLongPtrW(explorer, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            let _ = SetFocus(Some(query));
+            app.set_search_pane_active(false);
+            assert_eq!(GetFocus(), window);
+            assert_eq!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+
+            // Ctrl+F's document-search command also opens from the old view's
+            // focused child. This hidden host uses the editor fallback on close.
+            let _ = SetFocus(Some(explorer));
+            assert!(app.search_command(CMD_DOCUMENT_SEARCH));
+            assert_eq!(GetFocus(), query);
+            assert_ne!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            for unit in "ab".encode_utf16() {
+                shell::send(query, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+            }
+            assert_eq!(shell::text_of(query), "ab");
+            assert!(app.search_command(CMD_CLOSE));
+            assert_eq!(GetFocus(), window);
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn search_view_excludes_explorer_controls_and_preserves_query_and_document() {
+        let window = super::super::tests::hidden_test_window_size(1100, 793);
+        let mut app = super::super::tests::composing_test_app("synthetic source");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+        );
+        unsafe {
+            app.features_init();
+            app.search_init();
+            app.ensure_layout().unwrap();
+            let explorer = GetDlgItem(Some(window), 4690).unwrap();
+            let query = app.search_ui.controls.query;
+            let _ = SetWindowTextW(query, w!("preserved query"));
+            for _ in 0..10 {
+                app.set_search_pane_active(true);
+                app.features_sync();
+                app.search_sync();
+                assert_eq!(
+                    GetWindowLongPtrW(explorer, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                    0
+                );
+                assert_ne!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+                assert!(app.features_control(4690, LBN_DBLCLK as u16));
+                app.set_search_pane_active(false);
+                app.features_sync();
+                app.search_sync();
+                assert_ne!(
+                    GetWindowLongPtrW(explorer, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                    0
+                );
+                assert_eq!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+                assert!(app.search_control(CONTROL_RESULTS, LBN_SELCHANGE as u16));
+                assert_eq!(shell::text_of(query), "preserved query");
+            }
+            app.set_search_pane_active(true);
+            app.search_ui.scope = Scope::Workspace;
+            app.search_ui.details_open = true;
+            app.search_sync();
+            let mut scope = RECT::default();
+            let mut details = RECT::default();
+            GetWindowRect(app.search_ui.controls.scope_workspace, &mut scope).unwrap();
+            GetWindowRect(app.search_ui.controls.details, &mut details).unwrap();
+            assert!(
+                scope.bottom <= details.top,
+                "scope and details hit regions overlap"
+            );
+            // Retaining details across scope changes must leave a visible
+            // input. The owned visible GUI check additionally verifies focus
+            // and the first native character on both routes.
+            assert!(app.search_control(CONTROL_SCOPE_DOCUMENT, BN_CLICKED as u16));
+            assert_ne!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert!(app.search_control(CONTROL_SCOPE_WORKSPACE, BN_CLICKED as u16));
+            assert_eq!(GetWindowLongPtrW(query, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            assert_ne!(
+                GetWindowLongPtrW(app.search_ui.controls.include, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0
+            );
+            let include = app.search_ui.controls.include;
+            let exclude = app.search_ui.controls.exclude;
+            let _ = SetFocus(Some(include));
+            let tab = MSG {
+                hwnd: include,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_TAB.0 as usize),
+                ..Default::default()
+            };
+            assert!(app.search_message(&tab));
+            assert_eq!(GetFocus(), exclude);
+            let previous = GetNextDlgTabItem(window, Some(exclude), true).unwrap();
+            assert_eq!(previous, include);
+            let _ = SetFocus(Some(previous));
+            let late_selection = Cell::new(false);
+            let _ = SetWindowTextW(query, w!(""));
+            let _ = SetWindowSubclass(
+                query,
+                Some(late_selection_input),
+                2,
+                (&late_selection as *const Cell<bool>) as usize,
+            );
+            assert!(app.search_command(CMD_DOCUMENT_SEARCH));
+            assert_eq!(GetFocus(), query);
+            assert!(
+                !late_selection.get(),
+                "initial selection changed after focus publication"
+            );
+            for unit in "ab".encode_utf16() {
+                shell::send(query, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+            }
+            assert_eq!(shell::text_of(query), "ab");
+            let _ = RemoveWindowSubclass(query, Some(late_selection_input), 2);
+            assert!(app.search_control(CONTROL_SCOPE_DOCUMENT, BN_CLICKED as u16));
+            assert!(app.search_control(CONTROL_REPLACEMENT_TOGGLE, BN_CLICKED as u16));
+            let replacement = app.search_ui.controls.replacement;
+            assert_eq!(GetFocus(), replacement);
+            for unit in "ab".encode_utf16() {
+                shell::send(replacement, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                assert!(app.search_control(CONTROL_REPLACEMENT, EN_CHANGE as u16));
+                app.refresh();
+                assert_eq!(
+                    GetFocus(),
+                    replacement,
+                    "replacement EN_CHANGE/layout moved focus"
+                );
+            }
+            assert_eq!(shell::text_of(replacement), "ab");
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection()
+            ),
+            before
+        );
+    }
 
     #[test]
     fn empty_glob_lines_remain_empty_and_nonempty_patterns_are_preserved() {

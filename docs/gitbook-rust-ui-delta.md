@@ -5,6 +5,50 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## Rev3の文字重なり修正と確認範囲
+
+主画面のパレット／Git host自身のcaption描画を切り分け、名前と入力・通知を保った
+native container描画に変更した。Searchの明示queryラベルは維持した。
+直接関係するCompactの描画配送・clip・パレット子部品の色通知も確認したが、
+当初のCompact採取では文字欠落を観測した。後続の通常操作・受動撮影では初回／再表示とも
+見出しと複数行を読めることを確認した。旧採取のFAILと再表示の撮影制限は受入記録に保持する。
+10月18日の同一EXEでの再試行では文書／Workspaceの実結果移動と主画面のパレット・window操作を
+追加確認した。後続runでは各切替先を実画面で確認する10往復・20切替のnav送信区間432.990秒を記録した。
+準備時のquery再入力を含む観測窓561.880秒とは分けている。
+以前の即時frameの旧表示／Git白化を保持し、確認済み範囲は受入記録に限定する。
+今回必須の代表条件の確認と、全IME／DPI matrix・物理入力・全製品Human受入を区別する。
+開発線の通常統合とGitBook反映は最終HANDOFFの実結果で確認する。候補ごとの機械試験・実画面・残件は
+[受入記録](rust-acceptance.md)と最終HANDOFFを参照する。
+
+## Rev2の限定差分と未完了境界
+
+検索viewを開く際の不要なeditor経由のfocus移動を削除し、非表示にする部品の既存focus保護を維持した。
+診断なし最終候補で初回Unicode入力は5 fresh process連続PASS。query選択準備の順序は維持し、
+選択messageの遮断や入力を遅らせる処置は追加していない。
+一方、C01のWorkspace結果選択混在、C03の操作を覆う連続観測、最終候補の一部代表確認は未完了。
+作業branchのcheckpointに留め、develop統合や公開仕様の受入済み更新は行わない。
+buildと実画面の境界は[受入記録](rust-acceptance.md)と最終HANDOFFで示す。
+
+## Rev1の検索・コマンド表示復旧の反映対象（履歴）
+
+Task `20261017-mdlite-ui-surface-recovery` Rev1の局所差分。2026年10月17日の
+`product-ui`／`architecture-verification`限定更新を基準とし、旧C++節の履歴は維持する。
+最終commit・build・実画面の合否は受入記録とHANDOFFに結び付ける。
+今回の成果は未完了の作業branch checkpointで、developへは統合しない。
+初回queryの一括入力で文字順が入れ替わるC05 FAILと、C01／C03のPARTIALを明記し、
+GitBookの公開仕様へ受入済みとして反映しない。
+
+| 対象章 | 反映する契約・実装差分 |
+|---|---|
+| 製品概要と画面操作 | ExplorerとSearchは独立した論理viewで、既存sidebar領域を排他的に使う。非表示部品へfocusや入力を残さず、query・設定・Explorer状態を保持する。 |
+| 製品概要と画面操作 | パレットは一つのclient内hostで表示し、resize後も収める。IME取消を優先するEsc、外側の最初のクリックを消費するdismiss、実行・取消ごとのfocus復帰契約を記す。 |
+| 検索・置換とパネル操作 | queryと結果を優先し、置換・対象詳細を展開する。Explorer／Search／Calendar／Outline／Gitの低頻度操作はheaderメニュー・既存popup・パレットへ移し、registryと安全条件を維持する。 |
+| 構成と検証の境界 | App借用中の子部品の色問い合わせには描画専用の所有情報を使う。検索入力欄の白fallback回帰と通常起動W01/W03の白画面を別に扱う。単体試験、実画面、実IME、Human受入の境界を明記する。 |
+
+左右pin／unpin、複数pin、狭幅drawer、旧四枠設定の移行とresetは後続設計であり、
+今回の永続schemaやdrag dockingの実装ではない。W01/W03とE08の未解決記録も保持する。
+タイトル・メニューバー全体の再設計、全IME／DPI／物理入力matrixは今回の合格へ含めない。
+
 | 更新する章 | Rust節の変更内容 |
 |---|---|
 | 起動・Workspace | 明示初期化、未選択でも新規/開く、物理identityによる重複起動・重複文書検出、別Workspaceの別process起動 |
@@ -36,4 +80,4 @@
 | 製品概要と画面操作 | native child redraw、Feature/Git/Explorer/settingsのowner-draw | control identityに対応する描画先、空captionの安全なno-op、日本語captionの正確な文字数経路。native GDI回帰であり、最終画面のGUI確認ではない。 |
 | 構成と検証の境界 | source／EXE／harnessの対応、借用中の再描画、機械・GUI・IMEの証拠 | 修正前の失敗と限定回帰を保持し、最終buildの実測結果と未確認条件を分ける。 |
 
-章名は2026年10月15日の現行GitBookと照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから記入する。根拠source commitは未確定。
+章名は2026年10月18日の現行GitBookでも照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから反映する。Rev3製品source commitは`6d84d8c9762fa8857e141deb82ff38d8f9b27f78`。統合・公開の実結果は最終HANDOFFに記録する。

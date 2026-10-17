@@ -1,5 +1,155 @@
 # Rust Editor受入記録
 
+## 起動と入力復旧の残確認結果（2026-10-17）
+
+現行source集約SHA-256は `2fb81b7e33a4746aae931504660fa70299539eef04e5ffabc18ad217dc0748f4`。
+Releaseは `8ddf5b99a8f34c0e241cd51da95778393e63f65bce9bd40bf28133fa83480807`、
+Debugは `81cffeaf9eaa6e0c1200a201cdf6009ed344bfe8de691f4e6d6bccf6a926a792`。
+表間の境界に空の入力markerを作る局所修正とLF/CRLF回帰を追加した。
+Debug/Release各139 library + 201 native tests、各1件の専用可視試験、fmt、strict ClippyはPASS。
+独立した静的correctness reviewに追加の製品コード所見はなく、別のPonytail reviewにも
+複雑性の所見はなかった。以下の実操作上の失敗・未確認とは分けて扱う。
+
+ただし、現行Releaseの無介入起動14回は全て親画面とeditorが白く、W01/W03はFAILである。
+同条件の旧Releaseとの空文書対照でも両方が白かった。通常タイトルバーactivation直後と
+1.6秒後はrefreshなしで正常表示したが、これはW02の復帰確認でありW01の合格に代用しない。
+現行sourceに対応する隔離診断版では、背景状態の描画先から取得した画像が正常である一方、
+同時期の実画面は白かった。前面化後の描画先画像も同一だったため、文書の描画内容が
+生成されていないという説明では足りない。表示への反映経路の原因は未確定である。
+その後の通常起動では、診断版2回と製品版の空文書1回が初回描画前に前面化して正常表示した。
+この条件差は背景起動の失敗を取り消さない。診断版のGDI反映比較は背景条件を満たさず、
+制御呼び出し・GdiFlushとも未実行で通常終了した。
+さらに、製品版を起動情報の `SW_SHOWNOACTIVATE` 指定で1回起動したところ、
+別processが前面のままでも正常表示し、文書・EXE不変、通常終了code 0を確認した。
+背景状態だけでは失敗条件を説明できない。この診断用起動経路をW01の合格には数えない。
+2026-10-17のユーザー指示により、非アクティブ時の白画面は未解決のまま次回レビューへ回す。
+この問題の追加調査・介入試験は停止し、W01/W03の失敗記録と診断証拠を保持する。
+以後に発生した課題も修正せず残し、最終レビュー・Git配送・HANDOFF更新・アップロードへ
+進むようユーザーから明示指示を受けた。現行buildの残確認は以下の結果である。
+
+- 連続EditorRecoveryはE01 PASS。E02のASCII/Markdown、ATOK/MS-IMEのCoreとExtra、
+  選択・置換・preferred-x・Undo、折返しdrag、task編集に個別操作の証拠を得た。
+  E02〜E07の複合行は、未確認項目を含むためNOT_RUNのままとする。
+- E08の修正対象である最初の表末尾、表間、次の表の前の入力とUndoは通過した。
+  後続の「2番目の表の後の空行」でxとEnterを入力すると、表示表数が2から1となる
+  assertionでFAIL。入力sourceと選択位置のassertionは通過しており、製品原因か
+  判定条件の問題かは追加調査していない。失敗sourceはBOM付きUTF-8で正確に保存し通常終了した。
+  E09以降と同一sessionのI06には到達していない。
+- E14の外部変更時の保存拒否では、draft・選択・履歴の保持、通常保存、次のUndoと
+  元sourceの保存、通常終了code 0まで通過した。これはE14全体の合格ではない。
+- 状態領域を作らないWorkspaceでは、警告と編集継続、source保存、通常終了を確認した。
+  実際には自動保存でcleanとなり、予定したdirty-close Cancelと次の編集・Undoは未確認。
+- CoreはACK記録変数の未初期化、W02は予約変数PIDへの代入で停止した。I01はRootの
+  prompt操作が期限に間に合わず、試験本体は未実行。いずれも合格や製品不具合とは数えない。
+- UiParityはSave As関連のBLOCKEDと後続の待機timeoutで停止し、通常復元まで未到達。
+  IME中の終了はCONTROL_UNAVAILABLEでBLOCKED。Rootは残ったdialogを通常操作し、
+  確認用sourceを保持して終了した。各失敗記録とcleanup記録は区別して保存している。
+- F5は準備処理の空pathで停止し、IDE/debugger起動は未実行。PageUp/Down・折返しaffinity、
+  表の横scroll、長いIME候補の全bounds等の補完確認も、準備依存の不足により未実行である。
+  private I06 helperのchar配列変換に関するP2所見も、未修正の残課題として引き継ぐ。
+
+製品source・EXE・正規harnessは機械試験時から不変である。以上を完全なGUI・物理入力・
+Human受入とはしない。配送OIDとremote readback、残課題の詳細は最終HANDOFFに記録する。
+
+### 以前のbuildで得た証拠（現行buildの合格記録とは区別）
+
+旧時点の製品source集約SHA-256は `342092d27c0208031ce4810952cd77858505c7d9013a7b8c0fb82f8f8597bb20`。
+Release EXEは `6f0bf15155b7f5d5dad4c671c64f4c03ef76bbddfd87d275992dd6deb84a6ad6`、
+Debug EXEは `1f4e70ae4a2e32216f9c089b453f2063b95b399121027e1b294f1272a75d0e12`。
+canonical GUI harnessは `c832a4f7de2da3b1df50b22395860edc0d9aa2f864c44fb3ae251b4f63667acc`。
+未コミットの検証対象であり、Git配送・Human受入は未完了である。
+
+隔離診断版では、初回のWM_ACTIVATEとWM_SETFOCUS、および成功したEndDrawが、
+所有Mainが実際に最前面になる前に発生していた。通常タイトルバー操作後には正の
+WM_NCACTIVATEだけが届き、追加の本文描画がなかった。所有Main/Compactの正のactivationで、
+最小化中を除き全体描画を非同期予約するよう修正した。既存のdefault処理とfocus処理は維持する。
+WM_ACTIVATEだけを扱った中間候補の白画面は失敗記録として保持する。
+CheckWindowStateやEndDrawの成功だけで実画面正常を判定していない。
+
+最終Releaseの無介入起動14回をRootが実画像で確認した。ファイル指定10回
+（空4回・固定878-byte fixture6回）と設定済みWorkspace指定4回で、診断ON/OFF各7回、
+96 DPIのclient全体が正常だった。撮影前の本文click、resize、diagnostic RPC、入力はない。
+全14回とも通常終了code 0、fixture不変。別起動でも、操作前・通常タイトルバー操作直後・
+1.6秒後のclient全体が正常だった。最小化・最大化・遮蔽からの復帰の最終確認は継続中である。
+
+最終Debug/Releaseのfull testsは、それぞれ139 library + 200 native testsがPASS。
+通常suiteでignoredの可視native試験は専用実行で各1件PASSした。
+fmtと両profileのstrict ClippyもPASS。検証前後のsource・EXE・harnessのhashを照合した。
+この機械検証のharnessラベルは `d15f8c92…`。以後のharness修正ではRust sourceとEXEは変わっておらず、
+新harnessの実操作検証は別の継続記録で扱う。
+独立correctness reviewと、別のPonytail complexity reviewを実施した。
+Core/F5および連続GUI受入は未完了であり、機械試験から合格を推定しない。
+
+source集約はRust sourceとCargo/toolchainの42ファイルを対象とする。
+製品へ組み込むSVG5件とtest専用include fixtureは別に照合した。
+source ZIPは42ファイル、icons21件、fixtures9件、登録tools2件の計74件をbyte照合した。
+これらの対応付けはcommit・配送・実IMEの証明とは別である。
+
+連続EditorRecoveryでは、E01の作成・保存、E02のASCII/Markdown入力、
+E03のATOK通常変換・再変換・長いcompositionの機械検査を実行した。
+短いATOK candidateの位置と文節表示を画像で確認した。長いcompositionの画像には
+小さいIME panelの重なりがあり、その所有と原因は未測定のため長いcandidate配置の合格とはしない。
+harness変更前のMicrosoft IME試験は、最初のSpace後に異なる日本語preeditとなる条件で停止した。Enterは送らず、
+composition取消と元のATOK closedへの復元を確認した。同じ読みの候補か未処理かは未確定である。
+この失敗を残して追加観測したところ、1回目は同じ読み、2回目で「日本語きょうはいめへんか」へ変化した。
+Enterは送らず、4回のEscapeとprofile復元後、本文140 bytes・revision・dirty・履歴・選択が不変で、
+元のATOK closedへ戻った。client画像でも本文とcandidate表示を確認した。
+観測後の集計はevidenceの戻り値が配列へ混入して失敗したため、試験全体のPASSとはしない。
+Microsoft IMEだけで最大3回まで変換を観測するharness修正を、独立reviewとオフライン検証後に反映した。
+異なるstable Japanese preeditを確認するまでEnterを送らない条件は維持した。
+Microsoft IMEの `b328ab19…` harnessでは、2回ずつのSpace変換、候補巡回、取消、Enter確定と一単位のUndo/RedoがPASSした。
+再開用の試験行初期化漏れで停止した後も同じprocessを保持し、確定操作を再生せずExtraだけを継続した。
+再変換、全文F6ひらがな、異なる文字への確定置換、80文字の読みと長いcompositionの取消・確定・
+Undo/Redoを確認し、160-byte本文、U25/R1、元のATOK closedへ戻った。
+折返したpreeditと確定後のbaselineを画像で確認した。文節移動のRight側のtarget highlightと、
+親windowの撮影範囲を越える長いprediction popup全体の範囲は未検証として残す。
+
+E05では、見出し前の空行からCtrl+Downが進まない製品不具合の修正を最終EXEで確認した。
+Live表示の挿入位置補正を物理行へのCtrl上下移動に適用していたことが原因で、
+水平移動とtable処理を維持して修正した。LF/CRLF、Live/raw、Shift選択を含む恒久回帰を追加した。
+その後preferred-x試験が、残っているpointer fixtureを含む3タブに対し2タブを要求して停止した。
+本文140 bytesと履歴を保持し、E05だけ3タブを期待する修正helperで同じprocessから継続した。
+上下移動のpreferred-x、短い行での末尾への制限、逆向き選択と6回のUndoがPASSし、
+元の124-byte本文、dirty、U24/R6、EOFのcaretとATOK closedへ戻った。
+対応する画像でもcaret位置・選択・復元後の本文を確認した。元の停止記録は保持する。
+同じprocessのE06では、Coreを保存してから固定fixtureの日本語ドラッグ選択で停止した。
+本文673 bytes、clean、U0/R0は不変だが、期待した61–70 byteの選択が61–61に留まった。
+続く一回の観測では、DOWN後のcapture、終点座標付きのabsolute MOVE、UP前の61–70 byteの選択、
+UP後の選択維持とcapture／ボタン解放を確認した。本文・履歴・IME状態は不変で、画像でも日本語だけの選択を確認した。
+旧一括送信が失敗した具体的なOSイベント順は未確定だが、製品のドラッグ選択は段階を分けた操作で機能した。
+同じ検査手順を独立review後にcanonical harnessへ反映し、現在の選択から継続した。
+この変更はドラッグとその3つの呼出しに限定し、既存のIME検査条件は変更していない。
+新harnessで日本語・結合文字・ZWJ絵文字・全文の選択、置換／削除とUndo、
+145-byteの段落挿入・折返しをまたぐドラッグ・置換・2回のUndoがPASSした。
+Sourceの13画像とLive表示を確認し、673-byteの本文、clean、履歴を維持した。
+LiveのSVGは非対応の案内を表示しており、SVG描画のPASSとはしていない。
+再開用の集計変数漏れによる停止は別記録に保持している。
+
+E07では、段落・引用・リスト・コードのTab/Shift+TabとUndo、チェックリストのEnter継続・
+空項目での終了とUndoを実行し、17画像で表示を確認した。本文は正確な673 bytesへ戻った。
+Ctrl+W後には外部ランチャーのメニューが現れ、タブを閉じられなかった。
+MDLiteの通常メニュー「文書を閉じる」はenabledで、その操作では同じprocessのpointerを閉じ、
+保存済みCore160 bytes・U25/R1・2タブへ復帰した。外部設定やprocessは変更していない。
+Ctrl+Wの実到達と残るEnterの組合せは未検証として保持する。
+E08以降・保存復旧・Main/Compactの連続往復は未完了である。
+
+描画失敗時にはclipとEndDrawを対応させ、失敗targetを破棄し、一回だけ復旧を予約する。
+Resize失敗を処理し、target生成・再生成・表示先切替後は全体frameを作る。
+Git prompt Escape後は編集先surfaceを選んでからfocusを戻す。
+Main/Compactのnative message-loop回帰とtoolbar focus時のUndo回帰を追加している。
+calendarの状態行は行高17pxと文字サイズ10pxを分け、文字の下端切れを修正した。
+
+再変換取消は文書とsession generationを確認してnative CPS_CANCELを要求し、
+成功した世代の終了通知だけを処理する。失敗時は未確定文字を保持する。
+ATOK取消後は、本文・revision・dirty・履歴を保った有効位置への選択解除も許容する。
+Microsoft IMEや通常選択・確定置換のoracleは維持する。
+旧private診断版での取消と直後の同一文字Enter確定は、最終製品の実IME合格へ転用しない。
+最終EXEでの通常Enter・Undo/Redoは確認済み。同一文字の連続確定の追加確認は未完了である。
+
+現在の証拠はlocalの `.codex-runtime/input-rendering-recovery/` に保持する。
+以前の候補の失敗・成功記録は保持し、最終buildの結果と区別する。
+以下は過去の履歴であり、現在の受入状態を示さない。
+
 ## 入力・描画回復の現状（2026-10-15）
 
 以下はV5候補に対する記録。現在は借用中のWM_PAINT消失を修正しており、V5のbuild/testはそのsourceに限る履歴となる。新しい候補でGUI受入と最終検証が終わるまでは、Editor復旧完了とは扱わない。

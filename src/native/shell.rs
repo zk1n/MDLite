@@ -13,6 +13,8 @@ const RETURN: usize = 103;
 const RESET: usize = 104;
 const PALETTE_EXECUTE: usize = 105;
 const PALETTE_CANCEL: usize = 106;
+pub(super) const EDITOR_HISTORY_UNDO: usize = 0x7ef0;
+const EDITOR_HISTORY_REDO: usize = 0x7ef1;
 const ACTIVITY: usize = 110;
 const HEADER: usize = 130;
 const QUERY: usize = 150;
@@ -769,6 +771,7 @@ impl App {
                 self.shell.compact_target.take()
             };
             self.layout_key = None;
+            self.full_paint = true;
             self.image_cache.clear();
         }
         self.hwnd = hwnd;
@@ -1052,9 +1055,9 @@ impl App {
             (
                 Rect {
                     x: 24.,
-                    y: 52.,
+                    y: TOP,
                     width: (self.width - 48.).max(1.),
-                    height: (height - 76.).max(1.),
+                    height: (height - TOP - 24.).max(1.),
                 },
                 std::array::from_fn(|i| (IDS[i], Rect::default())),
             )
@@ -1547,24 +1550,6 @@ impl App {
                     self.return_from_compact();
                     Some(LRESULT(0))
                 }
-                WM_PAINT
-                    if hwnd == self.shell.main_window
-                        && self.shell.compact_window != HWND::default() =>
-                {
-                    let mut paint = PAINTSTRUCT::default();
-                    BeginPaint(hwnd, &mut paint);
-                    let _ = self.ensure_layout();
-                    if let Ok(t) = self.target() {
-                        t.BeginDraw();
-                        t.Clear(Some(&self.shell.tokens.background));
-                        let _ = self.draw_shell(&t);
-                        let _ = self.features_draw(&t);
-                        let _ = self.git_draw(&t);
-                        let _ = t.EndDraw(None, None);
-                    }
-                    let _ = EndPaint(hwnd, &paint);
-                    Some(LRESULT(0))
-                }
                 WM_KEYDOWN | WM_CHAR if hwnd != self.editing_window() => Some(LRESULT(0)),
                 _ => None,
             }
@@ -1574,6 +1559,22 @@ impl App {
         unsafe {
             if !self.shell.enabled {
                 return false;
+            }
+            if matches!(id, EDITOR_HISTORY_UNDO | EDITOR_HISTORY_REDO) {
+                if self.composing || self.feature_ime_active() || self.background_mutation_busy() {
+                    return true;
+                }
+                self.doc_mut().break_undo_group();
+                self.pending_surrogate = None;
+                self.pending_table_authoring = None;
+                self.preferred_x = None;
+                if id == EDITOR_HISTORY_REDO {
+                    self.doc_mut().redo();
+                } else {
+                    self.doc_mut().undo();
+                }
+                self.after_input();
+                return true;
             }
             if id == PALETTE_EXECUTE {
                 self.execute_palette();
@@ -2086,6 +2087,19 @@ impl App {
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+            if !self.feature_ime_active()
+                && !alt
+                && self.editor_actions.active_button(self) == msg.hwnd
+                && let Some(redo) = history_shortcut(msg.wParam.0 as u16, ctrl, shift)
+            {
+                let command = if redo {
+                    EDITOR_HISTORY_REDO
+                } else {
+                    EDITOR_HISTORY_UNDO
+                };
+                let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(command), LPARAM(0));
+                return true;
+            }
             if !self.feature_ime_active() {
                 for c in commands() {
                     let global = matches!(
@@ -2476,6 +2490,24 @@ mod tests {
         let (_, panels) = shell_geometry(&layout, 1440., 900., None);
         assert!(panels[PanelId::Calendar as usize].1.x > 700.);
         assert!(panels[PanelId::Outline as usize].1.x < 400.);
+    }
+
+    #[test]
+    fn compact_editor_body_starts_below_tab_strip_and_keeps_bottom_margin() {
+        let compact = super::super::tests::hidden_test_window_size(640, 480);
+        let mut app = super::super::tests::composing_test_app("body");
+        app.hwnd = compact;
+        app.width = 640.;
+        app.shell.enabled = true;
+        app.shell.compact_window = compact;
+        app.update_shell_geometry(480.);
+
+        assert_eq!(app.shell.editor.y, TOP);
+        assert_eq!(app.shell.editor.y + app.shell.editor.height, 480. - 24.);
+        assert!(app.shell.editor.y >= 75., "compact tabs end at y=75 DIP");
+        unsafe {
+            let _ = DestroyWindow(compact);
+        }
     }
 
     #[test]

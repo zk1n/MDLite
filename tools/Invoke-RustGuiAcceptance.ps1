@@ -37,8 +37,18 @@ public static class MdliteRustAcceptanceNative
 {
     public static string LastSaveAsFilenameFocusFailure = String.Empty;
     private const uint INPUT_KEYBOARD = 1;
+    private const uint INPUT_MOUSE = 0;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
+    private const uint MOUSEEVENTF_MOVE = 0x0001;
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+    private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+    private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
+    private const int SM_XVIRTUALSCREEN = 76;
+    private const int SM_YVIRTUALSCREEN = 77;
+    private const int SM_CXVIRTUALSCREEN = 78;
+    private const int SM_CYVIRTUALSCREEN = 79;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct KEYBDINPUT
@@ -165,6 +175,15 @@ public static class MdliteRustAcceptanceNative
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetGUIThreadInfo(uint threadId, ref GUITHREADINFO info);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetSystemMetrics(int index);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetCursorPos(out POINT point);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern short GetAsyncKeyState(int virtualKey);
 
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", ExactSpelling = true, SetLastError = true)]
     private static extern IntPtr SendControlTextTimeoutW(
@@ -816,36 +835,89 @@ public static class MdliteRustAcceptanceNative
         return 2;
     }
 
-    public static int DragOwnedBetween(
-        IntPtr expectedForeground, uint expectedProcessId,
-        int startX, int startY, int endX, int endY)
+    public static int[] GetVirtualScreenMetrics()
     {
-        if (GetForegroundWindow() != expectedForeground ||
-            !IsOwnedWindow(expectedForeground, expectedProcessId))
-            return -1;
-        RECT rect;
-        if (!GetWindowRect(expectedForeground, out rect) ||
-            startX < rect.Left || startX >= rect.Right ||
-            startY < rect.Top || startY >= rect.Bottom ||
-            endX < rect.Left || endX >= rect.Right ||
-            endY < rect.Top || endY >= rect.Bottom)
-            return -2;
-        if (!SetCursorPos(startX, startY))
-            return -3;
-        INPUT down = new INPUT();
-        down.type = 0;
-        down.data.mi.dwFlags = 0x0002;
-        if (SendInput(1, new INPUT[] { down }, Marshal.SizeOf(typeof(INPUT))) != 1)
-            return -4;
-        SetCursorPos(endX, endY);
-        INPUT move = new INPUT();
-        move.type = 0;
-        move.data.mi.dwFlags = 0x0001;
-        INPUT up = new INPUT();
-        up.type = 0;
-        up.data.mi.dwFlags = 0x0004;
-        INPUT[] finish = new INPUT[] { move, up };
-        return (int)SendInput(2, finish, Marshal.SizeOf(typeof(INPUT)));
+        return new int[] {
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        };
+    }
+
+    public static int NormalizeVirtualCoordinate(int coordinate, int origin, int extent)
+    {
+        if (extent <= 1) throw new ArgumentOutOfRangeException("extent");
+        int maximum = checked(origin + extent - 1);
+        if (coordinate < origin || coordinate > maximum)
+            throw new ArgumentOutOfRangeException("coordinate");
+
+        double scaled = (double)(coordinate - origin) * 65535.0 / (double)(extent - 1);
+        return (int)Math.Round(scaled, MidpointRounding.AwayFromZero);
+    }
+
+    public static uint MoveAbsoluteVirtual(
+        int x, int y, int virtualX, int virtualY, int virtualWidth, int virtualHeight,
+        out int lastError)
+    {
+        int absoluteX = NormalizeVirtualCoordinate(x, virtualX, virtualWidth);
+        int absoluteY = NormalizeVirtualCoordinate(y, virtualY, virtualHeight);
+        return SendMouse(absoluteX, absoluteY,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            out lastError);
+    }
+
+    public static uint LeftButtonDown(out int lastError)
+    {
+        return SendMouse(0, 0, MOUSEEVENTF_LEFTDOWN, out lastError);
+    }
+
+    public static uint LeftButtonUp(out int lastError)
+    {
+        return SendMouse(0, 0, MOUSEEVENTF_LEFTUP, out lastError);
+    }
+
+    public static bool TryGetCursorPosition(out int x, out int y, out int lastError)
+    {
+        POINT point;
+        bool ok = GetCursorPos(out point);
+        lastError = ok ? 0 : Marshal.GetLastWin32Error();
+        x = point.X;
+        y = point.Y;
+        return ok;
+    }
+
+    public static bool TryGetThreadCapture(
+        uint threadId, out IntPtr hwndCapture, out int lastError)
+    {
+        GUITHREADINFO info = new GUITHREADINFO();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+        bool ok = GetGUIThreadInfo(threadId, ref info);
+        lastError = ok ? 0 : Marshal.GetLastWin32Error();
+        hwndCapture = info.hwndCapture;
+        return ok;
+    }
+
+    public static bool IsLeftButtonDown()
+    {
+        return (GetAsyncKeyState(1) & 0x8000) != 0;
+    }
+
+    private static uint SendMouse(int dx, int dy, uint flags, out int lastError)
+    {
+        MOUSEINPUT mouse = new MOUSEINPUT();
+        mouse.dx = dx;
+        mouse.dy = dy;
+        mouse.dwFlags = flags;
+
+        INPUT input = new INPUT();
+        input.type = INPUT_MOUSE;
+        input.data = new INPUTUNION();
+        input.data.mi = mouse;
+
+        uint sent = SendInput(1, new INPUT[] { input }, Marshal.SizeOf(typeof(INPUT)));
+        lastError = sent == 1 ? 0 : Marshal.GetLastWin32Error();
+        return sent;
     }
 
     public static bool OwnedClientPointToScreen(
@@ -1410,7 +1482,20 @@ function Assert-EditorRecoveryImeInvariant($State, $Baseline, [string]$Phase) {
     }
 }
 
-function Cancel-EditorRecoveryImeComposition($Baseline, $CurrentState, [string]$Description, [int]$MaxEscapes = 3) {
+function Get-EditorRecoveryImeCancellationEscapeLimit($Profile) {
+    $identity = Get-EditorRecoveryProfileIdentity $Profile
+    if ($null -ne $identity -and
+        ([string]$identity.clsid).Trim('{}') -ieq '03B5835F-F03C-411B-9CE2-AA23E1171E36' -and
+        ([string]$identity.profile_guid).Trim('{}') -ieq 'A76C93D9-5523-4E90-AAFA-4DB112F9AC76') {
+        return 4
+    }
+    return 3
+}
+
+function Cancel-EditorRecoveryImeComposition(
+    $Baseline, $CurrentState, [string]$Description, [int]$MaxEscapes = 3,
+    [switch]$AllowAtokReconversionSelectionCollapse
+) {
     $state = $CurrentState
     $stages = @()
     while ($script:ImeEscapesSentForComposition -lt $MaxEscapes) {
@@ -1422,7 +1507,11 @@ function Cancel-EditorRecoveryImeComposition($Baseline, $CurrentState, [string]$
         $escapeNumber = $script:ImeEscapesSentForComposition
         $state = Wait-EditorRecoveryStableState -WaitMs 5000 -Description ($Description + ' Escape stage ' + $escapeNumber) -Condition {
             param($value)
-            Assert-EditorRecoveryImeInvariant $value $Baseline ($Description + ' Escape stage')
+            if ($AllowAtokReconversionSelectionCollapse) {
+                Assert-EditorRecoveryAtokReconversionCancelInvariant $value $Baseline ($Description + ' Escape stage')
+            } else {
+                Assert-EditorRecoveryImeInvariant $value $Baseline ($Description + ' Escape stage')
+            }
             $true
         }
         $cancelled = -not [bool]$state.ime.active -and [string]::IsNullOrEmpty([string]$state.ime.preedit)
@@ -1462,10 +1551,11 @@ function Restore-ImeOpenState {
     }
     if ([bool]$state.ime.active -or -not [string]::IsNullOrEmpty([string]$state.ime.preedit)) {
         $baseline = Wait-Diagnostic { param($value) $true } 'IME restoration source and history baseline'
-        $cancelResult = Cancel-EditorRecoveryImeComposition $baseline $state 'cancellation of owned composition' 3
+        $maxEscapes = Get-EditorRecoveryImeCancellationEscapeLimit $state.active_input_profile
+        $cancelResult = Cancel-EditorRecoveryImeComposition $baseline $state 'cancellation of owned composition' $maxEscapes
         $state = $cancelResult.state
         if (-not $cancelResult.cancelled) {
-            throw 'ENVIRONMENT_BLOCKED: owned IME composition remained active after three normal Escape stages.'
+            throw 'ENVIRONMENT_BLOCKED: owned IME composition remained active after the bounded normal Escape sequence.'
         }
         if ($state.source -cne $baseline.source -or
             [int]$state.selection.anchor -ne [int]$baseline.selection.anchor -or
@@ -1490,6 +1580,112 @@ function Restore-ImeOpenState {
     $script:ImeRestorePending = $false
     if ([bool]$state.ime.open_status.open -ne [bool]$script:ImeInitialOpen) {
         throw 'The owned app-local IME did not return to its original open state.'
+    }
+}
+
+function Assert-ConfiguredImeSpaceState($State,$Baseline,$Profile,[string]$Phase) {
+    if ($State.source -cne $Baseline.source -or
+        [int]$State.selection.anchor -ne [int]$Baseline.selection.anchor -or
+        [int]$State.selection.head -ne [int]$Baseline.selection.head -or
+        [bool]$State.dirty -ne [bool]$Baseline.dirty -or
+        [int]$State.undo_count -ne [int]$Baseline.undo_count -or
+        [int]$State.redo_count -ne [int]$Baseline.redo_count -or
+        [long]$State.document_id -ne [long]$Baseline.document_id -or
+        [long]$State.revision -ne [long]$Baseline.revision -or
+        [int]$State.tabs -ne [int]$Baseline.tabs -or
+        [bool]$State.raw -ne [bool]$Baseline.raw -or
+        [string]$State.selection_affinity -cne [string]$Baseline.selection_affinity -or
+        -not (Test-EditorRecoveryProfileIdentity $Profile $Baseline.active_input_profile) -or
+        [string]$Baseline.active_input_profile.description -cne [string]$Profile.description -or
+        -not (Test-EditorRecoveryProfileIdentity $Profile $State.active_input_profile) -or
+        [string]$State.active_input_profile.description -cne [string]$Profile.description -or
+        $null -eq $State.ime.open_status -or -not [bool]$State.ime.open_status.available -or
+        -not [bool]$State.ime.open_status.open -or -not [bool]$State.ime.active -or
+        [string]::IsNullOrEmpty([string]$State.ime.preedit) -or
+        -not (Test-EditorRecoveryJapaneseText ([string]$State.ime.preedit))) {
+        throw ('PRODUCT_ASSERTION: IME Space stage violated source/document/revision/selection/dirty/history/tabs/raw/profile/open/preedit invariants ('+$Phase+').')
+    }
+}
+
+function Invoke-ConfiguredImeSpaceConversion(
+    $Baseline,$Profile,$StartingState,[string]$ExpectedReading,[string]$Description
+) {
+    $rawReading=[string]$StartingState.ime.preedit
+    if ($rawReading -cne $ExpectedReading) {
+        throw ('PRODUCT_ASSERTION: '+$Description+' requires the exact full scripted reading before Space.')
+    }
+    Assert-ConfiguredImeSpaceState $StartingState $Baseline $Profile ($Description+' initial state')
+
+    $exactMicrosoftIme=$false
+    if ([string]$Profile.status -ceq 'active' -and
+        [string]$Profile.profile_type -ceq 'text_service' -and
+        [string]$Profile.language_id -ceq '0x0411') {
+        try {
+            $profileClsid=[guid]::Parse([string]$Profile.clsid)
+            $profileGuid=[guid]::Parse([string]$Profile.profile_guid)
+            $exactMicrosoftIme=$profileClsid -eq [guid]'03B5835F-F03C-411B-9CE2-AA23E1171E36' -and
+                $profileGuid -eq [guid]'A76C93D9-5523-4E90-AAFA-4DB112F9AC76'
+        } catch { $exactMicrosoftIme=$false }
+    }
+    $maximumSpaces=if($exactMicrosoftIme){3}else{1}
+    $profileKind=if($exactMicrosoftIme){'exact-Microsoft-IME'}elseif([string]$Profile.description -ceq 'ATOK'){'ATOK-single-Space'}else{'other-profile-single-Space'}
+    $progression=@()
+    $state=$StartingState
+    for($spaceNumber=1;$spaceNumber -le $maximumSpaces;$spaceNumber++) {
+        Set-OwnedForeground
+        Send-Key $script:WindowHandle 0x20
+        try {
+            $next=Wait-EditorRecoveryStableState -WaitMs 10000 -Description ($Description+' Space '+$spaceNumber) -Condition {
+                param($value)
+                Assert-ConfiguredImeSpaceState $value $Baseline $Profile ($Description+' Space '+$spaceNumber)
+                return $true
+            }
+        } catch {
+            $_.Exception.Data['ConfiguredImeSpaceProgression']=@($progression)
+            $_.Exception.Data['ConfiguredImeSpaceActions']=$spaceNumber
+            throw
+        }
+        $record=[pscustomobject]@{
+            phase=$Description
+            action='Space'
+            space_number=$spaceNumber
+            preedit_before=$rawReading
+            preedit_after=[string]$next.ime.preedit
+            preedit_sha256=(Get-EditorRecoveryBytesSha256 ([Text.Encoding]::UTF8.GetBytes([string]$next.ime.preedit)))
+            distinct_from_full_reading=([string]$next.ime.preedit -cne $rawReading)
+            document_id=[long]$next.document_id
+            revision=[long]$next.revision
+            selection=$next.selection
+            selection_affinity=[string]$next.selection_affinity
+            dirty=[bool]$next.dirty
+            undo_count=[int]$next.undo_count
+            redo_count=[int]$next.redo_count
+            tabs=[int]$next.tabs
+            raw=[bool]$next.raw
+            profile=$next.active_input_profile
+            ime_open=[bool]$next.ime.open_status.open
+            ime_active=[bool]$next.ime.active
+        }
+        $progression+= $record
+        $state=$next
+        if([string]$state.ime.preedit -cne $rawReading) {
+            return [pscustomobject]@{
+                state=$state
+                distinct=$true
+                space_actions=$spaceNumber
+                max_spaces=$maximumSpaces
+                profile_kind=$profileKind
+                progression=@($progression)
+            }
+        }
+    }
+    return [pscustomobject]@{
+        state=$state
+        distinct=$false
+        space_actions=$maximumSpaces
+        max_spaces=$maximumSpaces
+        profile_kind=$profileKind
+        progression=@($progression)
     }
 }
 
@@ -1576,97 +1772,113 @@ function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedH
         Add-Observation 'configured IME complete scripted reading' $state
 
         $rawPreedit = [string]$state.ime.preedit
-        Set-OwnedForeground
-        Send-Key $script:WindowHandle 0x20
+        $spaceConversion = $null
         try {
-            $converted = Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'stable Space conversion' -Condition {
-                param($value)
-                Assert-EditorRecoveryImeInvariant $value $baseline 'Space conversion'
-                [bool]$value.ime.active -and
-                    -not [string]::IsNullOrEmpty([string]$value.ime.preedit) -and
-                    [string]$value.ime.preedit -cne $rawPreedit -and
-                    (Test-EditorRecoveryJapaneseText ([string]$value.ime.preedit))
-            }
+            $spaceConversion = Invoke-ConfiguredImeSpaceConversion $baseline $profile $state $expectedReading 'scripted reading conversion'
         } catch {
-            if ($_.Exception.Message -match '^OBSERVER_FAILURE:|^PRODUCT_ASSERTION:') { throw }
+            $lastConversionState = $_.Exception.Data['LastDiagnosticState']
             $script:Report.ime_space_conversion = @{
                 status='NOT_RUN'; before_preedit=$rawPreedit
-                reason='Space did not expose a distinct stable Japanese conversion in the owner-thread diagnostic.'
+                after_preedit=if($null -ne $lastConversionState){[string]$lastConversionState.ime.preedit}else{$null}
+                space_actions=$_.Exception.Data['ConfiguredImeSpaceActions']
+                progression=@($_.Exception.Data['ConfiguredImeSpaceProgression'])
+                reason=[string]$_.Exception.Message
             }
+            if ($_.Exception.Message -match '^OBSERVER_FAILURE:|^PRODUCT_ASSERTION:') { throw }
+            if ($null -eq $lastConversionState) { throw }
             $script:Report.ime_status = "BLOCKED: Space conversion for '$reading' was not observable as a stable, changed Japanese preedit."
-            return $_.Exception.Data['LastDiagnosticState']
+            return $lastConversionState
         }
+        if (-not [bool]$spaceConversion.distinct) {
+            $script:Report.ime_space_conversion = @{
+                status='NOT_RUN'; before_preedit=$rawPreedit; after_preedit=[string]$spaceConversion.state.ime.preedit
+                space_actions=[int]$spaceConversion.space_actions; max_spaces=[int]$spaceConversion.max_spaces
+                profile_kind=[string]$spaceConversion.profile_kind; progression=@($spaceConversion.progression)
+                reason='No distinct stable Japanese preedit was observed; Enter was withheld.'
+            }
+            $script:Report.ime_status = "BLOCKED: Space conversion for '$reading' did not expose a distinct stable Japanese preedit after $($spaceConversion.space_actions) bounded Space action(s)."
+            return $spaceConversion.state
+        }
+        $converted = $spaceConversion.state
         $convertedPreedit = [string]$converted.ime.preedit
         $script:Report.ime_space_conversion = @{
             status='PASS'; before_preedit=$rawPreedit; after_preedit=$convertedPreedit
-            stable_for_ms=250
+            stable_for_ms=250; space_actions=[int]$spaceConversion.space_actions
+            max_spaces=[int]$spaceConversion.max_spaces; profile_kind=[string]$spaceConversion.profile_kind
+            progression=@($spaceConversion.progression)
         }
         $script:Report.ime_conversion_candidate = $convertedPreedit
-        $script:Report.ime_composition_invariants += 'Space: source, selection, dirty state, history, and profile unchanged'
-        Add-Observation 'configured IME stable Space conversion' $converted
+        $script:Report.ime_composition_invariants += ('Space conversion ('+[int]$spaceConversion.space_actions+' action(s)): source, document, revision, selection, dirty state, history, tabs, raw mode, and profile unchanged')
+        Add-Observation ('configured IME stable Space conversion after '+[int]$spaceConversion.space_actions+' action(s)') $converted
 
         $candidateMovementObserved = $false
-        $candidateKeys = @('Space','Space')
+        $candidateKeys = @()
+        $opened = $null
+        $moved = $null
         try {
             Set-OwnedForeground
             Send-Key $script:WindowHandle 0x20
-            $opened = Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'stable candidate opening or cycling after second Space' -Condition {
+            $candidateKeys += 'Space'
+            $opened = Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'stable candidate opening or cycling after conversion' -Condition {
                 param($value)
-                Assert-EditorRecoveryImeInvariant $value $baseline 'candidate opening'
-                [bool]$value.ime.active -and
-                    -not [string]::IsNullOrEmpty([string]$value.ime.preedit) -and
-                    (Test-EditorRecoveryJapaneseText ([string]$value.ime.preedit))
+                Assert-ConfiguredImeSpaceState $value $baseline $profile 'candidate opening'
+                return $true
             }
-            Add-Observation 'configured IME second Space candidate opening or cycling' $opened
+            Add-Observation 'configured IME candidate opening Space' $opened
             $moved = $opened
             if ([string]$opened.ime.preedit -ceq $convertedPreedit) {
-                # Second Space may only open the list. One further ordinary
-                # Space cycles it; Down can partially confirm ATOK text.
-                $candidateKeys += 'Space'
+                # Candidate-list cycling remains a separate, bounded stage.
                 Set-OwnedForeground
                 Send-Key $script:WindowHandle 0x20
-                $moved = Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'distinct stable candidate cycling after third Space' -Condition {
+                $candidateKeys += 'Space'
+                $moved = Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'distinct stable candidate cycling after one additional Space' -Condition {
                     param($value)
-                    Assert-EditorRecoveryImeInvariant $value $baseline 'candidate cycling'
-                    [bool]$value.ime.active -and
-                        -not [string]::IsNullOrEmpty([string]$value.ime.preedit) -and
-                        [string]$value.ime.preedit -cne $convertedPreedit -and
-                        (Test-EditorRecoveryJapaneseText ([string]$value.ime.preedit))
+                    Assert-ConfiguredImeSpaceState $value $baseline $profile 'candidate cycling'
+                    [string]$value.ime.preedit -cne $convertedPreedit
                 }
             }
             $candidateMovementObserved = $true
             $state = $moved
             $script:Report.ime_candidate_movement = @{
-                status='PASS'; key='Space'; key_sequence=$candidateKeys; before_preedit=$convertedPreedit
+                status='PASS'; key='Space'; key_sequence=@($candidateKeys); before_preedit=$convertedPreedit
+                conversion_space_actions=[int]$spaceConversion.space_actions
+                candidate_opening_space_actions=1
+                candidate_cycling_space_actions=[Math]::Max(0,$candidateKeys.Count-1)
+                candidate_space_actions=[int]$candidateKeys.Count
+                total_space_actions=[int]$spaceConversion.space_actions+[int]$candidateKeys.Count
+                candidate_opening_preedit=[string]$opened.ime.preedit
                 after_preedit=[string]$moved.ime.preedit; stable_for_ms=250
                 evidence='distinct stable owner-thread preedit after bounded Space cycling'
                 candidate_popup_visual_review='NOT_RUN'
             }
-            $script:Report.ime_composition_invariants += 'Space cycling: source, selection, dirty state, history, and profile unchanged'
+            $script:Report.ime_composition_invariants += 'Candidate Space opening/cycling: source, document, revision, selection, dirty state, history, tabs, raw mode, and profile unchanged'
             Add-Observation 'configured IME candidate movement with distinct readback' $moved
         } catch {
             if ($_.Exception.Message -match '^OBSERVER_FAILURE:|^PRODUCT_ASSERTION:') { throw }
             $lastCandidateState = $_.Exception.Data['LastDiagnosticState']
             if ($null -eq $lastCandidateState) { throw }
-            Assert-EditorRecoveryImeInvariant $lastCandidateState $baseline 'candidate movement'
-            if (-not [bool]$lastCandidateState.ime.active -or
-                -not (Test-EditorRecoveryJapaneseText ([string]$lastCandidateState.ime.preedit))) {
-                throw 'ENVIRONMENT_BLOCKED: pure candidate Space action did not retain observable active Japanese composition.'
-            }
+            Assert-ConfiguredImeSpaceState $lastCandidateState $baseline $profile 'candidate movement recovery'
             $script:Report.ime_candidate_movement = @{
-                status='NOT_RUN'; key='Space'; key_sequence=$candidateKeys; before_preedit=$convertedPreedit
+                status='NOT_RUN'; key='Space'; key_sequence=@($candidateKeys); before_preedit=$convertedPreedit
+                conversion_space_actions=[int]$spaceConversion.space_actions
+                candidate_opening_space_actions=[Math]::Min(1,$candidateKeys.Count)
+                candidate_cycling_space_actions=[Math]::Max(0,$candidateKeys.Count-1)
+                candidate_space_actions=[int]$candidateKeys.Count
+                total_space_actions=[int]$spaceConversion.space_actions+[int]$candidateKeys.Count
+                candidate_opening_preedit=if($null -ne $opened){[string]$opened.ime.preedit}else{$null}
                 after_preedit=[string]$lastCandidateState.ime.preedit
                 reason='No distinct stable preedit was observed; candidate-list movement is not exposed by the diagnostic contract.'
                 candidate_popup_visual_review='NOT_RUN'
             }
-            $script:Report.ime_composition_invariants += 'Space attempt: source, selection, dirty state, history, and profile unchanged'
+            $script:Report.ime_composition_invariants += 'Candidate Space attempt: source, document, revision, selection, dirty state, history, tabs, raw mode, and profile unchanged'
             $state = $lastCandidateState
         }
 
-        $cancelResult = Cancel-EditorRecoveryImeComposition $baseline $state 'configured IME reading' 3
+        $maxEscapes = Get-EditorRecoveryImeCancellationEscapeLimit $profile
+        $cancelResult = Cancel-EditorRecoveryImeComposition $baseline $state 'configured IME reading' $maxEscapes
         $state = $cancelResult.state
         if (-not $cancelResult.cancelled) {
-            $script:Report.ime_status = 'BLOCKED: native composition remained active after three ordinary Escape stages.'
+            $script:Report.ime_status = 'BLOCKED: native composition remained active after the bounded ordinary Escape sequence.'
             return $state
         }
         $script:Report.ime_composition_invariants += 'Escape: source, selection, dirty state, history, and profile unchanged'
@@ -1698,21 +1910,38 @@ function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedH
         }
         $script:Report.ime_composition_invariants += 'commit reading: source, selection, dirty state, history, and profile unchanged'
         $rawCommitPreedit = [string]$state.ime.preedit
-        Set-OwnedForeground
-        Send-Key $script:WindowHandle 0x20
-        $converted = Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'stable conversion before Enter commit' -Condition {
-            param($value)
-            Assert-EditorRecoveryImeInvariant $value $baseline 'commit Space conversion'
-            [bool]$value.ime.active -and
-                -not [string]::IsNullOrEmpty([string]$value.ime.preedit) -and
-                [string]$value.ime.preedit -cne $rawCommitPreedit -and
-                (Test-EditorRecoveryJapaneseText ([string]$value.ime.preedit))
+        $commitSpaceConversion = $null
+        try {
+            $commitSpaceConversion = Invoke-ConfiguredImeSpaceConversion $baseline $profile $state $expectedReading 'pre-Enter conversion'
+        } catch {
+            $script:Report.ime_space_conversion.commit_status='NOT_RUN'
+            $script:Report.ime_space_conversion.commit_before_preedit=$rawCommitPreedit
+            $script:Report.ime_space_conversion.commit_after_preedit=if($null -ne $_.Exception.Data['LastDiagnosticState']){[string]$_.Exception.Data['LastDiagnosticState'].ime.preedit}else{$null}
+            $script:Report.ime_space_conversion.commit_space_actions=$_.Exception.Data['ConfiguredImeSpaceActions']
+            $script:Report.ime_space_conversion.commit_progression=@($_.Exception.Data['ConfiguredImeSpaceProgression'])
+            $script:Report.ime_space_conversion.commit_failure=[string]$_.Exception.Message
+            throw
         }
+        if (-not [bool]$commitSpaceConversion.distinct) {
+            $script:Report.ime_space_conversion.commit_status='NOT_RUN'
+            $script:Report.ime_space_conversion.commit_before_preedit=$rawCommitPreedit
+            $script:Report.ime_space_conversion.commit_after_preedit=[string]$commitSpaceConversion.state.ime.preedit
+            $script:Report.ime_space_conversion.commit_space_actions=[int]$commitSpaceConversion.space_actions
+            $script:Report.ime_space_conversion.commit_max_spaces=[int]$commitSpaceConversion.max_spaces
+            $script:Report.ime_space_conversion.commit_progression=@($commitSpaceConversion.progression)
+            throw 'ENVIRONMENT_BLOCKED: no distinct stable Japanese preedit was observed before Enter; Enter was not sent.'
+        }
+        $converted = $commitSpaceConversion.state
         $script:Report.ime_conversion_candidate = [string]$converted.ime.preedit
         $script:Report.ime_space_conversion.commit_preedit = [string]$converted.ime.preedit
         $script:Report.ime_space_conversion.commit_stable_for_ms = 250
-        $script:Report.ime_composition_invariants += 'commit Space: source, selection, dirty state, history, and profile unchanged'
-        Add-Observation 'configured IME stable conversion before commit' $converted
+        $script:Report.ime_space_conversion.commit_status = 'PASS_DISTINCT_JAPANESE_PREEDIT_BEFORE_ENTER'
+        $script:Report.ime_space_conversion.commit_space_actions = [int]$commitSpaceConversion.space_actions
+        $script:Report.ime_space_conversion.commit_max_spaces = [int]$commitSpaceConversion.max_spaces
+        $script:Report.ime_space_conversion.commit_profile_kind = [string]$commitSpaceConversion.profile_kind
+        $script:Report.ime_space_conversion.commit_progression = @($commitSpaceConversion.progression)
+        $script:Report.ime_composition_invariants += ('pre-Enter Space conversion ('+[int]$commitSpaceConversion.space_actions+' action(s)): source, document, revision, selection, dirty state, history, tabs, raw mode, and profile unchanged')
+        Add-Observation ('configured IME stable conversion before commit after '+[int]$commitSpaceConversion.space_actions+' action(s)') $converted
 
         Set-OwnedForeground
         Send-Key $script:WindowHandle 0x0D
@@ -1767,9 +1996,9 @@ function Invoke-ConfiguredImeAcceptance([string]$ExpectedSource, [int]$ExpectedH
         Add-Observation 'Redo configured IME commit' $state
         $movementLabel = if ($candidateMovementObserved) { 'candidate movement read back' } else { 'candidate movement NOT_RUN' }
         $script:Report.ime_status = if ($candidateMovementObserved) {
-            "PASS: active configured profile '$profileDescription' (language $($profile.language_id)); full scripted reading, stable Space conversion, bounded Space candidate readback, Escape cancellation, Enter commit, and one-unit Undo/Redo were observed; candidate UI review remains NOT_RUN."
+            "PASS: active configured profile '$profileDescription' (language $($profile.language_id)); full scripted reading, stable Space conversion after $($spaceConversion.space_actions) action(s), $($candidateKeys.Count) candidate-stage Space action(s), Escape cancellation, Enter commit, and one-unit Undo/Redo were observed; candidate UI review remains NOT_RUN."
         } else {
-            "PARTIAL: active configured profile '$profileDescription' (language $($profile.language_id)); full reading, stable conversion, Escape, commit, and Undo/Redo passed; $movementLabel."
+            "PARTIAL: active configured profile '$profileDescription' (language $($profile.language_id)); full reading, stable conversion after $($spaceConversion.space_actions) action(s), Escape, commit, and Undo/Redo passed; $movementLabel."
         }
     } catch {
         $primaryFailure = $_.Exception
@@ -2350,8 +2579,59 @@ function Invoke-UiPaletteCommand([string]$Label) {
         throw [System.NotSupportedException]::new('PALETTE_CONTROLS_UNAVAILABLE')
     }
     Invoke-UiControlClick $script:WindowHandle $query
+    $queryFocusReady = $false
+    do {
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        try {
+            $focusQuery = Get-UiControlById -Root $script:WindowHandle -ControlId 150 `
+                -Class 'EDIT' -RequireVisible -RequireEnabled
+            Assert-UiOwnedWindow $script:WindowHandle
+            Assert-UiOwnedWindow $focusQuery.Handle
+            $focusInfo = [MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus(
+                $script:WindowHandle, $script:WindowHandle, [IntPtr]::Zero, [uint32]$script:ProcessId)
+            $focusQueryHandleText = '0x{0:X}' -f $focusQuery.Handle.ToInt64()
+            $queryFocusReady = $focusInfo.registered_editor_window -and
+                $focusInfo.gui_thread_info_available -and
+                $focusInfo.foreground_is_expected -and $focusInfo.active_is_expected -and
+                $focusInfo.focus_hwnd -ceq $focusQueryHandleText -and
+                $focusInfo.caret_hwnd -ceq $focusQueryHandleText
+            if ($queryFocusReady) { break }
+        } catch [System.NotSupportedException] {
+        }
+        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $queryFocusReady) {
+        throw [System.TimeoutException]::new('PALETTE_QUERY_FOCUS_TIMEOUT')
+    }
     Send-UnicodeText $Label $script:WindowHandle
-    $count = Wait-UiListCount $script:WindowHandle 151 1 2500
+    $queryText = $null
+    $count = -1
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(2500)
+    do {
+        try {
+            $query = Get-UiControlById -Root $script:WindowHandle -ControlId 150 `
+                -Class 'EDIT' -RequireVisible -RequireEnabled
+            $results = Get-UiControlById -Root $script:WindowHandle -ControlId 151 `
+                -Class 'LISTBOX' -RequireVisible -RequireEnabled
+            Assert-UiOwnedWindow $query.Handle
+            Assert-UiOwnedWindow $results.Handle
+            $queryText = [MdliteRustAcceptanceNative]::OwnedControlText($query.Handle, [uint32]$script:ProcessId)
+            $count = -1
+            if ($queryText -ceq $Label) {
+                $count = Get-UiListCount $results.Handle
+                if ($count -eq 1) { break }
+            }
+        } catch [System.NotSupportedException] {
+        } catch [System.TimeoutException] {
+        }
+        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($queryText -cne $Label) {
+        throw [System.TimeoutException]::new('PALETTE_QUERY_TEXT_TIMEOUT')
+    }
+    if ($count -lt 0) {
+        throw [System.TimeoutException]::new('PALETTE_RESULT_COUNT_TIMEOUT')
+    }
     if ($count -ne 1) {
         throw [System.InvalidOperationException]::new('PALETTE_FILTER_NOT_UNIQUE')
     }
@@ -2711,36 +2991,270 @@ function Invoke-UiDiagnosticShiftClick([double]$DipX, [double]$DipY, [double]$Dp
     throw [System.InvalidOperationException]::new('ENVIRONMENT_BLOCKED: Shift-click SendInput did not complete and release all keys/buttons.')
 }
 
+function Assert-UiDiagnosticDragInvariants($State, $Baseline, [string]$Stage) {
+    foreach ($name in @('document_id','source','revision','dirty','undo_count','redo_count','raw','tabs','active_input_profile','ime')) {
+        if ($null -eq $State.PSObject.Properties[$name] -or $null -eq $State.PSObject.Properties[$name].Value) {
+            throw ('OBSERVER_FAILURE: drag {0} diagnostic lacks {1}.' -f $Stage,$name)
+        }
+    }
+    if ([long]$State.document_id -ne [long]$Baseline.document_id -or
+        [string]$State.source -cne [string]$Baseline.source -or
+        [long]$State.revision -ne [long]$Baseline.revision -or
+        [bool]$State.dirty -ne [bool]$Baseline.dirty -or
+        [int]$State.undo_count -ne [int]$Baseline.undo_count -or
+        [int]$State.redo_count -ne [int]$Baseline.redo_count -or
+        [bool]$State.raw -ne [bool]$Baseline.raw -or
+        [int]$State.tabs -ne [int]$Baseline.tabs -or
+        (ConvertTo-Json -InputObject $State.active_input_profile -Depth 12 -Compress) -cne
+            (ConvertTo-Json -InputObject $Baseline.active_input_profile -Depth 12 -Compress) -or
+        (ConvertTo-Json -InputObject $State.ime -Depth 12 -Compress) -cne
+            (ConvertTo-Json -InputObject $Baseline.ime -Depth 12 -Compress)) {
+        throw ('PRODUCT_ASSERTION: drag {0} changed source/document/revision/dirty/history/tabs/raw/profile/IME state.' -f $Stage)
+    }
+}
+
+function Assert-UiDiagnosticDragOwnershipWhileHeld([uint32]$ExpectedThreadId) {
+    Assert-OwnedWindow $script:WindowHandle
+    $foreground = [MdliteRustAcceptanceNative]::GetForegroundWindow()
+    [uint32]$foregroundProcessId = 0
+    if ($foreground -ne [IntPtr]::Zero) {
+        [void][MdliteRustAcceptanceNative]::GetWindowThreadProcessId($foreground,[ref]$foregroundProcessId)
+    }
+    if ($foreground -ne $script:WindowHandle -or $foregroundProcessId -ne $script:ProcessId) {
+        throw 'OWNERSHIP_GATE: exact owned Main foreground changed while drag button was held; refusing to refocus.'
+    }
+
+    [uint32]$targetProcessId = 0
+    $targetThreadId = [MdliteRustAcceptanceNative]::GetWindowThreadProcessId(
+        $script:WindowHandle,[ref]$targetProcessId)
+    if ($targetThreadId -eq 0 -or $targetProcessId -ne $script:ProcessId -or
+        $targetThreadId -ne $ExpectedThreadId) {
+        throw 'OWNERSHIP_GATE: exact owned Main GUI-thread identity changed while drag button was held.'
+    }
+
+    $capture = [IntPtr]::Zero
+    $captureError = 0
+    $captureRead = [MdliteRustAcceptanceNative]::TryGetThreadCapture(
+        $targetThreadId,[ref]$capture,[ref]$captureError)
+    if (-not $captureRead -or $capture -ne $script:WindowHandle) {
+        throw ('OWNERSHIP_GATE: exact owned Main GUI-thread capture changed while drag button was held; error={0}.' -f $captureError)
+    }
+    if (-not [MdliteRustAcceptanceNative]::IsLeftButtonDown()) {
+        throw 'OWNERSHIP_GATE: physical left button was released before the held-drag condition was accepted.'
+    }
+}
+
 function Invoke-UiDiagnosticDrag(
     [double]$StartDipX,
     [double]$StartDipY,
     [double]$EndDipX,
     [double]$EndDipY,
-    [double]$DpiScale
+    [double]$DpiScale,
+    [Parameter(Mandatory=$true)][scriptblock]$WhileHeldCondition
 ) {
-    $startX = [int][Math]::Round($StartDipX * $DpiScale)
-    $startY = [int][Math]::Round($StartDipY * $DpiScale)
-    $endX = [int][Math]::Round($EndDipX * $DpiScale)
-    $endY = [int][Math]::Round($EndDipY * $DpiScale)
-    [int]$screenStartX = 0
-    [int]$screenStartY = 0
-    [int]$screenEndX = 0
-    [int]$screenEndY = 0
-    $startConverted = [MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
-        $script:WindowHandle, $script:ProcessId, $startX, $startY,
-        [ref]$screenStartX, [ref]$screenStartY)
-    $endConverted = [MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
-        $script:WindowHandle, $script:ProcessId, $endX, $endY,
-        [ref]$screenEndX, [ref]$screenEndY)
-    if (-not $startConverted -or -not $endConverted) {
-        throw [System.InvalidOperationException]::new('DIAGNOSTIC_GEOMETRY_CONVERSION_FAILED')
+    $primaryFailure = $null
+    $cleanupFailures = [Collections.Generic.List[string]]::new()
+    $baseline = $null
+    $downAccepted = $false
+    $upAttempted = $false
+    $upSent = $false
+    $targetThreadId = [uint32]0
+    $releaseRead = $false
+    $releasedCapture = [IntPtr]::Zero
+    $releasedCaptureError = 0
+    $captureReleased = $false
+    $buttonStillDown = $null
+    $buttonReleased = $false
+    try {
+        $startX = [int][Math]::Round($StartDipX * $DpiScale)
+        $startY = [int][Math]::Round($StartDipY * $DpiScale)
+        $endX = [int][Math]::Round($EndDipX * $DpiScale)
+        $endY = [int][Math]::Round($EndDipY * $DpiScale)
+        [int]$screenStartX = 0
+        [int]$screenStartY = 0
+        [int]$screenEndX = 0
+        [int]$screenEndY = 0
+        $startConverted = [MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
+            $script:WindowHandle, $script:ProcessId, $startX, $startY,
+            [ref]$screenStartX, [ref]$screenStartY)
+        $endConverted = [MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
+            $script:WindowHandle, $script:ProcessId, $endX, $endY,
+            [ref]$screenEndX, [ref]$screenEndY)
+        if (-not $startConverted -or -not $endConverted) {
+            throw [System.InvalidOperationException]::new('DIAGNOSTIC_GEOMETRY_CONVERSION_FAILED')
+        }
+
+        Assert-OwnedWindow $script:WindowHandle
+        Set-OwnedForeground -Window $script:WindowHandle
+        $foreground = [MdliteRustAcceptanceNative]::GetForegroundWindow()
+        [uint32]$foregroundProcessId = 0
+        if ($foreground -ne [IntPtr]::Zero) {
+            [void][MdliteRustAcceptanceNative]::GetWindowThreadProcessId($foreground,[ref]$foregroundProcessId)
+        }
+        if ($foreground -ne $script:WindowHandle -or $foregroundProcessId -ne $script:ProcessId) {
+            throw 'OWNERSHIP_GATE: drag requires the exact owned Main HWND in the foreground.'
+        }
+
+        $baseline = Read-Diagnostic
+        Assert-UiDiagnosticDragInvariants $baseline $baseline 'baseline'
+        $virtualMetrics = [int[]][MdliteRustAcceptanceNative]::GetVirtualScreenMetrics()
+        if ($virtualMetrics.Count -ne 4 -or $virtualMetrics[2] -le 1 -or $virtualMetrics[3] -le 1) {
+            throw 'ENVIRONMENT_BLOCKED: virtual-screen metrics are invalid.'
+        }
+
+        $startMoveError = 0
+        $startMoveSent = [MdliteRustAcceptanceNative]::MoveAbsoluteVirtual(
+            $screenStartX,$screenStartY,$virtualMetrics[0],$virtualMetrics[1],
+            $virtualMetrics[2],$virtualMetrics[3],[ref]$startMoveError)
+        $cursorX = 0
+        $cursorY = 0
+        $cursorError = 0
+        $cursorRead = [MdliteRustAcceptanceNative]::TryGetCursorPosition([ref]$cursorX,[ref]$cursorY,[ref]$cursorError)
+        if ($startMoveSent -ne 1 -or -not $cursorRead -or $cursorX -ne $screenStartX -or $cursorY -ne $screenStartY) {
+            throw ('ENVIRONMENT_BLOCKED: absolute start MOVE/readback failed; count={0}; error={1}; cursor_error={2}.' -f
+                $startMoveSent,$startMoveError,$cursorError)
+        }
+        $beforeDown = Read-Diagnostic
+        Assert-UiDiagnosticDragInvariants $beforeDown $baseline 'pre-down'
+
+        if ([MdliteRustAcceptanceNative]::IsLeftButtonDown()) {
+            throw 'ENVIRONMENT_BLOCKED: left mouse button was already down before the staged drag.'
+        }
+        Assert-OwnedWindow $script:WindowHandle
+        if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $script:WindowHandle) {
+            throw 'OWNERSHIP_GATE: owned Main HWND lost foreground before drag button-down.'
+        }
+        $downError = 0
+        $downSent = [MdliteRustAcceptanceNative]::LeftButtonDown([ref]$downError)
+        if ($downSent -eq 1) { $downAccepted = $true }
+        if (-not $downAccepted) {
+            throw ('ENVIRONMENT_BLOCKED: staged drag button-down was not accepted; error={0}.' -f $downError)
+        }
+
+        [uint32]$targetProcessId = 0
+        $targetThreadId = [MdliteRustAcceptanceNative]::GetWindowThreadProcessId(
+            $script:WindowHandle,[ref]$targetProcessId)
+        if ($targetThreadId -eq 0 -or $targetProcessId -ne $script:ProcessId) {
+            throw 'OWNERSHIP_GATE: drag target GUI thread no longer belongs to the owned Main process.'
+        }
+        $capture = [IntPtr]::Zero
+        $captureError = 0
+        $captureRead = $false
+        $captureDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        do {
+            $capture = [IntPtr]::Zero
+            $captureRead = [MdliteRustAcceptanceNative]::TryGetThreadCapture(
+                $targetThreadId,[ref]$capture,[ref]$captureError)
+            if ($captureRead -and $capture -eq $script:WindowHandle) { break }
+            if ([DateTime]::UtcNow -lt $captureDeadline) { Start-Sleep -Milliseconds 10 }
+        } while ([DateTime]::UtcNow -lt $captureDeadline)
+        if (-not $captureRead -or $capture -ne $script:WindowHandle) {
+            throw ('ENVIRONMENT_BLOCKED: Main GUI-thread capture was not observed before timeout; error={0}.' -f $captureError)
+        }
+        $endMoveError = 0
+        $afterDown = Read-Diagnostic
+        Assert-UiDiagnosticDragInvariants $afterDown $baseline 'post-down'
+        Assert-UiDiagnosticDragOwnershipWhileHeld $targetThreadId
+        $endMoveSent = [MdliteRustAcceptanceNative]::MoveAbsoluteVirtual(
+            $screenEndX,$screenEndY,$virtualMetrics[0],$virtualMetrics[1],
+            $virtualMetrics[2],$virtualMetrics[3],[ref]$endMoveError)
+        $endCursorX = 0
+        $endCursorY = 0
+        $endCursorError = 0
+        $endCursorRead = [MdliteRustAcceptanceNative]::TryGetCursorPosition(
+            [ref]$endCursorX,[ref]$endCursorY,[ref]$endCursorError)
+        if ($endMoveSent -ne 1 -or -not $endCursorRead -or $endCursorX -ne $screenEndX -or $endCursorY -ne $screenEndY) {
+            throw ('ENVIRONMENT_BLOCKED: absolute endpoint MOVE/readback failed; count={0}; error={1}; cursor_error={2}.' -f
+                $endMoveSent,$endMoveError,$endCursorError)
+        }
+
+        $heldDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        $conditionMatched = $false
+        do {
+            $heldState = Read-Diagnostic
+            Assert-UiDiagnosticDragInvariants $heldState $baseline 'while-held'
+            Assert-UiDiagnosticDragOwnershipWhileHeld $targetThreadId
+            $conditionResults = @(& $WhileHeldCondition $heldState)
+            if ($conditionResults.Count -ne 1 -or $conditionResults[0] -isnot [bool]) {
+                throw 'WHILE_HELD_CONDITION_MUST_RETURN_EXACTLY_ONE_BOOLEAN'
+            }
+            if ($conditionResults[0]) { $conditionMatched = $true; break }
+            if ([DateTime]::UtcNow -lt $heldDeadline) { Start-Sleep -Milliseconds 20 }
+        } while ([DateTime]::UtcNow -lt $heldDeadline)
+        if (-not $conditionMatched) {
+            throw 'SEMANTIC_WAIT_TIMEOUT: drag WhileHeldCondition was not observed before button-up.'
+        }
+    } catch {
+        $primaryFailure = $_
+    } finally {
+        if ($downAccepted) {
+            $upAttempted = $true
+            try {
+                $upError = 0
+                $upSentCount = [MdliteRustAcceptanceNative]::LeftButtonUp([ref]$upError)
+                $upSent = ($upSentCount -eq 1)
+                if (-not $upSent) { $cleanupFailures.Add(('LEFT_BUTTON_UP_NOT_ACCEPTED:{0}' -f $upError)) }
+            } catch {
+                $cleanupFailures.Add(('LEFT_BUTTON_UP_EXCEPTION:{0}' -f $_.Exception.Message))
+            }
+
+            try {
+                $releaseDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+                do {
+                    $releasedCapture = [IntPtr]::Zero
+                    $releasedCaptureError = 0
+                    $releaseRead = [MdliteRustAcceptanceNative]::TryGetThreadCapture(
+                        $targetThreadId,[ref]$releasedCapture,[ref]$releasedCaptureError)
+                    $buttonStillDown = [MdliteRustAcceptanceNative]::IsLeftButtonDown()
+                    $captureReleased = ($releaseRead -and $releasedCapture -eq [IntPtr]::Zero)
+                    $buttonReleased = -not $buttonStillDown
+                    if ($captureReleased -and $buttonReleased) { break }
+                    if ([DateTime]::UtcNow -lt $releaseDeadline) { Start-Sleep -Milliseconds 10 }
+                } while ([DateTime]::UtcNow -lt $releaseDeadline)
+                if (-not $captureReleased) { $cleanupFailures.Add('MAIN_GUI_THREAD_CAPTURE_NOT_RELEASED') }
+                if (-not $buttonReleased) { $cleanupFailures.Add('LEFT_BUTTON_REMAINS_DOWN') }
+            } catch {
+                $cleanupFailures.Add(('RELEASE_OBSERVATION_EXCEPTION:{0}' -f $_.Exception.Message))
+            }
+        }
+
+        if ($null -ne $baseline) {
+            try {
+                $afterUp = Read-Diagnostic
+                Assert-UiDiagnosticDragInvariants $afterUp $baseline 'post-up'
+            } catch {
+                $cleanupFailures.Add(('POST_UP_DIAGNOSTIC_OR_INVARIANT_FAILURE:{0}' -f $_.Exception.Message))
+            }
+        }
+
+        $cleanupStatus = if ($null -ne $primaryFailure) { 'CLEANUP_AFTER_PRIMARY_FAILURE' }
+            elseif ($cleanupFailures.Count -gt 0) { 'FAIL' } else { 'PASS' }
+        $cleanupReport = [ordered]@{
+            status = $cleanupStatus
+            primary_failure = if ($null -ne $primaryFailure) { [string]$primaryFailure.Exception.Message } else { $null }
+            down_accepted = [bool]$downAccepted
+            up_attempted = [bool]$upAttempted
+            up_sent = [bool]$upSent
+            release_capture_read = if ($downAccepted) { [bool]$releaseRead } else { $null }
+            release_capture_hwnd = if ($downAccepted -and $releaseRead) { '0x{0:X}' -f $releasedCapture.ToInt64() } else { $null }
+            capture_released = if ($downAccepted) { [bool]$captureReleased } else { $null }
+            button_still_down = if ($downAccepted) { [bool]$buttonStillDown } else { $null }
+            button_released = if ($downAccepted) { [bool]$buttonReleased } else { $null }
+            secondary_failure_count = [int]$cleanupFailures.Count
+            secondary_failures = @($cleanupFailures.ToArray() | Select-Object -First 8)
+        }
+        if ($script:Report -is [System.Collections.IDictionary]) {
+            $script:Report['drag_cleanup'] = $cleanupReport
+        } else {
+            $cleanupFailures.Add('DRAG_CLEANUP_REPORT_NOT_DICTIONARY')
+        }
     }
-    Set-OwnedForeground -Window $script:WindowHandle
-    $sent = [MdliteRustAcceptanceNative]::DragOwnedBetween(
-        $script:WindowHandle, $script:ProcessId,
-        $screenStartX, $screenStartY, $screenEndX, $screenEndY)
-    if ($sent -ne 2) {
-        throw [System.InvalidOperationException]::new('OWNED_DRAG_FAILED')
+
+    if ($null -ne $primaryFailure) {
+        throw $primaryFailure
+    }
+    if ($cleanupFailures.Count -gt 0) {
+        throw [System.InvalidOperationException]::new('DRAG_CLEANUP_FAILURE: ' + ($cleanupFailures -join '; '))
     }
 }
 
@@ -3307,7 +3821,13 @@ function Invoke-UiParitySuite {
             }
             $splitY = [double]$resizePanel.rect.y + [double]$resizePanel.rect.height / 2.0
             $delta = if ($leftSide) { 36.0 } else { -36.0 }
-            Invoke-UiDiagnosticDrag $splitX $splitY ($splitX + $delta) $splitY ([double]$expandedParent.dpi)
+            Invoke-UiDiagnosticDrag $splitX $splitY ($splitX + $delta) $splitY ([double]$expandedParent.dpi) `
+                -WhileHeldCondition {
+                    param($state)
+                    $panels = @($state.parent_root.panel_rects | Where-Object { [string]$_.id -ceq 'explorer' })
+                    if ($panels.Count -ne 1) { [bool]$false }
+                    else { [bool]([double]$panels[0].rect.width -gt ($beforeWidth + 8.0)) }
+                }
             $resized = Wait-UiState {
                 param($value)
                 $panel = @($value.parent_root.panel_rects | Where-Object { [string]$_.id -ceq 'explorer' })[0]
@@ -4781,6 +5301,28 @@ function Assert-EditorRecoveryExtraInvariant($State,$Baseline,[string]$Phase) {
     }
 }
 
+function Assert-EditorRecoveryAtokReconversionCancelInvariant($State,$Baseline,[string]$Phase) {
+    Assert-EditorRecoveryFiniteGeometryNumber $State.revision ($Phase+' state revision') -Integer
+    Assert-EditorRecoveryFiniteGeometryNumber $Baseline.revision ($Phase+' baseline revision') -Integer
+    if ([long]$State.revision -ne [long]$Baseline.revision) {
+        throw ('PRODUCT_ASSERTION: '+$Phase+' changed revision.')
+    }
+    $selectionPreserved=[int]$State.selection.anchor -eq [int]$Baseline.selection.anchor -and
+        [int]$State.selection.head -eq [int]$Baseline.selection.head -and
+        $State.selection_affinity -ceq $Baseline.selection_affinity
+    $selectionCollapsed=[int]$State.selection.anchor -eq [int]$State.selection.head
+    if (-not $selectionPreserved -and -not $selectionCollapsed) {
+        throw ('PRODUCT_ASSERTION: '+$Phase+' must preserve the directed selection or collapse it to a valid source position.')
+    }
+    Assert-SelectionBoundary $State
+    $acceptedSelectionBaseline=[pscustomobject]@{
+        source=$Baseline.source;selection=$State.selection;selection_affinity=$State.selection_affinity
+        dirty=$Baseline.dirty;undo_count=$Baseline.undo_count;redo_count=$Baseline.redo_count
+        document_id=$Baseline.document_id;tabs=$Baseline.tabs
+    }
+    Assert-EditorRecoveryExtraInvariant $State $acceptedSelectionBaseline $Phase
+}
+
 function Invoke-EditorRecoveryReconversionProbe($Baseline,[string]$Pattern,$Evidence) {
     # Operational evidence only: custom key assignments can differ from the
     # documented templates. No template receipt/query/settings change is used.
@@ -4871,6 +5413,192 @@ function Invoke-EditorRecoveryLiteralImeCommitCycle(
     return $undone
 }
 
+function Invoke-EditorRecoveryLiteralF6Traversal($Baseline,$CurrentState,[string]$ExpectedLiteral,[string]$CaseId,[string]$ProfilePattern) {
+    if ($ProfilePattern -notin @('^ATOK','^Microsoft IME')) {
+        throw 'SETUP_FAILURE: literal F6 traversal requires an explicit ATOK or Microsoft IME profile pattern.'
+    }
+    $graphemeCount=[Globalization.StringInfo]::ParseCombiningCharacters($ExpectedLiteral).Count
+    if ($graphemeCount -le 0) { throw 'SETUP_FAILURE: F6 phrase traversal needs a nonempty fixed literal oracle.' }
+    $maxPhraseAdvances=[Math]::Min(16,[Math]::Max(0,$graphemeCount-1))
+    $state=$CurrentState
+    Assert-EditorRecoveryExtraInvariant $state $Baseline 'F6 phrase traversal baseline'
+    if ([long]$state.revision -ne [long]$Baseline.revision) {
+        throw 'PRODUCT_ASSERTION: F6 phrase traversal started from a changed revision.'
+    }
+    $profile=Get-EditorRecoveryProfileIdentity $state.active_input_profile
+    if ($null -eq $profile -or [string]$profile.description -notmatch $ProfilePattern -or
+        -not (Test-EditorRecoveryProfileIdentity $Baseline.active_input_profile $state.active_input_profile)) {
+        throw 'ENVIRONMENT_BLOCKED: F6 phrase traversal is not running in its explicitly selected profile.'
+    }
+    if (-not [bool]$state.ime.active -or [string]::IsNullOrEmpty([string]$state.ime.preedit)) {
+        throw 'PRODUCT_ASSERTION: F6 phrase traversal requires an active reconversion composition.'
+    }
+
+    $isAtok=$ProfilePattern -ceq '^ATOK'
+    $progression=@()
+    $before=[string]$state.ime.preedit
+    Send-Key $script:InputWindowHandle 0x75
+    $initialDescription=if($isAtok){'ATOK initial F6 literal phrase conversion'}else{'Microsoft IME initial F6 literal phrase conversion'}
+    $state=Wait-EditorRecoveryStableState -WaitMs 10000 -Description $initialDescription -Condition {
+        param($s)
+        Assert-EditorRecoveryExtraInvariant $s $Baseline 'initial F6 literal phrase conversion'
+        if ([long]$s.revision -ne [long]$Baseline.revision) { throw 'PRODUCT_ASSERTION: F6 phrase conversion changed revision.' }
+        if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: F6 phrase conversion ended composition.' }
+        -not [string]::IsNullOrEmpty([string]$s.ime.preedit) -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+    }
+    $progression+=@{step=0;action='F6';preedit_before=$before;preedit_after=[string]$state.ime.preedit;exact=([string]$state.ime.preedit -ceq $ExpectedLiteral)}
+    Add-Observation ($initialDescription) $state
+    $initialPhase=if($isAtok){'extra-atok-literal-f6-0'}else{'extra-ms-literal-f6-0'}
+    [void](Save-EditorRecoveryEvidence $CaseId $initialPhase)
+    if ([string]$state.ime.preedit -ceq $ExpectedLiteral) {
+        return [pscustomobject]@{status='EXACT';state=$state;progression=@($progression);max_phrase_advances=$maxPhraseAdvances}
+    }
+    if (-not $isAtok) {
+        $seenPreedits = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        [void]$seenPreedits.Add([string]$state.ime.preedit)
+    }
+
+    $phraseAdvance=0
+    if ($isAtok) {
+        while ([string]$state.ime.preedit -cne $ExpectedLiteral) {
+            if ($phraseAdvance -ge $maxPhraseAdvances) {
+                throw ('PRODUCT_ASSERTION: ATOK F6 phrase traversal exhausted its {0}-advance fixture bound before the exact literal oracle; no text was committed.' -f $maxPhraseAdvances)
+            }
+            $phraseAdvance++
+            $before=[string]$state.ime.preedit
+            Send-Key $script:InputWindowHandle 0x27 ([uint16[]]@(0x10))
+            $state=Wait-EditorRecoveryStableState -WaitMs 5000 -Description ('ATOK literal phrase Shift+Right '+$phraseAdvance) -Condition {
+                param($s)
+                Assert-EditorRecoveryExtraInvariant $s $Baseline ('ATOK literal phrase Shift+Right '+$phraseAdvance)
+                if ([long]$s.revision -ne [long]$Baseline.revision) { throw 'PRODUCT_ASSERTION: ATOK phrase navigation changed revision.' }
+                if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: ATOK phrase navigation ended composition.' }
+                -not [string]::IsNullOrEmpty([string]$s.ime.preedit) -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+            }
+            $progression+=@{step=$phraseAdvance;action='Shift+Right';preedit_before=$before;preedit_after=[string]$state.ime.preedit;exact=([string]$state.ime.preedit -ceq $ExpectedLiteral)}
+            Add-Observation ('ATOK literal phrase Shift+Right '+$phraseAdvance) $state
+            [void](Save-EditorRecoveryEvidence $CaseId ('extra-atok-literal-shift-right-'+$phraseAdvance))
+
+            $before=[string]$state.ime.preedit
+            Send-Key $script:InputWindowHandle 0x75
+            $state=Wait-EditorRecoveryStableState -WaitMs 10000 -Description ('ATOK literal F6 phrase '+$phraseAdvance) -Condition {
+                param($s)
+                Assert-EditorRecoveryExtraInvariant $s $Baseline ('ATOK literal F6 phrase '+$phraseAdvance)
+                if ([long]$s.revision -ne [long]$Baseline.revision) { throw 'PRODUCT_ASSERTION: ATOK F6 phrase conversion changed revision.' }
+                if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: ATOK F6 phrase conversion ended composition.' }
+                $preedit=[string]$s.ime.preedit
+                -not [string]::IsNullOrEmpty($preedit) -and (Test-EditorRecoveryJapaneseText $preedit)
+            }
+            $progression+=@{step=$phraseAdvance;action='F6';preedit_before=$before;preedit_after=[string]$state.ime.preedit;exact=([string]$state.ime.preedit -ceq $ExpectedLiteral)}
+            Add-Observation ('ATOK literal F6 phrase '+$phraseAdvance) $state
+            [void](Save-EditorRecoveryEvidence $CaseId ('extra-atok-literal-f6-'+$phraseAdvance))
+        }
+    } else {
+        while ([string]$state.ime.preedit -cne $ExpectedLiteral) {
+            if ($phraseAdvance -ge $maxPhraseAdvances) {
+                return [pscustomobject]@{status='BOUND_REACHED';state=$state;progression=@($progression);max_phrase_advances=$maxPhraseAdvances}
+            }
+            $phraseAdvance++
+            $before=[string]$state.ime.preedit
+            Send-Key $script:InputWindowHandle 0x27
+            $state=Wait-EditorRecoveryStableState -WaitMs 5000 -Description ('Microsoft IME literal phrase Right '+$phraseAdvance) -Condition {
+                param($s)
+                Assert-EditorRecoveryExtraInvariant $s $Baseline ('Microsoft IME literal phrase Right '+$phraseAdvance)
+                if ([long]$s.revision -ne [long]$Baseline.revision) { throw 'PRODUCT_ASSERTION: Microsoft IME phrase navigation changed revision.' }
+                if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: Microsoft IME phrase navigation ended composition.' }
+                -not [string]::IsNullOrEmpty([string]$s.ime.preedit) -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+            }
+            $afterRight=[string]$state.ime.preedit
+            Add-Observation ('Microsoft IME literal phrase Right '+$phraseAdvance) $state
+            [void](Save-EditorRecoveryEvidence $CaseId ('extra-ms-literal-right-'+$phraseAdvance))
+
+            Send-Key $script:InputWindowHandle 0x75
+            $state=Wait-EditorRecoveryStableState -WaitMs 10000 -Description ('Microsoft IME literal F6 phrase '+$phraseAdvance) -Condition {
+                param($s)
+                Assert-EditorRecoveryExtraInvariant $s $Baseline ('Microsoft IME literal F6 phrase '+$phraseAdvance)
+                if ([long]$s.revision -ne [long]$Baseline.revision) { throw 'PRODUCT_ASSERTION: Microsoft IME F6 phrase conversion changed revision.' }
+                if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: Microsoft IME F6 phrase conversion ended composition.' }
+                $preedit=[string]$s.ime.preedit
+                -not [string]::IsNullOrEmpty($preedit) -and (Test-EditorRecoveryJapaneseText $preedit)
+            }
+            $afterPair=[string]$state.ime.preedit
+            $repeated = -not $seenPreedits.Add($afterPair)
+            $progression+=@{step=$phraseAdvance;action='Right+F6';preedit_before=$before;preedit_after_right=$afterRight;preedit_after=$afterPair;exact=($afterPair -ceq $ExpectedLiteral);changed=($afterPair -cne $before);repeated=$repeated}
+            Add-Observation ('Microsoft IME literal Right+F6 pair '+$phraseAdvance) $state
+            [void](Save-EditorRecoveryEvidence $CaseId ('extra-ms-literal-f6-'+$phraseAdvance))
+            if ($repeated) {
+                return [pscustomobject]@{status='STOPPED_REPEATED_PREEDIT';state=$state;progression=@($progression);max_phrase_advances=$maxPhraseAdvances}
+            }
+        }
+    }
+    return [pscustomobject]@{status='EXACT';state=$state;progression=@($progression);max_phrase_advances=$maxPhraseAdvances}
+}
+
+function Invoke-EditorRecoveryAtokLongSpaceTraversal($Baseline,[string]$ExpectedReading,[string]$CaseId) {
+    $maxSpaces=3
+    $state=$Baseline
+    $progression=@()
+    for ($spaceIndex=1;$spaceIndex -le $maxSpaces;$spaceIndex++) {
+        $before=[string]$state.ime.preedit
+        Send-Key $script:InputWindowHandle 0x20
+        $state=Wait-EditorRecoveryStableState -WaitMs 10000 -Description ('ATOK long Space '+$spaceIndex) -Condition {
+            param($s)
+            Assert-EditorRecoveryExtraInvariant $s $Baseline ('ATOK long Space '+$spaceIndex)
+            if ([long]$s.revision -ne [long]$Baseline.revision) {
+                throw 'PRODUCT_ASSERTION: ATOK long Space conversion changed revision.'
+            }
+            if (-not [bool]$s.ime.active) { throw 'PRODUCT_ASSERTION: ATOK long Space conversion ended composition.' }
+            -not [string]::IsNullOrEmpty([string]$s.ime.preedit) -and
+                (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+        }
+        $progression+=@{step=$spaceIndex;action='Space';preedit_before=$before;preedit_after=[string]$state.ime.preedit;distinct=([string]$state.ime.preedit -cne $ExpectedReading)}
+        Add-Observation ('ATOK long Space '+$spaceIndex) $state
+        [void](Save-EditorRecoveryEvidence $CaseId ('extra-atok-long-space-'+$spaceIndex))
+        if ([string]$state.ime.preedit -cne $ExpectedReading) {
+            return [pscustomobject]@{state=$state;progression=@($progression);space_actions=$spaceIndex;max_spaces=$maxSpaces}
+        }
+    }
+    throw ('PRODUCT_ASSERTION: ATOK Space still exposed the original long reading after {0} bounded actions; distinct-candidate conversion PASS was withheld.' -f $maxSpaces)
+}
+
+function Invoke-EditorRecoveryLongReadingByWord(
+    $Baseline,[string]$Source,[long]$DocumentId,[int]$Tabs,[int]$Undo,[int]$Redo,[string]$ExpectedReading,[string]$CaseId,
+    [ValidateSet('first','second')][string]$Phase
+) {
+    if([string]$Baseline.source -cne $Source -or $ExpectedReading -cne ('にほんご'*20)){
+        throw 'SETUP_FAILURE: word-step reading requires the exact preexisting Core baseline and fixed eighty-character oracle.'
+    }
+    $profile=Get-EditorRecoveryProfileIdentity $Baseline.active_input_profile
+    $progression=[Collections.Generic.List[object]]::new()
+    $state=$null
+    for($wordIndex=1;$wordIndex -le 20;$wordIndex++){
+        $expectedPrefix='にほんご'*$wordIndex
+        Send-Ascii 'nihongo' $script:InputWindowHandle
+        $state=Wait-EditorRecoveryStableState -WaitMs 10000 -Description (($Phase+' long reading word ')+$wordIndex+'/20') -Condition {
+            param($s)
+            Assert-EditorRecoveryExtraInvariant $s $Baseline (($Phase+' long reading word ')+$wordIndex)
+            $s.source -ceq $Source -and [long]$s.document_id -eq $DocumentId -and [int]$s.tabs -eq $Tabs -and
+                [long]$s.revision -eq [long]$Baseline.revision -and [bool]$s.dirty -eq [bool]$Baseline.dirty -and
+                [int]$s.undo_count -eq $Undo -and [int]$s.redo_count -eq $Redo -and
+                [int]$s.selection.anchor -eq [int]$Baseline.selection.anchor -and [int]$s.selection.head -eq [int]$Baseline.selection.head -and
+                [string]$s.selection_affinity -ceq [string]$Baseline.selection_affinity -and -not [bool]$s.raw -and
+                (Test-EditorRecoveryProfileIdentity $profile $s.active_input_profile) -and [bool]$s.ime.open_status.open -and
+                [bool]$s.ime.active -and $s.ime.preedit -ceq $expectedPrefix
+        }
+        Add-Observation (($Phase+' long reading exact word prefix ')+$wordIndex+'/20') $state
+        $progression.Add([pscustomobject]@{
+            phase=$Phase;word_index=$wordIndex;expected_preedit=$expectedPrefix;observed_preedit=[string]$state.ime.preedit
+            source_sha256=Get-UiTextSha256 ([string]$state.source);document_id=[long]$state.document_id;tabs=[int]$state.tabs
+            revision=[long]$state.revision;dirty=[bool]$state.dirty;undo_count=[int]$state.undo_count;redo_count=[int]$state.redo_count
+            selection=$state.selection;selection_affinity=[string]$state.selection_affinity
+            active_profile=Get-EditorRecoveryProfileIdentity $state.active_input_profile;app_local_open=[bool]$state.ime.open_status.open
+        })
+    }
+    if($null -eq $state -or [string]$state.ime.preedit -cne $ExpectedReading -or $progression.Count -ne 20){
+        throw 'PRODUCT_ASSERTION: long word-step route did not reach the exact twenty-word reading.'
+    }
+    [pscustomobject]@{progression=@($progression.ToArray())}
+}
+
 function Invoke-EditorRecoveryImeExtra(
     [string]$CaseId,[string]$Pattern,[string]$CommittedSuffix,[string]$LiteralReading
 ) {
@@ -4891,8 +5619,15 @@ function Invoke-EditorRecoveryImeExtra(
     $initialOpen=[bool]$initial.ime.open_status.open
     $extra=[ordered]@{
         reconversion='NOT_RUN';literal_replacement='NOT_RUN';phrase_focus='NOT_RUN';phrase_boundary='NOT_RUN'
-        global_key_template='UNVERIFIED';tested_operational_routes=@();long_reading='NOT_RUN';long_conversion_cancel='NOT_RUN';long_literal_commit='NOT_RUN'
+        global_key_template='UNVERIFIED';tested_operational_routes=@();long_reading='NOT_RUN';long_space_progression='NOT_RUN';long_conversion_cancel='NOT_RUN';long_literal_f6='NOT_RUN';long_literal_f6_note='NOT_APPLICABLE';long_literal_commit='NOT_RUN'
+        microsoft_literal_f6_progression=@();microsoft_literal_f6_status='NOT_RUN'
+        first_long_reading_word_route='NOT_RUN';first_long_reading_word_progression=@()
+        second_long_reading_word_route='NOT_RUN';second_long_reading_word_progression=@()
         wrapped_geometry='NOT_RUN';candidate_ui_visual_review='NOT_RUN';physical_input='NOT_RUN'
+    }
+    if ($Pattern -ceq 'ATOK') {
+        $extra.long_literal_f6='NOT_ACCEPTED_SEPARATE_RAW80_DIAGNOSTIC'
+        $extra.long_literal_f6_note='Separate raw-80 F6 observation changed two characters; provider reason is unproven and this is not an acceptance result.'
     }
     $case.details['extra_ime']=$extra
     $primary=$null;$profileReady=$false
@@ -4933,10 +5668,20 @@ function Invoke-EditorRecoveryImeExtra(
                 }
             }
             $extra.phrase_focus='NOT_RUN_TARGET_HIGHLIGHT_REVIEW';$extra.phrase_boundary='NOT_RUN_BOUNDARY_HIGHLIGHT_REVIEW'
-            $cancel=Cancel-EditorRecoveryImeComposition $selected $converted 'extra reconversion and phrase navigation' 3
-            if (-not $cancel.cancelled) { throw 'ENVIRONMENT_BLOCKED: reconversion remained active after three ordinary Escape stages.' }
-            Assert-EditorRecoveryExtraInvariant $cancel.state $selected 'reconversion Esc'
-            [void](Assert-EditorRecoverySelection $source $id $selected.selection.anchor $selected.selection.head $selected.dirty $u $redo 'reconversion Esc preserves exact source/direction/history')
+            if ($Pattern -ceq 'ATOK') {
+                $cancel=Cancel-EditorRecoveryImeComposition $selected $converted 'extra reconversion and phrase navigation' 3 -AllowAtokReconversionSelectionCollapse
+            } else {
+                $maxEscapes = Get-EditorRecoveryImeCancellationEscapeLimit $converted.active_input_profile
+                $cancel=Cancel-EditorRecoveryImeComposition $selected $converted 'extra reconversion and phrase navigation' $maxEscapes
+            }
+            if (-not $cancel.cancelled) { throw 'ENVIRONMENT_BLOCKED: reconversion remained active after the bounded ordinary Escape sequence.' }
+            if ($Pattern -ceq 'ATOK') {
+                Assert-EditorRecoveryAtokReconversionCancelInvariant $cancel.state $selected 'ATOK reconversion Esc'
+                Add-Observation 'ATOK reconversion Esc preserves source, ownership, revision, dirty/history; selection preserved or collapsed' $cancel.state
+            } else {
+                Assert-EditorRecoveryExtraInvariant $cancel.state $selected 'reconversion Esc'
+                [void](Assert-EditorRecoverySelection $source $id $selected.selection.anchor $selected.selection.head $selected.dirty $u $redo 'reconversion Esc preserves exact source/direction/history')
+            }
             # Fixed alternate spelling makes replacement meaningful even when
             # the core's observed candidate is already the literal hiragana.
             $literal=$LiteralReading;$literalKey=0x75;$literalName='F6 hiragana'
@@ -4953,17 +5698,33 @@ function Invoke-EditorRecoveryImeExtra(
             $selected=Select-EditorRecoveryCommittedSuffix $source $id $CommittedSuffix ([bool]$initial.dirty) $u $redo $CaseId 'literal reconversion'
             $script:ImeEscapesSentForComposition=0
             Send-Key $script:InputWindowHandle 0x1C $probe.modifiers
-            [void](Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'repeat observed operational reconversion route' -Condition {
+            $literalComposition=Wait-EditorRecoveryStableState -WaitMs 5000 -Description 'repeat observed operational reconversion route' -Condition {
                 param($s)
                 Assert-EditorRecoveryExtraInvariant $s $selected 'repeat reconversion'
                 [bool]$s.ime.active -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
-            })
-            Send-Key $script:InputWindowHandle $literalKey
-            [void](Wait-EditorRecoveryStableState -WaitMs 10000 -Description ('independently fixed '+$literalName) -Condition {
-                param($s)
-                Assert-EditorRecoveryExtraInvariant $s $selected 'literal reconversion'
-                [bool]$s.ime.active -and $s.ime.preedit -ceq $literal
-            })
+            }
+            if ($Pattern -ceq 'ATOK' -and $literalKey -eq 0x75) {
+                $literalTraversal=Invoke-EditorRecoveryLiteralF6Traversal $selected $literalComposition $literal $CaseId '^ATOK'
+                if ([string]$literalTraversal.status -cne 'EXACT') { throw 'PRODUCT_ASSERTION: ATOK literal F6 did not reach its fixed oracle.' }
+                $extra.literal_progression=@($literalTraversal.progression)
+            } elseif ($Pattern -ceq 'Microsoft IME' -and $literalKey -eq 0x75) {
+                $literalTraversal=Invoke-EditorRecoveryLiteralF6Traversal $selected $literalComposition $literal $CaseId '^Microsoft IME'
+                $extra.microsoft_literal_f6_progression=@($literalTraversal.progression)
+                if ([string]$literalTraversal.status -ceq 'EXACT') {
+                    $extra.microsoft_literal_f6_status='PASS_FULL_FIXED_ORACLE'
+                } else {
+                    $extra.microsoft_literal_f6_status='BLOCKED_'+[string]$literalTraversal.status
+                    $extra.literal_replacement='NOT_RUN_F6_ORACLE_INCOMPLETE'
+                    throw 'ENVIRONMENT_BLOCKED: Microsoft IME Right+F6 phrase traversal did not reach the exact full literal.'
+                }
+            } else {
+                Send-Key $script:InputWindowHandle $literalKey
+                [void](Wait-EditorRecoveryStableState -WaitMs 10000 -Description ('independently fixed '+$literalName) -Condition {
+                    param($s)
+                    Assert-EditorRecoveryExtraInvariant $s $selected 'literal reconversion'
+                    [bool]$s.ime.active -and $s.ime.preedit -ceq $literal
+                })
+            }
             $prefix=$source.Substring(0,$source.Length-$CommittedSuffix.Length)
             $replacement=$prefix+$literal
             [void](Invoke-EditorRecoveryLiteralImeCommitCycle $selected $replacement ([Text.Encoding]::UTF8.GetByteCount($replacement)) $CaseId ('reconverted '+$literalName))
@@ -4985,7 +5746,13 @@ function Invoke-EditorRecoveryImeExtra(
         $end=[Text.Encoding]::UTF8.GetByteCount($source)
         $baseline=Assert-EditorRecoverySelection $source $id $end $end ([bool]$initial.dirty) $u $redo 'long-reading exact Core EOF'
         $romaji=('nihongo'*20);$hiragana=('にほんご'*20);$script:ImeEscapesSentForComposition=0
-        Send-Ascii $romaji $script:InputWindowHandle
+        if ($Pattern -ceq 'Microsoft IME') {
+            $firstWordTraversal=Invoke-EditorRecoveryLongReadingByWord $baseline $source $id $tabs $u $redo $hiragana $CaseId -Phase 'first'
+            $extra.first_long_reading_word_progression=@($firstWordTraversal.progression)
+            $extra.first_long_reading_word_route='PASS_20_CANONICAL_STABLE_PREFIXES'
+        } else {
+            Send-Ascii $romaji $script:InputWindowHandle
+        }
         $reading=Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'complete eighty-character Japanese reading' -Condition {
             param($s)
             Assert-EditorRecoveryExtraInvariant $s $baseline 'long reading'
@@ -5004,31 +5771,40 @@ function Invoke-EditorRecoveryImeExtra(
                 $extra.wrapped_geometry='MULTILINE_CARET_HINT_VISUAL_REVIEW_NOT_RUN'
             }
         }
-        Send-Key $script:InputWindowHandle 0x20
-        $converted=Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'long stable normal Space conversion' -Condition {
-            param($s)
-            Assert-EditorRecoveryExtraInvariant $s $baseline 'long Space conversion'
-            [long]$s.document_id -eq $id -and [int]$s.tabs -eq $tabs -and [bool]$s.ime.active -and
-                [string]$s.ime.preedit -cne $hiragana -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+        if ($Pattern -ceq 'ATOK') {
+            $longSpaceTraversal=Invoke-EditorRecoveryAtokLongSpaceTraversal $baseline $hiragana $CaseId
+            $converted=$longSpaceTraversal.state
+            $extra.long_space_progression=@($longSpaceTraversal.progression)
+        } else {
+            Send-Key $script:InputWindowHandle 0x20
+            $converted=Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'long stable normal Space conversion' -Condition {
+                param($s)
+                Assert-EditorRecoveryExtraInvariant $s $baseline 'long Space conversion'
+                [long]$s.document_id -eq $id -and [int]$s.tabs -eq $tabs -and [bool]$s.ime.active -and
+                    [string]$s.ime.preedit -cne $hiragana -and (Test-EditorRecoveryJapaneseText ([string]$s.ime.preedit))
+            }
         }
         [void](Save-EditorRecoveryEvidence $CaseId 'extra-long-conversion')
-        $cancel=Cancel-EditorRecoveryImeComposition $baseline $converted 'extra long conversion' 3
-        if (-not $cancel.cancelled) { throw 'ENVIRONMENT_BLOCKED: long conversion remained active after three Escape stages.' }
+        $maxEscapes = Get-EditorRecoveryImeCancellationEscapeLimit $converted.active_input_profile
+        $cancel=Cancel-EditorRecoveryImeComposition $baseline $converted 'extra long conversion' $maxEscapes
+        if (-not $cancel.cancelled) { throw 'ENVIRONMENT_BLOCKED: long conversion remained active after the bounded ordinary Escape sequence.' }
         Assert-EditorRecoveryExtraInvariant $cancel.state $baseline 'long conversion Esc'
         [void](Assert-EditorRecoverySelection $source $id $end $end ([bool]$initial.dirty) $u $redo 'long conversion Esc preserves exact source/direction/history')
         $extra.long_conversion_cancel='PASS_SOURCE_DIRECTION_HISTORY_UNCHANGED';$script:ImeEscapesSentForComposition=0
-        Send-Ascii $romaji $script:InputWindowHandle
-        [void](Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'second exact long reading before literal commit' -Condition {
+        if ($Pattern -ceq 'Microsoft IME') {
+            $secondWordTraversal=Invoke-EditorRecoveryLongReadingByWord $baseline $source $id $tabs $u $redo $hiragana $CaseId -Phase 'second'
+            $extra.second_long_reading_word_progression=@($secondWordTraversal.progression)
+            $extra.second_long_reading_word_route='PASS_20_CANONICAL_STABLE_PREFIXES'
+        } else {
+            Send-Ascii $romaji $script:InputWindowHandle
+        }
+        $longLiteralReady=Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'second exact long reading before literal commit' -Condition {
             param($s)
             Assert-EditorRecoveryExtraInvariant $s $baseline 'second long reading'
             [long]$s.document_id -eq $id -and [int]$s.tabs -eq $tabs -and [bool]$s.ime.active -and $s.ime.preedit -ceq $hiragana
-        })
-        Send-Key $script:InputWindowHandle 0x75
-        [void](Wait-EditorRecoveryStableState -WaitMs 10000 -Description 'documented F6 fixed long hiragana' -Condition {
-            param($s)
-            Assert-EditorRecoveryExtraInvariant $s $baseline 'long F6'
-            [long]$s.document_id -eq $id -and [int]$s.tabs -eq $tabs -and [bool]$s.ime.active -and $s.ime.preedit -ceq $hiragana
-        })
+        }
+        Add-Observation 'long exact reading directly before literal commit' $longLiteralReady
+        [void](Save-EditorRecoveryEvidence $CaseId 'extra-long-literal-before-commit')
         [void](Invoke-EditorRecoveryLiteralImeCommitCycle $baseline ($source+$hiragana) ($end+240) $CaseId 'long fixed hiragana')
         $extra.long_literal_commit='PASS_SOURCE_ONE_UNDO_REDO_FINAL_UNDO'
         $extra.final_source_sha256=Get-UiTextSha256 $source;$extra.final_undo=$u;$extra.final_redo=1
@@ -5140,7 +5916,8 @@ function Restore-EditorRecoveryInitialImeStateForFailure {
         if ([bool]$before.ime.active -or -not [string]::IsNullOrEmpty([string]$before.ime.preedit)) {
             if ($null -eq $before.active_input_profile) { throw 'SETUP_FAILURE: active profile was unavailable while preserving an owned IME composition.' }
             $script:ImeProfile = $before.active_input_profile
-            $cancelResult = Cancel-EditorRecoveryImeComposition $before $before 'failure-finally owned composition' 3
+            $maxEscapes = Get-EditorRecoveryImeCancellationEscapeLimit $before.active_input_profile
+            $cancelResult = Cancel-EditorRecoveryImeComposition $before $before 'failure-finally owned composition' $maxEscapes
             if (-not $cancelResult.cancelled) {
                 throw 'ENVIRONMENT_BLOCKED: initial profile was not switched because the owned composition remained active after the bounded Escape sequence.'
             }
@@ -5298,13 +6075,13 @@ function Get-EditorRecoveryBoundaryLocation([string]$Source, [int]$Byte) {
 
 function Move-EditorRecoveryBoundaryCaret(
     [string]$Source,[long]$DocumentId,[int]$Byte,[int]$SelectedBytes,
-    [bool]$Dirty,[int]$Undo,[int]$Redo,[string]$CaseId,[string]$Description
+    [bool]$Dirty,[int]$Undo,[int]$Redo,[string]$CaseId,[string]$Description,[int]$ExpectedTabs=2
 ) {
     $start=Get-EditorRecoveryBoundaryLocation $Source $Byte
     $finish=Get-EditorRecoveryBoundaryLocation $Source ($Byte+$SelectedBytes)
     $state=Switch-ToSource $Source
-    if ([long]$state.document_id -ne $DocumentId -or [int]$state.tabs -ne 2) {
-        throw 'SETUP_FAILURE: E08/E10 must retain the original two owned Workspace tabs.'
+    if ([long]$state.document_id -ne $DocumentId -or [int]$state.tabs -ne $ExpectedTabs) {
+        throw "SETUP_FAILURE: $Description requires document $DocumentId and exactly $ExpectedTabs owned Workspace tabs."
     }
     [void](Invoke-EditorViewportBodyClick $CaseId ($Description+' native body focus'))
     if (-not [bool]$state.raw) {
@@ -5723,7 +6500,7 @@ function Invoke-EditorRecoverySuite {
     $script:Report.executable_path = [IO.Path]::GetFullPath($ExecutablePath)
     $script:Report.harness_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $script:Report.foreground_log_path = $script:ForegroundLogPath.Substring($ProjectRoot.Length).TrimStart('\').Replace('\','/')
-    $script:Report.input_delivery = 'Editor ASCII uses guarded current-layout virtual-key SendInput; IME uses selected installed profiles. Owned SaveAs filename fixture setup uses bounded WM_SETTEXT and exact WM_GETTEXT, not editor keyboard proof. Unicode packets and OS clipboard are not used.'
+    $script:Report.input_delivery = 'Document ASCII uses guarded current-layout native virtual-key SendInput; IME uses selected installed profiles. Unicode command-palette query packets and owned SaveAs WM_SETTEXT/GETTEXT are fixture setup only, not document or IME keyboard proof. OS clipboard is not used.'
     $script:Report.normal_close = @()
     $editorRecoveryReportFields = [ordered]@{
         suite='EditorRecovery'; run_id=$runId
@@ -6195,7 +6972,7 @@ function Invoke-EditorRecoverySuite {
         $e05Sample=$e05AfterEnter3+'abcdef'
         [void](Assert-EditorRecoverySelection $e05Sample $e05DocumentId ([Text.Encoding]::UTF8.GetByteCount($e05Sample)) ([Text.Encoding]::UTF8.GetByteCount($e05Sample)) $true ($e05SampleUndo+6) 0 'E05 complete ordinary-typed preferred-x sample')
         [void](Save-EditorRecoveryEvidence 'E05' 'preferred-x-sample-created')
-        $e05SampleState=Move-EditorRecoveryBoundaryCaret $e05Sample $e05DocumentId ($e05SampleStart+5) 0 $true ($e05SampleUndo+6) 0 'E05' 'preferred-x first-line byte 5'
+        $e05SampleState=Move-EditorRecoveryBoundaryCaret $e05Sample $e05DocumentId ($e05SampleStart+5) 0 $true ($e05SampleUndo+6) 0 'E05' 'preferred-x first-line byte 5' 3
         $e05PreferredX=[double]$e05SampleState.caret.x
         [void](Save-EditorRecoveryEvidence 'E05' 'preferred-x-first-line-start')
         Send-Key $script:InputWindowHandle 0x28
@@ -6335,7 +7112,12 @@ function Invoke-EditorRecoverySuite {
         for ($step=0; $step -lt 3; $step++) { Send-Key $script:InputWindowHandle 0x27 }
         $japaneseEndState=Assert-EditorRecoverySelection $e06Source $e06DocumentId $japaneseEnd $japaneseEnd $false $e06BaseUndo $e06BaseRedo 'E06 Japanese drag end caret'
         $japaneseEndPoint=Get-EditorRecoveryCaretDipPoint $japaneseEndState 'Japanese drag end'
-        Invoke-UiDiagnosticDrag $japaneseStartPoint.x $japaneseStartPoint.y $japaneseEndPoint.x $japaneseEndPoint.y $japaneseStartPoint.dpi
+        Invoke-UiDiagnosticDrag $japaneseStartPoint.x $japaneseStartPoint.y $japaneseEndPoint.x $japaneseEndPoint.y $japaneseStartPoint.dpi `
+            -WhileHeldCondition {
+                param($state)
+                [bool]([int]$state.selection.anchor -eq $japaneseStart -and
+                    [int]$state.selection.head -eq $japaneseEnd)
+            }
         [void](Assert-EditorRecoverySelection $e06Source $e06DocumentId $japaneseStart $japaneseEnd $false $e06BaseUndo $e06BaseRedo 'E06 forward drag selects exact 日本語 bytes')
         [void](Save-EditorRecoveryEvidence 'E06' 'japanese-forward-drag-selection')
         $japaneseReplacement=$e06Source.Remove($japaneseIndex,$japanese.Length).Insert($japaneseIndex,'J')
@@ -6513,7 +7295,12 @@ function Invoke-EditorRecoverySuite {
             throw 'ENVIRONMENT_BLOCKED: the E06 sample/current viewport did not provide two-to-three wrapped rows; do not drag or claim wrap coverage for this setup.'
         }
         [void](Save-EditorRecoveryEvidence 'E06' 'wrapped-paragraph-same-view-points-before-drag')
-        Invoke-UiDiagnosticDrag $e06WrapStartPoint.x $e06WrapStartPoint.y $e06WrapEndPoint.x $e06WrapEndPoint.y $e06WrapStartPoint.dpi
+        Invoke-UiDiagnosticDrag $e06WrapStartPoint.x $e06WrapStartPoint.y $e06WrapEndPoint.x $e06WrapEndPoint.y $e06WrapStartPoint.dpi `
+            -WhileHeldCondition {
+                param($state)
+                [bool]([int]$state.selection.anchor -eq $e06WrapStartByte -and
+                    [int]$state.selection.head -eq $e06WrapEndByte)
+            }
         $e06WrapDragState=Assert-EditorRecoverySelection $e06WrapSource $e06DocumentId $e06WrapStartByte $e06WrapEndByte $true ($e06WrapBaseUndo+1) 0 'E06 owned cross-wrap drag selects exact ordinary paragraph bytes'
         $e06WrapSourceBytes=[Text.Encoding]::UTF8.GetBytes($e06WrapSource)
         $e06WrapSelected=[Text.Encoding]::UTF8.GetString($e06WrapSourceBytes,$e06WrapStartByte,$e06WrapEndByte-$e06WrapStartByte)
@@ -8087,6 +8874,29 @@ Set-EditorRecoveryCase 'E14' 'NOT_RUN' @{
         $script:Report.failure_exception_type = $failureRecord.Exception.GetType().FullName
         $script:Report.failure_exception_message = $failureMessage
         $script:Report.failure_script_stack_trace = [string]$failureRecord.ScriptStackTrace
+        $lastDiagnosticState=$failureRecord.Exception.Data['LastDiagnosticState']
+        if ($null -ne $lastDiagnosticState) {
+            try {
+                $validSnapshotCount=0
+                if ($failureRecord.Exception.Data.Contains('ValidSnapshotCount')) {
+                    $validSnapshotCount=[int]$failureRecord.Exception.Data['ValidSnapshotCount']
+                }
+                if ($validSnapshotCount -lt 1) { throw 'Primary timeout snapshot has no valid read count.' }
+                $description=[string]$failureRecord.Exception.Data['EditorRecoveryBodyDiagnosticStage']
+                if ([string]::IsNullOrWhiteSpace($description)) { $description=[string]$failureRecord.Exception.Data['Description'] }
+                if ([string]::IsNullOrWhiteSpace($description)) { $description=$failureMessage }
+                $capturePath=Join-Path $script:UiRunDirectory 'primary-timeout-last-diagnostic.json'
+                $payload=[ordered]@{description=$description;valid_snapshot_count=$validSnapshotCount;snapshot=$lastDiagnosticState}
+                $captureBytes=[Text.UTF8Encoding]::new($false).GetBytes(($payload|ConvertTo-Json -Depth 40))
+                $captureStream=[IO.File]::Open($capturePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                try { $captureStream.Write($captureBytes,0,$captureBytes.Length) } finally { $captureStream.Dispose() }
+                $captureHash=(Get-FileHash -LiteralPath $capturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                $script:Report.primary_timeout_last_diagnostic=[ordered]@{
+                    relative_path=[IO.Path]::GetFileName($capturePath);sha256=$captureHash
+                    valid_snapshot_count=$validSnapshotCount;description=$description
+                }
+            } catch { $script:Report.primary_timeout_last_diagnostic_capture_error=$_.Exception.Message }
+        }
         $bodyDiagnosticFailureKind = [string]$failureRecord.Exception.Data['EditorRecoveryBodyDiagnosticFailureKind']
         if ($failureRecord.Exception.Data.Contains('EditorRecoveryBodyDiagnosticStage')) {
             $script:Report.failure_body_diagnostic_stage = [string]$failureRecord.Exception.Data['EditorRecoveryBodyDiagnosticStage']

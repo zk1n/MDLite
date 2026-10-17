@@ -1093,8 +1093,10 @@ impl App {
     fn git_close_prompt(&mut self) {
         self.git_ui.prompt = None;
         self.git_sync();
+        let editor = self.editing_window();
+        self.select_surface(editor);
         unsafe {
-            let _ = SetFocus(Some(self.editing_window()));
+            let _ = SetFocus(Some(editor));
         }
     }
     fn git_apply_status(&mut self, status: Result<GitStatus, GitError>) {
@@ -2129,6 +2131,192 @@ mod tests {
             unsafe {
                 let _ = DestroyWindow(self.0);
             }
+        }
+    }
+    fn pump_queued_message(
+        fixture: &super::super::tests::MessagePumpFixture,
+        target: HWND,
+        message_min: u32,
+        message_max: u32,
+    ) -> bool {
+        let mut message = MSG::default();
+        assert!(
+            unsafe {
+                PeekMessageW(
+                    &mut message,
+                    Some(target),
+                    message_min,
+                    message_max,
+                    PM_REMOVE,
+                )
+            }
+            .as_bool()
+        );
+        let handled = {
+            let mut app = fixture.state.app.borrow_mut();
+            unsafe { super::super::drain_native_notifications(&fixture.state, &mut app) };
+            app.shell_message(&message)
+                || unsafe { app.features_message(&message) }
+                || app.git_message(&message)
+                || app.search_message(&message)
+        };
+        if !handled {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        handled
+    }
+    fn native_caret_owner(hwnd: HWND) -> HWND {
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+        unsafe { GetGUIThreadInfo(thread, &mut info).unwrap() };
+        info.hwndCaret
+    }
+
+    #[test]
+    fn git_prompt_escape_restores_caret_for_the_next_queued_character_and_arrow() {
+        for compact_surface in [false, true] {
+            let mut fixture = super::super::tests::MessagePumpFixture::new(
+                super::super::tests::composing_test_app("body"),
+            );
+            let parking = OwnedWindow(super::super::tests::hidden_test_window_size(160, 80));
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.clear_composition();
+                app.doc_mut().set_selection(0, 0).unwrap();
+                app.shell.enabled = true;
+                app.shell.main_window = fixture.hwnd;
+                app.shell.panels[PanelId::Git as usize].1 = Rect {
+                    x: 760.,
+                    y: 350.,
+                    width: 260.,
+                    height: 340.,
+                };
+                app.git_init();
+            }
+            unsafe {
+                let _ = SetFocus(Some(parking.0));
+                assert_eq!(GetFocus(), parking.0);
+                let _ = SetFocus(Some(fixture.hwnd));
+                assert_eq!(GetFocus(), fixture.hwnd);
+            }
+            let app = fixture.state.app.borrow();
+            assert_eq!(
+                native_caret_owner(fixture.hwnd),
+                fixture.hwnd,
+                "focus={:?}, input={:?}, parking={:?}, native_caret={:?}/{:?}/{}",
+                unsafe { GetFocus() },
+                app.git_ui.controls.as_ref().unwrap().input,
+                parking.0,
+                app.native_caret.size,
+                app.native_caret.position,
+                app.native_caret.visible,
+            );
+            drop(app);
+
+            let input;
+            let before;
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.git_prompt(COMMIT);
+                input = app.git_ui.controls.as_ref().unwrap().input;
+                assert_eq!(unsafe { GetFocus() }, input);
+                before = (
+                    app.doc().id(),
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().selection(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                );
+            }
+
+            if compact_surface {
+                let compact = fixture.create_compact();
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    app.shell.compact_window = compact;
+                }
+                assert!(
+                    unsafe { PostMessageW(Some(fixture.hwnd), WM_PAINT, WPARAM(0), LPARAM(0)) }
+                        .is_ok()
+                );
+                assert!(!pump_queued_message(
+                    &fixture,
+                    fixture.hwnd,
+                    WM_PAINT,
+                    WM_PAINT,
+                ));
+                let app = fixture.state.app.borrow();
+                assert_eq!(app.hwnd, fixture.hwnd);
+                assert_eq!(unsafe { GetFocus() }, input);
+            }
+            assert!(
+                unsafe {
+                    PostMessageW(
+                        Some(input),
+                        WM_KEYDOWN,
+                        WPARAM(VK_ESCAPE.0 as usize),
+                        LPARAM(1),
+                    )
+                }
+                .is_ok()
+            );
+            assert!(pump_queued_message(&fixture, input, 0, 0));
+
+            let editor = {
+                let app = fixture.state.app.borrow();
+                let editor = app.editing_window();
+                assert_eq!(app.hwnd, editor);
+                assert_eq!(unsafe { GetFocus() }, editor);
+                assert_eq!(native_caret_owner(editor), editor);
+                assert_eq!(
+                    (
+                        app.doc().id(),
+                        app.doc().source().to_owned(),
+                        app.doc().revision(),
+                        app.doc().selection(),
+                        app.doc().is_dirty(),
+                        app.doc().undo_count(),
+                        app.doc().redo_count(),
+                    ),
+                    before
+                );
+                editor
+            };
+
+            assert!(
+                unsafe { PostMessageW(Some(editor), WM_CHAR, WPARAM('x' as usize), LPARAM(1)) }
+                    .is_ok()
+            );
+            assert!(!pump_queued_message(&fixture, editor, 0, 0));
+            assert!(
+                unsafe {
+                    PostMessageW(
+                        Some(editor),
+                        WM_KEYDOWN,
+                        WPARAM(VK_RIGHT.0 as usize),
+                        LPARAM(1),
+                    )
+                }
+                .is_ok()
+            );
+            assert!(!pump_queued_message(&fixture, editor, 0, 0));
+
+            let app = fixture.state.app.borrow();
+            assert_eq!(app.doc().source(), "xbody");
+            assert_eq!(app.doc().selection(), Selection::caret(2));
+            assert!(app.doc().is_dirty());
+            assert_eq!(app.doc().undo_count(), before.5 + 1);
+            assert_eq!(app.doc().redo_count(), 0);
+            assert_eq!(unsafe { GetFocus() }, editor);
+            assert_eq!(native_caret_owner(editor), editor);
         }
     }
     #[test]

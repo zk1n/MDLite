@@ -438,7 +438,7 @@ impl EditorActions {
         ActionCompletion::MenuClosed((selected != 0).then_some(selected))
     }
 
-    fn active_button(&self, app: &App) -> HWND {
+    pub(super) fn active_button(&self, app: &App) -> HWND {
         if app.shell.compact_window != HWND::default() {
             self.compact_button
         } else {
@@ -653,6 +653,18 @@ mod tests {
 
     const TABLE: &str = "| H1 | H2 |\n| --- | --- |\n| a | b |\n| c | d |\n";
 
+    fn toolbar_button_count(owner: HWND, id: usize) -> usize {
+        let mut count = 0;
+        let mut child = unsafe { GetWindow(owner, GW_CHILD).unwrap_or_default() };
+        while child != HWND::default() {
+            if unsafe { GetDlgCtrlID(child) as usize } == id {
+                count += 1;
+            }
+            child = unsafe { GetWindow(child, GW_HWNDNEXT).unwrap_or_default() };
+        }
+        count
+    }
+
     #[test]
     fn editor_actions_owner_draw_routes_registered_main_and_compact_buttons_only() {
         use windows::Win32::{
@@ -801,26 +813,17 @@ mod tests {
             unsafe { GetParent(original_button).unwrap_or_default() },
             main
         );
-        let button_count = |owner: HWND| {
-            let mut count = 0;
-            let mut child = unsafe { GetWindow(owner, GW_CHILD).unwrap_or_default() };
-            while child != HWND::default() {
-                if unsafe { GetDlgCtrlID(child) as usize } == TABLE_MENU {
-                    count += 1;
-                }
-                child = unsafe { GetWindow(child, GW_HWNDNEXT).unwrap_or_default() };
-            }
-            count
-        };
-        let original_count = button_count(main);
+        let original_count = toolbar_button_count(main, TABLE_MENU);
         assert_eq!(original_count, 1);
+        assert_eq!(shell::text_of(original_button), TOOLBAR_LABEL);
 
         let actions = std::mem::take(&mut app.editor_actions);
         app.complete_editor_action(actions, ActionCompletion::MenuClosed(None));
 
         assert!(unsafe { IsWindow(Some(original_button)).as_bool() });
         assert_eq!(app.editor_actions.main_button, original_button);
-        assert_eq!(button_count(main), original_count);
+        assert_eq!(toolbar_button_count(main, TABLE_MENU), original_count);
+        assert_eq!(shell::text_of(original_button), TOOLBAR_LABEL);
         assert_eq!(
             (
                 app.doc().id(),
@@ -836,6 +839,110 @@ mod tests {
         unsafe { DestroyWindow(main).unwrap() };
     }
 
+    #[test]
+    fn table_toolbar_ctrl_z_undoes_the_active_document_without_losing_focus() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CONTROL,
+        };
+
+        struct KeyboardState([u8; 256]);
+        impl KeyboardState {
+            fn with_control() -> Self {
+                let mut original = [0u8; 256];
+                unsafe { GetKeyboardState(&mut original).unwrap() };
+                let mut pressed = original;
+                pressed[VK_CONTROL.0 as usize] |= 0x80;
+                unsafe { SetKeyboardState(&pressed).unwrap() };
+                assert!(unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0);
+                Self(original)
+            }
+        }
+        impl Drop for KeyboardState {
+            fn drop(&mut self) {
+                unsafe { SetKeyboardState(&self.0).unwrap() };
+            }
+        }
+
+        let fixture = super::super::tests::MessagePumpFixture::new(
+            super::super::tests::composing_test_app(TABLE),
+        );
+        let mut app = fixture.state.app.borrow_mut();
+        app.clear_composition();
+        app.hwnd = fixture.hwnd;
+        app.shell.enabled = true;
+        app.shell.main_window = fixture.hwnd;
+        let cell = TABLE.find("a").unwrap();
+        app.doc_mut().set_selection(cell, cell).unwrap();
+        unsafe { app.editor_actions_init() };
+        let button = app.editor_actions.active_button(&app);
+        assert_eq!(unsafe { GetDlgCtrlID(button) as usize }, TABLE_MENU);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+        unsafe {
+            let _ = SetFocus(Some(button));
+        };
+        assert_eq!(unsafe { GetFocus() }, button);
+        let actions = std::mem::take(&mut app.editor_actions);
+        app.complete_editor_action(actions, ActionCompletion::MenuClosed(None));
+        assert_eq!(app.editor_actions.active_button(&app), button);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+
+        assert!(app.editor_action(ROW_ABOVE));
+        assert_ne!(app.doc().source(), TABLE);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+        let handled = {
+            let _keyboard = KeyboardState::with_control();
+            assert!(
+                unsafe { PostMessageW(Some(button), WM_KEYDOWN, WPARAM(0x5a), LPARAM(1)) }.is_ok()
+            );
+            let mut message = MSG::default();
+            assert!(
+                unsafe {
+                    PeekMessageW(
+                        &mut message,
+                        Some(button),
+                        WM_KEYDOWN,
+                        WM_KEYDOWN,
+                        PM_REMOVE,
+                    )
+                }
+                .as_bool()
+            );
+            app.shell_message(&message)
+        };
+        assert!(handled);
+        assert_eq!(unsafe { GetFocus() }, button);
+        drop(app);
+
+        let mut command = MSG::default();
+        assert!(
+            unsafe {
+                PeekMessageW(
+                    &mut command,
+                    Some(fixture.hwnd),
+                    WM_COMMAND,
+                    WM_COMMAND,
+                    PM_REMOVE,
+                )
+            }
+            .as_bool()
+        );
+        assert_eq!(command.wParam.0 & 0xffff, shell::EDITOR_HISTORY_UNDO);
+        unsafe {
+            let _ = TranslateMessage(&command);
+            DispatchMessageW(&command);
+        }
+
+        let app = fixture.state.app.borrow();
+        assert_eq!(app.doc().source(), TABLE);
+        assert!(!app.doc().is_dirty());
+        assert_eq!(unsafe { GetFocus() }, button);
+        assert_eq!(app.editor_actions.active_button(&app), button);
+        assert_eq!(unsafe { GetDlgCtrlID(button) as usize }, TABLE_MENU);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+    }
     #[test]
     fn registry_ids_are_unique_and_within_the_shared_range() {
         let ids: Vec<_> = COMMANDS.iter().map(|entry| entry.0).collect();

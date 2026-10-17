@@ -313,6 +313,90 @@ impl Drop for HiddenCaret {
         }
     }
 }
+
+// Each frame owns all clips it pushes and ends its draw exactly once, including
+// an early DirectWrite/resource error. A failed frame is discarded by WM_PAINT.
+struct DrawFrame<'a> {
+    target: &'a ID2D1HwndRenderTarget,
+    clips: usize,
+    ended: bool,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintFault {
+    Target,
+    Drawing,
+    EndDraw,
+    Resize,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct PaintTestState {
+    fault: Option<PaintFault>,
+    failures: usize,
+    began: usize,
+    ended: usize,
+    unwound_clips: usize,
+    damage: Option<D2D_RECT_F>,
+}
+#[cfg(test)]
+thread_local! {
+    static PAINT_TEST: RefCell<PaintTestState> = RefCell::new(PaintTestState::default());
+}
+#[cfg(test)]
+fn paint_fault(stage: PaintFault) -> windows::core::Result<()> {
+    PAINT_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.fault == Some(stage) && state.failures != 0 {
+            state.failures -= 1;
+            Err(E_FAIL.into())
+        } else {
+            Ok(())
+        }
+    })
+}
+impl<'a> DrawFrame<'a> {
+    unsafe fn new(target: &'a ID2D1HwndRenderTarget) -> Self {
+        unsafe { target.BeginDraw() };
+        #[cfg(test)]
+        PAINT_TEST.with(|state| state.borrow_mut().began += 1);
+        Self {
+            target,
+            clips: 0,
+            ended: false,
+        }
+    }
+    unsafe fn push_clip(&mut self, rect: &D2D_RECT_F, mode: D2D1_ANTIALIAS_MODE) {
+        unsafe { self.target.PushAxisAlignedClip(rect, mode) };
+        self.clips += 1;
+    }
+    unsafe fn pop_clip(&mut self) {
+        unsafe { self.target.PopAxisAlignedClip() };
+        self.clips -= 1;
+    }
+    unsafe fn finish(&mut self) -> windows::core::Result<()> {
+        #[cfg(test)]
+        PAINT_TEST.with(|state| state.borrow_mut().unwound_clips += self.clips);
+        while self.clips != 0 {
+            unsafe { self.pop_clip() };
+        }
+        self.ended = true;
+        let result = unsafe { self.target.EndDraw(None, None) };
+        #[cfg(test)]
+        {
+            PAINT_TEST.with(|state| state.borrow_mut().ended += 1);
+            paint_fault(PaintFault::EndDraw)?;
+        }
+        result
+    }
+}
+impl Drop for DrawFrame<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = unsafe { self.finish() };
+        }
+    }
+}
 struct App {
     hwnd: HWND,
     graphics: Graphics,
@@ -327,6 +411,8 @@ struct App {
     images: Vec<ImageView>,
     image_cache: HashMap<PathBuf, CachedImage>,
     minimized: bool,
+    full_paint: bool,
+    paint_retry_pending: bool,
     animation_timer_armed: bool,
     height: f32,
     width: f32,
@@ -345,6 +431,11 @@ struct App {
     ime_attributes: Vec<u8>,
     ime_last_result: Option<(String, Option<String>)>,
     reconversion_owner: Option<ReconversionOwner>,
+    pending_reconversion: Option<ReconversionOwner>,
+    ime_ingress: Rc<ImeIngress>,
+    ime_session: Option<ImeEnvelope>,
+    ime_generation: u64,
+    reconversion_cancel: Option<ReconversionCancel>,
     preferred_x: Option<f32>,
     typing: bool,
     last_typing: Option<Instant>,
@@ -370,8 +461,9 @@ struct App {
 // may be queued while a modal/native callback holds its RefCell borrow.
 struct WindowState {
     app: RefCell<App>,
-    notifications: RefCell<VecDeque<(u64, NativeNotification)>>,
+    notifications: RefCell<VecDeque<(ImeEnvelope, NativeNotification)>>,
     document_id: Cell<u64>,
+    ime_ingress: Rc<ImeIngress>,
     main_window: Cell<HWND>,
     editor_window: Cell<HWND>,
     compact_window: Cell<HWND>,
@@ -386,10 +478,12 @@ struct WindowState {
 impl WindowState {
     fn new(app: App) -> Self {
         let document_id = Cell::new(app.doc().id());
+        let ime_ingress = Rc::clone(&app.ime_ingress);
         Self {
             app: RefCell::new(app),
             notifications: RefCell::new(VecDeque::new()),
             document_id,
+            ime_ingress,
             main_window: Cell::new(HWND::default()),
             editor_window: Cell::new(HWND::default()),
             compact_window: Cell::new(HWND::default()),
@@ -401,6 +495,15 @@ impl WindowState {
             ime_input: Cell::new(None),
             ime_dispatch_key: Cell::new(None),
         }
+    }
+    fn ime_input_for_ingress(
+        &self,
+        captured: Option<ImeEnvelope>,
+        input: Option<ImeInputContext>,
+    ) -> Option<ImeInputContext> {
+        // Key recovery predates draining and pretranslation. A fresh session
+        // cannot inherit the recovered key's synchronous Escape attribution.
+        input.filter(|_| self.ime_ingress.current.get() == captured)
     }
     fn scoped_ime_input(&self, input: Option<ImeInputContext>, message: &MSG) -> ImeInputScope<'_> {
         self.ime_input.set(input);
@@ -516,6 +619,73 @@ impl Drop for ImeInputScope<'_> {
         self.0.ime_dispatch_key.set(None);
     }
 }
+// Local ingress freshness only: IMM carries no native session identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImeEnvelope {
+    document_id: u64,
+    editor: HWND,
+    generation: u64,
+}
+#[derive(Default)]
+struct ImeIngress {
+    next: Cell<u64>,
+    current: Cell<Option<ImeEnvelope>>,
+}
+impl ImeIngress {
+    fn allocate(&self) -> u64 {
+        let next = self
+            .next
+            .get()
+            .checked_add(1)
+            .expect("IME generation exhausted");
+        self.next.set(next);
+        next
+    }
+    fn start(&self, document_id: u64, editor: HWND) -> ImeEnvelope {
+        let envelope = ImeEnvelope {
+            document_id,
+            editor,
+            generation: self.allocate(),
+        };
+        self.current.set(Some(envelope));
+        envelope
+    }
+    fn retire(&self, envelope: ImeEnvelope) {
+        if self.current.get() == Some(envelope) {
+            self.current.set(None);
+        }
+    }
+    fn capture(&self, document_id: u64, editor: HWND, message: u32) -> ImeEnvelope {
+        if message == WM_IME_STARTCOMPOSITION {
+            return self.start(document_id, editor);
+        }
+        let envelope = self
+            .current
+            .get()
+            .filter(|envelope| envelope.document_id == document_id && envelope.editor == editor)
+            .unwrap_or(ImeEnvelope {
+                document_id,
+                editor,
+                generation: 0,
+            });
+        if message == WM_IME_ENDCOMPOSITION {
+            self.retire(envelope);
+        }
+        envelope
+    }
+}
+#[derive(Clone, Copy)]
+struct ReconversionCancel {
+    envelope: ImeEnvelope,
+    owner: ReconversionOwner,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImeCancelOutcome {
+    Cancelled,
+    NoContext,
+    Rejected,
+}
+
 enum NativeNotification {
     Start,
     Update(ImeUpdate),
@@ -539,6 +709,9 @@ struct ImeInputContext {
 }
 #[derive(Clone, Copy)]
 struct ReconversionOwner {
+    request_id: u64,
+    editor: HWND,
+    generation: Option<u64>,
     document_id: u64,
     revision: u64,
     selection: Selection,
@@ -801,6 +974,8 @@ fn startup_window_state(
         images: Vec::new(),
         image_cache: HashMap::new(),
         minimized: false,
+        full_paint: true,
+        paint_retry_pending: false,
         animation_timer_armed: false,
         height: 0.0,
         width: 900.0,
@@ -819,6 +994,11 @@ fn startup_window_state(
         ime_attributes: Vec::new(),
         ime_last_result: None,
         reconversion_owner: None,
+        pending_reconversion: None,
+        ime_ingress: Rc::default(),
+        ime_session: None,
+        ime_generation: 0,
+        reconversion_cancel: None,
         preferred_x: None,
         typing: false,
         last_typing: None,
@@ -918,6 +1098,10 @@ pub fn run() -> windows::core::Result<()> {
             startup.git_init();
             startup.search_init();
             startup.editor_actions_init();
+            // Initial child placement/synchronization can send many native
+            // callbacks. Complete it while hidden so focus/size on ShowWindow
+            // cannot leave a visible, unpainted parent waiting for that work.
+            let _ = startup.ensure_layout();
         }
         replay_deferred_paints(&app);
         DragAcceptFiles(hwnd, true);
@@ -925,6 +1109,7 @@ pub fn run() -> windows::core::Result<()> {
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let key_down = matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let ingress = app.ime_ingress.current.get();
             let input = if key_down {
                 let owned_editor =
                     message.hwnd == app.editor_window.get() && message.hwnd != HWND::default();
@@ -949,7 +1134,16 @@ pub fn run() -> windows::core::Result<()> {
             // before the next key is classified by any input owner.
             drain_native_notifications(&app, &mut app.app.borrow_mut());
             if key_down {
-                app.app.borrow_mut().invalidate_stale_reconversion();
+                let mut owner = app.app.borrow_mut();
+                owner.invalidate_stale_reconversion();
+                if let Some(cancel) =
+                    owner.prepare_reconversion_cancel(ingress, input, message.hwnd)
+                {
+                    perform_reconversion_cancel(&app, &mut owner, cancel, |editor| {
+                        native_cancel_ime(editor)
+                    });
+                    continue;
+                }
             }
             replay_deferred_paints(&app);
             let handled = app.app.borrow().shell_message(&message);
@@ -982,6 +1176,7 @@ pub fn run() -> windows::core::Result<()> {
                 // Retrieval, draining and pretranslation helpers have no
                 // eligible key context. Only this dispatch interval may attach
                 // the captured key to a synchronously received IME update.
+                let input = app.ime_input_for_ingress(ingress, input);
                 let _input_scope = app.scoped_ime_input(input, &message);
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -1031,6 +1226,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         let state = &*pointer;
         state.observe_ime_input_message(hwnd, msg, wp, lp);
+        if ((msg == WM_ACTIVATE && matches!(wp.0 & 0xffff, 1 | 2) && (wp.0 >> 16) & 0xffff == 0)
+            || (msg == WM_NCACTIVATE && wp.0 != 0 && !IsIconic(hwnd).as_bool()))
+            && state.owns_paint_surface(hwnd)
+        {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         if msg == WM_SYSCOMMAND && wp.0 & 0xfff0 == SC_CLOSE as usize {
             // DefWindowProc sends WM_CLOSE synchronously for system Close,
             // including Alt+F4. Post it so the normal unsaved/IME gate can
@@ -1053,11 +1254,47 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return LRESULT(isize::from(activated));
         }
         if msg == WM_DESTROY {
+            if state.editor_window.get() == hwnd {
+                if let Some(envelope) = state
+                    .ime_ingress
+                    .current
+                    .get()
+                    .filter(|envelope| envelope.editor == hwnd)
+                {
+                    state.ime_ingress.retire(envelope);
+                    state
+                        .notifications
+                        .borrow_mut()
+                        .push_back((envelope, NativeNotification::End));
+                }
+                if let Ok(mut app) = state.app.try_borrow_mut()
+                    && app.editing_window() == hwnd
+                {
+                    app.pending_reconversion = None;
+                    app.clear_composition();
+                }
+            }
             if state.main_window.get() == hwnd {
                 PostQuitMessage(0);
             }
             return LRESULT(0);
         }
+        let app_borrow = state.app.try_borrow_mut();
+        let queue_position = state.notifications.borrow().len();
+        let envelope = if (state.editor_window.get() == HWND::default()
+            || state.editor_window.get() == hwnd)
+            && matches!(
+                msg,
+                WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION | WM_KILLFOCUS
+            ) {
+            Some(
+                state
+                    .ime_ingress
+                    .capture(state.document_id.get(), hwnd, msg),
+            )
+        } else {
+            None
+        };
         let notification = match msg {
             WM_IME_STARTCOMPOSITION => Some(NativeNotification::Start),
             WM_IME_COMPOSITION => {
@@ -1076,7 +1313,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             } else {
                 notification
             };
-        let Ok(mut app) = state.app.try_borrow_mut() else {
+        if let Some(notification) = notification {
+            // An IMM read may reenter. Insert ahead of notifications captured
+            // by that read, without holding the queue borrow across native work.
+            state
+                .notifications
+                .borrow_mut()
+                .insert(queue_position, (envelope.unwrap(), notification));
+        }
+        let Ok(mut app) = app_borrow else {
             if msg == WM_DRAWITEM && lp.0 != 0 {
                 // Keep IME observation above this branch unchanged. Clone the
                 // owned paint data and release its RefCell before any GDI call.
@@ -1124,11 +1369,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             if msg == WM_TIMER && wp.0 == PERSISTENCE_TIMER {
                 state.deferred_persistence.set(true);
             }
-            if let Some(notification) = notification {
-                state
-                    .notifications
-                    .borrow_mut()
-                    .push_back((state.document_id.get(), notification));
+            if envelope.is_some() {
                 return LRESULT(0);
             }
             if matches!(
@@ -1175,8 +1416,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         // than this event. In particular, End must release IME ownership before
         // the first ordinary character or Enter is dispatched.
         drain_native_notifications(state, &mut app);
-        let result = if let Some(notification) = notification {
-            app.native_notification(notification);
+        let result = if envelope.is_some() {
             Some(LRESULT(0))
         } else if (msg == WM_CLOSE || (msg == WM_COMMAND && wp.0 & 0xffff == CMD_CLOSE))
             && app.composing
@@ -1213,6 +1453,62 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
+unsafe fn native_cancel_ime(editor: HWND) -> ImeCancelOutcome {
+    unsafe {
+        let context = ImmGetContext(editor);
+        if context.0.is_null() {
+            return ImeCancelOutcome::NoContext;
+        }
+        let cancelled = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0).as_bool();
+        let _ = ImmReleaseContext(editor, context);
+        if cancelled {
+            ImeCancelOutcome::Cancelled
+        } else {
+            ImeCancelOutcome::Rejected
+        }
+    }
+}
+unsafe fn perform_reconversion_cancel(
+    state: &WindowState,
+    app: &mut App,
+    cancel: ReconversionCancel,
+    operation: impl FnOnce(HWND) -> ImeCancelOutcome,
+) {
+    unsafe {
+        // This key is now an explicit native command. A failed attempt cannot
+        // lend its Escape attribution to the legacy synchronous result rule.
+        state.ime_input.set(None);
+        state.ime_dispatch_key.set(None);
+        // App remains borrowed through execute: reentry only captures packets.
+        let outcome = operation(cancel.envelope.editor);
+        if outcome == ImeCancelOutcome::Cancelled {
+            // Publish completion and retain the captured owner before draining.
+            app.reconversion_cancel = Some(cancel);
+        }
+        drain_native_notifications(state, app);
+        if outcome == ImeCancelOutcome::Cancelled {
+            if app.ime_session == Some(cancel.envelope) {
+                app.clear_composition();
+            }
+            state.ime_ingress.retire(cancel.envelope);
+            app.reconversion_cancel = None;
+            let editor = app.editing_window();
+            if editor == cancel.envelope.editor
+                && app
+                    .ime_session
+                    .as_ref()
+                    .is_none_or(|session| session.editor == editor)
+                && IsWindow(Some(editor)).as_bool()
+            {
+                app.select_surface(editor);
+            }
+        } else {
+            app.status = "IME再変換の取消に失敗しました".into();
+        }
+        app.refresh();
+    }
+}
+
 unsafe fn drain_native_notifications(state: &WindowState, app: &mut App) {
     unsafe {
         // Release the queue borrow before invoking IMM or native callbacks.
@@ -1221,10 +1517,9 @@ unsafe fn drain_native_notifications(state: &WindowState, app: &mut App) {
             let Some((owner, notification)) = next else {
                 break;
             };
-            if owner == app.doc().id() {
-                app.native_notification(notification);
-            }
+            app.native_packet(owner, notification);
         }
+        app.invalidate_ime_editor();
         state.document_id.set(app.doc().id());
         state.editor_window.set(app.editing_window());
         if state.deferred_control_redraw.replace(false) {
@@ -1289,13 +1584,21 @@ unsafe fn dispatch_window_message(
                     (ps.rcPaint.right - ps.rcPaint.left) as f32 / app.dpi,
                     (ps.rcPaint.bottom - ps.rcPaint.top) as f32 / app.dpi,
                 );
-                if let Err(e) = app.paint(damage) {
+                let result = app.paint(damage);
+                let retry = result.is_err() && !app.paint_retry_pending;
+                if let Err(e) = result {
                     app.status = e.to_string();
-                    app.graphics.target = None;
-                    app.image_cache.clear();
-                    app.layout_key = None;
+                    app.discard_target();
+                    app.paint_retry_pending = true;
+                } else {
+                    app.paint_retry_pending = false;
                 }
                 let _ = EndPaint(hwnd, &ps);
+                if retry {
+                    // EndPaint consumes this damage. Reserve one recovery
+                    // frame afterward, never an unbounded WM_PAINT loop.
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_SIZE => {
@@ -1304,21 +1607,17 @@ unsafe fn dispatch_window_message(
                     app.sync_animations();
                     return Some(LRESULT(0));
                 }
-                if let Some(target) = &app.graphics.target {
-                    let _ = target.Resize(&D2D_SIZE_U {
-                        width: (lp.0 as u32) & 0xffff,
-                        height: ((lp.0 as u32) >> 16) & 0xffff,
-                    });
-                }
+                app.resize_target(D2D_SIZE_U {
+                    width: (lp.0 as u32) & 0xffff,
+                    height: ((lp.0 as u32) >> 16) & 0xffff,
+                });
                 app.layout_key = None;
                 app.refresh();
                 LRESULT(0)
             }
             WM_DPICHANGED => {
                 app.dpi = (wp.0 & 0xffff) as f32 / 96.0;
-                app.graphics.target = None;
-                app.image_cache.clear();
-                app.layout_key = None;
+                app.discard_target();
                 let r = &*(lp.0 as *const RECT);
                 let _ = SetWindowPos(
                     hwnd,
@@ -1857,11 +2156,14 @@ impl App {
                         ..selection.anchor.max(selection.head)]
                         .encode_utf16()
                         .count();
-                    let confirmed =
-                        request.dwTargetStrOffset == 0 && request.dwTargetStrLen as usize == len;
-                    if confirmed {
-                        self.arm_reconversion();
-                    }
+                    let confirmed = request.dwTargetStrOffset == 0
+                        && request.dwTargetStrLen as usize == len
+                        && self
+                            .pending_reconversion
+                            .or(self.reconversion_owner)
+                            .is_some_and(|owner| {
+                                owner.editor == self.editing_window() && owner.matches(self.doc())
+                            });
                     LRESULT(confirmed as isize)
                 }
                 IMR_QUERYCHARPOSITION => {
@@ -2316,7 +2618,12 @@ impl App {
     }
     fn arm_reconversion(&mut self) {
         if !self.doc().selection().is_caret() {
-            self.reconversion_owner = Some(ReconversionOwner {
+            // A filled request is pending until START, including a request
+            // received while an older native session still owns composition.
+            self.pending_reconversion = Some(ReconversionOwner {
+                request_id: self.ime_ingress.allocate(),
+                editor: self.editing_window(),
+                generation: None,
                 document_id: self.doc().id(),
                 revision: self.doc().revision(),
                 selection: self.doc().selection(),
@@ -2335,14 +2642,105 @@ impl App {
         })
     }
     fn invalidate_stale_reconversion(&mut self) {
-        if self
+        self.reconversion_owner = self
             .reconversion_owner
-            .is_some_and(|owner| !owner.matches(self.doc()))
+            .filter(|owner| owner.matches(self.doc()));
+        self.pending_reconversion = self
+            .pending_reconversion
+            .filter(|owner| owner.matches(self.doc()));
+    }
+    fn invalidate_ime_editor(&mut self) {
+        let editor = self.editing_window();
+        let document_id = self.doc().id();
+        if self
+            .ime_session
+            .is_some_and(|session| session.editor != editor || session.document_id != document_id)
         {
-            self.reconversion_owner = None;
+            self.clear_composition();
+        }
+        self.reconversion_owner = self
+            .reconversion_owner
+            .filter(|owner| owner.editor == editor && owner.document_id == document_id);
+        self.pending_reconversion = self
+            .pending_reconversion
+            .filter(|owner| owner.editor == editor && owner.document_id == document_id);
+    }
+    fn prepare_reconversion_cancel(
+        &self,
+        captured: Option<ImeEnvelope>,
+        input: Option<ImeInputContext>,
+        editor: HWND,
+    ) -> Option<ReconversionCancel> {
+        let envelope = captured?;
+        let input = input?;
+        let owner = self.reconversion_owner?;
+        (input.virtual_key == VK_ESCAPE.0 as u32
+            && input.document_id == envelope.document_id
+            && editor == envelope.editor
+            && editor == self.editing_window()
+            && self.composing
+            && self.ime_session == Some(envelope)
+            && self.ime_owner
+                == Some((
+                    self.doc().id(),
+                    self.doc().revision(),
+                    self.doc().selection().anchor,
+                    self.doc().selection().head,
+                ))
+            && self.ime_affinity == self.doc().selection_affinity()
+            && self.ime_ingress.current.get() == Some(envelope)
+            && owner.request_id != 0
+            && owner.editor == editor
+            && owner.generation == Some(envelope.generation)
+            && owner.matches(self.doc()))
+        .then_some(ReconversionCancel { envelope, owner })
+    }
+    unsafe fn native_packet(&mut self, envelope: ImeEnvelope, notification: NativeNotification) {
+        unsafe {
+            if envelope.document_id != self.doc().id() || envelope.editor != self.editing_window() {
+                return;
+            }
+            if self.reconversion_cancel.is_some_and(|cancel| {
+                cancel.envelope == envelope && cancel.owner.generation == Some(envelope.generation)
+            }) {
+                return;
+            }
+            match notification {
+                NativeNotification::Start if envelope.generation > self.ime_generation => {
+                    self.start_composition_for(envelope);
+                    self.refresh();
+                }
+                NativeNotification::Update(update)
+                    if self.ime_session.is_none()
+                        && envelope.generation == 0
+                        && composition_is_cancelled(update.flags) =>
+                {
+                    self.pending_reconversion = None;
+                }
+                NativeNotification::End
+                    if self.ime_session.is_none() && envelope.generation == 0 =>
+                {
+                    self.pending_reconversion = None;
+                }
+                NativeNotification::FocusLost
+                    if self.ime_session == Some(envelope)
+                        || (self.ime_session.is_none() && envelope.generation == 0) =>
+                {
+                    self.native_notification(NativeNotification::FocusLost)
+                }
+                notification if self.ime_session == Some(envelope) => {
+                    self.native_notification(notification)
+                }
+                _ => (),
+            }
         }
     }
     fn clear_composition(&mut self) {
+        if let Some(session) = self.ime_session.take() {
+            self.ime_ingress.retire(session);
+        } else {
+            self.pending_reconversion = None;
+        }
         self.doc_mut().break_undo_group();
         self.composing = false;
         self.ime_owner = None;
@@ -2354,41 +2752,33 @@ impl App {
         self.pending_surrogate = None;
     }
     unsafe fn cancel_composition(&mut self) -> bool {
-        // SAFETY: the context is acquired/released on the owner thread. App's
-        // RefCell borrow remains held, so synchronous IMM callbacks snapshot
-        // into WindowState's separate queue. CPS_CANCEL produces no source edit;
-        // clear locally on success, then accept its idempotent end notification.
-        unsafe {
-            let context = ImmGetContext(self.hwnd);
-            if context.0.is_null() {
-                return false;
-            }
-            let cancelled = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0).as_bool();
-            let _ = ImmReleaseContext(self.hwnd, context);
-            if cancelled {
-                self.clear_composition();
-            }
-            cancelled
+        // The ordinary focus/nonreconversion path retains failure ownership.
+        let cancelled =
+            unsafe { native_cancel_ime(self.editing_window()) } == ImeCancelOutcome::Cancelled;
+        if cancelled {
+            self.clear_composition();
         }
+        cancelled
     }
+    #[cfg(test)]
     fn start_composition(&mut self) {
+        let envelope = self
+            .ime_ingress
+            .start(self.doc().id(), self.editing_window());
+        self.start_composition_for(envelope);
+    }
+    fn start_composition_for(&mut self, envelope: ImeEnvelope) {
         let selection = self.doc().selection();
-        let owner = (
-            self.doc().id(),
-            self.doc().revision(),
-            selection.anchor,
-            selection.head,
-        );
-        if self.composing
-            && !self.preedit.is_empty()
-            && self.ime_owner == Some(owner)
-            && self.ime_affinity == self.doc().selection_affinity()
-        {
-            return;
-        }
-        // RECONVERTSTRING may precede STARTCOMPOSITION. Preserve only the
-        // request bound to this exact document/selection/affinity.
         self.invalidate_stale_reconversion();
+        self.reconversion_owner = self
+            .pending_reconversion
+            .take()
+            .filter(|owner| owner.editor == envelope.editor);
+        if let Some(owner) = &mut self.reconversion_owner {
+            owner.generation = Some(envelope.generation);
+        }
+        self.ime_session = Some(envelope);
+        self.ime_generation = envelope.generation;
         self.doc_mut().break_undo_group();
         self.composing = true;
         self.ime_owner = Some((
@@ -2409,7 +2799,12 @@ impl App {
         unsafe {
             let updated = matches!(notification, NativeNotification::Update(_));
             match notification {
-                NativeNotification::Start => self.start_composition(),
+                NativeNotification::Start => {
+                    let envelope = self
+                        .ime_ingress
+                        .start(self.doc().id(), self.editing_window());
+                    self.start_composition_for(envelope);
+                }
                 NativeNotification::Update(update) => self.apply_ime_update(update),
                 NativeNotification::End => {
                     self.clear_composition();
@@ -2420,6 +2815,7 @@ impl App {
                     }
                 }
                 NativeNotification::FocusLost => {
+                    self.pending_reconversion = None;
                     self.reconversion_owner = None;
                     if self.composing {
                         let _ = self.cancel_composition();
@@ -2472,6 +2868,12 @@ impl App {
                 self.clear_composition();
                 return;
             }
+            let preserve_cancel = update.result.as_ref().is_some_and(|result| {
+                self.cancelled_reconversion_result(result, update.input_context)
+            });
+            if update.result.is_some() {
+                self.reconversion_owner = None;
+            }
             let fingerprint = update
                 .result
                 .as_ref()
@@ -2491,7 +2893,7 @@ impl App {
                     // ATOK can return the unchanged original as RESULTSTR on
                     // Escape. Preserve the reconversion selection in that one
                     // case; Enter, unknown input and changed results still edit.
-                    if !self.cancelled_reconversion_result(&result, update.input_context) {
+                    if !preserve_cancel {
                         self.edit(&result);
                         self.reconversion_owner = None;
                     }
@@ -2543,8 +2945,32 @@ impl App {
             if self.composing {
                 // Composition owns Escape before table exit or other editing.
                 // Failed cancellation keeps the local preedit/owner intact.
-                if key == VK_ESCAPE.0 && self.cancel_composition() {
-                    self.refresh();
+                if key == VK_ESCAPE.0 {
+                    let editor = self.editing_window();
+                    let input = Some(ImeInputContext {
+                        document_id: self.doc().id(),
+                        virtual_key: key as u32,
+                    });
+                    if let Some(cancel) = self.prepare_reconversion_cancel(
+                        self.ime_ingress.current.get(),
+                        input,
+                        editor,
+                    ) {
+                        let pointer =
+                            GetWindowLongPtrW(editor, GWLP_USERDATA) as *const WindowState;
+                        if !pointer.is_null() {
+                            perform_reconversion_cancel(&*pointer, self, cancel, |editor| {
+                                native_cancel_ime(editor)
+                            });
+                            return;
+                        }
+                        self.status =
+                            "IME再変換の取消に失敗しました — 編集ウィンドウがありません".into();
+                        return;
+                    }
+                    if self.cancel_composition() {
+                        self.refresh();
+                    }
                 }
                 return;
             }
@@ -2624,7 +3050,7 @@ impl App {
                             self.after_input();
                             return;
                         }
-                        let target = if self.tabs[self.active].raw {
+                        let target = if self.tabs[self.active].raw || matches!(key, 0x26 | 0x28) {
                             target
                         } else if matches!(key, 0x25 | 0x27) {
                             self.live_word_point(selection.head, target, key == 0x25)
@@ -3285,6 +3711,7 @@ impl App {
         self.capture_view_anchor();
         self.doc_mut().break_undo_group();
         self.active = index;
+        self.invalidate_ime_editor();
         self.ensure_active_tab_visible();
         self.doc_mut().break_undo_group();
         self.last_typing = None;
@@ -4190,6 +4617,14 @@ impl App {
                             .any(|view| view.map.contains(&p) && !view.source.is_empty())
                 })
                 .collect();
+            markers.extend(self.tables.windows(2).filter_map(|tables| {
+                let p = tables[0].table.range.end;
+                let next_start = tables[1].table.range.start;
+                source
+                    .get(p..next_start)
+                    .filter(|gap| !gap.is_empty() && gap.trim().is_empty())
+                    .map(|_| p)
+            }));
             // A source position after a closing fence is distinct from the last
             // literal line even if the code block source range encloses both.
             markers.extend(
@@ -4807,6 +5242,42 @@ impl App {
             Ok(top + 20.0)
         }
     }
+    fn discard_target(&mut self) {
+        for view in &self.views {
+            // A failed frame may leave target brushes on retained layouts.
+            let _ = unsafe {
+                view.layout.SetDrawingEffect(
+                    None::<&windows::core::IUnknown>,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: 0,
+                        length: view.text.len() as u32,
+                    },
+                )
+            };
+        }
+        self.graphics.target = None;
+        self.image_cache.clear();
+        for image in &mut self.images {
+            image.bitmap = None;
+        }
+        self.layout_key = None;
+        self.full_paint = true;
+    }
+    unsafe fn resize_target(&mut self, size: D2D_SIZE_U) {
+        // Resize invalidates the backbuffer even with RETAIN_CONTENTS.
+        self.full_paint = true;
+        if let Some(target) = &self.graphics.target {
+            #[cfg(test)]
+            let result =
+                paint_fault(PaintFault::Resize).and_then(|()| unsafe { target.Resize(&size) });
+            #[cfg(not(test))]
+            let result = unsafe { target.Resize(&size) };
+            if let Err(error) = result {
+                self.status = error.to_string();
+                self.discard_target();
+            }
+        }
+    }
     unsafe fn target(&mut self) -> windows::core::Result<ID2D1HwndRenderTarget> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
@@ -4814,6 +5285,8 @@ impl App {
             if let Some(t) = &self.graphics.target {
                 return Ok(t.clone());
             }
+            #[cfg(test)]
+            paint_fault(PaintFault::Target)?;
             let mut r = RECT::default();
             GetClientRect(self.hwnd, &mut r)?;
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
@@ -4841,6 +5314,7 @@ impl App {
                 },
             )?;
             self.graphics.target = Some(target.clone());
+            self.full_paint = true;
             Ok(target)
         }
     }
@@ -4851,12 +5325,26 @@ impl App {
             if self.minimized {
                 return Ok(());
             }
+            let layout_invalid = self.layout_key.is_none();
             self.ensure_layout()?;
-            self.ensure_active_tab_visible();
-            self.update_caret();
-            self.prepare_images();
+            let inactive_main = self.shell.enabled
+                && self.hwnd == self.shell.main_window
+                && self.shell.compact_window != HWND::default();
+            if !inactive_main {
+                self.ensure_active_tab_visible();
+                self.update_caret();
+                self.prepare_images();
+            }
             let t = self.target()?;
+            let damage = if self.full_paint || layout_invalid {
+                let size = t.GetSize();
+                rect(0.0, 0.0, size.width, size.height)
+            } else {
+                damage
+            };
             let text = t.CreateSolidColorBrush(&self.shell.tokens.foreground, None)?;
+            #[cfg(test)]
+            PAINT_TEST.with(|state| state.borrow_mut().damage = Some(damage));
             let muted = t.CreateSolidColorBrush(&self.shell.tokens.muted, None)?;
             let selected = t.CreateSolidColorBrush(&self.shell.tokens.selected, None)?;
             let border = t.CreateSolidColorBrush(&self.shell.tokens.border, None)?;
@@ -4874,10 +5362,21 @@ impl App {
             } else {
                 None
             };
-            t.BeginDraw();
-            t.PushAxisAlignedClip(&damage, D2D1_ANTIALIAS_MODE_ALIASED);
+            let mut frame = DrawFrame::new(&t);
+            frame.push_clip(&damage, D2D1_ANTIALIAS_MODE_ALIASED);
             t.Clear(Some(&self.shell.tokens.background));
             self.draw_shell(&t)?;
+            if inactive_main {
+                // The inactive main surface shows panels and the Compact
+                // placeholder, while sharing the same target/error lifecycle.
+                #[cfg(test)]
+                paint_fault(PaintFault::Drawing)?;
+                self.features_draw(&t)?;
+                self.git_draw(&t)?;
+                frame.finish()?;
+                self.full_paint = false;
+                return Ok(());
+            }
             let mut x = self.editor_left();
             if !self.shell.enabled {
                 for (_, label, width) in TOOLBAR {
@@ -4903,7 +5402,7 @@ impl App {
                 let label = format!("{}{}", name, if tab.doc.is_dirty() { " •" } else { "" });
                 let layout =
                     self.tab_label_layout(&label, (strip.tab_width - 32.0).max(1.0), tab_height)?;
-                t.PushAxisAlignedClip(
+                frame.push_clip(
                     &rect(x, tab_top, strip.tab_width, tab_height),
                     D2D1_ANTIALIAS_MODE_ALIASED,
                 );
@@ -4913,7 +5412,7 @@ impl App {
                     &text,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
-                t.PopAxisAlignedClip();
+                frame.pop_clip();
             }
             if self.shell.enabled {
                 let close = self.text_layout("×", 18., 14.)?;
@@ -4988,7 +5487,7 @@ impl App {
                     &muted,
                 );
             }
-            t.PushAxisAlignedClip(
+            frame.push_clip(
                 &rect(
                     self.editor_left() - 8.0,
                     self.editor_top(),
@@ -5048,6 +5547,8 @@ impl App {
                 }
                 self.paint_inline_code_backgrounds(&t, view, view.x, y, &code_background)?;
                 self.apply_link_color(view, &link)?;
+                #[cfg(test)]
+                paint_fault(PaintFault::Drawing)?;
                 let view_text = if self.view_is_heading(view) {
                     &heading
                 } else {
@@ -5129,7 +5630,7 @@ impl App {
                     .filter(|visual| visual.view_index == index)
                 {
                     let clip_height = visual.height;
-                    t.PushAxisAlignedClip(
+                    frame.push_clip(
                         &rect(visual.x, visual.y, visual.width, clip_height),
                         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                     );
@@ -5176,7 +5677,7 @@ impl App {
                         view_text,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     );
-                    t.PopAxisAlignedClip();
+                    frame.pop_clip();
                 } else {
                     t.DrawTextLayout(
                         point(view.x, y),
@@ -5241,7 +5742,7 @@ impl App {
                     t.DrawRectangle(&r, &selected, 3.0, None);
                 }
             }
-            t.PopAxisAlignedClip();
+            frame.pop_clip();
             self.draw_shell(&t)?;
             self.features_draw(&t)?;
             self.git_draw(&t)?;
@@ -5259,7 +5760,7 @@ impl App {
             };
             let layout = self.text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            t.PushAxisAlignedClip(
+            frame.push_clip(
                 &rect(
                     status_x,
                     viewport + 2.,
@@ -5274,11 +5775,12 @@ impl App {
                 &muted,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
             );
-            t.PopAxisAlignedClip();
-            t.PopAxisAlignedClip();
-            let draw_result = t.EndDraw(None, None);
+            frame.pop_clip();
+            frame.pop_clip();
+            let draw_result = frame.finish();
             drop(hidden_caret);
             draw_result?;
+            self.full_paint = false;
             self.sync_animations();
             self.diagnostic();
             Ok(())
@@ -5590,6 +6092,8 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            // A new external refresh permits one bounded recovery attempt.
+            self.paint_retry_pending = false;
             let _ = self.ensure_layout();
             self.restore_pending_view();
             self.update_caret();
@@ -7671,6 +8175,174 @@ mod tests {
         }
     }
 
+    pub(super) struct MessagePumpFixture {
+        pub(super) state: Box<WindowState>,
+        pub(super) hwnd: HWND,
+        instance: HINSTANCE,
+        class_name: Vec<u16>,
+        compact: Option<HWND>,
+    }
+    impl MessagePumpFixture {
+        pub(super) fn new(app: App) -> Self {
+            static NEXT_CLASS_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let instance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap().0 });
+            let class_name: Vec<u16> = format!(
+                "MDLiteGitPromptMessagePumpTest-{}-{}",
+                std::process::id(),
+                NEXT_CLASS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+            let class_name_pcwstr = PCWSTR(class_name.as_ptr());
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class_name_pcwstr,
+                ..Default::default()
+            };
+            unsafe { assert_ne!(RegisterClassW(&class), 0) };
+            let state = Box::new(WindowState::new(app));
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class_name_pcwstr,
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    900,
+                    700,
+                    None,
+                    None,
+                    Some(instance),
+                    Some((&*state as *const WindowState).cast()),
+                )
+                .unwrap()
+            };
+            state.app.borrow_mut().hwnd = hwnd;
+            Self {
+                state,
+                hwnd,
+                instance,
+                class_name,
+                compact: None,
+            }
+        }
+        pub(super) fn create_compact(&mut self) -> HWND {
+            let class_name = PCWSTR(self.class_name.as_ptr());
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class_name,
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    640,
+                    480,
+                    Some(self.hwnd),
+                    None,
+                    Some(self.instance),
+                    Some((&*self.state as *const WindowState).cast()),
+                )
+                .unwrap()
+            };
+            self.compact = Some(hwnd);
+            hwnd
+        }
+    }
+    impl Drop for MessagePumpFixture {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(compact) = self.compact.take() {
+                    let _ = DestroyWindow(compact);
+                }
+                let _ = DestroyWindow(self.hwnd);
+                let mut message = MSG::default();
+                let _ = PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE);
+                let _ = UnregisterClassW(PCWSTR(self.class_name.as_ptr()), Some(self.instance));
+            }
+        }
+    }
+
+    #[test]
+    fn e08_table_end_boundary_preserves_structural_edit_and_undo() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!(
+                "| H | J |{eol}| --- | --- |{eol}| first | one |{eol}{eol}| K | L |{eol}| --- | --- |"
+            );
+            let fixture = EditorFixture::new(&source, false);
+            let p;
+            let gap;
+            let next_table;
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                assert_eq!(app.tables.len(), 2, "expected two tables ({eol:?})");
+                p = app.tables[0].table.range.end;
+                next_table = app.tables[1].table.range.start;
+                gap = table_gap_marker(&source, p, next_table).unwrap();
+                app.doc_mut().set_selection(p, p).unwrap();
+                unsafe {
+                    app.after_input();
+                }
+                assert!(
+                    app.views.iter().any(|view| view.source == (gap..gap)),
+                    "table-gap marker {gap} disappeared ({eol:?})"
+                );
+                assert!(
+                    app.views
+                        .iter()
+                        .any(|view| view.source == (next_table..next_table)),
+                    "next-table marker {next_table} disappeared ({eol:?})"
+                );
+                assert!(
+                    app.views.iter().any(|view| view.source == (p..p)),
+                    "table-end marker {p} is missing ({eol:?})"
+                );
+                assert!(
+                    !app.views.iter().any(|view| {
+                        view.table.is_none() && !view.source.is_empty() && view.map.contains(&p)
+                    }),
+                    "previous raw-row fallback still covers table end {p} ({eol:?})"
+                );
+                assert_eq!(app.caret_view().unwrap().source, p..p);
+            }
+
+            fixture.message(WM_CHAR, 'x' as usize);
+            let mut expected = source[..p].to_owned();
+            expected.push_str(&eol.repeat(2));
+            expected.push('x');
+            expected.push_str(&source[p..]);
+            let mut app = fixture.state.app.borrow_mut();
+            assert_eq!(app.doc().source(), expected, "edited source ({eol:?})");
+            assert_eq!(
+                app.doc().selection(),
+                Selection::caret(p + eol.len() * 2 + 1),
+                "edited caret ({eol:?})"
+            );
+            assert_eq!(app.tables.len(), 2, "both tables must survive ({eol:?})");
+            assert_eq!(app.doc().undo_count(), 1, "one edit ({eol:?})");
+            unsafe {
+                app.key_with_modifiers(0x5a, true, false);
+            }
+            assert_eq!(
+                app.doc().source(),
+                source,
+                "undo restores exact source ({eol:?})"
+            );
+            assert_eq!(app.doc().selection(), Selection::caret(p));
+            assert_eq!(app.tables.len(), 2, "both tables survive undo ({eol:?})");
+            assert_eq!(
+                app.doc().undo_count(),
+                0,
+                "undo consumes the edit ({eol:?})"
+            );
+            assert!(!app.doc().is_dirty(), "undo restores clean state ({eol:?})");
+        }
+    }
+
     #[test]
     fn review_table_boundary_enter_typing_undo_source_and_geometry() {
         for eol in ["\n", "\r\n"] {
@@ -7950,7 +8622,7 @@ mod tests {
             // dialog is driven by this synthetic owned lifecycle test.
             app.close_after_composition = Some((WM_COMMAND, WPARAM(CMD_CLOSE), LPARAM(0)));
             fixture.state.notifications.borrow_mut().push_back((
-                app.doc().id(),
+                app.ime_session.unwrap(),
                 NativeNotification::Update(ImeUpdate {
                     flags: GCS_RESULTSTR.0,
                     result: Some("確定".into()),
@@ -8306,6 +8978,375 @@ mod tests {
         assert!(result.is_err());
         assert!(fixture.state.button_paint.borrow().is_none());
     }
+    fn visible_paint_fixture(source: &str) -> MessagePumpFixture {
+        let mut app = composing_test_app(source);
+        app.clear_composition();
+        let fixture = MessagePumpFixture::new(app);
+        // Hidden HWNDs need not retain an update region. This owned, inactive
+        // surface exercises the actual Win32 invalidation/WM_PAINT contract.
+        unsafe {
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+        }
+        fixture
+    }
+
+    #[test]
+    fn paint_recovery_hidden_startup_prepares_controls_before_first_frame() {
+        let fixture = EditorFixture::new("# Startup\n\nbody", false);
+        let before = document_state(fixture.state.app.borrow().doc());
+        unsafe {
+            fixture.state.main_window.set(fixture.hwnd);
+            fixture.state.editor_window.set(fixture.hwnd);
+            SetWindowLongPtrW(
+                fixture.hwnd,
+                GWLP_WNDPROC,
+                window_proc as *const () as isize,
+            );
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_shell();
+            app.features_init();
+            app.git_init();
+            app.search_init();
+            app.editor_actions_init();
+            app.ensure_layout().unwrap();
+            assert!(!IsWindowVisible(fixture.hwnd).as_bool());
+            assert!(app.layout_key.is_some());
+            assert!(app.graphics.target.is_none());
+            let editor = app.shell.editor;
+            app.refresh();
+            assert_eq!(app.shell.editor, editor);
+            app.paint(rect(1., 2., 3., 4.)).unwrap();
+            assert!(!app.full_paint);
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+
+    #[test]
+    fn paint_recovery_activation_repaints_owned_surfaces_before_app_borrow() {
+        let mut fixture = visible_paint_fixture("activation body");
+        let main = fixture.hwnd;
+        let compact = fixture.create_compact();
+        unsafe {
+            let _ = ShowWindow(compact, SW_SHOWNOACTIVATE);
+        }
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = main;
+            app.shell.compact_window = compact;
+            unsafe {
+                app.select_surface(main);
+                app.target().unwrap();
+                app.select_surface(compact);
+                app.target().unwrap();
+                app.select_surface(main);
+            }
+        }
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+        unsafe {
+            for (hwnd, message, activation) in [
+                (main, WM_ACTIVATE, WA_ACTIVE as usize),
+                (main, WM_ACTIVATE, WA_CLICKACTIVE as usize),
+                (compact, WM_ACTIVATE, WA_ACTIVE as usize),
+                (compact, WM_ACTIVATE, WA_CLICKACTIVE as usize),
+                (main, WM_NCACTIVATE, 1),
+                (compact, WM_NCACTIVATE, 1),
+            ] {
+                SetFocus(Some(hwnd)).unwrap();
+                assert_eq!(GetFocus(), hwnd, "fixture must focus the target first");
+                let _ = ValidateRect(Some(hwnd), None);
+                assert!(!GetUpdateRect(hwnd, None, false).as_bool());
+                SendMessageW(hwnd, message, Some(WPARAM(activation)), Some(LPARAM(0)));
+                assert_eq!(GetFocus(), hwnd, "activation changed thread focus");
+                let mut update = RECT::default();
+                assert!(GetUpdateRect(hwnd, Some(&mut update), false).as_bool());
+                let mut client = RECT::default();
+                GetClientRect(hwnd, &mut client).unwrap();
+                assert_eq!(
+                    [update.left, update.top, update.right, update.bottom],
+                    [client.left, client.top, client.right, client.bottom],
+                    "activation must invalidate the full owned surface"
+                );
+                let before_paint = PAINT_TEST.with(|state| {
+                    let state = state.borrow();
+                    (state.began, state.ended)
+                });
+                let _ = UpdateWindow(hwnd);
+                assert_eq!(GetFocus(), hwnd, "painting changed thread focus");
+                PAINT_TEST.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(
+                        (state.began, state.ended),
+                        (before_paint.0 + 1, before_paint.1 + 1),
+                        "activation must reach one complete WM_PAINT"
+                    );
+                });
+                assert!(!GetUpdateRect(hwnd, None, false).as_bool());
+                assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            }
+
+            for (hwnd, activation) in [
+                (main, WA_INACTIVE as usize),
+                (main, WA_ACTIVE as usize | (1 << 16)),
+                (compact, WA_INACTIVE as usize),
+                (compact, WA_CLICKACTIVE as usize | (1 << 16)),
+            ] {
+                SetFocus(Some(hwnd)).unwrap();
+                assert_eq!(GetFocus(), hwnd);
+                let _ = ValidateRect(Some(hwnd), None);
+                SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(activation)), Some(LPARAM(0)));
+                assert!(!GetUpdateRect(hwnd, None, false).as_bool());
+            }
+
+            for hwnd in [main, compact] {
+                SetFocus(Some(hwnd)).unwrap();
+                let _ = ValidateRect(Some(hwnd), None);
+                SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
+                assert!(!GetUpdateRect(hwnd, None, false).as_bool());
+            }
+
+            for (hwnd, message, activation) in [
+                (main, WM_ACTIVATE, WA_ACTIVE as usize),
+                (compact, WM_ACTIVATE, WA_CLICKACTIVE as usize),
+                (main, WM_NCACTIVATE, 1),
+                (compact, WM_NCACTIVATE, 1),
+            ] {
+                SetFocus(Some(hwnd)).unwrap();
+                assert_eq!(GetFocus(), hwnd);
+                let _ = ValidateRect(Some(hwnd), None);
+                {
+                    let _app = fixture.state.app.borrow_mut();
+                    SendMessageW(hwnd, message, Some(WPARAM(activation)), Some(LPARAM(0)));
+                    assert_eq!(GetFocus(), hwnd);
+                    assert!(GetUpdateRect(hwnd, None, false).as_bool());
+                    let _ = UpdateWindow(hwnd);
+                    assert!(
+                        fixture
+                            .state
+                            .deferred_paints
+                            .get()
+                            .iter()
+                            .flatten()
+                            .any(|(deferred, _)| *deferred == hwnd)
+                    );
+                    assert!(!GetUpdateRect(hwnd, None, false).as_bool());
+                }
+                SendMessageW(fixture.hwnd, WM_NULL, Some(WPARAM(0)), Some(LPARAM(0)));
+                assert!(GetUpdateRect(hwnd, None, false).as_bool());
+                assert_eq!(fixture.state.deferred_paints.get(), [None, None]);
+                let before_paint = PAINT_TEST.with(|state| {
+                    let state = state.borrow();
+                    (state.began, state.ended)
+                });
+                let _ = UpdateWindow(hwnd);
+                PAINT_TEST.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(
+                        (state.began, state.ended),
+                        (before_paint.0 + 1, before_paint.1 + 1),
+                        "replayed paint must complete once App is available"
+                    );
+                });
+                assert_eq!(GetFocus(), hwnd);
+                assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            }
+
+            let _ = ShowWindow(main, SW_SHOWMINNOACTIVE);
+            assert!(IsIconic(main).as_bool(), "test main window must be iconic");
+            let _ = ValidateRect(Some(main), None);
+            assert!(!GetUpdateRect(main, None, false).as_bool());
+            SendMessageW(main, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+            assert!(!GetUpdateRect(main, None, false).as_bool());
+        }
+        drop(fixture);
+        unsafe {
+            assert!(!IsWindow(Some(main)).as_bool());
+            assert!(!IsWindow(Some(compact)).as_bool());
+        }
+    }
+
+    #[test]
+    fn paint_recovery_unwinds_clips_and_bounds_persistent_failure() {
+        let fixture = visible_paint_fixture("unsaved [link](https://example.test)");
+        fixture
+            .state
+            .app
+            .borrow_mut()
+            .doc_mut()
+            .replace_selection("x")
+            .unwrap();
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| {
+            *state.borrow_mut() = PaintTestState {
+                fault: Some(PaintFault::Drawing),
+                failures: 2,
+                ..Default::default()
+            }
+        });
+        unsafe {
+            let _ = InvalidateRect(Some(fixture.hwnd), None, false);
+            let _ = UpdateWindow(fixture.hwnd);
+            for view in &fixture.state.app.borrow().views {
+                for position in 0..view.text.len() as u32 {
+                    let mut effect = None;
+                    view.layout
+                        .GetDrawingEffect(position, &mut effect, None)
+                        .unwrap();
+                    assert!(
+                        effect.is_none(),
+                        "failed target brushes must leave retained layouts"
+                    );
+                }
+            }
+            assert!(
+                GetUpdateRect(fixture.hwnd, None, false).as_bool(),
+                "one retry must remain after EndPaint"
+            );
+            assert!(fixture.state.app.borrow().graphics.target.is_none());
+            let _ = UpdateWindow(fixture.hwnd);
+            assert!(
+                !GetUpdateRect(fixture.hwnd, None, false).as_bool(),
+                "persistent failure must stop retrying"
+            );
+            PAINT_TEST.with(|state| {
+                let state = state.borrow();
+                assert_eq!((state.began, state.ended, state.unwound_clips), (2, 2, 4));
+            });
+            fixture.state.app.borrow_mut().refresh();
+            let _ = UpdateWindow(fixture.hwnd);
+        }
+        let app = fixture.state.app.borrow();
+        assert!(app.graphics.target.is_some());
+        assert!(!app.full_paint);
+        assert!(!app.paint_retry_pending);
+        assert_eq!(document_state(app.doc()), before);
+        PAINT_TEST.with(|state| {
+            let state = state.borrow();
+            assert_eq!((state.began, state.ended), (3, 3));
+        });
+    }
+
+    #[test]
+    fn paint_recovery_target_and_enddraw_failures_recreate_full_frame() {
+        for fault in [PaintFault::Target, PaintFault::EndDraw] {
+            let fixture = visible_paint_fixture("retained body");
+            let before = document_state(fixture.state.app.borrow().doc());
+            PAINT_TEST.with(|state| {
+                *state.borrow_mut() = PaintTestState {
+                    fault: Some(fault),
+                    failures: 1,
+                    ..Default::default()
+                }
+            });
+            unsafe {
+                let partial = RECT {
+                    left: 1,
+                    top: 2,
+                    right: 8,
+                    bottom: 9,
+                };
+                let _ = InvalidateRect(Some(fixture.hwnd), Some(&partial), false);
+                let _ = UpdateWindow(fixture.hwnd);
+                assert!(fixture.state.app.borrow().graphics.target.is_none());
+                assert!(GetUpdateRect(fixture.hwnd, None, false).as_bool());
+                let _ = UpdateWindow(fixture.hwnd);
+                let mut app = fixture.state.app.borrow_mut();
+                let size = app.target().unwrap().GetSize();
+                PAINT_TEST.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(state.damage, Some(rect(0., 0., size.width, size.height)));
+                    let expected = if fault == PaintFault::Target { 1 } else { 2 };
+                    assert_eq!((state.began, state.ended), (expected, expected));
+                });
+                let small = rect(2., 3., 4., 5.);
+                app.paint(small).unwrap();
+                PAINT_TEST.with(|state| assert_eq!(state.borrow().damage, Some(small)));
+                assert_eq!(document_state(app.doc()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn paint_recovery_inactive_main_and_compact_share_target_recovery() {
+        let mut fixture = visible_paint_fixture("body owned by Compact");
+        let compact = fixture.create_compact();
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact;
+        }
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| {
+            *state.borrow_mut() = PaintTestState {
+                fault: Some(PaintFault::Drawing),
+                failures: 1,
+                ..Default::default()
+            }
+        });
+        unsafe {
+            let _ = InvalidateRect(Some(fixture.hwnd), None, false);
+            let _ = UpdateWindow(fixture.hwnd);
+            assert!(fixture.state.app.borrow().graphics.target.is_none());
+            assert!(GetUpdateRect(fixture.hwnd, None, false).as_bool());
+            let _ = UpdateWindow(fixture.hwnd);
+            let mut app = fixture.state.app.borrow_mut();
+            assert_eq!(app.target().unwrap().GetHwnd(), fixture.hwnd);
+            PAINT_TEST.with(|state| {
+                let state = state.borrow();
+                assert_eq!((state.began, state.ended, state.unwound_clips), (2, 2, 2));
+            });
+            for surface in [compact, fixture.hwnd] {
+                app.select_surface(surface);
+                assert!(app.full_paint);
+                app.paint(rect(1., 2., 3., 4.)).unwrap();
+                assert_eq!(app.target().unwrap().GetHwnd(), surface);
+                assert!(!app.full_paint);
+            }
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+
+    #[test]
+    fn paint_recovery_resize_invalidates_frame_and_discards_failed_target() {
+        let fixture = EditorFixture::new("resize body", false);
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            let small = rect(2., 3., 4., 5.);
+            app.paint(small).unwrap();
+            let target = app.target().unwrap();
+            let size = target.GetPixelSize();
+            app.resize_target(size);
+            app.paint(small).unwrap();
+            let full = target.GetSize();
+            PAINT_TEST.with(|state| {
+                assert_eq!(
+                    state.borrow().damage,
+                    Some(rect(0., 0., full.width, full.height))
+                )
+            });
+            PAINT_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.fault = Some(PaintFault::Resize);
+                state.failures = 1;
+            });
+            app.resize_target(size);
+            assert!(app.graphics.target.is_none());
+            app.paint(small).unwrap();
+            assert_ne!(app.target().unwrap().as_raw(), target.as_raw());
+            PAINT_TEST.with(|state| {
+                assert_eq!(
+                    state.borrow().damage,
+                    Some(rect(0., 0., full.width, full.height))
+                )
+            });
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+
     #[test]
     fn deferred_parent_paint_merges_owned_surfaces_and_preserves_editor_state() {
         let fixture = EditorFixture::new("body", false);
@@ -8565,7 +9606,7 @@ mod tests {
             app.preedit = "未確定".into();
             app.close_after_composition = Some((WM_CLOSE, WPARAM(0), LPARAM(0)));
             fixture.state.notifications.borrow_mut().push_back((
-                app.doc().id(),
+                app.ime_session.unwrap(),
                 NativeNotification::Update(ImeUpdate {
                     flags: GCS_RESULTSTR.0,
                     result: Some("確定".into()),
@@ -9298,6 +10339,72 @@ mod tests {
         assert_eq!(app.doc().redo_count(), 0);
     }
     #[test]
+    fn editor_ctrl_vertical_tracks_physical_starts_with_hidden_heading() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("alpha beta{eol}{eol}# Heading text");
+            let blank_start = "alpha beta".len() + eol.len();
+            let heading_start = blank_start + eol.len();
+            for raw in [false, true] {
+                let fixture = EditorFixture::new(&source, raw);
+                let mut app = fixture.state.app.borrow_mut();
+                if !raw {
+                    let projection = &app.projection_cache.as_ref().unwrap().2;
+                    assert!(projection.blocks.iter().any(|block| {
+                        block.source.start == heading_start
+                            && matches!(block.kind, BlockKind::Heading { .. })
+                    }));
+                }
+                assert!(
+                    app.views
+                        .iter()
+                        .any(|view| view.map.contains(&(heading_start + 2))),
+                    "heading body was not laid out (raw={raw}, eol={eol:?})"
+                );
+
+                let before = document_state(app.doc());
+                for (key, expected) in [
+                    (VK_DOWN.0, blank_start),
+                    (VK_DOWN.0, heading_start),
+                    (VK_UP.0, blank_start),
+                    (VK_UP.0, 0),
+                ] {
+                    unsafe { app.key_with_modifiers(key, true, false) };
+                    assert_eq!(
+                        app.doc().selection(),
+                        Selection::caret(expected),
+                        "physical line start (raw={raw}, eol={eol:?}, key={key:#x})"
+                    );
+                }
+
+                app.doc_mut().set_selection(2, 2).unwrap();
+                for (key, expected) in [
+                    (VK_DOWN.0, blank_start),
+                    (VK_DOWN.0, heading_start),
+                    (VK_UP.0, blank_start),
+                    (VK_UP.0, 0),
+                ] {
+                    unsafe { app.key_with_modifiers(key, true, true) };
+                    assert_eq!(
+                        app.doc().selection(),
+                        Selection {
+                            anchor: 2,
+                            head: expected,
+                        },
+                        "Shift anchor or physical line start (raw={raw}, eol={eol:?}, key={key:#x})"
+                    );
+                }
+
+                let after = document_state(app.doc());
+                assert_eq!(after.0, before.0);
+                assert_eq!(after.1, before.1);
+                assert_eq!(after.2, before.2);
+                assert_eq!(after.3, before.3);
+                assert_eq!(after.4, before.4);
+                assert_eq!(after.5, before.5);
+            }
+        }
+    }
+    #[test]
     fn editor_typed_markdown_transitions_keep_source_caret_and_code_literal() {
         for source in [
             "*italic*",
@@ -9446,6 +10553,8 @@ mod tests {
             images: Vec::new(),
             image_cache: HashMap::new(),
             minimized: false,
+            full_paint: true,
+            paint_retry_pending: false,
             animation_timer_armed: false,
             height: 0.0,
             width: 900.0,
@@ -9464,6 +10573,11 @@ mod tests {
             ime_attributes: Vec::new(),
             ime_last_result: None,
             reconversion_owner: None,
+            pending_reconversion: None,
+            ime_ingress: Rc::default(),
+            ime_session: None,
+            ime_generation: 0,
+            reconversion_cancel: None,
             preferred_x: None,
             typing: false,
             last_typing: None,
@@ -10515,6 +11629,658 @@ mod tests {
         app.preedit = "日本語".into();
         app
     }
+    fn owned_cancel_input(app: &App, key: u16) -> Option<ImeInputContext> {
+        Some(ImeInputContext {
+            document_id: app.doc().id(),
+            virtual_key: key as u32,
+        })
+    }
+    fn owned_cancel_snapshot(app: &App) -> ReconversionCancel {
+        app.prepare_reconversion_cancel(
+            app.ime_ingress.current.get(),
+            owned_cancel_input(app, VK_ESCAPE.0),
+            app.editing_window(),
+        )
+        .unwrap()
+    }
+    fn owned_result(text: &str) -> NativeNotification {
+        NativeNotification::Update(ImeUpdate {
+            flags: GCS_RESULTSTR.0,
+            result: Some(text.into()),
+            ..Default::default()
+        })
+    }
+    #[test]
+    fn ime_owned_cancel_success_drains_callbacks_without_source_or_selection_edits() {
+        for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After] {
+            let state = WindowState::new(ime_reconversion_test_app(affinity));
+            let mut app = state.app.borrow_mut();
+            let before = document_state(app.doc());
+            let cancel = owned_cancel_snapshot(&app);
+            unsafe {
+                perform_reconversion_cancel(&state, &mut app, cancel, |editor| {
+                    assert_eq!(editor, cancel.envelope.editor);
+                    assert!(state.app.try_borrow_mut().is_err());
+                    // Callbacks snapshot while the native operation holds App.
+                    state
+                        .notifications
+                        .borrow_mut()
+                        .push_back((cancel.envelope, owned_result("changed callback")));
+                    state
+                        .notifications
+                        .borrow_mut()
+                        .push_back((cancel.envelope, NativeNotification::End));
+                    ImeCancelOutcome::Cancelled
+                });
+            }
+            assert_eq!(document_state(app.doc()), before);
+            assert_eq!(app.doc().selection_affinity(), affinity);
+            assert!(app.ime_session.is_none());
+            assert!(app.ime_ingress.current.get().is_none());
+            assert!(app.reconversion_owner.is_none());
+            assert!(app.reconversion_cancel.is_none());
+            assert!(state.notifications.borrow().is_empty());
+            // A callback first arriving after completion has no live ingress.
+            // No ambient Escape or text equality is consulted.
+            let late =
+                state
+                    .ime_ingress
+                    .capture(app.doc().id(), app.editing_window(), WM_IME_COMPOSITION);
+            assert_eq!(late.generation, 0);
+            unsafe {
+                app.native_packet(late, owned_result("日本語"));
+            }
+            assert_eq!(document_state(app.doc()), before);
+            // The next ordinary Enter acts immediately on the preserved selection.
+            unsafe {
+                app.key_with_modifiers(VK_RETURN.0, false, false);
+            }
+            assert_eq!(app.doc().source(), "prefix\n");
+            assert_eq!(app.doc().undo_count(), before.4 + 1);
+            assert!(app.doc_mut().undo());
+            assert_eq!(app.doc().source(), before.0);
+            assert_eq!(app.doc().selection(), before.6);
+            assert_eq!(app.doc().selection_affinity(), affinity);
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_failed_outcomes_preserve_state_and_allow_only_fresh_attempt() {
+        for outcome in [ImeCancelOutcome::NoContext, ImeCancelOutcome::Rejected] {
+            let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::Before));
+            let mut app = state.app.borrow_mut();
+            let before = document_state(app.doc());
+            let preedit = app.preedit.clone();
+            let owner = app.ime_owner;
+            let cancel = owned_cancel_snapshot(&app);
+            unsafe {
+                perform_reconversion_cancel(&state, &mut app, cancel, |_| outcome);
+            }
+            assert_eq!(document_state(app.doc()), before);
+            assert_eq!(app.preedit, preedit);
+            assert_eq!(app.ime_owner, owner);
+            assert_eq!(app.ime_session, Some(cancel.envelope));
+            assert_eq!(state.ime_ingress.current.get(), Some(cancel.envelope));
+            assert!(app.reconversion_owner.is_some());
+            assert!(app.reconversion_cancel.is_none());
+            assert!(app.status.contains("失敗"));
+            let fresh = owned_cancel_snapshot(&app);
+            unsafe {
+                perform_reconversion_cancel(&state, &mut app, fresh, |_| {
+                    ImeCancelOutcome::Cancelled
+                });
+            }
+            assert!(!app.composing);
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_failed_direct_escape_cannot_use_legacy_result_suppression() {
+        let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::Before));
+        let input = owned_cancel_input(&state.app.borrow(), VK_ESCAPE.0);
+        let message = MSG {
+            message: WM_KEYDOWN,
+            wParam: WPARAM(VK_ESCAPE.0 as usize),
+            ..Default::default()
+        };
+        let _scope = state.scoped_ime_input(input, &message);
+        let mut app = state.app.borrow_mut();
+        let before = document_state(app.doc());
+        let cancel = owned_cancel_snapshot(&app);
+        unsafe {
+            perform_reconversion_cancel(&state, &mut app, cancel, |_| {
+                state.notifications.borrow_mut().push_back((
+                    cancel.envelope,
+                    NativeNotification::Update(ImeUpdate {
+                        flags: GCS_RESULTSTR.0,
+                        result: Some("日本語".into()),
+                        input_context: state.ime_input.get(),
+                        ..Default::default()
+                    }),
+                ));
+                ImeCancelOutcome::Rejected
+            });
+        }
+        assert_eq!(app.doc().selection(), Selection::caret(15));
+        assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::After);
+        assert_eq!(app.doc().source(), before.0);
+        assert_eq!(app.doc().revision(), before.2);
+        assert_eq!(
+            (app.doc().undo_count(), app.doc().redo_count()),
+            (before.4, before.5)
+        );
+        assert!(state.ime_input.get().is_none());
+        assert!(app.reconversion_cancel.is_none());
+    }
+    #[test]
+    fn ime_owned_cancel_failed_native_result_keeps_ordinary_commit_semantics() {
+        let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::Before));
+        let mut app = state.app.borrow_mut();
+        let cancel = owned_cancel_snapshot(&app);
+        let undo = app.doc().undo_count();
+        unsafe {
+            perform_reconversion_cancel(&state, &mut app, cancel, |_| {
+                state
+                    .notifications
+                    .borrow_mut()
+                    .push_back((cancel.envelope, owned_result("にほんご")));
+                ImeCancelOutcome::Rejected
+            });
+        }
+        assert_eq!(app.doc().source(), "prefixにほんご");
+        assert_eq!(app.doc().undo_count(), undo + 1);
+        assert!(app.reconversion_owner.is_none());
+        assert!(app.reconversion_cancel.is_none());
+    }
+    #[test]
+    fn ime_owned_cancel_captured_old_packets_cannot_edit_or_end_fresh_same_owner_session() {
+        let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::After));
+        let mut app = state.app.borrow_mut();
+        let before = document_state(app.doc());
+        let cancel = owned_cancel_snapshot(&app);
+        let mut fresh = None;
+        unsafe {
+            perform_reconversion_cancel(&state, &mut app, cancel, |_| {
+                let mut queue = state.notifications.borrow_mut();
+                queue.push_back((cancel.envelope, owned_result("stale result")));
+                let next = state.ime_ingress.capture(
+                    cancel.envelope.document_id,
+                    cancel.envelope.editor,
+                    WM_IME_STARTCOMPOSITION,
+                );
+                assert_ne!(next, cancel.envelope);
+                fresh = Some(next);
+                queue.push_back((next, NativeNotification::Start));
+                queue.push_back((cancel.envelope, NativeNotification::End));
+                queue.push_back((next, owned_result("日本語")));
+                ImeCancelOutcome::Cancelled
+            });
+        }
+        let fresh = fresh.unwrap();
+        assert_eq!(app.ime_session, Some(fresh));
+        assert_eq!(state.ime_ingress.current.get(), Some(fresh));
+        assert!(app.composing);
+        assert_eq!(app.doc().source(), before.0);
+        assert_eq!(app.doc().revision(), before.2);
+        assert_eq!(app.doc().selection(), Selection::caret(15));
+        assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::After);
+        assert_eq!(app.doc().undo_count(), before.4);
+        unsafe {
+            app.native_packet(cancel.envelope, owned_result("stale result"));
+            app.native_packet(cancel.envelope, NativeNotification::End);
+            app.native_packet(cancel.envelope, NativeNotification::Start);
+        }
+        assert_eq!(app.ime_session, Some(fresh));
+        assert_eq!(app.doc().source(), before.0);
+        // A raw callback arriving NOW is assigned the fresh ingress. IMM has no
+        // old-native provenance; do not fake an old generation or suppress it.
+        let raw =
+            state
+                .ime_ingress
+                .capture(app.doc().id(), app.editing_window(), WM_IME_COMPOSITION);
+        assert_eq!(raw, fresh);
+    }
+    #[test]
+    fn ime_owned_cancel_fresh_identical_and_changed_genuine_commits_reset_fingerprint() {
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+        let original_epoch = app.ime_session.unwrap();
+        app.clear_composition();
+        let before = document_state(app.doc());
+        let mut epochs = vec![original_epoch.generation];
+        for _ in 0..2 {
+            app.doc_mut()
+                .set_selection_with_affinity(15, 6, BoundaryAffinity::Before)
+                .unwrap();
+            app.arm_reconversion();
+            app.start_composition();
+            let epoch = app.ime_session.unwrap();
+            assert!(!epochs.contains(&epoch.generation));
+            epochs.push(epoch.generation);
+            unsafe {
+                app.native_packet(epoch, owned_result("日本語"));
+            }
+            assert_eq!(app.doc().selection(), Selection::caret(15));
+            assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::After);
+            assert_eq!(app.doc().revision(), before.2);
+            assert!(app.reconversion_owner.is_none());
+            let end = app.ime_ingress.capture(
+                app.doc().id(),
+                app.editing_window(),
+                WM_IME_ENDCOMPOSITION,
+            );
+            unsafe {
+                app.native_packet(end, NativeNotification::End);
+            }
+        }
+        assert_eq!(app.doc().undo_count(), before.4);
+        for result in ["にほんご", "日本語"] {
+            let end = app.doc().source().len();
+            app.doc_mut().set_selection(6, end).unwrap();
+            app.start_composition();
+            let epoch = app.ime_session.unwrap();
+            let undo = app.doc().undo_count();
+            unsafe {
+                app.native_packet(epoch, owned_result(result));
+            }
+            assert_eq!(app.doc().source(), format!("prefix{result}"));
+            assert_eq!(app.doc().undo_count(), undo + 1);
+            unsafe {
+                app.native_packet(epoch, NativeNotification::End);
+            }
+            assert!(app.doc_mut().undo());
+            assert!(app.doc_mut().redo());
+            assert_eq!(app.doc().source(), format!("prefix{result}"));
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_admission_revalidates_key_editor_document_and_session() {
+        for case in 0..12 {
+            let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+            let captured = app.ime_session;
+            let mut editor = app.editing_window();
+            let mut input = owned_cancel_input(&app, VK_ESCAPE.0);
+            match case {
+                0 => app.reconversion_owner = None,
+                1 => input = None,
+                2 => input.as_mut().unwrap().virtual_key = VK_RETURN.0 as u32,
+                3 => input.as_mut().unwrap().virtual_key = VK_PROCESSKEY.0 as u32,
+                4 => input.as_mut().unwrap().document_id += 1,
+                5 => editor = HWND(std::ptr::dangling_mut()),
+                6 => app.doc_mut().set_selection(6, 15).unwrap(),
+                7 => app
+                    .doc_mut()
+                    .set_selection_with_affinity(15, 6, BoundaryAffinity::After)
+                    .unwrap(),
+                8 => app.reconversion_owner.as_mut().unwrap().revision += 1,
+                9 => {
+                    app.start_composition();
+                }
+                10 => app.ime_owner = None,
+                11 => {
+                    app.ime_ingress.start(app.doc().id(), editor);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                app.prepare_reconversion_cancel(captured, input, editor)
+                    .is_none(),
+                "case {case}"
+            );
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_confirm_preserves_filled_request_and_start_adopts_once() {
+        #[repr(C)]
+        struct Buffer {
+            request: RECONVERTSTRING,
+            text: [u16; 4],
+        }
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+        app.clear_composition();
+        unsafe {
+            assert!(app.ime_request(IMR_RECONVERTSTRING, LPARAM(0)).0 > 0);
+        }
+        assert!(app.pending_reconversion.is_none());
+        let mut buffer = Buffer {
+            request: RECONVERTSTRING {
+                dwSize: 1,
+                ..Default::default()
+            },
+            text: [0; 4],
+        };
+        let ptr = LPARAM((&mut buffer as *mut Buffer) as isize);
+        unsafe {
+            assert_eq!(app.ime_request(IMR_RECONVERTSTRING, ptr).0, 0);
+        }
+        assert!(app.pending_reconversion.is_none());
+        buffer.request.dwSize = std::mem::size_of::<Buffer>() as u32;
+        assert_eq!(
+            buffer.request.dwSize as usize,
+            std::mem::size_of::<Buffer>()
+        );
+        unsafe {
+            assert!(app.ime_request(IMR_RECONVERTSTRING, ptr).0 > 0);
+        }
+        let request = app.pending_reconversion.unwrap().request_id;
+        assert!(app.pending_reconversion.unwrap().generation.is_none());
+        unsafe {
+            assert_eq!(app.ime_request(IMR_CONFIRMRECONVERTSTRING, ptr).0, 1);
+        }
+        assert_eq!(app.pending_reconversion.unwrap().request_id, request);
+        app.start_composition();
+        let first = app.ime_session.unwrap();
+        assert_eq!(
+            app.reconversion_owner.unwrap().generation,
+            Some(first.generation)
+        );
+        unsafe {
+            assert_eq!(app.ime_request(IMR_CONFIRMRECONVERTSTRING, ptr).0, 1);
+        }
+        assert_eq!(app.reconversion_owner.unwrap().request_id, request);
+        assert_eq!(app.ime_session, Some(first));
+        app.start_composition();
+        assert_ne!(app.ime_session, Some(first));
+        assert!(app.reconversion_owner.is_none());
+        unsafe {
+            assert_eq!(app.ime_request(IMR_CONFIRMRECONVERTSTRING, ptr).0, 0);
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_filled_request_during_old_session_does_not_replace_active_owner() {
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+        let old = app.reconversion_owner.unwrap();
+        let old_epoch = app.ime_session.unwrap();
+        app.arm_reconversion();
+        let pending = app.pending_reconversion.unwrap();
+        assert_ne!(pending.request_id, old.request_id);
+        assert_eq!(app.reconversion_owner.unwrap().request_id, old.request_id);
+        // The old END cannot delete a later independently filled request.
+        unsafe {
+            app.native_packet(old_epoch, NativeNotification::End);
+        }
+        assert_eq!(
+            app.pending_reconversion.unwrap().request_id,
+            pending.request_id
+        );
+        app.start_composition();
+        assert_ne!(app.ime_session, Some(old_epoch));
+        assert_eq!(
+            app.reconversion_owner.unwrap().request_id,
+            pending.request_id
+        );
+        assert!(app.pending_reconversion.is_none());
+    }
+    #[test]
+    fn ime_owned_cancel_result_plus_preedit_zero_flags_focus_and_editor_changes() {
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+        unsafe {
+            app.apply_ime_update(ImeUpdate {
+                flags: GCS_RESULTSTR.0 | GCS_COMPSTR.0,
+                result: Some(String::new()),
+                preedit: Some("next".into()),
+                ..Default::default()
+            });
+        }
+        assert!(app.reconversion_owner.is_none());
+        assert_eq!(app.preedit, "next");
+        let epoch = app.ime_session.unwrap();
+        unsafe {
+            app.native_packet(epoch, NativeNotification::Update(ImeUpdate::default()));
+        }
+        assert!(app.ime_session.is_none());
+        assert!(app.ime_ingress.current.get().is_none());
+        unsafe {
+            app.native_packet(epoch, NativeNotification::End);
+        }
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::After);
+        let before = document_state(app.doc());
+        let epoch = app.ime_session;
+        let preedit = app.preedit.clone();
+        unsafe {
+            app.native_notification(NativeNotification::FocusLost);
+        }
+        assert_eq!(app.ime_session, epoch); // no HWND/HIMC: native failure
+        assert_eq!(app.preedit, preedit);
+        assert!(app.reconversion_owner.is_none());
+        app.shell.compact_window = HWND(std::ptr::dangling_mut());
+        app.invalidate_ime_editor();
+        assert!(app.ime_session.is_none());
+        assert_eq!(document_state(app.doc()), before);
+    }
+    #[test]
+    fn ime_owned_cancel_main_paint_surface_keeps_compact_editor_ownership() {
+        let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::Before));
+        let mut app = state.app.borrow_mut();
+        app.clear_composition();
+        let main = app.hwnd;
+        let compact = HWND(2usize as *mut _);
+        app.shell.compact_window = compact;
+        app.arm_reconversion();
+        app.start_composition();
+        app.hwnd = main; // incidental Main paint did not change editing_window
+        let cancel = owned_cancel_snapshot(&app);
+        assert_eq!(cancel.envelope.editor, compact);
+        assert_ne!(cancel.envelope.editor, app.hwnd);
+        let before = document_state(app.doc());
+        unsafe {
+            perform_reconversion_cancel(&state, &mut app, cancel, |editor| {
+                assert_eq!(editor, compact);
+                ImeCancelOutcome::Rejected
+            });
+        }
+        assert_eq!(app.ime_session, Some(cancel.envelope));
+        assert_eq!(document_state(app.doc()), before);
+    }
+    #[test]
+    fn ime_owned_cancel_success_refreshes_current_compact_surface_after_main_paint() {
+        let source = format!("{}日本語", "long text ".repeat(80));
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut fixture = visible_paint_fixture(&source);
+        let main = fixture.hwnd;
+        let compact = fixture.create_compact();
+        fixture.state.main_window.set(main);
+        fixture.state.editor_window.set(compact);
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = main;
+            app.shell.compact_window = compact;
+            app.select_surface(compact);
+            app.tabs[0].raw = true;
+            let word_start = source.len() - "日本語".len();
+            app.doc_mut()
+                .set_selection_with_affinity(source.len(), word_start, BoundaryAffinity::After)
+                .unwrap();
+            app.arm_reconversion();
+            app.start_composition();
+            app.preedit = "日本語".into();
+            assert_eq!(app.editing_window(), compact);
+            assert_eq!(app.ime_session.map(|session| session.editor), Some(compact));
+        }
+        unsafe {
+            let _ = ShowWindow(compact, SW_SHOWNOACTIVATE);
+            let mut main_client = RECT::default();
+            let mut compact_client = RECT::default();
+            GetClientRect(main, &mut main_client).unwrap();
+            GetClientRect(compact, &mut compact_client).unwrap();
+            assert!(compact_client.right < main_client.right);
+            let _ = UpdateWindow(main);
+            let _ = UpdateWindow(compact);
+        }
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            assert_eq!(app.hwnd, compact);
+            unsafe {
+                app.refresh();
+            }
+        }
+        unsafe {
+            let _ = UpdateWindow(compact);
+        }
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            app.select_surface(main);
+            unsafe {
+                app.refresh();
+            }
+        }
+        unsafe {
+            let _ = UpdateWindow(main);
+        }
+
+        let (cancel, main_caret, main_layout, before) = {
+            let app = fixture.state.app.borrow();
+            assert_eq!(app.hwnd, main);
+            assert_eq!(app.editing_window(), compact);
+            assert!(
+                app.ime_session
+                    .is_some_and(|session| session.editor == compact)
+            );
+            assert!(!unsafe { GetUpdateRect(compact, None, false).as_bool() });
+            (
+                owned_cancel_snapshot(&app),
+                app.caret,
+                app.layout_key,
+                document_state(app.doc()),
+            )
+        };
+        assert_eq!(cancel.envelope.editor, compact);
+
+        {
+            let mut app = fixture.state.app.borrow_mut();
+            unsafe {
+                perform_reconversion_cancel(&fixture.state, &mut app, cancel, |editor| {
+                    assert_eq!(editor, compact);
+                    ImeCancelOutcome::Cancelled
+                });
+            }
+            assert_eq!(document_state(app.doc()), before);
+            assert!(app.ime_session.is_none());
+            assert!(!app.composing);
+            assert_eq!(app.hwnd, compact, "completion refresh stayed on Main");
+            assert!(
+                app.full_paint,
+                "Compact surface switch did not require a full paint"
+            );
+            assert_ne!(
+                app.layout_key, main_layout,
+                "Compact layout was not recomputed"
+            );
+            assert_ne!(app.caret, main_caret, "Compact caret was not refreshed");
+        }
+        unsafe {
+            assert!(
+                GetUpdateRect(compact, None, false).as_bool(),
+                "successful cancellation did not invalidate Compact"
+            );
+            assert!(
+                !GetUpdateRect(main, None, false).as_bool(),
+                "successful cancellation invalidated Main instead of Compact"
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_pending_request_zero_flags_and_end_are_idempotent() {
+        for message in [WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION] {
+            let mut app = ime_reconversion_test_app(BoundaryAffinity::After);
+            app.clear_composition();
+            app.arm_reconversion();
+            assert!(app.pending_reconversion.is_some());
+            let envelope = app
+                .ime_ingress
+                .capture(app.doc().id(), app.editing_window(), message);
+            let notification = if message == WM_IME_COMPOSITION {
+                NativeNotification::Update(ImeUpdate::default())
+            } else {
+                NativeNotification::End
+            };
+            unsafe {
+                app.native_packet(envelope, notification);
+            }
+            assert!(app.pending_reconversion.is_none());
+            unsafe {
+                app.native_packet(envelope, NativeNotification::End);
+            }
+        }
+    }
+    #[test]
+    fn ime_owned_cancel_superseded_recovered_escape_cannot_suppress_new_session_result() {
+        let state = WindowState::new(ime_reconversion_test_app(BoundaryAffinity::Before));
+        let captured = state.ime_ingress.current.get();
+        let input = owned_cancel_input(&state.app.borrow(), VK_ESCAPE.0);
+        {
+            let mut app = state.app.borrow_mut();
+            app.arm_reconversion();
+            let fresh = state.ime_ingress.capture(
+                app.doc().id(),
+                app.editing_window(),
+                WM_IME_STARTCOMPOSITION,
+            );
+            state
+                .notifications
+                .borrow_mut()
+                .push_back((fresh, NativeNotification::Start));
+            unsafe {
+                drain_native_notifications(&state, &mut app);
+            }
+            assert!(app.reconversion_owner.is_some());
+            assert!(
+                app.prepare_reconversion_cancel(captured, input, app.editing_window())
+                    .is_none()
+            );
+        }
+        let current_input = state.ime_input_for_ingress(captured, input);
+        assert!(current_input.is_none());
+        let message = MSG {
+            message: WM_KEYDOWN,
+            wParam: WPARAM(VK_PROCESSKEY.0 as usize),
+            ..Default::default()
+        };
+        let _scope = state.scoped_ime_input(current_input, &message);
+        let mut app = state.app.borrow_mut();
+        let fresh = app.ime_session.unwrap();
+        unsafe {
+            app.native_packet(
+                fresh,
+                NativeNotification::Update(ImeUpdate {
+                    flags: GCS_RESULTSTR.0,
+                    result: Some("日本語".into()),
+                    input_context: state.ime_input.get(),
+                    ..Default::default()
+                }),
+            );
+        }
+        assert_eq!(app.doc().selection(), Selection::caret(15));
+        assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::After);
+        assert!(app.reconversion_owner.is_none());
+    }
+    #[test]
+    fn ime_owned_cancel_fresh_start_retires_prior_reconversion() {
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::Before);
+        assert!(app.reconversion_owner.is_some());
+        app.start_composition();
+        assert!(
+            app.reconversion_owner.is_none(),
+            "fresh START inherited cancellation eligibility"
+        );
+    }
+    #[test]
+    fn ime_owned_cancel_empty_result_retires_reconversion() {
+        let mut app = ime_reconversion_test_app(BoundaryAffinity::After);
+        unsafe {
+            app.apply_ime_update(ImeUpdate {
+                flags: GCS_RESULTSTR.0,
+                result: Some(String::new()),
+                ..Default::default()
+            })
+        };
+        assert!(
+            app.reconversion_owner.is_none(),
+            "empty result retained cancellation eligibility"
+        );
+    }
     #[test]
     fn ime_reconversion_pending_request_survives_keyframe_before_start() {
         for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After] {
@@ -10536,7 +12302,7 @@ mod tests {
                 // This is the production validation used after a new key frame
                 // drains older notifications, before START has been received.
                 app.invalidate_stale_reconversion();
-                assert_eq!(app.reconversion_owner.is_some(), !stale);
+                assert_eq!(app.pending_reconversion.is_some(), !stale);
                 app.start_composition();
                 unsafe {
                     app.apply_ime_update(ImeUpdate {
@@ -10677,7 +12443,7 @@ mod tests {
                 &message,
             );
             state.notifications.borrow_mut().push_back((
-                id,
+                state.ime_ingress.current.get().unwrap(),
                 NativeNotification::Update(ImeUpdate {
                     flags: GCS_RESULTSTR.0,
                     result: Some("日本語".into()),

@@ -1893,14 +1893,17 @@ impl FeaturePanes {
                 CalendarListState::Cancelled => "一覧の取得を中止しました".to_owned(),
             };
             if layout.status_height > 0.0 {
-                draw_feature_text(
+                draw_feature_text_single_line(
                     app,
                     target,
                     &status,
-                    body.x + 8.,
-                    list_y,
-                    body.width - 16.,
-                    layout.status_height,
+                    Rect {
+                        x: body.x + 8.,
+                        y: list_y,
+                        width: body.width - 16.,
+                        height: layout.status_height,
+                    },
+                    10.,
                     muted,
                 )?;
             }

@@ -12,8 +12,9 @@ use windows::{
     Win32::{
         Foundation::*,
         UI::{
+            Controls::{DRAWITEMSTRUCT, ODT_BUTTON},
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::*,
         },
     },
@@ -71,6 +72,13 @@ struct ActionContext {
     image_range: Option<Range<usize>>,
 }
 
+enum ActionCompletion {
+    None,
+    AfterInput,
+    Refresh,
+    MenuClosed(Option<usize>),
+}
+
 #[derive(Default)]
 pub(super) struct EditorActions {
     main_button: HWND,
@@ -79,6 +87,31 @@ pub(super) struct EditorActions {
 }
 
 impl EditorActions {
+    pub(super) unsafe fn owner_draw_button(
+        &self,
+        owner: HWND,
+        main: HWND,
+        compact: HWND,
+        message_id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> Option<shell::OwnerDrawState> {
+        unsafe {
+            if owner == HWND::default()
+                || item.CtlType != ODT_BUTTON
+                || message_id != TABLE_MENU
+                || item.CtlID as usize != TABLE_MENU
+                || item.hwndItem == HWND::default()
+                || !((owner == main && item.hwndItem == self.main_button)
+                    || (owner == compact && item.hwndItem == self.compact_button))
+                || GetParent(item.hwndItem).unwrap_or_default() != owner
+                || GetDlgCtrlID(item.hwndItem) as usize != TABLE_MENU
+            {
+                return None;
+            }
+            Some(shell::owner_draw_state(TOOLBAR_LABEL.into(), item))
+        }
+    }
+
     pub(super) fn sync(&mut self, app: &mut App) {
         if !app.is_markdown_document() {
             self.context = None;
@@ -118,16 +151,16 @@ impl EditorActions {
         unsafe { self.sync_controls(app) };
     }
 
-    pub(super) fn command(&mut self, app: &mut App, id: usize) -> bool {
+    fn command(&mut self, app: &mut App, id: usize) -> (bool, ActionCompletion) {
         if !is_editor_command(id) {
-            return false;
+            return (false, ActionCompletion::None);
         }
         self.sync(app);
         if !self.enabled(app, id) {
             app.status = self.disabled_reason(app, id).to_owned();
-            return true;
+            return (true, ActionCompletion::None);
         }
-        match id {
+        let completion = match id {
             TABLE_SOURCE => {
                 let raw = &mut app.tabs[app.active].raw;
                 *raw = !*raw;
@@ -136,18 +169,29 @@ impl EditorActions {
                 }
                 app.layout_key = None;
                 self.sync(app);
-                unsafe { app.refresh() };
+                ActionCompletion::Refresh
             }
             TABLE_MENU => self.open_menu(app),
             TABLE_OPERATIONS => {
                 self.focus_toolbar(app, TABLE_OPERATIONS);
+                ActionCompletion::None
             }
             IMAGE_NARROWER | IMAGE_WIDER | IMAGE_320 | IMAGE_480 | IMAGE_640 => {
-                self.set_image_width(app, id);
+                if self.set_image_width(app, id) {
+                    ActionCompletion::AfterInput
+                } else {
+                    ActionCompletion::None
+                }
             }
-            _ => self.apply_table_action(app, id),
-        }
-        true
+            _ => {
+                if self.apply_table_action(app, id) {
+                    ActionCompletion::AfterInput
+                } else {
+                    ActionCompletion::None
+                }
+            }
+        };
+        (true, completion)
     }
 
     pub(super) fn enabled(&self, app: &App, id: usize) -> bool {
@@ -298,7 +342,18 @@ impl EditorActions {
                     self.main_button,
                     if main_active { SW_SHOW } else { SW_HIDE },
                 );
-                let _ = EnableWindow(self.main_button, button_enabled);
+                shell::enable_owner_button(
+                    shell::OwnerButtonPaint {
+                        recipient: main,
+                        parent: main,
+                        parent_id: None,
+                        child: self.main_button,
+                        id: TABLE_MENU,
+                        tokens: app.shell.tokens,
+                        label: TOOLBAR_LABEL.into(),
+                    },
+                    button_enabled,
+                );
                 if main_active && app.hwnd == main {
                     position_button(self.main_button, app.editor_right() - 114.0, 42.0, main);
                 }
@@ -316,7 +371,18 @@ impl EditorActions {
                     self.compact_button,
                     if compact_active { SW_SHOW } else { SW_HIDE },
                 );
-                let _ = EnableWindow(self.compact_button, button_enabled);
+                shell::enable_owner_button(
+                    shell::OwnerButtonPaint {
+                        recipient: compact,
+                        parent: compact,
+                        parent_id: None,
+                        child: self.compact_button,
+                        id: TABLE_MENU,
+                        tokens: app.shell.tokens,
+                        label: TOOLBAR_LABEL.into(),
+                    },
+                    button_enabled,
+                );
                 if compact_active && app.hwnd == compact {
                     position_button(self.compact_button, app.width - 114.0, 10.0, compact);
                 }
@@ -324,13 +390,13 @@ impl EditorActions {
         }
     }
 
-    fn open_menu(&mut self, app: &mut App) {
+    fn open_menu(&mut self, app: &mut App) -> ActionCompletion {
         if !self.focus_toolbar(app, TABLE_OPERATIONS) {
-            return;
+            return ActionCompletion::None;
         }
         let button = self.active_button(app);
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-            return;
+            return ActionCompletion::None;
         };
         for (id, label, _) in COMMANDS.iter().copied() {
             if matches!(id, TABLE_MENU | TABLE_OPERATIONS) {
@@ -352,7 +418,7 @@ impl EditorActions {
             unsafe {
                 let _ = DestroyMenu(menu);
             }
-            return;
+            return ActionCompletion::None;
         }
         let selected = unsafe {
             TrackPopupMenu(
@@ -369,13 +435,10 @@ impl EditorActions {
         unsafe {
             let _ = DestroyMenu(menu);
         }
-        if selected != 0 {
-            self.command(app, selected);
-        }
-        unsafe { app.after_input() };
+        ActionCompletion::MenuClosed((selected != 0).then_some(selected))
     }
 
-    fn active_button(&self, app: &App) -> HWND {
+    pub(super) fn active_button(&self, app: &App) -> HWND {
         if app.shell.compact_window != HWND::default() {
             self.compact_button
         } else {
@@ -383,28 +446,28 @@ impl EditorActions {
         }
     }
 
-    fn apply_table_action(&mut self, app: &mut App, id: usize) {
+    fn apply_table_action(&mut self, app: &mut App, id: usize) -> bool {
         let Some(context) = self.current_context(app) else {
-            return;
+            return false;
         };
         let Some(edit) = table_edit_for_context(app, context, id) else {
-            return;
+            return false;
         };
         app.doc_mut().break_undo_group();
         app.apply_table(edit);
         self.sync(app);
-        unsafe { app.after_input() };
+        true
     }
 
-    fn set_image_width(&mut self, app: &mut App, id: usize) {
+    fn set_image_width(&mut self, app: &mut App, id: usize) -> bool {
         let Some(context) = self.current_context(app) else {
-            return;
+            return false;
         };
         let Some(range) = context.image_range.clone() else {
-            return;
+            return false;
         };
         let Some(replacement) = image_replacement(app, context, id) else {
-            return;
+            return false;
         };
         app.doc_mut().break_undo_group();
         if let Err(error) = app.doc_mut().replace_range(range, &replacement) {
@@ -413,7 +476,7 @@ impl EditorActions {
             app.layout_key = None;
         }
         self.sync(app);
-        unsafe { app.after_input() };
+        true
     }
 
     fn current_context(&self, app: &App) -> Option<&ActionContext> {
@@ -440,9 +503,25 @@ impl App {
 
     pub(super) fn editor_action(&mut self, id: usize) -> bool {
         let mut actions = std::mem::take(&mut self.editor_actions);
-        let handled = actions.command(self, id);
-        self.editor_actions = actions;
+        let (handled, completion) = actions.command(self, id);
+        self.complete_editor_action(actions, completion);
         handled
+    }
+
+    fn complete_editor_action(&mut self, actions: EditorActions, completion: ActionCompletion) {
+        // Completion can lay out again and synchronize controls; restore their owner first.
+        self.editor_actions = actions;
+        match completion {
+            ActionCompletion::None => {}
+            ActionCompletion::AfterInput => unsafe { self.after_input() },
+            ActionCompletion::Refresh => unsafe { self.refresh() },
+            ActionCompletion::MenuClosed(selected) => {
+                if let Some(selected) = selected {
+                    let _ = self.editor_action(selected);
+                }
+                unsafe { self.after_input() };
+            }
+        }
     }
 
     pub(super) fn editor_enabled(&self, id: usize) -> bool {
@@ -574,6 +653,296 @@ mod tests {
 
     const TABLE: &str = "| H1 | H2 |\n| --- | --- |\n| a | b |\n| c | d |\n";
 
+    fn toolbar_button_count(owner: HWND, id: usize) -> usize {
+        let mut count = 0;
+        let mut child = unsafe { GetWindow(owner, GW_CHILD).unwrap_or_default() };
+        while child != HWND::default() {
+            if unsafe { GetDlgCtrlID(child) as usize } == id {
+                count += 1;
+            }
+            child = unsafe { GetWindow(child, GW_HWNDNEXT).unwrap_or_default() };
+        }
+        count
+    }
+
+    #[test]
+    fn editor_actions_owner_draw_routes_registered_main_and_compact_buttons_only() {
+        use windows::Win32::{
+            Graphics::Gdi::{GetDC, ReleaseDC},
+            UI::Controls::ODT_LISTBOX,
+        };
+        let main = super::super::tests::hidden_test_window_size(640, 480);
+        let compact = super::super::tests::hidden_test_window_size(640, 480);
+        let foreign = super::super::tests::hidden_test_window_size(640, 480);
+        let mut app = super::super::tests::composing_test_app(TABLE);
+        app.composing = false;
+        app.hwnd = main;
+        app.shell.enabled = true;
+        app.shell.main_window = main;
+        app.shell.compact_window = compact;
+        let before = (
+            app.doc().source_shared(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().is_dirty(),
+        );
+        unsafe {
+            app.editor_actions_init();
+            for (owner, button) in [
+                (main, app.editor_actions.main_button),
+                (compact, app.editor_actions.compact_button),
+            ] {
+                let dc = GetDC(Some(owner));
+                let mut item = DRAWITEMSTRUCT {
+                    CtlType: ODT_BUTTON,
+                    CtlID: TABLE_MENU as u32,
+                    hwndItem: button,
+                    hDC: dc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 110,
+                        bottom: 24,
+                    },
+                    ..Default::default()
+                };
+                assert_eq!(
+                    app.editor_actions
+                        .owner_draw_button(owner, main, compact, TABLE_MENU, &item,)
+                        .unwrap()
+                        .label,
+                    TOOLBAR_LABEL
+                );
+                assert_eq!(
+                    app.shell_window_message(
+                        owner,
+                        WM_DRAWITEM,
+                        WPARAM(TABLE_MENU),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    ),
+                    Some(LRESULT(1))
+                );
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(foreign, main, compact, TABLE_MENU, &item,)
+                        .is_none()
+                );
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(owner, main, compact, TABLE_MENU + 1, &item,)
+                        .is_none()
+                );
+                item.CtlType = ODT_LISTBOX;
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(owner, main, compact, TABLE_MENU, &item,)
+                        .is_none()
+                );
+                item.CtlType = ODT_BUTTON;
+                let unregistered = shell::control(
+                    owner,
+                    w!("BUTTON"),
+                    "foreign",
+                    TABLE_MENU,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                );
+                item.hwndItem = unregistered;
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(owner, main, compact, TABLE_MENU, &item,)
+                        .is_none()
+                );
+                item.hwndItem = button;
+                let _ = SetParent(button, Some(foreign));
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(foreign, main, compact, TABLE_MENU, &item,)
+                        .is_none()
+                );
+                let _ = SetParent(button, Some(owner));
+                SetWindowLongPtrW(button, GWLP_ID, TABLE_MENU as isize + 1);
+                assert!(
+                    app.editor_actions
+                        .owner_draw_button(owner, main, compact, TABLE_MENU, &item,)
+                        .is_none()
+                );
+                SetWindowLongPtrW(button, GWLP_ID, TABLE_MENU as isize);
+                ReleaseDC(Some(owner), dc);
+            }
+            assert_eq!(
+                (
+                    app.doc().source_shared(),
+                    app.doc().revision(),
+                    app.doc().selection(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().is_dirty()
+                ),
+                before
+            );
+            DestroyWindow(foreign).unwrap();
+            DestroyWindow(compact).unwrap();
+            DestroyWindow(main).unwrap();
+        }
+    }
+
+    #[test]
+    fn canceled_menu_completion_preserves_registered_toolbar_controls() {
+        let main = super::super::tests::hidden_test_window_size(900, 520);
+        let mut app = super::super::tests::composing_test_app(TABLE);
+        app.composing = false;
+        app.hwnd = main;
+        app.shell.enabled = true;
+        app.shell.main_window = main;
+        let before = (
+            app.doc().id(),
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().is_dirty(),
+        );
+
+        unsafe { app.editor_actions_init() };
+        let original_button = app.editor_actions.main_button;
+        assert_ne!(original_button, HWND::default());
+        assert_eq!(
+            unsafe { GetParent(original_button).unwrap_or_default() },
+            main
+        );
+        let original_count = toolbar_button_count(main, TABLE_MENU);
+        assert_eq!(original_count, 1);
+        assert_eq!(shell::text_of(original_button), TOOLBAR_LABEL);
+
+        let actions = std::mem::take(&mut app.editor_actions);
+        app.complete_editor_action(actions, ActionCompletion::MenuClosed(None));
+
+        assert!(unsafe { IsWindow(Some(original_button)).as_bool() });
+        assert_eq!(app.editor_actions.main_button, original_button);
+        assert_eq!(toolbar_button_count(main, TABLE_MENU), original_count);
+        assert_eq!(shell::text_of(original_button), TOOLBAR_LABEL);
+        assert_eq!(
+            (
+                app.doc().id(),
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+                app.doc().is_dirty(),
+            ),
+            before
+        );
+        unsafe { DestroyWindow(main).unwrap() };
+    }
+
+    #[test]
+    fn table_toolbar_ctrl_z_undoes_the_active_document_without_losing_focus() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CONTROL,
+        };
+
+        struct KeyboardState([u8; 256]);
+        impl KeyboardState {
+            fn with_control() -> Self {
+                let mut original = [0u8; 256];
+                unsafe { GetKeyboardState(&mut original).unwrap() };
+                let mut pressed = original;
+                pressed[VK_CONTROL.0 as usize] |= 0x80;
+                unsafe { SetKeyboardState(&pressed).unwrap() };
+                assert!(unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0);
+                Self(original)
+            }
+        }
+        impl Drop for KeyboardState {
+            fn drop(&mut self) {
+                unsafe { SetKeyboardState(&self.0).unwrap() };
+            }
+        }
+
+        let fixture = super::super::tests::MessagePumpFixture::new(
+            super::super::tests::composing_test_app(TABLE),
+        );
+        let mut app = fixture.state.app.borrow_mut();
+        app.clear_composition();
+        app.hwnd = fixture.hwnd;
+        app.shell.enabled = true;
+        app.shell.main_window = fixture.hwnd;
+        let cell = TABLE.find("a").unwrap();
+        app.doc_mut().set_selection(cell, cell).unwrap();
+        unsafe { app.editor_actions_init() };
+        let button = app.editor_actions.active_button(&app);
+        assert_eq!(unsafe { GetDlgCtrlID(button) as usize }, TABLE_MENU);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+        unsafe {
+            let _ = SetFocus(Some(button));
+        };
+        assert_eq!(unsafe { GetFocus() }, button);
+        let actions = std::mem::take(&mut app.editor_actions);
+        app.complete_editor_action(actions, ActionCompletion::MenuClosed(None));
+        assert_eq!(app.editor_actions.active_button(&app), button);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+
+        assert!(app.editor_action(ROW_ABOVE));
+        assert_ne!(app.doc().source(), TABLE);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+        let handled = {
+            let _keyboard = KeyboardState::with_control();
+            assert!(
+                unsafe { PostMessageW(Some(button), WM_KEYDOWN, WPARAM(0x5a), LPARAM(1)) }.is_ok()
+            );
+            let mut message = MSG::default();
+            assert!(
+                unsafe {
+                    PeekMessageW(
+                        &mut message,
+                        Some(button),
+                        WM_KEYDOWN,
+                        WM_KEYDOWN,
+                        PM_REMOVE,
+                    )
+                }
+                .as_bool()
+            );
+            app.shell_message(&message)
+        };
+        assert!(handled);
+        assert_eq!(unsafe { GetFocus() }, button);
+        drop(app);
+
+        let mut command = MSG::default();
+        assert!(
+            unsafe {
+                PeekMessageW(
+                    &mut command,
+                    Some(fixture.hwnd),
+                    WM_COMMAND,
+                    WM_COMMAND,
+                    PM_REMOVE,
+                )
+            }
+            .as_bool()
+        );
+        assert_eq!(command.wParam.0 & 0xffff, shell::EDITOR_HISTORY_UNDO);
+        unsafe {
+            let _ = TranslateMessage(&command);
+            DispatchMessageW(&command);
+        }
+
+        let app = fixture.state.app.borrow();
+        assert_eq!(app.doc().source(), TABLE);
+        assert!(!app.doc().is_dirty());
+        assert_eq!(unsafe { GetFocus() }, button);
+        assert_eq!(app.editor_actions.active_button(&app), button);
+        assert_eq!(unsafe { GetDlgCtrlID(button) as usize }, TABLE_MENU);
+        assert_eq!(toolbar_button_count(fixture.hwnd, TABLE_MENU), 1);
+        assert_eq!(shell::text_of(button), TOOLBAR_LABEL);
+    }
     #[test]
     fn registry_ids_are_unique_and_within_the_shared_range() {
         let ids: Vec<_> = COMMANDS.iter().map(|entry| entry.0).collect();

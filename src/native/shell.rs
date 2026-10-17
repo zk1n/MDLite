@@ -13,6 +13,8 @@ const RETURN: usize = 103;
 const RESET: usize = 104;
 const PALETTE_EXECUTE: usize = 105;
 const PALETTE_CANCEL: usize = 106;
+pub(super) const EDITOR_HISTORY_UNDO: usize = 0x7ef0;
+const EDITOR_HISTORY_REDO: usize = 0x7ef1;
 const ACTIVITY: usize = 110;
 const HEADER: usize = 130;
 const QUERY: usize = 150;
@@ -29,6 +31,83 @@ const NAMES: [&str; 4] = [
     "アウトライン",
     "Git（ソース管理）",
 ];
+
+pub(super) struct OwnerDrawState {
+    pub(super) label: String,
+    pub(super) enabled: bool,
+    pub(super) hovered: bool,
+    pub(super) pressed: bool,
+    pub(super) focused: bool,
+}
+
+// A single registered button's immutable paint inputs, scoped to one native
+// enabled-state call. This is not a cache of application or document state.
+pub(super) struct OwnerButtonPaint {
+    pub(super) recipient: HWND,
+    pub(super) parent: HWND,
+    pub(super) parent_id: Option<usize>,
+    pub(super) child: HWND,
+    pub(super) id: usize,
+    pub(super) tokens: Tokens,
+    pub(super) label: String,
+}
+impl OwnerButtonPaint {
+    pub(super) unsafe fn state(
+        &self,
+        recipient: HWND,
+        message_id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> Option<OwnerDrawState> {
+        unsafe {
+            if recipient != self.recipient
+                || recipient == HWND::default()
+                || item.CtlType != ODT_BUTTON
+                || item.CtlID as usize != self.id
+                || message_id != self.id
+                || item.hwndItem != self.child
+                || self.child == HWND::default()
+                || self.parent == HWND::default()
+                || GetParent(self.child).unwrap_or_default() != self.parent
+                || GetDlgCtrlID(self.child) as usize != self.id
+                || self
+                    .parent_id
+                    .is_some_and(|id| GetDlgCtrlID(self.parent) as usize != id)
+                || (self.parent != recipient
+                    && GetParent(self.parent).unwrap_or_default() != recipient)
+            {
+                return None;
+            }
+            Some(owner_draw_state(self.label.clone(), item))
+        }
+    }
+}
+pub(super) unsafe fn owner_draw_state(label: String, item: &DRAWITEMSTRUCT) -> OwnerDrawState {
+    OwnerDrawState {
+        label,
+        enabled: item.itemState.0 & ODS_DISABLED.0 == 0
+            && unsafe { IsWindowEnabled(item.hwndItem).as_bool() },
+        hovered: item.itemState.0 & ODS_HOTLIGHT.0 != 0,
+        pressed: item.itemState.0 & ODS_SELECTED.0 != 0,
+        focused: item.itemState.0 & ODS_FOCUS.0 != 0,
+    }
+}
+pub(super) unsafe fn enable_owner_button(paint: OwnerButtonPaint, enabled: bool) {
+    unsafe {
+        let child = paint.child;
+        if IsWindowEnabled(child).as_bool() == enabled {
+            return;
+        }
+        let pointer = GetWindowLongPtrW(paint.recipient, GWLP_USERDATA) as *const WindowState;
+        let _scope = if !pointer.is_null() && (&*pointer).owns_paint_surface(paint.recipient) {
+            Some(ButtonPaintScope::new(&*pointer, paint))
+        } else {
+            None
+        };
+        // The context's independent RefCell is no longer borrowed here. Native
+        // owner drawing may reenter while the caller still exclusively owns App.
+        let _ = EnableWindow(child, enabled);
+    }
+}
 const ICONS: [&str; 5] = [
     include_str!("../../assets/ui/icons/explorer.svg"),
     include_str!("../../assets/ui/icons/search.svg"),
@@ -438,6 +517,92 @@ pub(super) unsafe fn control(
         .unwrap_or_default()
     }
 }
+
+unsafe fn child_control_state(hwnd: HWND) -> Option<([i32; 4], bool)> {
+    unsafe {
+        let mut process = 0;
+        let thread = GetWindowThreadProcessId(hwnd, Some(&mut process));
+        if process != std::process::id()
+            || thread != windows_sys::Win32::System::Threading::GetCurrentThreadId()
+        {
+            return None;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if style & WS_CHILD.0 == 0 {
+            return None;
+        }
+        let parent = GetParent(hwnd).ok()?;
+        let mut parent_process = 0;
+        if GetWindowThreadProcessId(parent, Some(&mut parent_process)) != thread
+            || parent_process != process
+        {
+            return None;
+        }
+        let mut bounds = RECT::default();
+        GetWindowRect(hwnd, &mut bounds).ok()?;
+        let mut points = [
+            POINT {
+                x: bounds.left,
+                y: bounds.top,
+            },
+            POINT {
+                x: bounds.right,
+                y: bounds.bottom,
+            },
+        ];
+        // Zero is also a successful zero-offset map. Two points preserve RECT
+        // mapping when a parent uses mirrored coordinates.
+        SetLastError(ERROR_SUCCESS);
+        if MapWindowPoints(None, Some(parent), &mut points) == 0 && GetLastError() != ERROR_SUCCESS
+        {
+            return None;
+        }
+        if GetParent(hwnd).ok() != Some(parent) || !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        Some((
+            [
+                points[0].x,
+                points[0].y,
+                points[1].x - points[0].x,
+                points[1].y - points[0].y,
+            ],
+            style & WS_VISIBLE.0 != 0,
+        ))
+    }
+}
+
+pub(super) unsafe fn position_child_control(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> windows::core::Result<()> {
+    unsafe {
+        if child_control_state(hwnd).is_some_and(|(bounds, _)| bounds == [x, y, width, height]) {
+            return Ok(());
+        }
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    }
+}
+
+pub(super) unsafe fn show_child_control(hwnd: HWND, visible: bool) -> windows::core::BOOL {
+    unsafe {
+        if child_control_state(hwnd).is_some_and(|(_, shown)| shown == visible) {
+            return windows::core::BOOL(i32::from(visible));
+        }
+        ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE })
+    }
+}
 fn shell_geometry(
     layout: &PanelLayout,
     width: f32,
@@ -606,6 +771,7 @@ impl App {
                 self.shell.compact_target.take()
             };
             self.layout_key = None;
+            self.full_paint = true;
             self.image_cache.clear();
         }
         self.hwnd = hwnd;
@@ -889,9 +1055,9 @@ impl App {
             (
                 Rect {
                     x: 24.,
-                    y: 52.,
+                    y: TOP,
                     width: (self.width - 48.).max(1.),
-                    height: (height - 76.).max(1.),
+                    height: (height - TOP - 24.).max(1.),
                 },
                 std::array::from_fn(|i| (IDS[i], Rect::default())),
             )
@@ -912,14 +1078,12 @@ impl App {
         unsafe {
             let dpi = self.dpi;
             let position = |h: HWND, r: Rect| {
-                let _ = SetWindowPos(
+                let _ = position_child_control(
                     h,
-                    None,
                     (r.x * dpi) as i32,
                     (r.y * dpi) as i32,
                     (r.width * dpi).max(0.) as i32,
                     (r.height * dpi).max(0.) as i32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             };
             for (i, h) in self.shell.activity.iter().enumerate() {
@@ -949,7 +1113,7 @@ impl App {
             );
             for (i, h) in self.shell.headers.iter().enumerate() {
                 let r = panels[i].1;
-                let _ = ShowWindow(*h, if r.width > 0. { SW_SHOW } else { SW_HIDE });
+                let _ = show_child_control(*h, r.width > 0.);
                 position(
                     *h,
                     Rect {
@@ -1203,10 +1367,9 @@ impl App {
                 let mut area = item.rcItem;
                 let _ = SetBkMode(item.hDC, TRANSPARENT);
                 SetTextColor(item.hDC, rgb(self.shell.tokens.foreground));
-                let mut text = wide(&text);
-                DrawTextW(
+                draw_gdi_text(
                     item.hDC,
-                    &mut text,
+                    &text,
                     &mut area,
                     DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
                 );
@@ -1216,6 +1379,72 @@ impl App {
             }
         }
     }
+}
+pub(super) unsafe fn draw_owner_button(
+    tokens: Tokens,
+    item: &DRAWITEMSTRUCT,
+    state: &OwnerDrawState,
+) {
+    unsafe {
+        let dpi = (GetDpiForWindow(item.hwndItem) as f32 / 96.).max(1.);
+        let active = state.hovered || state.pressed;
+        let background = if active {
+            tokens.selected
+        } else {
+            tokens.panel
+        };
+        let border = if active || state.focused {
+            tokens.accent
+        } else {
+            tokens.border
+        };
+        let foreground = if state.enabled {
+            tokens.foreground
+        } else {
+            tokens.muted
+        };
+        let brush = CreateSolidBrush(rgb(background));
+        FillRect(item.hDC, &item.rcItem, brush);
+        let _ = DeleteObject(brush.into());
+
+        let border_brush = CreateSolidBrush(rgb(border));
+        FrameRect(item.hDC, &item.rcItem, border_brush);
+        let _ = DeleteObject(border_brush.into());
+
+        let mut area = RECT {
+            left: item.rcItem.left + (4. * dpi).round() as i32,
+            top: item.rcItem.top + (1. * dpi).round() as i32,
+            right: item.rcItem.right - (4. * dpi).round() as i32,
+            bottom: item.rcItem.bottom - (1. * dpi).round() as i32,
+        };
+        if state.pressed {
+            let offset = (1. * dpi).round() as i32;
+            area.left += offset;
+            area.top += offset;
+            area.right += offset;
+            area.bottom += offset;
+        }
+        let _ = SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, rgb(foreground));
+        draw_gdi_text(
+            item.hDC,
+            &state.label,
+            &mut area,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        if state.focused {
+            let inset = (3. * dpi).round() as i32;
+            let focus = RECT {
+                left: item.rcItem.left + inset,
+                top: item.rcItem.top + inset,
+                right: item.rcItem.right - inset,
+                bottom: item.rcItem.bottom - inset,
+            };
+            let _ = DrawFocusRect(item.hDC, &focus);
+        }
+    }
+}
+impl App {
     pub(super) unsafe fn shell_window_message(
         &mut self,
         hwnd: HWND,
@@ -1242,6 +1471,28 @@ impl App {
                     }
                     let item = &*(lp.0 as *const DRAWITEMSTRUCT);
                     let id = item.CtlID as usize;
+                    if hwnd == self.shell.main_window
+                        && let Some(state) = self.features.owner_draw_button(hwnd, wp.0, item)
+                    {
+                        draw_owner_button(self.shell.tokens, item, &state);
+                        return Some(LRESULT(1));
+                    }
+                    if hwnd == self.shell.main_window
+                        && let Some(state) = self.git_ui.owner_draw_button(hwnd, wp.0, item)
+                    {
+                        draw_owner_button(self.shell.tokens, item, &state);
+                        return Some(LRESULT(1));
+                    }
+                    if let Some(state) = self.editor_actions.owner_draw_button(
+                        hwnd,
+                        self.shell.main_window,
+                        self.shell.compact_window,
+                        wp.0,
+                        item,
+                    ) {
+                        draw_owner_button(self.shell.tokens, item, &state);
+                        return Some(LRESULT(1));
+                    }
                     if id != PALETTE
                         && !(ACTIVITY..ACTIVITY + 5).contains(&id)
                         && !(HEADER..HEADER + 4).contains(&id)
@@ -1251,7 +1502,9 @@ impl App {
                     self.draw_shell_button(item);
                     Some(LRESULT(1))
                 }
-                WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
+                WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC
+                    if hwnd == self.shell.main_window =>
+                {
                     let dc = HDC(wp.0 as *mut _);
                     SetTextColor(dc, rgb(self.shell.tokens.foreground));
                     SetBkColor(dc, rgb(self.shell.tokens.panel));
@@ -1297,24 +1550,6 @@ impl App {
                     self.return_from_compact();
                     Some(LRESULT(0))
                 }
-                WM_PAINT
-                    if hwnd == self.shell.main_window
-                        && self.shell.compact_window != HWND::default() =>
-                {
-                    let mut paint = PAINTSTRUCT::default();
-                    BeginPaint(hwnd, &mut paint);
-                    let _ = self.ensure_layout();
-                    if let Ok(t) = self.target() {
-                        t.BeginDraw();
-                        t.Clear(Some(&self.shell.tokens.background));
-                        let _ = self.draw_shell(&t);
-                        let _ = self.features_draw(&t);
-                        let _ = self.git_draw(&t);
-                        let _ = t.EndDraw(None, None);
-                    }
-                    let _ = EndPaint(hwnd, &paint);
-                    Some(LRESULT(0))
-                }
                 WM_KEYDOWN | WM_CHAR if hwnd != self.editing_window() => Some(LRESULT(0)),
                 _ => None,
             }
@@ -1324,6 +1559,22 @@ impl App {
         unsafe {
             if !self.shell.enabled {
                 return false;
+            }
+            if matches!(id, EDITOR_HISTORY_UNDO | EDITOR_HISTORY_REDO) {
+                if self.composing || self.feature_ime_active() || self.background_mutation_busy() {
+                    return true;
+                }
+                self.doc_mut().break_undo_group();
+                self.pending_surrogate = None;
+                self.pending_table_authoring = None;
+                self.preferred_x = None;
+                if id == EDITOR_HISTORY_REDO {
+                    self.doc_mut().redo();
+                } else {
+                    self.doc_mut().undo();
+                }
+                self.after_input();
+                return true;
             }
             if id == PALETTE_EXECUTE {
                 self.execute_palette();
@@ -1836,6 +2087,19 @@ impl App {
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+            if !self.feature_ime_active()
+                && !alt
+                && self.editor_actions.active_button(self) == msg.hwnd
+                && let Some(redo) = history_shortcut(msg.wParam.0 as u16, ctrl, shift)
+            {
+                let command = if redo {
+                    EDITOR_HISTORY_REDO
+                } else {
+                    EDITOR_HISTORY_UNDO
+                };
+                let _ = PostMessageW(Some(owner), WM_COMMAND, WPARAM(command), LPARAM(0));
+                return true;
+            }
             if !self.feature_ime_active() {
                 for c in commands() {
                     let global = matches!(
@@ -2229,6 +2493,24 @@ mod tests {
     }
 
     #[test]
+    fn compact_editor_body_starts_below_tab_strip_and_keeps_bottom_margin() {
+        let compact = super::super::tests::hidden_test_window_size(640, 480);
+        let mut app = super::super::tests::composing_test_app("body");
+        app.hwnd = compact;
+        app.width = 640.;
+        app.shell.enabled = true;
+        app.shell.compact_window = compact;
+        app.update_shell_geometry(480.);
+
+        assert_eq!(app.shell.editor.y, TOP);
+        assert_eq!(app.shell.editor.y + app.shell.editor.height, 480. - 24.);
+        assert!(app.shell.editor.y >= 75., "compact tabs end at y=75 DIP");
+        unsafe {
+            let _ = DestroyWindow(compact);
+        }
+    }
+
+    #[test]
     fn custom_heading_and_code_background_colors_reach_shell_tokens() {
         let mut tokens = Tokens::default();
         apply_custom_color_token(&mut tokens, "heading", "#123456");
@@ -2457,7 +2739,7 @@ mod tests {
                     parameter,
                     &mut app
                 ),
-                LRESULT(1)
+                Some(LRESULT(1))
             );
             item.CtlType = ODT_BUTTON;
             item.CtlID = PALETTE as u32;

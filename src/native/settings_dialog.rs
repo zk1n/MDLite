@@ -569,9 +569,9 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 SetTextColor(item.hDC, shell::rgb(form.tokens.foreground));
                 let _ = SetBkMode(item.hDC, TRANSPARENT);
                 let mut r = item.rcItem;
-                DrawTextW(
+                draw_gdi_text(
                     item.hDC,
-                    &mut wide(&shell::text_of(item.hwndItem)),
+                    &shell::text_of(item.hwndItem),
                     &mut r,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );

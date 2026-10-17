@@ -1,13 +1,13 @@
 //! Native small icons for the Explorer listbox's extension-based owner draw.
 
-use super::{shell, wide};
+use super::{draw_gdi_text, shell, wide};
 use std::path::Path;
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
         Graphics::Gdi::{
             CreateSolidBrush, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-            DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FillRect, GetStockObject, HGDIOBJ,
+            DT_VCENTER, DeleteObject, DrawFocusRect, FillRect, GetStockObject, HGDIOBJ,
             SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
         },
         Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
@@ -175,10 +175,9 @@ impl ExplorerIcons {
                         right: item.rcItem.right - padding,
                         bottom: item.rcItem.bottom,
                     };
-                    let mut display = wide(label);
-                    let _ = DrawTextW(
+                    let _ = draw_gdi_text(
                         item.hDC,
-                        &mut display,
+                        label,
                         &mut text_rect,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );

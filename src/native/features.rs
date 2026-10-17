@@ -39,16 +39,16 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::{Direct2D::*, Gdi::MapWindowPoints},
+        Graphics::{Direct2D::*, DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP, Gdi::MapWindowPoints},
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
         UI::{
             Controls::{
-                TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTS_ALWAYSTIP,
-                TTTOOLINFOW,
+                DRAWITEMSTRUCT, ODT_BUTTON, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS,
+                TTM_ADDTOOLW, TTS_ALWAYSTIP, TTTOOLINFOW,
             },
             Input::KeyboardAndMouse::{
-                EnableWindow, GetFocus, SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_NEXT, VK_PRIOR,
-                VK_RETURN, VK_RIGHT, VK_UP,
+                GetFocus, SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+                VK_RIGHT, VK_UP,
             },
             Shell::{
                 DefSubclassProc, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
@@ -70,6 +70,7 @@ const EXPLORER_LIST: usize = 4690;
 const QUICK_OPEN_LIST: usize = 4691;
 const CONTROL_BASE: usize = 4800;
 const BUTTON_OWNERDRAW: u32 = 0x0000000B;
+const BUTTON_NOTIFY: u32 = 0x00000400;
 const CALENDAR_GRID_TOP: f32 = 98.0;
 const CALENDAR_COMPACT_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_HEIGHT: f32 = 273.0;
@@ -79,6 +80,7 @@ const CALENDAR_LIST_GAP: f32 = 6.0;
 const CALENDAR_STATUS_HEIGHT: f32 = 17.0;
 const CALENDAR_ROW_HEIGHT: f32 = 18.0;
 const CALENDAR_CELL_INSET: f32 = 2.0;
+const CALENDAR_DAY_FONT_SIZE: f32 = 9.0;
 const PROFILE_BUTTON_FOOTER: f32 = 34.0;
 const PROFILE_LIST_TOP: f32 = 26.0;
 const OUTLINE_ROW_HEIGHT: f32 = 22.0;
@@ -258,6 +260,78 @@ struct CalendarLayout {
     rows_top: f32,
     status_height: f32,
     visible_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CalendarCellDrawBounds {
+    cell: Rect,
+    label: Rect,
+}
+
+fn calendar_cell_draw_bounds(
+    body: Rect,
+    layout: CalendarLayout,
+    index: usize,
+) -> Option<CalendarCellDrawBounds> {
+    if index >= 42 || body.width <= 0.0 || body.height <= 0.0 {
+        return None;
+    }
+    let cell_width = ((body.width - 10.0) / 7.0).max(1.0);
+    let column = index % 7;
+    let row = index / 7;
+    let raw_cell = Rect {
+        x: body.x + 6.0 + column as f32 * cell_width,
+        y: body.y + layout.grid_top + row as f32 * layout.week_step,
+        width: (cell_width - 2.0).max(0.0),
+        height: layout.cell_height.max(0.0),
+    };
+    let cell = intersect_rect(raw_cell, body)?;
+    let label = intersect_rect(
+        Rect {
+            x: cell.x + 1.0,
+            y: cell.y + 1.0,
+            width: (cell.width - 2.0).max(0.0),
+            height: (cell.height - 2.0).max(0.0),
+        },
+        cell,
+    )?;
+    Some(CalendarCellDrawBounds { cell, label })
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    (right > left && bottom > top).then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn calendar_day_label(day: i32, daily_file: bool, holiday: bool) -> String {
+    format!(
+        "{day}{}{}",
+        if daily_file { "•" } else { "" },
+        if holiday { "祝" } else { "" }
+    )
+}
+
+fn calendar_day_font_size(label: &str, width: f32) -> f32 {
+    let units = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_digit() {
+                0.55
+            } else {
+                1.0
+            }
+        })
+        .sum::<f32>()
+        .max(1.0);
+    (width.max(0.0) / units).clamp(1.0, CALENDAR_DAY_FONT_SIZE)
 }
 
 fn calendar_layout(body_height: f32) -> CalendarLayout {
@@ -564,6 +638,35 @@ const PROFILE_BUTTONS: [usize; 6] = [4080, 4081, 4082, 4083, 4084, 4088];
 const FORM_BUTTONS: [usize; 3] = [4085, 4086, 4087];
 
 impl FeaturePanes {
+    pub(super) unsafe fn owner_draw_button(
+        &self,
+        owner: HWND,
+        message_id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> Option<shell::OwnerDrawState> {
+        if self.controls.owner != owner
+            || item.CtlType != ODT_BUTTON
+            || item.CtlID as usize != message_id
+        {
+            return None;
+        }
+        let (control_id, command, hwnd, _) =
+            self.controls
+                .buttons
+                .iter()
+                .find(|(control_id, _, hwnd, _)| {
+                    *control_id == item.CtlID as usize && *hwnd == item.hwndItem
+                })?;
+        if *hwnd == HWND::default()
+            || unsafe { GetParent(*hwnd).unwrap_or_default() } != owner
+            || unsafe { GetDlgCtrlID(*hwnd) as u32 } != *control_id as u32
+        {
+            return None;
+        }
+        let (_, label, _) = COMMANDS.iter().find(|(id, _, _)| id == command)?;
+        Some(unsafe { shell::owner_draw_state(localized_label(*command, label), item) })
+    }
+
     unsafe fn create_controls(&mut self, owner: HWND, dpi: f32) {
         unsafe {
             self.controls.owner = owner;
@@ -660,7 +763,7 @@ impl FeaturePanes {
                     w!("BUTTON"),
                     &localized_label(command, label),
                     control_id,
-                    WINDOW_STYLE(BUTTON_OWNERDRAW),
+                    WINDOW_STYLE(BUTTON_OWNERDRAW | BUTTON_NOTIFY),
                 );
                 self.controls
                     .buttons
@@ -726,18 +829,16 @@ impl FeaturePanes {
     fn position_controls(&self, app: &App, layout: FeatureControlLayout) {
         unsafe {
             let position = |hwnd: HWND, rect: Rect| {
-                let _ = SetWindowPos(
+                let _ = shell::position_child_control(
                     hwnd,
-                    None,
                     (rect.x * layout.dpi) as i32,
                     (rect.y * layout.dpi) as i32,
                     (rect.width.max(0.) * layout.dpi) as i32,
                     (rect.height.max(0.) * layout.dpi) as i32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             };
             let show = |hwnd: HWND, visible: bool| {
-                let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+                let _ = shell::show_child_control(hwnd, visible);
             };
 
             let explorer = layout.explorer.unwrap_or_default();
@@ -895,7 +996,22 @@ impl FeaturePanes {
                 let visible = rect.width > 0. && self.button_visible(*command, *panel, prompt_mode);
                 show(*hwnd, visible);
                 let enabled = !app.background_mutation_busy() && app.features_enabled(*command);
-                let _ = EnableWindow(*hwnd, enabled);
+                shell::enable_owner_button(
+                    shell::OwnerButtonPaint {
+                        recipient: self.controls.owner,
+                        parent: self.controls.owner,
+                        parent_id: None,
+                        child: *hwnd,
+                        id: *control_id,
+                        tokens: app.shell.tokens,
+                        label: COMMANDS
+                            .iter()
+                            .find(|(id, _, _)| id == command)
+                            .map(|(_, label, _)| localized_label(*command, label))
+                            .unwrap_or_else(|| shell::text_of(*hwnd)),
+                    },
+                    enabled,
+                );
             }
         }
     }
@@ -1702,9 +1818,8 @@ impl FeaturePanes {
             &holidays,
             &self.calendar.daily_markers,
         );
-        let width = (body.width - 10.) / 7.;
+        let width = ((body.width - 10.) / 7.).max(1.0);
         let x0 = body.x + 5.;
-        let y0 = body.y + layout.grid_top;
         for (column, label) in ["日", "月", "火", "水", "木", "金", "土"]
             .iter()
             .enumerate()
@@ -1722,13 +1837,19 @@ impl FeaturePanes {
         }
         for (index, cell) in cells.iter().enumerate() {
             let row = index / 7;
-            let column = index % 7;
-            let x = x0 + column as f32 * width;
-            let y = y0 + row as f32 * layout.week_step;
+            let y = body.y + layout.grid_top + row as f32 * layout.week_step;
             if y + layout.cell_height > body.y + body.height {
                 break;
             }
-            let cell_rect = super::rect(x + 1., y, width - 2., layout.cell_height);
+            let Some(bounds) = calendar_cell_draw_bounds(body, layout, index) else {
+                continue;
+            };
+            let cell_rect = super::rect(
+                bounds.cell.x,
+                bounds.cell.y,
+                bounds.cell.width,
+                bounds.cell.height,
+            );
             if cell.marks.selected || cell.marks.focused {
                 unsafe {
                     target.FillRectangle(&cell_rect, selected);
@@ -1743,25 +1864,18 @@ impl FeaturePanes {
                 }
             }
             if let Some(date) = cell.date {
-                let label = format!(
-                    "{}{}{}",
-                    date.day,
-                    if cell.marks.daily_file { " •" } else { "" },
-                    if cell.marks.holiday { " 祝" } else { "" }
-                );
+                let label = calendar_day_label(date.day, cell.marks.daily_file, cell.marks.holiday);
                 let brush = if cell.marks.sunday || cell.marks.holiday {
                     accent
                 } else {
                     foreground
                 };
-                draw_feature_text(
+                draw_feature_text_single_line(
                     app,
                     target,
                     &label,
-                    x + 2.,
-                    y + 1.,
-                    width - 4.,
-                    (layout.cell_height - 2.).max(8.0),
+                    bounds.label,
+                    calendar_day_font_size(&label, bounds.label.width),
                     brush,
                 )?;
             }
@@ -1779,14 +1893,17 @@ impl FeaturePanes {
                 CalendarListState::Cancelled => "一覧の取得を中止しました".to_owned(),
             };
             if layout.status_height > 0.0 {
-                draw_feature_text(
+                draw_feature_text_single_line(
                     app,
                     target,
                     &status,
-                    body.x + 8.,
-                    list_y,
-                    body.width - 16.,
-                    layout.status_height,
+                    Rect {
+                        x: body.x + 8.,
+                        y: list_y,
+                        width: body.width - 16.,
+                        height: layout.status_height,
+                    },
+                    10.,
                     muted,
                 )?;
             }
@@ -2364,6 +2481,28 @@ fn draw_feature_text(
     unsafe {
         target.DrawTextLayout(
             super::point(x, y),
+            &layout,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+        );
+    }
+    Ok(())
+}
+
+fn draw_feature_text_single_line(
+    app: &App,
+    target: &ID2D1HwndRenderTarget,
+    text: &str,
+    bounds: Rect,
+    size: f32,
+    brush: &ID2D1SolidColorBrush,
+) -> windows::core::Result<()> {
+    let layout = unsafe { app.text_layout(text, bounds.width.max(1.0), size)? };
+    unsafe {
+        layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        layout.SetMaxHeight(bounds.height.max(1.0))?;
+        target.DrawTextLayout(
+            super::point(bounds.x, bounds.y),
             &layout,
             brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -4959,12 +5098,12 @@ fn localized_label(command: usize, label: &str) -> String {
         4020 => "前月".to_owned(),
         4021 => "次月".to_owned(),
         4022 => "今日".to_owned(),
-        4023 => "Daily".to_owned(),
-        4024 => "Meeting".to_owned(),
-        4025 => "Memo".to_owned(),
+        4023 => "日誌".to_owned(),
+        4024 => "会議".to_owned(),
+        4025 => "メモ".to_owned(),
         4026 => "祝日".to_owned(),
         4027 => "管理".to_owned(),
-        4028 => "今日Dairy".to_owned(),
+        4028 => "今日の日誌".to_owned(),
         CALENDAR_OPERATIONS_BUTTON => "操作…".to_owned(),
         4040 => "移動".to_owned(),
         4041 => "上へ".to_owned(),
@@ -5417,6 +5556,10 @@ fn recycle_paths(paths: &[PathBuf]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::{
+        Controls::{ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED},
+        Input::KeyboardAndMouse::EnableWindow,
+    };
 
     fn explorer_list_for_test(owner: HWND) -> HWND {
         unsafe {
@@ -5500,6 +5643,148 @@ mod tests {
         assert_eq!(calendar_layout(250.0).status_height, 0.0);
         assert_eq!(calendar_layout(273.0).grid_top, CALENDAR_GRID_TOP);
         assert_eq!(calendar_layout(320.0).visible_rows, 3);
+    }
+
+    #[test]
+    fn calendar_day_labels_keep_both_markers_on_one_bounded_line() {
+        assert_eq!(calendar_day_label(31, true, true), "31•祝");
+        assert_eq!(calendar_day_label(31, true, false), "31•");
+        assert_eq!(calendar_day_label(31, false, true), "31祝");
+
+        for body in [
+            Rect {
+                x: 13.0,
+                y: 7.0,
+                width: 180.0,
+                height: 180.0,
+            },
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 260.0,
+                height: 234.0,
+            },
+            Rect {
+                x: 6.0,
+                y: 12.0,
+                width: 320.0,
+                height: 320.0,
+            },
+        ] {
+            let layout = calendar_layout(body.height);
+            let right = body.x + body.width;
+            let bottom = body.y + body.height;
+            for index in 0..42 {
+                let Some(bounds) = calendar_cell_draw_bounds(body, layout, index) else {
+                    continue;
+                };
+                assert!(bounds.cell.x >= body.x);
+                assert!(bounds.cell.y >= body.y);
+                assert!(bounds.cell.x + bounds.cell.width <= right);
+                assert!(bounds.cell.y + bounds.cell.height <= bottom);
+                assert!(bounds.label.x >= bounds.cell.x);
+                assert!(bounds.label.y >= bounds.cell.y);
+                assert!(bounds.label.x + bounds.label.width <= bounds.cell.x + bounds.cell.width);
+                assert!(bounds.label.y + bounds.label.height <= bounds.cell.y + bounds.cell.height);
+                let size = calendar_day_font_size("31•祝", bounds.label.width);
+                assert!(size > 0.0 && size <= CALENDAR_DAY_FONT_SIZE);
+                assert!(size < bounds.cell.height);
+            }
+        }
+    }
+
+    #[test]
+    fn feature_owner_draw_requires_the_registered_parent_and_button_identity() {
+        let owner = super::super::tests::hidden_test_window_size(240, 80);
+        let other_owner = super::super::tests::hidden_test_window_size(240, 80);
+        unsafe {
+            let button = shell::control(
+                owner,
+                w!("BUTTON"),
+                "検索",
+                CONTROL_BASE,
+                WINDOW_STYLE(BUTTON_OWNERDRAW | BUTTON_NOTIFY),
+            );
+            let wrong_id_button = shell::control(
+                owner,
+                w!("BUTTON"),
+                "別のコントロール",
+                CONTROL_BASE + 1,
+                WINDOW_STYLE(BUTTON_OWNERDRAW | BUTTON_NOTIFY),
+            );
+            let mut features = FeaturePanes::default();
+            features.controls.owner = owner;
+            features
+                .controls
+                .buttons
+                .push((CONTROL_BASE, 4000, button, PanelId::Explorer));
+            let mut item = DRAWITEMSTRUCT {
+                CtlType: ODT_BUTTON,
+                CtlID: CONTROL_BASE as u32,
+                hwndItem: button,
+                ..Default::default()
+            };
+
+            let drawn = features
+                .owner_draw_button(owner, CONTROL_BASE, &item)
+                .expect("the registered Feature child belongs to this owner");
+            assert_eq!(drawn.label, "検索");
+            assert!(drawn.enabled);
+
+            item.itemState.0 = ODS_HOTLIGHT.0 | ODS_SELECTED.0 | ODS_FOCUS.0;
+            let drawn = features
+                .owner_draw_button(owner, CONTROL_BASE, &item)
+                .unwrap();
+            assert!(drawn.hovered && drawn.pressed && drawn.focused);
+
+            let _ = EnableWindow(button, false);
+            assert!(
+                !features
+                    .owner_draw_button(owner, CONTROL_BASE, &item)
+                    .unwrap()
+                    .enabled
+            );
+            let _ = EnableWindow(button, true);
+
+            assert!(
+                features
+                    .owner_draw_button(other_owner, CONTROL_BASE, &item)
+                    .is_none()
+            );
+            assert!(
+                features
+                    .owner_draw_button(owner, CONTROL_BASE + 1, &item)
+                    .is_none()
+            );
+            item.CtlType = windows::Win32::UI::Controls::ODT_LISTBOX;
+            assert!(
+                features
+                    .owner_draw_button(owner, CONTROL_BASE, &item)
+                    .is_none()
+            );
+            item.CtlType = ODT_BUTTON;
+            item.hwndItem = wrong_id_button;
+            features.controls.buttons[0].2 = wrong_id_button;
+            assert!(
+                features
+                    .owner_draw_button(owner, CONTROL_BASE, &item)
+                    .is_none()
+            );
+
+            features.controls.owner = other_owner;
+            item.hwndItem = button;
+            features.controls.buttons[0].2 = button;
+            assert!(
+                features
+                    .owner_draw_button(other_owner, CONTROL_BASE, &item)
+                    .is_none()
+            );
+
+            let _ = DestroyWindow(button);
+            let _ = DestroyWindow(wrong_id_button);
+            let _ = DestroyWindow(owner);
+            let _ = DestroyWindow(other_owner);
+        }
     }
 
     #[test]

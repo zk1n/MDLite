@@ -567,18 +567,16 @@ impl SearchPane {
             let visible = app.search_pane_active() && area.width > 0.0 && area.height > 0.0;
             let dpi = app.dpi.max(0.1);
             let position = |hwnd: HWND, r: Rect| {
-                let _ = SetWindowPos(
+                let _ = shell::position_child_control(
                     hwnd,
-                    None,
                     (r.x * dpi) as i32,
                     (r.y * dpi) as i32,
                     (r.width.max(0.0) * dpi) as i32,
                     (r.height.max(0.0) * dpi) as i32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             };
             let show = |hwnd: HWND, state: bool| {
-                let _ = ShowWindow(hwnd, if state { SW_SHOW } else { SW_HIDE });
+                let _ = shell::show_child_control(hwnd, state);
             };
             let left = area.x + 5.0;
             let width = (area.width - 10.0).max(0.0);

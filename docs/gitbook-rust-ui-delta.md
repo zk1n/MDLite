@@ -5,6 +5,26 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## 検索・コマンド表示復旧の反映対象
+
+Task `20261017-mdlite-ui-surface-recovery` Rev1の局所差分。2026年10月17日の
+`product-ui`／`architecture-verification`限定更新を基準とし、旧C++節の履歴は維持する。
+最終commit・build・実画面の合否は受入記録とHANDOFFに結び付ける。
+今回の成果は未完了の作業branch checkpointで、developへは統合しない。
+初回queryの一括入力で文字順が入れ替わるC05 FAILと、C01／C03のPARTIALを明記し、
+GitBookの公開仕様へ受入済みとして反映しない。
+
+| 対象章 | 反映する契約・実装差分 |
+|---|---|
+| 製品概要と画面操作 | ExplorerとSearchは独立した論理viewで、既存sidebar領域を排他的に使う。非表示部品へfocusや入力を残さず、query・設定・Explorer状態を保持する。 |
+| 製品概要と画面操作 | パレットは一つのclient内hostで表示し、resize後も収める。IME取消を優先するEsc、外側の最初のクリックを消費するdismiss、実行・取消ごとのfocus復帰契約を記す。 |
+| 検索・置換とパネル操作 | queryと結果を優先し、置換・対象詳細を展開する。Explorer／Search／Calendar／Outline／Gitの低頻度操作はheaderメニュー・既存popup・パレットへ移し、registryと安全条件を維持する。 |
+| 構成と検証の境界 | App借用中の子部品の色問い合わせには描画専用の所有情報を使う。検索入力欄の白fallback回帰と通常起動W01/W03の白画面を別に扱う。単体試験、実画面、実IME、Human受入の境界を明記する。 |
+
+左右pin／unpin、複数pin、狭幅drawer、旧四枠設定の移行とresetは後続設計であり、
+今回の永続schemaやdrag dockingの実装ではない。W01/W03とE08の未解決記録も保持する。
+タイトル・メニューバー全体の再設計、全IME／DPI／物理入力matrixは今回の合格へ含めない。
+
 | 更新する章 | Rust節の変更内容 |
 |---|---|
 | 起動・Workspace | 明示初期化、未選択でも新規/開く、物理identityによる重複起動・重複文書検出、別Workspaceの別process起動 |

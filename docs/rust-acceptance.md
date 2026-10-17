@@ -1,6 +1,63 @@
 # Rust Editor受入記録
 
-## 起動と入力復旧の残確認結果（2026-10-17）
+## 検索・コマンド表示復旧のcheckpoint（2026-10-17・未完了）
+
+Task `20261017-mdlite-ui-surface-recovery` Rev1、基準develop `48555ea840abd4fcb17ba1601eeb4f67ec9ad209`。
+作業branchは `fix/ui-surface-recovery-20261017`。Explorer/Searchの排他表示、
+パレットの表示・終了とfocus、子部品の色、局所UI整理と恒久回帰を追加した。
+操作契約と後続pin案は[製品要件](product-requirements.md)、GitBook向け差分は
+[更新差分](gitbook-rust-ui-delta.md)に記録する。
+必要受入が未完了のためdevelopへ完成扱いで統合しない。Git配送・HANDOFFの実績は最終HANDOFFを参照する。
+
+固定source集約SHA-256は `d8c52bf010a543b2968d1dd93eadf80cd075ba51092e898ce730216de056efe5`。
+Release EXEは `67258c9a9eab2d606ced32a7c2ebf328d2ce4bb4466128fe3bc7067db9a796b7`、
+Debug EXEは `7ffe25e3e1b9cc29dcd73e2554c7fa698e41011121eea8875ecaaefaa6890f28`。
+Debug／Release各profileでcore 139＋native 205＝通常344件PASS、失敗0。
+通常suiteでignoredのnative 2件も、各profileの排他的な別実行でPASSした。
+fmt、Debug／明示Releaseのstrict ClippyもPASS。source／Release EXE／canonical harnessの
+前後一致と、cargo／rustc／MDLite processの不在を確認した。
+Release buildは同じ固定sourceの登録receiptとEXEを再利用し、Debugは登録手順でbuildした。
+build receiptの個別test／fmt／clippy欄は別実行のためNOT_RUNで、全体結果は機械検証summaryを正とする。
+source集約は登録wrapperの対象（Cargo関連3ファイルとsrc以下）であり、
+src外のcompile-time assetsを含む完全な資材pinではない。今回変更したdocsはsrcからの埋込み対象ではない。
+
+独立Sol High correctness reviewの指摘を修正し、最終sourceの局所再確認で残指摘なし。
+別Ponytail reviewで提案された常時非表示HWNDの生成・配置・有効化を削り、registryとメニュー経路を保持した。
+reviewは静的読取りでありGUI合格ではない。App借用中の色問い合わせ、owner-draw、
+scope／詳細のbounds、可視入力へのfocus、置換欄のEN_CHANGE後の連続入力、
+外側scrollbarのdismiss、Tab移動とパレット復帰focusにnative回帰を加えた。
+
+以下は合成Workspace・可視所有windowに対するOS合成入力と実IMEの観測で、物理入力・Human受入とは分ける。
+配置・色・IMEなど変更されていない部分は前候補の証拠を継承し、最後のfocus復帰変更は最終Releaseで更新した。
+各観測のEXE／PID／HWNDと介入はHANDOFFの証拠へ結び付け、途中候補全体を最終buildの全面合格へ転用しない。
+
+| 行 | 状態・確認できた範囲と残件 |
+|---|---|
+| C01 | PARTIAL。10回のnative commandによる排他切替、query／設定保持、可視windowでのTab／Shift+Tabと次の入力、Explorer親描画の抑止を確認。混合した結果選択ケースは未実施。初回query入力はC05 FAIL。 |
+| C02 | PASS（観測範囲）。10回開閉、query／list移動、Esc、無効理由と維持、有効Searchへのfocus、外側NewFile click／子scrollbarのdismiss消費、部品破棄と文書選択保全を確認。ATOK／MS IMEの補完確認で最初のEscが変換取消を優先し、後続Escで閉じることも確認。 |
+| C03 | PARTIAL。検索pushbuttonの白化とExplorerタイトルの混在を解消。補正後の160 client frame・9.72秒では大きな白いSearch／button矩形を観測しなかった（平均60.53ms、最大80.61ms間隔）。captionの描き直し途中やOS scrollbarの白いstripは残り、未観測の瞬間・全状態の見た目まで保証しない。 |
+| C04 | PASS（96 DPIの観測範囲）。幅1086／1500／700と復帰のboundsを確認。最終Releaseで最小化・最大化復帰後のquery focus、続くxy、Esc後のeditor復帰、保存fixtureの再openと本文不変を確認。他monitor／DPIはNOT_RUN。 |
+| C05 | FAIL。最終shipping Releaseでも、前面・query focusを確認した一括Unicode入力MarkdownがwnMarkdoとなった。安定focus後のabcdは正順。本文・revision・dirty・選択・Undo／Redoは不変。限定ATOK／MS IME取消・editorへの次の入力、ATOK日本語確定とUndo／Redo、673-byte保存／再openは別のPASS。 |
+
+初回入力ではcaret準備をfocus前へ移した局所回帰はPASSしたが、実画面の文字順問題は残った。
+二つの一時診断でWM_CHAR到着順は正しく、途中の二回の `EM_SETSEL(0,0)` が挿入位置を先頭へ戻すことを確認した。
+印付き診断は既知の同期focus helperからの送信を除外したが、送信元・queued／directの区別は未確定。
+IME・accessibility・外部processのいずれかを原因と断定しない。入力直前の追加前面化を省く比較でも再現した。
+診断sourceは完全に戻し、shipping四ファイルとRelease EXEのhash一致・process不在を確認した。
+未知のselection変更を遮断する製品patchは入れず、Taskの未完了時の保存手順として区切る。
+
+正常保存した合成fixtureは673 bytes、SHA-256 `cd41641aeff281e497da279ed0425a0328aac7612659ef563ef38dc7677b8cd4`。
+所有windowで元のATOK profile／IME closedを確認。通常CloseMainWindow完了とPID消滅を確認し、
+exit codeを取得しなかった記録はUNKNOWNとする。OS clipboardは未操作。
+原点計算が誤っていた最初のframe記録は無効・ローカル限定で、HANDOFFへ含めない。
+
+W01/W03の既存FAIL14とE08のFAILを継承し、今回の合格へ読み替えない。
+通常起動の新しい因果仮説がないため旧実験を再開せず、表／parserのE08修正も行っていない。
+全IME matrix、物理操作感、他DPI、F5準備系の全面修理、左右pin schema／migration／drag dockingは後続。
+
+## 前Taskの起動と入力復旧の残確認結果（2026-10-17）
+
+以下の「現行」は前Taskの固定source/buildを指す。今回変更後の検証結果ではない。
 
 現行source集約SHA-256は `2fb81b7e33a4746aae931504660fa70299539eef04e5ffabc18ad217dc0748f4`。
 Releaseは `8ddf5b99a8f34c0e241cd51da95778393e63f65bce9bd40bf28133fa83480807`、

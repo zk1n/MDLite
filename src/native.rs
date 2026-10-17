@@ -471,6 +471,7 @@ struct WindowState {
     deferred_persistence: Cell<bool>,
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
+    control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
     deferred_paints: Cell<[Option<(HWND, RECT)>; 2]>,
     ime_input: Cell<Option<ImeInputContext>>,
     ime_dispatch_key: Cell<Option<(HWND, u32, usize, isize)>>,
@@ -491,6 +492,7 @@ impl WindowState {
             deferred_persistence: Cell::new(false),
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
+            control_colors: RefCell::new(None),
             deferred_paints: Cell::new([None, None]),
             ime_input: Cell::new(None),
             ime_dispatch_key: Cell::new(None),
@@ -1146,7 +1148,7 @@ pub fn run() -> windows::core::Result<()> {
                 }
             }
             replay_deferred_paints(&app);
-            let handled = app.app.borrow().shell_message(&message);
+            let handled = app.app.borrow_mut().shell_message(&message);
             replay_deferred_paints(&app);
             if handled {
                 continue;
@@ -1322,7 +1324,31 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 .insert(queue_position, (envelope.unwrap(), notification));
         }
         let Ok(mut app) = app_borrow else {
+            if matches!(
+                msg,
+                WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN
+            ) && hwnd == state.main_window.get()
+                && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool()
+            {
+                let colors = state.control_colors.borrow().clone();
+                if let Some(colors) = colors {
+                    return colors.paint(wp);
+                }
+            }
             if msg == WM_DRAWITEM && lp.0 != 0 {
+                if hwnd == state.main_window.get() && state.owns_paint_surface(hwnd) {
+                    let colors = state.control_colors.borrow().clone();
+                    if let Some(colors) = colors
+                        && search_ui::draw_owned_button(
+                            hwnd,
+                            wp.0,
+                            &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
+                            colors.tokens,
+                        )
+                    {
+                        return LRESULT(1);
+                    }
+                }
                 // Keep IME observation above this branch unchanged. Clone the
                 // owned paint data and release its RefCell before any GDI call.
                 let paint = state.button_paint.borrow().clone();
@@ -1632,6 +1658,9 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_SETFOCUS => {
+                if app.focus_palette_after_main_activation(hwnd) {
+                    return Some(LRESULT(0));
+                }
                 app.native_caret = NativeCaretState::default();
                 app.refresh();
                 LRESULT(0)
@@ -8791,6 +8820,170 @@ mod tests {
         assert_eq!(document_state(app.doc()), before);
         unsafe {
             DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn palette_main_activation_restores_only_a_live_visible_query() {
+        let fixture = EditorFixture::new("selected body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.enabled = true;
+                app.shell.main_window = fixture.hwnd;
+                let settings = app.shell.settings.clone();
+                app.apply_shell_settings(settings);
+                let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+                app.open_palette();
+            }
+            let query = {
+                let children = fixture.state.app.borrow();
+                // The palette owns its query through its common native host.
+                let main = children.shell.main_window;
+                let mut found = HWND::default();
+                unsafe extern "system" fn find_query(
+                    hwnd: HWND,
+                    data: LPARAM,
+                ) -> windows::core::BOOL {
+                    unsafe {
+                        if GetDlgCtrlID(hwnd) == 150 {
+                            *(data.0 as *mut HWND) = hwnd;
+                        }
+                        windows::core::BOOL(1)
+                    }
+                }
+                let _ = EnumChildWindows(
+                    Some(main),
+                    Some(find_query),
+                    LPARAM((&mut found as *mut HWND) as isize),
+                );
+                found
+            };
+            assert_ne!(query, HWND::default());
+            let before = document_state(fixture.state.app.borrow().doc());
+            let _ = SetFocus(Some(fixture.hwnd));
+            fixture.message(WM_SETFOCUS, 0);
+            assert_eq!(GetFocus(), query);
+            let _ = EnableWindow(query, false);
+            let _ = SetFocus(Some(fixture.hwnd));
+            fixture.message(WM_SETFOCUS, 0);
+            assert_eq!(GetFocus(), fixture.hwnd);
+            let _ = EnableWindow(query, true);
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
+        }
+    }
+    #[test]
+    fn search_owned_pushbutton_paints_normal_and_borrowed_states() {
+        use windows::Win32::UI::Controls::{
+            DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED, ODT_BUTTON,
+        };
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.enabled = true;
+                app.shell.main_window = fixture.hwnd;
+                let settings = app.shell.settings.clone();
+                app.apply_shell_settings(settings);
+                app.search_init();
+            }
+            let child = GetDlgItem(Some(fixture.hwnd), 5614).unwrap();
+            let screen = GetDC(Some(child));
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 180, 32);
+            let previous = SelectObject(dc, bitmap.into());
+            let tokens = fixture.state.app.borrow().shell.tokens;
+            let before = document_state(fixture.state.app.borrow().doc());
+            for state in [
+                0,
+                ODS_FOCUS.0,
+                ODS_SELECTED.0,
+                ODS_DISABLED.0,
+                ODS_HOTLIGHT.0,
+            ] {
+                let item = DRAWITEMSTRUCT {
+                    CtlType: ODT_BUTTON,
+                    CtlID: 5614,
+                    hwndItem: child,
+                    hDC: dc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 180,
+                        bottom: 32,
+                    },
+                    itemState: windows::Win32::UI::Controls::ODS_FLAGS(state),
+                    ..Default::default()
+                };
+                let expected = shell::rgb(if state & (ODS_SELECTED.0 | ODS_HOTLIGHT.0) != 0 {
+                    tokens.selected
+                } else {
+                    tokens.panel
+                });
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_DRAWITEM,
+                        WPARAM(5614),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    ),
+                    LRESULT(1)
+                );
+                assert_eq!(GetPixel(dc, 2, 2), expected);
+                {
+                    let _borrow = fixture.state.app.borrow_mut();
+                    assert_eq!(
+                        window_proc(
+                            fixture.hwnd,
+                            WM_DRAWITEM,
+                            WPARAM(5614),
+                            LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                        ),
+                        LRESULT(1)
+                    );
+                    assert_eq!(GetPixel(dc, 2, 2), expected);
+                }
+            }
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(Some(child), screen);
+        }
+    }
+    #[test]
+    fn search_control_color_reentry_keeps_the_owned_theme() {
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.enabled = true;
+                app.shell.main_window = fixture.hwnd;
+                let settings = app.shell.settings.clone();
+                app.apply_shell_settings(settings);
+                app.search_init();
+            }
+            let child = GetDlgItem(Some(fixture.hwnd), 5602).unwrap();
+            let dc = GetDC(Some(child));
+            let expected = shell::rgb(fixture.state.app.borrow().shell.tokens.panel);
+            let before = document_state(fixture.state.app.borrow().doc());
+            {
+                let _borrow = fixture.state.app.borrow_mut();
+                let brush = window_proc(
+                    fixture.hwnd,
+                    WM_CTLCOLOREDIT,
+                    WPARAM(dc.0 as usize),
+                    LPARAM(child.0 as isize),
+                );
+                assert_ne!(brush.0, 0);
+                assert_eq!(GetBkColor(dc), expected);
+            }
+            ReleaseDC(Some(child), dc);
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
         }
     }
     #[test]

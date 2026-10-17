@@ -7,6 +7,7 @@ use mdlite::{
 use windows::Win32::UI::Controls::*;
 
 pub(super) const PALETTE: usize = 100;
+pub(super) const CONTAINER_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x000d); // SS_OWNERDRAW
 const SETTINGS: usize = 101;
 const COMPACT: usize = 102;
 const RETURN: usize = 103;
@@ -334,6 +335,28 @@ impl ControlColors {
             LRESULT(self.brush.0 as isize)
         }
     }
+    // Named STATIC hosts are containers, not visible labels. Keep their native
+    // names while drawing only the panel background, including during reentry.
+    pub(super) unsafe fn draw_container(
+        &self,
+        owner: HWND,
+        id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> bool {
+        unsafe {
+            if owner == HWND::default()
+                || item.CtlType != ODT_STATIC
+                || item.CtlID as usize != id
+                || GetParent(item.hwndItem).ok() != Some(owner)
+                || GetDlgCtrlID(item.hwndItem) as usize != id
+                || GetWindowLongPtrW(item.hwndItem, GWL_STYLE) as u32 & 0x1f != CONTAINER_STYLE.0
+            {
+                return false;
+            }
+            FillRect(item.hDC, &item.rcItem, self.brush);
+            true
+        }
+    }
 }
 impl Drop for ControlColors {
     fn drop(&mut self) {
@@ -615,6 +638,23 @@ unsafe extern "system" fn palette_host_proc(
     owner: usize,
 ) -> LRESULT {
     unsafe {
+        if matches!(
+            msg,
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+        ) && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool()
+        {
+            let owner = HWND(owner as *mut _);
+            let pointer = GetWindowLongPtrW(owner, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(owner)
+                && GetParent(hwnd).ok() == Some(owner)
+            {
+                let colors = state.control_colors.borrow().clone();
+                if let Some(colors) = colors {
+                    return colors.paint(wp);
+                }
+            }
+        }
         if matches!(
             msg,
             WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
@@ -1532,6 +1572,11 @@ impl App {
                     }
                     let item = &*(lp.0 as *const DRAWITEMSTRUCT);
                     let id = item.CtlID as usize;
+                    if (hwnd == self.shell.main_window || hwnd == self.shell.compact_window)
+                        && self.shell.colors.draw_container(hwnd, wp.0, item)
+                    {
+                        return Some(LRESULT(1));
+                    }
                     if hwnd == self.shell.main_window
                         && super::search_ui::draw_owned_button(hwnd, wp.0, item, self.shell.tokens)
                     {
@@ -2031,7 +2076,7 @@ impl App {
                 w!("STATIC"),
                 "コマンドパレット",
                 0,
-                WS_BORDER | WS_CLIPCHILDREN | WINDOW_STYLE(0x0100), // SS_NOTIFY: host receives its background clicks.
+                WS_BORDER | WS_CLIPCHILDREN | CONTAINER_STYLE | WINDOW_STYLE(0x0100), // SS_NOTIFY
             );
             let _ = SetWindowLongPtrW(host, GWL_EXSTYLE, WS_EX_CONTROLPARENT.0 as isize);
             let _ = SetWindowSubclass(host, Some(palette_host_proc), 1, self.hwnd.0 as usize);
@@ -2459,7 +2504,7 @@ impl App {
                 WINDOW_EX_STYLE::default(),
                 w!("MDLiteRustEditor"),
                 PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW,
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 placement.x,
                 placement.y,
                 placement.width.min(800) as i32,

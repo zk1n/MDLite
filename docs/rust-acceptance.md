@@ -1,5 +1,54 @@
 # Rust Editor受入記録
 
+## 文字重なり修正と実画面受入（Rev3・未完了checkpoint）
+
+Task `20261017-mdlite-ui-surface-recovery` Revision 3は、作業branchの
+`f6354c8db7eb362c262c063c1db0d726c38ddc5e`から継続した。
+基準Releaseの同一processでパレット／Git hostのcaptionだけを消すと文字片が消え、
+戻すと再発した。名前付きSTATIC hostを既存テーマ色のnative owner-drawにし、
+見出し・通知・子部品・focus／IME経路とhost名を維持した。
+Search入力欄下の「検索」は明示ラベル5620であり、同じ不具合ではなかった。
+
+Compactからのパレットにも描画を配送する局所回帰を追加した。
+別Agentのread-only correctness reviewで見つかったCompact配送漏れは修正し、
+最終差分の再確認に追加指摘はない。実装者のPonytail確認とは別のreviewである。
+Compactの既存不具合も基準EXEで再現した。子領域clipとパレット子部品の色通知を
+直接の関連範囲として修正したが、最終EXEの初回／再表示では見出し・query・一覧文字が
+欠ける。局所描画試験のPASSを実画面合格にせず、この修正手法の反復を止めた。
+
+固定Release EXEは`24719c6a1b5dedf793e56a212e607fe6fb2ed53b304a3c40da7d7733a98053c9`、
+source集約は`ded5523f1f338c2ef78b671166f07c8fabe17fbc42f72074609092cb2e403459`。
+実画面は96 DPI、主画面1086×793／client1070×734、Compact800×700／client784×661。
+元添付画像の実行EXEは未確認で、同一EXEだったとは断定しない。
+build入力資材・機械試験・操作記録・Git結合情報は最終HANDOFFに記録する。
+
+この固定候補でDebug／Release各通常346件＋排他visible 2件、fmt、
+両構成のstrict ClippyはPASS。通常試験はRev2の345件に、名前付きcontainerの
+main／Compact描画・色・再入・文書不変の回帰1件を加えた。
+mise／Cargoは通常環境、試験子processだけ合成AppDataを使い、全試験processの終了を確認した。
+Debug EXEは`6d121c62bc32d10bc9d2b1ad2d72b18aa9a44f6174f6a18aa87f80a8ac3bccdf`。
+これらの機械試験はCompactの実画面FAILや未確認のA〜Eを合格にしない。
+
+| Rev3必須項目／対応 | 最終候補の状態 |
+|---|---|
+| A・文字重なり | PARTIAL。主画面NoWorkspaceパレット／Gitの局所確認PASS。全表示操作は未確認。CompactパレットはFAIL。 |
+| B・C01 結果移動 | NOT_RUN／BLOCKED。最終候補のquery入力・結果選択前に前面化で停止。Rev2の文書Next限定結果を転記しない。 |
+| C・C03 10往復／60秒以上 | NOT_RUN／BLOCKED。前面化できず操作未実施。過去の静止撮影・9操作を10往復に数えない。 |
+| D・C02／C04 パレット／window | 主画面一連操作はNOT_RUN／BLOCKED。局所表示のみ確認。Compact初回／再表示FAIL。 |
+| E・C05 入力／実IME／編集保存 | NOT_RUN／BLOCKED。最終候補では入力未実施。旧EXEのUnicode5回PASSや実IME結果を転記しない。 |
+
+主画面の追加採取では、最初のhelper import不足を修正後、入力helperが前面化前の
+foreground条件で送信前に停止した。この方法の反復を止め、既存Orcaのrestoreと
+window操作に切り替えたが、対象のnative foregroundを確認できなかった。
+Orcaの操作は未検証のsynthetic結果で、query／control入力は送っていない。
+別windowに覆われた画像を製品画面の合格や配送用画像にせず、raw記録はlocalだけに保持する。
+所有PIDは通常終了し、fixture／合成領域の復元・未変更を記録した。
+これは製品の検索・IME・保存FAILを示す試験ではなく、実行前のGUI採取blockerである。
+
+必須未確認とCompactのFAILを残した作業branch checkpointであり、developへ統合しない。
+W01／W03、E08、pin／unpin、全DPI／IME matrix・物理入力・Human受入は別の残件として保持する。
+以下のRev2以前の証拠は、それぞれのbuildに限定した履歴である。
+
 ## 検索初回入力・表示復旧継続のcheckpoint（2026-10-17・Rev2未完了）
 
 Task `20261017-mdlite-ui-surface-recovery` Rev2は、下記Rev1の保存commit

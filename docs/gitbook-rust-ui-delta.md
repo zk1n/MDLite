@@ -5,6 +5,16 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## Rev3の文字重なり修正と未統合境界
+
+主画面のパレット／Git host自身のcaption描画を切り分け、名前と入力・通知を保った
+native container描画に変更した。Searchの明示queryラベルは維持した。
+直接関係するCompactの描画配送・clip・パレット子部品の色通知も確認したが、
+最終候補でもCompactパレットの初回／再表示は未合格である。
+作業branchの未完了checkpointとして記録し、developへ統合しない。
+この差分をGitBookの公開受入へ反映していない。候補ごとの機械試験・実画面・残件は
+[受入記録](rust-acceptance.md)と最終HANDOFFを参照する。
+
 ## Rev2の限定差分と未完了境界
 
 検索viewを開く際の不要なeditor経由のfocus移動を削除し、非表示にする部品の既存focus保護を維持した。

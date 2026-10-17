@@ -1336,15 +1336,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if msg == WM_DRAWITEM && lp.0 != 0 {
-                if hwnd == state.main_window.get() && state.owns_paint_surface(hwnd) {
+                if state.owns_paint_surface(hwnd) {
                     let colors = state.control_colors.borrow().clone();
                     if let Some(colors) = colors
-                        && search_ui::draw_owned_button(
+                        && (colors.draw_container(
                             hwnd,
                             wp.0,
                             &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
-                            colors.tokens,
-                        )
+                        ) || (hwnd == state.main_window.get()
+                            && search_ui::draw_owned_button(
+                                hwnd,
+                                wp.0,
+                                &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
+                                colors.tokens,
+                            )))
                     {
                         return LRESULT(1);
                     }
@@ -8872,6 +8877,149 @@ mod tests {
             let _ = EnableWindow(query, true);
             assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
             let _ = ShowWindow(fixture.hwnd, SW_HIDE);
+        }
+    }
+    #[test]
+    fn named_static_containers_paint_without_captions_in_normal_and_borrowed_states() {
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODT_STATIC};
+        let mut app = composing_test_app("body");
+        app.clear_composition();
+        let mut fixture = MessagePumpFixture::new(app);
+        let compact = fixture.create_compact();
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                assert_eq!(app.hwnd, compact); // Native WM_SIZE selected the new surface.
+                app.select_surface(fixture.hwnd);
+                app.shell.enabled = true;
+                app.shell.main_window = fixture.hwnd;
+                let settings = app.shell.settings.clone();
+                app.apply_shell_settings(settings);
+                app.git_init();
+                app.open_palette();
+            }
+            let hosts = [
+                (
+                    FindWindowExW(
+                        Some(fixture.hwnd),
+                        None,
+                        w!("STATIC"),
+                        w!("コマンドパレット"),
+                    )
+                    .unwrap(),
+                    "コマンドパレット",
+                ),
+                (GetDlgItem(Some(fixture.hwnd), 6508).unwrap(), "Git pane"),
+            ];
+            let screen = GetDC(Some(fixture.hwnd));
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 96, 24);
+            let previous = SelectObject(dc, bitmap.into());
+            let expected = shell::rgb(fixture.state.app.borrow().shell.tokens.panel);
+            let before = document_state(fixture.state.app.borrow().doc());
+            let check_host = |owner: HWND, host: HWND, name: &str| {
+                assert_eq!(shell::text_of(host), name);
+                let id = GetDlgCtrlID(host) as usize;
+                let item = DRAWITEMSTRUCT {
+                    CtlType: ODT_STATIC,
+                    CtlID: id as u32,
+                    hwndItem: host,
+                    hDC: dc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 96,
+                        bottom: 24,
+                    },
+                    ..Default::default()
+                };
+                assert!(
+                    !fixture
+                        .state
+                        .control_colors
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .draw_container(owner, id + 1, &item)
+                );
+                for borrowed in [false, true] {
+                    let _borrow = borrowed.then(|| fixture.state.app.borrow_mut());
+                    PatBlt(dc, 0, 0, 96, 24, BLACKNESS).unwrap();
+                    assert_eq!(
+                        window_proc(
+                            owner,
+                            WM_DRAWITEM,
+                            WPARAM(id),
+                            LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                        ),
+                        LRESULT(1)
+                    );
+                    for y in 0..24 {
+                        for x in 0..96 {
+                            assert_eq!(GetPixel(dc, x, y), expected);
+                        }
+                    }
+                }
+            };
+            for (host, name) in hosts {
+                check_host(fixture.hwnd, host, name);
+            }
+            fixture.state.app.borrow_mut().shell_command(106);
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.compact_window = compact;
+                app.select_surface(compact);
+                app.open_palette();
+            }
+            let host =
+                FindWindowExW(Some(compact), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
+            check_host(compact, host, "コマンドパレット");
+            for owner in [fixture.hwnd, compact] {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell_command(106);
+                app.select_surface(owner);
+                app.open_palette();
+                drop(app);
+                let host =
+                    FindWindowExW(Some(owner), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
+                for (id, message) in [(150, WM_CTLCOLOREDIT), (151, WM_CTLCOLORLISTBOX)] {
+                    let child = GetDlgItem(Some(host), id).unwrap();
+                    for borrowed in [false, true] {
+                        let _borrow = borrowed.then(|| fixture.state.app.borrow_mut());
+                        SetBkColor(dc, COLORREF(0));
+                        let brush = SendMessageW(
+                            host,
+                            message,
+                            Some(WPARAM(dc.0 as usize)),
+                            Some(LPARAM(child.0 as isize)),
+                        );
+                        assert_ne!(brush.0, 0);
+                        assert_eq!(GetBkColor(dc), expected);
+                    }
+                }
+                if owner == compact {
+                    for borrowed in [false, true] {
+                        let _borrow = borrowed.then(|| fixture.state.app.borrow_mut());
+                        SetBkColor(dc, COLORREF(0));
+                        SendMessageW(
+                            host,
+                            WM_CTLCOLOREDIT,
+                            Some(WPARAM(dc.0 as usize)),
+                            Some(LPARAM(fixture.hwnd.0 as isize)),
+                        );
+                        assert_ne!(
+                            GetBkColor(dc),
+                            expected,
+                            "foreign HWND must not use palette colors"
+                        );
+                    }
+                }
+            }
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(Some(fixture.hwnd), screen);
         }
     }
     #[test]

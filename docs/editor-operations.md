@@ -4,6 +4,18 @@ Markdownの原文と向き付きselection（anchor/head）は文書に属する�
 Live/Sourceの切替、描画、scrollだけでは本文・dirty・Undoを変更しない。
 IME合成中は未確定文字を本文や履歴へ入れず、変換キーをIMEへ渡す。
 
+## 原文行番号とLiveの縦間隔
+
+Source／Liveとも原文の物理行番号を左gutterへ表示する。折返しや表の複数cellには
+同じ番号を重ねず、Liveで隠すfence／Front Matter等の行番号は飛ぶことがある。
+gutter幅は行数の桁と実fontの計測から決まり、本文・表を横scrollしても固定する。
+番号へのclickは本文selectionを変えない。
+
+原文の空行は一行分のfont-relativeな高さとして扱う。表・画像・literal境界の
+挿入位置だけのために余分な空行を増やさず、source、改行、encoding、dirty、履歴を維持する。
+上下移動は移動先を選ぶlayoutの表示行と希望する横位置を使う。移動後に構文の一時表示で
+再配置される場合があるため、再配置前後の画面Yだけを同一行の証拠にしない。
+
 ## 移動と選択
 
 | 操作 | 規則 |

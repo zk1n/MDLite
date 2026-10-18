@@ -5,6 +5,17 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## 2026年10月18日・Live移動／UI／Git候補（未公開）
+
+今回の候補は全native scrollbar共通化と必須GUI条件が未達であり、developへ統合しない。
+そのためGitBookの現行develop仕様を候補の実装済み仕様で置き換えない。
+後続の限定反映先は「製品概要と画面操作」（上部bar、font、pointer）、
+「編集とMarkdown」（物理行番号、実空行、上下移動）、
+「検索・置換・Git」（Trust明示操作後だけlocal init、親repo／worktree、remoteなし）、
+「設定と保存形式」（modal ownershipと縦scroll）、
+「実装と検証状況」（最終buildと未確認境界）。旧C++節とstable linkは維持する。
+公開時には候補・統合・実GUI・Human受入の区別と、その時点のHANDOFF根拠を明記する。
+
 ## Rev3の文字重なり修正と確認範囲
 
 主画面のパレット／Git host自身のcaption描画を切り分け、名前と入力・通知を保った

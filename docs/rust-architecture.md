@@ -21,7 +21,7 @@ Markdown原文を永続正本とし、表示は派生データとする。
 Win32とDirectWrite/Direct2Dを選ぶ。OSの文字整形と同じlayoutを描画、
 hit test、selection、IME候補位置に使い、独自の文字幅推測を避ける。
 `windows` 0.62.2のライセンスはMIT/Apache-2.0、MSRVは1.82。
-採用版はCargo.lockを正本とし、Rust 1.99.0の既存mise環境を使う。
+採用版はCargo.lockを正本とし、Rust 1.99.1の既存mise環境を使う。
 
 このVMでのrenderer-only controlled A/Bは、instrumented diagnostic
 binariesで実施し、canonical product EXEは使っていない。Direct2Dの
@@ -56,6 +56,12 @@ Git and storage adapters use `ProcessRequest`/`process::run` for explicit truste
 children enter an owned Job Object before resume; request timeout, cancellation, and per-stream retained
 output are bounded. This execution API serves those operations without adding an arbitrary-process UI.
 GUI, real storage service, and physical-input acceptance remain in the acceptance record.
+
+Gitの明示的なTrust付与／再試行は、通常のrepository discoveryで親repo・worktreeを
+優先し、repoなしを直前に再確認できた場合だけWorkspace rootをlocal initする。
+Trust登録とinitは別の結果であり、init失敗でもTrustと編集状態を保持する。
+通常のWorkspace切替は世代を更新し、信頼済みの場合だけ読取りのStatusを予約する。
+表示pathだけprefix／区切りを整え、process引数のcanonical pathは変更しない。
 
 ## 適合を実アプリで確認する境界
 

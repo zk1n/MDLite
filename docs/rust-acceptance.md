@@ -1,5 +1,40 @@
 # Rust Editor受入記録
 
+## Live移動・UI・Git候補のcheckpoint（2026年10月19日 JST、未完了）
+
+Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 1の作業branch
+`fix/live-navigation-ui-git-polish-20261018`。全native scrollbarのstyle統一と
+必須GUI条件が未達のため、developへ統合・pushしない。Task Inboxは保持する。
+ユーザーのGUI利用開始により、画面操作は再開の連絡まで停止した。
+
+最終ReleaseはRust 1.99.1、source集約
+`65cd3cc9b935a01e0de500cef88523a8ec87ce781ec0be534fd92271a32aa312`、EXE SHA256
+`81b30d4669aecca7166b8b378d71e4e0f788800a6040967ce6c7933054f23be6`。
+compile-time入力20件と正式GUI harnessのhashはlocal HANDOFFで対応付ける。
+
+| 検証 | 実結果・境界 |
+|---|---|
+| Debug通常 | lib141＋bin239 PASS。libは同一test EXE hashの既存141件receiptを再利用。binのexit0・hash・件数は記録、child PIDだけ記録漏れとしてUNKNOWN。 |
+| Release通常 | lib141＋bin239 PASS、両test process exit0。 |
+| 排他visible | 既存NOACTIVATE 2件をDebug／Release各一processずつ実行、全PASS。SendInputなし。実製品GUIの代替ではない。 |
+| fmt／Clippy | fmt、Debug／Releaseのstrict all-targets Clippy PASS。 |
+| 独立review | 実装者と別のSol Highがread-onlyで確認。表の列位置とharnessの表示／toggle前提を修正後、追加指摘なし。RootのPonytail確認とは別。 |
+| 最終EXE・96 DPI dark | 問題fixtureの通常上下で先頭→末尾→先頭、13 steps・循環なし。Source／Live行番号、上部bar、1候補paletteを実画面で確認。設定のCancel／Esc／Alt+F4／×閉じ後に次の編集操作を確認。 |
+| 設定scroll | 実resize、capture確認付きthumb drag、top／middle／bottomを観測。EDITへのnative WM_MOUSEWHEEL注入でもdraft18と選択を維持。物理wheel／touchpadの証拠ではない。draft破棄で設定file不変。 |
+| 最終EXE・96 DPI light | 合成LocalAppDataだけへthemeをApplyし、通知を閉じてmainへ復帰。実画面と本文・履歴不変を確認。Calendarの土日・祝日・前後月を代表画面で確認。全custom色matrixではない。 |
+| 100,000行runtime | 100,000内容行＋EOF行の起動観測は60秒以内にsemantic layoutへ到達せず。その後process不在、exit code／原因UNKNOWN。fixture file不変、入力・captureなし。helperの6桁／行数試験をruntime PASSへ読み替えない。 |
+
+検証の隔離AppData内で、fixture compilerの`rustc.exe`がmise shimを経由して
+ツールcacheを展開した。後続の排他試験は既存compilerの実binをchild PATHの先頭へ固定した。
+Cargo／miseの親環境とglobal設定は変更していない。これは試験実行環境の記録であり、製品失敗の断定ではない。
+
+残存標準LISTBOX／EDIT等の全axis style、Calendar次月buttonのicon化、実tooltip／pointer、
+Compact、Git GUI matrix、実150 DPI、physical／ATOK／Microsoft IME・再変換とHuman受入は未完了または未確認。
+OS menu／dialog fontの全条件も未確認。既知W01／W03、E08、pin／unpinを解消済みにしない。
+設定Apply通知の実OK buttonはID2であり、正式harnessの固定ID1前提は後続修正が必要。suite全体は未実行。
+観測手順の早期focus guardやAPI識別失敗はlocal記録に保持し、未観測の入力を成功にしない。
+GUI停止時のPID22580はユーザーが使用し得るため、その後のclean状態や所有を推定して閉じない。
+
 ## 文字重なり修正と実画面受入（Rev3）
 
 Task `20261017-mdlite-ui-surface-recovery` Revision 3は、作業branchの

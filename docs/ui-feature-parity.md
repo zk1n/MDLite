@@ -1,5 +1,21 @@
 # Rust UI・周辺機能の実装記録
 
+## 2026年10月18日・Live移動／UI／Git候補
+
+Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 1の作業branch候補。
+以下は実装と重点機械試験の範囲であり、下記の過去のdevelop基準や実GUI受入を置き換えない。
+
+| 対象 | 候補の変更と確認境界 |
+|---|---|
+| 設定 | default処理前にform borrowを解放し、破棄通知を独立管理。resize、末尾、wheel、focus、DPI、font再入を重点試験。縦railは既存scroll位置へ要求を渡す。 |
+| Live上下 | view／表示行を保持したhit候補と逆写像を検査。同じ高さの表cellは希望する横位置で選ぶ。LF／CRLF、循環なし、両端到達、Shift anchor、原文・履歴不変を重点試験。 |
+| 間隔・番号 | 実空行一行分の高さ、表／画像境界の余白削減、物理行番号、折返し／cell重複除外。100,000行helperは実大規模layoutの受入とは区別する。 |
+| Git | Trust後の明示操作だけrepoなしrootをinit。親repo／worktree優先、remoteなしlocal操作、世代照合、表示path正規化。 |
+| UI | 上部一行、コンパクトなpalette／tabs、共通UI fontとpointer、Calendar曜日／祝日色。hidden native試験は実画面確認の代替ではない。 |
+
+全native scrollbarの共通styleと必須GUI条件は未完了。条件未達のためdevelopへ統合しない。
+最終候補identity、試験とGUIの実結果は[受入記録](rust-acceptance.md)とlocal HANDOFFに固定する。
+
 今回の基準は Rust `develop` の `671e25a637d07828c02048145e8e84f1a30625ca`。
 旧C++は `cpp-archive/pre-rust-20261013` を参照し、現在のRope編集基盤へ機能を接続する。
 Markdown本文、encoding、改行、向き付き選択、IMEの実通知、Undo/Redo、安全保存を保護する。

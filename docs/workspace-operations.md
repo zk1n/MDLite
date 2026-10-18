@@ -69,8 +69,15 @@ open文書は文書ごと1 Undo。journal復元はopen tabと後続編集を拒�
 
 ## Trust・Git・storage
 
-Workspaceを開くだけではGitやadapterを実行しない。Status/Diffも端末local Trustが必要。
+Status/Diffも端末local Trustが必要。未TrustのWorkspaceではGitを起動しない。
+Trust済みWorkspaceを開いた際は、既存repositoryを読取りで検出しStatusを更新する。
 Trustはcanonical pathと物理directory identityへ結び付け、Workspace内の設定で自己信頼しない。
+明示的なTrust付与・再試行では、親repositoryとworktreeを含むGitの検出結果を優先する。
+repositoryがないことを直前に再確認できた場合だけWorkspace rootでlocal initする。
+既定branch設定を尊重し、remote、user設定、initial commitを作らない。init失敗でも
+Trustは維持し、原因と再試行を表示する。通常のrefreshだけではinitしない。
+remote未設定でもStatus、Diff、Stage、Unstage、Commit、branch等のlocal操作を利用できる。
+Fetch/Pull/Pushは開始前に無効にし、短い理由を表示する。
 Gitは選択だけのStage/Unstage、indexだけのCommitを行う。通常操作で暗黙の保存・stage・
 commit・pushを連鎖しない。branch/worktree変更の事前保存とGit確認は別段階である。
 fetch/ff-only pull/pushは既存remoteと明示確認を使う。forceや自動rebaseを追加しない。

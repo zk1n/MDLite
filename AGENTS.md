@@ -26,3 +26,9 @@ review and Ponytail complexity review are separate.
 Use the repository's existing AI author convention and actual model trailers
 per commit; never alter global Git identity. Keep HANDOFF in this repository's
 local area and use the existing registered generator/uploader.
+
+<!-- CodexAppRouting:start -->
+## Shared Codex routing
+
+At task start, read `.codex/routing-entry.md` and follow the shared `app-entry.md` and `routing-core.md` it references.
+<!-- CodexAppRouting:end -->

@@ -32,3 +32,6 @@
 /target/
 /.codex-runtime/
 /samples/
+
+# Machine-local semantic code-search configuration and indexes
+/.grepai/

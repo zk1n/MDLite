@@ -8,15 +8,24 @@ use windows::Win32::UI::Controls::*;
 
 pub(super) const PALETTE: usize = 100;
 pub(super) const CONTAINER_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x000d); // SS_OWNERDRAW
+pub(super) const TOP_BAR_HEIGHT: f32 = 36.;
+pub(super) const TAB_STRIP_TOP: f32 = TOP_BAR_HEIGHT;
+pub(super) const TAB_STRIP_HEIGHT: f32 = 28.;
+pub(super) const TAB_LABEL_TOP: f32 = 40.;
+pub(super) const TAB_DIVIDER_Y: f32 = 67.;
+pub(super) const EDITOR_TOP: f32 = 80.;
+pub(super) const UI_FONT_FAMILY: &str = "Yu Gothic UI";
 const SETTINGS: usize = 101;
 const COMPACT: usize = 102;
 const RETURN: usize = 103;
 const RESET: usize = 104;
 const PALETTE_EXECUTE: usize = 105;
 const PALETTE_CANCEL: usize = 106;
+const SHELL_MENU: usize = 107;
 pub(super) const EDITOR_HISTORY_UNDO: usize = 0x7ef0;
 const EDITOR_HISTORY_REDO: usize = 0x7ef1;
 const ACTIVITY: usize = 110;
+const ACTIVITY_COUNT: usize = 6;
 const HEADER: usize = 130;
 const QUERY: usize = 150;
 const RESULTS: usize = 151;
@@ -109,13 +118,20 @@ pub(super) unsafe fn enable_owner_button(paint: OwnerButtonPaint, enabled: bool)
         let _ = EnableWindow(child, enabled);
     }
 }
-const ICONS: [&str; 5] = [
+const ACTIVITY_ICONS: [&str; ACTIVITY_COUNT] = [
     include_str!("../../assets/ui/icons/explorer.svg"),
     include_str!("../../assets/ui/icons/search.svg"),
-    include_str!("../../assets/ui/icons/git-branch.svg"),
     include_str!("../../assets/ui/icons/calendar.svg"),
+    include_str!("../../assets/ui/icons/outline.svg"),
+    include_str!("../../assets/ui/icons/git-branch.svg"),
     include_str!("../../assets/ui/icons/settings.svg"),
 ];
+const TOP_ACTION_ICONS: [&str; 3] = [
+    include_str!("../../assets/ui/icons/file.svg"),
+    include_str!("../../assets/ui/icons/folder.svg"),
+    include_str!("../../assets/ui/icons/save.svg"),
+];
+const MENU_ICON: &str = include_str!("../../assets/ui/icons/more.svg");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
@@ -301,6 +317,25 @@ fn commands() -> impl Iterator<Item = Command> {
         )
 }
 
+fn command_menu_group(command: Command) -> usize {
+    match command {
+        Command::Feature(_) => 2,
+        Command::Editor(_) => 5,
+        Command::Search(_) => 3,
+        Command::Git(_) => 4,
+        Command::Diagnostics
+        | Command::Palette
+        | Command::Settings
+        | Command::Compact
+        | Command::Return
+        | Command::Reset
+        | Command::Source
+        | Command::PanelMove(_)
+        | Command::PanelResize(_) => 1,
+        _ => 0,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Tokens {
     pub background: D2D1_COLOR_F,
@@ -312,6 +347,9 @@ pub(super) struct Tokens {
     pub accent: D2D1_COLOR_F,
     pub heading: D2D1_COLOR_F,
     pub code_background: D2D1_COLOR_F,
+    pub weekend_red: D2D1_COLOR_F,
+    pub weekend_blue: D2D1_COLOR_F,
+    pub high_contrast: bool,
 }
 
 // Native controls ask their parent for colors synchronously, including while
@@ -377,6 +415,9 @@ impl Default for Tokens {
             accent: color(0.49, 0.69, 0.96),
             heading: color(0.70, 0.82, 0.99),
             code_background: color(0.13, 0.15, 0.18),
+            weekend_red: color(0.98, 0.60, 0.62),
+            weekend_blue: color(0.55, 0.75, 1.0),
+            high_contrast: false,
         }
     }
 }
@@ -387,7 +428,7 @@ enum Splitter {
 }
 struct PaletteState {
     host: HWND,
-    font: HFONT,
+    font: Option<control_style::UiFont>,
     label: HWND,
     query: HWND,
     list: HWND,
@@ -405,7 +446,6 @@ impl Drop for PaletteState {
             if IsWindow(Some(self.host)).as_bool() {
                 let _ = DestroyWindow(self.host);
             }
-            let _ = DeleteObject(self.font.into());
         }
     }
 }
@@ -413,6 +453,8 @@ pub(super) struct NativeShell {
     pub enabled: bool,
     pub main_window: HWND,
     pub compact_window: HWND,
+    main_font: Option<control_style::UiFont>,
+    compact_font: Option<control_style::UiFont>,
     pub settings: EffectiveSettings,
     pub tokens: Tokens,
     pub editor: Rect,
@@ -420,6 +462,10 @@ pub(super) struct NativeShell {
     layout: PanelLayout,
     panel_file: Option<FileSnapshot>,
     panel_writable: bool,
+    menu: HMENU,
+    menu_groups: [HMENU; 6],
+    menu_button: HWND,
+    top_actions: Vec<HWND>,
     activity: Vec<HWND>,
     headers: Vec<HWND>,
     command_button: HWND,
@@ -431,6 +477,7 @@ pub(super) struct NativeShell {
     last_client: (u32, u32),
     controls_dirty: bool,
     active_activity: usize,
+    alt_menu_pending: bool,
     active_panel: PanelId,
     pub(super) scroll_hover: bool,
     pub(super) status_eol_cache: Option<(u64, u64, super::presentation::StatusEolSummary)>,
@@ -446,6 +493,8 @@ impl Default for NativeShell {
             enabled: false,
             main_window: HWND::default(),
             compact_window: HWND::default(),
+            main_font: None,
+            compact_font: None,
             settings: EffectiveSettings::default(),
             tokens: Tokens::default(),
             editor: Rect::default(),
@@ -453,6 +502,10 @@ impl Default for NativeShell {
             layout: PanelLayout::default(),
             panel_file: None,
             panel_writable: false,
+            menu: HMENU::default(),
+            menu_groups: [HMENU::default(); 6],
+            menu_button: HWND::default(),
+            top_actions: Vec::new(),
             activity: Vec::new(),
             headers: Vec::new(),
             command_button: HWND::default(),
@@ -464,6 +517,7 @@ impl Default for NativeShell {
             last_client: (0, 0),
             controls_dirty: true,
             active_activity: 0,
+            alt_menu_pending: false,
             active_panel: PanelId::Explorer,
             scroll_hover: false,
             status_eol_cache: None,
@@ -472,6 +526,22 @@ impl Default for NativeShell {
             compact_target: None,
             colors: Rc::new(ControlColors::new(Tokens::default())),
             tooltip_text: Vec::new(),
+        }
+    }
+}
+impl Drop for NativeShell {
+    fn drop(&mut self) {
+        unsafe {
+            if self.menu != HMENU::default() {
+                if self.main_window != HWND::default()
+                    && IsWindow(Some(self.main_window)).as_bool()
+                    && GetMenu(self.main_window) == self.menu
+                {
+                    let _ = SetMenu(self.main_window, None);
+                }
+                let _ = DestroyMenu(self.menu);
+                self.menu = HMENU::default();
+            }
         }
     }
 }
@@ -492,8 +562,9 @@ impl NativeShell {
         if let Some(index) = self.activity.iter().position(|h| *h == focus) {
             return match index {
                 0 | 1 => PanelId::Explorer,
-                2 => PanelId::Git,
-                3 => PanelId::Calendar,
+                2 => PanelId::Calendar,
+                3 => PanelId::Outline,
+                4 => PanelId::Git,
                 _ => self.active_panel,
             };
         }
@@ -549,7 +620,7 @@ pub(super) unsafe fn control(
     style: WINDOW_STYLE,
 ) -> HWND {
     unsafe {
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class,
             PCWSTR(wide(label).as_ptr()),
@@ -571,7 +642,12 @@ pub(super) unsafe fn control(
             None,
             None,
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+        if hwnd != HWND::default() {
+            let _ = control_style::inherit_font(hwnd, parent);
+            let _ = control_style::install_child_cursor(hwnd);
+        }
+        hwnd
     }
 }
 
@@ -712,7 +788,7 @@ fn shell_geometry(
             p.hidden = true;
         }
     }
-    let geometry = layout.geometry((width - 4.).max(0.), height, 36., 24.);
+    let geometry = layout.geometry((width - 4.).max(0.), height, TOP_BAR_HEIGHT, 24.);
     let mut panels = geometry.panels.map(|(id, mut r)| {
         if r.width > 0. {
             r.x += 4.;
@@ -722,23 +798,44 @@ fn shell_geometry(
     if narrow && let Some(id) = drawer {
         panels[id as usize].1 = Rect {
             x: 48.,
-            y: 36.,
+            y: TOP_BAR_HEIGHT,
             width: (width - 48.).clamp(0., 300.),
-            height: (height - 60.).max(0.),
+            height: (height - TOP_BAR_HEIGHT - 24.).max(0.),
         };
     }
     let center = geometry.editor;
     (
         Rect {
             x: center.x + 4. + 20.,
-            y: 88.,
+            y: EDITOR_TOP,
             width: (center.width - 40.).max(1.),
-            height: (height - 112.).max(1.),
+            height: (height - EDITOR_TOP - 24.).max(1.),
         },
         panels,
     )
 }
 impl App {
+    fn activity_button_active(&self, index: usize) -> bool {
+        if index != self.shell.active_activity || index >= ACTIVITY_COUNT - 1 {
+            return false;
+        }
+        let id = match index {
+            0 | 1 => PanelId::Explorer,
+            2 => PanelId::Calendar,
+            3 => PanelId::Outline,
+            4 => PanelId::Git,
+            _ => return false,
+        };
+        if (index == 0 && self.search_pane_active()) || (index == 1 && !self.search_pane_active()) {
+            return false;
+        }
+        if self.width < 760. {
+            self.shell.drawer == Some(id)
+        } else {
+            let panel = self.shell.layout.get(id);
+            !panel.hidden && !panel.collapsed
+        }
+    }
     pub(super) fn parent_root_diagnostic(&self) -> serde_json::Value {
         unsafe {
             let main = self.shell.main_window;
@@ -829,6 +926,12 @@ impl App {
     pub(super) fn editor_right(&self) -> f32 {
         self.editor_left() + self.editor_width()
     }
+    pub(super) fn content_left(&self) -> f32 {
+        self.editor_left() + self.gutter_width
+    }
+    pub(super) fn content_width(&self) -> f32 {
+        (self.editor_right() - self.content_left() - 12.0).max(50.0)
+    }
     pub(super) fn editor_bottom(&self) -> f32 {
         if self.shell.enabled {
             self.shell.editor.y + self.shell.editor.height
@@ -878,10 +981,53 @@ impl App {
             self.minimized = unsafe { IsIconic(hwnd).as_bool() };
         }
     }
+    pub(super) fn update_surface_font(&mut self, hwnd: HWND, dpi: u32) {
+        let slot = if hwnd == self.shell.main_window {
+            &mut self.shell.main_font
+        } else if hwnd == self.shell.compact_window {
+            &mut self.shell.compact_font
+        } else {
+            return;
+        };
+        if let Some(font) = slot {
+            let _ = font.replace_on(hwnd, dpi, 14.);
+        } else if let Ok(mut font) = control_style::UiFont::new(dpi, 14.)
+            && font.apply_to(hwnd).is_ok()
+        {
+            *slot = Some(font);
+        }
+        if let Some(palette) = &mut self.shell.palette
+            && unsafe { GetParent(palette.host).ok() } == Some(hwnd)
+            && let Some(font) = &mut palette.font
+        {
+            let _ = font.replace_on(palette.host, dpi, 14.);
+        }
+    }
     pub(super) unsafe fn start_shell(&mut self) {
         unsafe {
             self.shell.enabled = true;
             self.shell.main_window = self.hwnd;
+            self.update_surface_font(self.hwnd, GetDpiForWindow(self.hwnd));
+            self.shell.menu_button = control(
+                self.hwnd,
+                w!("BUTTON"),
+                "メニュー",
+                SHELL_MENU,
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+            );
+            for (id, label) in [
+                (CMD_NEW, "新しい文書"),
+                (CMD_OPEN, "文書を開く"),
+                (CMD_SAVE, "保存"),
+            ] {
+                self.shell.top_actions.push(control(
+                    self.hwnd,
+                    w!("BUTTON"),
+                    label,
+                    id,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                ));
+            }
             self.shell.command_button = control(
                 self.hwnd,
                 w!("BUTTON"),
@@ -892,8 +1038,9 @@ impl App {
             for (i, label) in [
                 "エクスプローラー",
                 "検索",
-                "Git（ソース管理）",
                 "カレンダー",
+                "アウトライン",
+                "Git（ソース管理）",
                 "設定",
             ]
             .into_iter()
@@ -932,10 +1079,13 @@ impl App {
                 None,
             )
             .unwrap_or_default();
+            let _ = control_style::inherit_font(self.shell.tooltip, self.hwnd);
             for h in self
                 .shell
-                .activity
+                .top_actions
                 .iter()
+                .chain(std::iter::once(&self.shell.menu_button))
+                .chain(self.shell.activity.iter())
                 .chain(self.shell.headers.iter())
                 .chain(std::iter::once(&self.shell.command_button))
             {
@@ -962,7 +1112,7 @@ impl App {
     pub(super) unsafe fn install_shell_menu(&mut self) {
         unsafe {
             let (Ok(menu), Ok(file), Ok(view), Ok(workspace), Ok(search), Ok(git), Ok(editor)) = (
-                CreateMenu(),
+                CreatePopupMenu(),
                 CreatePopupMenu(),
                 CreatePopupMenu(),
                 CreatePopupMenu(),
@@ -973,30 +1123,8 @@ impl App {
                 return;
             };
             for command in commands() {
-                let destination = if matches!(command, Command::Feature(_)) {
-                    workspace
-                } else if matches!(command, Command::Editor(_)) {
-                    editor
-                } else if matches!(command, Command::Search(_)) {
-                    search
-                } else if matches!(command, Command::Git(_)) {
-                    git
-                } else if matches!(
-                    command,
-                    Command::Diagnostics
-                        | Command::Palette
-                        | Command::Settings
-                        | Command::Compact
-                        | Command::Return
-                        | Command::Reset
-                        | Command::Source
-                        | Command::PanelMove(_)
-                        | Command::PanelResize(_)
-                ) {
-                    view
-                } else {
-                    file
-                };
+                let destination =
+                    [file, view, workspace, search, git, editor][command_menu_group(command)];
                 let flags = MF_STRING
                     | if self.command_enabled(command) {
                         MENU_ITEM_FLAGS(0)
@@ -1026,12 +1154,69 @@ impl App {
             } else {
                 self.hwnd
             };
-            let old = GetMenu(owner);
-            let _ = SetMenu(owner, Some(menu));
-            if old != HMENU::default() {
-                let _ = DestroyMenu(old);
+            let attached = GetMenu(owner);
+            if attached != HMENU::default() {
+                let _ = SetMenu(owner, None);
+                if attached != self.shell.menu {
+                    let _ = DestroyMenu(attached);
+                }
             }
+            if self.shell.menu != HMENU::default() && self.shell.menu != attached {
+                let _ = DestroyMenu(self.shell.menu);
+            }
+            self.shell.menu = menu;
+            self.shell.menu_groups = [file, view, workspace, search, git, editor];
             let _ = DrawMenuBar(owner);
+        }
+    }
+    unsafe fn open_shell_menu(&mut self, group: Option<usize>) {
+        unsafe {
+            let menu = group
+                .and_then(|index| self.shell.menu_groups.get(index).copied())
+                .filter(|menu| *menu != HMENU::default())
+                .unwrap_or(self.shell.menu);
+            if menu == HMENU::default() {
+                return;
+            }
+            for command in commands() {
+                let group = command_menu_group(command);
+                let destination = self.shell.menu_groups[group];
+                let flags = MF_BYCOMMAND
+                    | MF_STRING
+                    | if self.command_enabled(command) {
+                        MF_ENABLED
+                    } else {
+                        MF_GRAYED
+                    };
+                let _ = ModifyMenuW(
+                    destination,
+                    command.id() as u32,
+                    flags,
+                    command.id(),
+                    PCWSTR(wide(&self.command_label(command)).as_ptr()),
+                );
+            }
+            let mut button = RECT::default();
+            let _ = GetWindowRect(self.shell.menu_button, &mut button);
+            let focus = GetFocus();
+            let selected = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY,
+                button.left,
+                button.bottom,
+                None,
+                self.hwnd,
+                None,
+            )
+            .0 as usize;
+            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+            if focus != HWND::default() && IsWindow(Some(focus)).as_bool() {
+                let _ = SetFocus(Some(focus));
+            }
+            if selected != 0 {
+                self.command(selected);
+                self.refresh();
+            }
         }
     }
     pub(super) unsafe fn append_shell_context(&self, menu: HMENU) {
@@ -1153,9 +1338,9 @@ impl App {
             (
                 Rect {
                     x: 24.,
-                    y: TOP,
+                    y: EDITOR_TOP,
                     width: (self.width - 48.).max(1.),
-                    height: (height - TOP - 24.).max(1.),
+                    height: (height - EDITOR_TOP - 24.).max(1.),
                 },
                 std::array::from_fn(|i| (IDS[i], Rect::default())),
             )
@@ -1184,26 +1369,60 @@ impl App {
                     (r.height * dpi).max(0.) as i32,
                 );
             };
-            for (i, h) in self.shell.activity.iter().enumerate() {
+            let actions_visible = self.width >= 480.;
+            let _ = show_child_control(self.shell.menu_button, true);
+            position(
+                self.shell.menu_button,
+                Rect {
+                    x: 8.,
+                    y: 4.,
+                    width: 28.,
+                    height: 28.,
+                },
+            );
+            for (i, h) in self.shell.top_actions.iter().enumerate() {
+                let _ = show_child_control(*h, actions_visible);
                 position(
                     *h,
                     Rect {
-                        x: 0.,
-                        y: if i == 4 {
-                            (height - 68.).max(36.)
-                        } else {
-                            36. + i as f32 * 44.
-                        },
-                        width: 48.,
-                        height: 44.,
+                        x: 40. + i as f32 * 32.,
+                        y: 4.,
+                        width: 28.,
+                        height: 28.,
                     },
                 );
             }
-            let w = (self.width - 160.).clamp(80., 500.);
+            let left_end = if actions_visible { 132. } else { 36. };
+            let activity_count = if self.width >= 480. {
+                ACTIVITY_COUNT
+            } else if self.width < 320. {
+                3
+            } else {
+                ACTIVITY_COUNT - 1
+            };
+            let activity_width = activity_count as f32 * 32. - 4.;
+            let right_start = (self.width - 8. - activity_width).max(left_end + 1.);
+            for (i, h) in self.shell.activity.iter().enumerate() {
+                let visible = i < activity_count;
+                let _ = show_child_control(*h, visible);
+                position(
+                    *h,
+                    Rect {
+                        x: right_start + i as f32 * 32.,
+                        y: 4.,
+                        width: 28.,
+                        height: 28.,
+                    },
+                );
+            }
+            let center_left = left_end + 8.;
+            let available = (right_start - center_left - 8.).max(80.);
+            let w = available.min(500.);
+            let x = center_left + ((right_start - center_left - w) / 2.).max(0.);
             position(
                 self.shell.command_button,
                 Rect {
-                    x: (self.width - w) / 2.,
+                    x,
                     y: 4.,
                     width: w,
                     height: 28.,
@@ -1245,6 +1464,9 @@ impl App {
                     accent: color(0.16, 0.37, 0.67),
                     heading: color(0.12, 0.30, 0.60),
                     code_background: color(0.93, 0.95, 0.97),
+                    weekend_red: color(0.72, 0.12, 0.16),
+                    weekend_blue: color(0.10, 0.31, 0.68),
+                    high_contrast: false,
                 }
             } else {
                 Tokens::default()
@@ -1281,6 +1503,9 @@ impl App {
                 tokens.accent = tokens.foreground;
                 tokens.heading = tokens.foreground;
                 tokens.code_background = tokens.background;
+                tokens.weekend_red = tokens.foreground;
+                tokens.weekend_blue = tokens.foreground;
+                tokens.high_contrast = true;
             }
             self.shell.tokens = tokens;
             self.shell.colors = Rc::new(ControlColors::new(tokens));
@@ -1376,9 +1601,8 @@ impl App {
             let fg = t.CreateSolidColorBrush(&self.shell.tokens.foreground, None)?;
             let mut r = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut r);
-            let h = r.bottom as f32 / self.dpi;
             if self.hwnd == self.shell.compact_window {
-                let text = self.text_layout(
+                let text = self.ui_text_layout(
                     "Compact — ×で主windowへ戻す",
                     (self.width - 152.).max(1.),
                     12.,
@@ -1386,8 +1610,7 @@ impl App {
                 t.DrawTextLayout(point(16., 8.), &text, &fg, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                 return Ok(());
             }
-            t.FillRectangle(&rect(0., 0., self.width, 36.), &panel);
-            t.FillRectangle(&rect(0., 36., 48., (h - 60.).max(0.)), &panel);
+            t.FillRectangle(&rect(0., 0., self.width, TOP_BAR_HEIGHT), &panel);
             for (id, r) in self.shell.panels {
                 if r.width == 0. {
                     continue;
@@ -1402,7 +1625,7 @@ impl App {
                 } else {
                     NAMES[id as usize]
                 };
-                let text = self.text_layout(name, (r.width - 42.).max(1.), 12.)?;
+                let text = self.ui_text_layout(name, (r.width - 42.).max(1.), 12.)?;
                 t.DrawTextLayout(
                     point(r.x + 12., r.y + 7.),
                     &text,
@@ -1411,7 +1634,7 @@ impl App {
                 );
             }
             if self.shell.compact_window != HWND::default() {
-                let label = self.text_layout(
+                let label = self.ui_text_layout(
                     "文書はCompactで編集中です。表示メニューから主windowへ戻せます。",
                     self.editor_width(),
                     14.,
@@ -1429,8 +1652,18 @@ impl App {
     pub(super) unsafe fn draw_shell_button(&self, item: &DRAWITEMSTRUCT) {
         unsafe {
             let control_dpi = (GetDpiForWindow(item.hwndItem) as f32 / 96.).max(1.);
-            let selected = item.itemState.0 & ODS_SELECTED.0 != 0;
-            let bg = if selected || item.CtlID as usize == ACTIVITY + self.shell.active_activity {
+            let id = item.CtlID as usize;
+            let activity = id
+                .checked_sub(ACTIVITY)
+                .filter(|index| *index < ACTIVITY_COUNT);
+            let action = match id {
+                CMD_NEW => Some(0),
+                CMD_OPEN => Some(1),
+                CMD_SAVE => Some(2),
+                _ => None,
+            };
+            let active = activity.is_some_and(|index| self.activity_button_active(index));
+            let bg = if item.itemState.0 & ODS_SELECTED.0 != 0 || active {
                 self.shell.tokens.selected
             } else {
                 self.shell.tokens.panel
@@ -1438,34 +1671,43 @@ impl App {
             let brush = CreateSolidBrush(rgb(bg));
             FillRect(item.hDC, &item.rcItem, brush);
             let _ = DeleteObject(brush.into());
-            let id = item.CtlID as usize;
-            if id == ACTIVITY + self.shell.active_activity {
+            if active {
                 let brush = CreateSolidBrush(rgb(self.shell.tokens.accent));
                 let stripe = RECT {
-                    left: 0,
-                    top: 0,
-                    right: (3. * control_dpi).round() as i32,
+                    left: item.rcItem.left,
+                    top: item.rcItem.bottom - (3. * control_dpi).round() as i32,
+                    right: item.rcItem.right,
                     bottom: item.rcItem.bottom,
                 };
                 FillRect(item.hDC, &stripe, brush);
                 let _ = DeleteObject(brush.into());
             }
-            if (ACTIVITY..ACTIVITY + 5).contains(&id) {
+            let icon = if id == SHELL_MENU || (HEADER..HEADER + 4).contains(&id) {
+                Some(MENU_ICON)
+            } else if let Some(index) = action {
+                Some(TOP_ACTION_ICONS[index])
+            } else {
+                activity.map(|index| ACTIVITY_ICONS[index])
+            };
+            if let Some(icon) = icon {
                 draw_icon(
                     item.hDC,
                     &item.rcItem,
-                    ICONS[id - ACTIVITY],
+                    icon,
                     control_dpi,
                     self.shell.tokens.foreground,
                     bg,
                 );
             } else {
-                let text = if (HEADER..HEADER + 4).contains(&id) {
-                    "⋯".into()
-                } else {
-                    text_of(item.hwndItem)
-                };
+                let text = text_of(item.hwndItem);
                 let mut area = item.rcItem;
+                let font =
+                    HGDIOBJ(send(item.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as *mut _);
+                let previous = if font != HGDIOBJ::default() {
+                    Some(SelectObject(item.hDC, font))
+                } else {
+                    None
+                };
                 let _ = SetBkMode(item.hDC, TRANSPARENT);
                 SetTextColor(item.hDC, rgb(self.shell.tokens.foreground));
                 draw_gdi_text(
@@ -1474,6 +1716,9 @@ impl App {
                     &mut area,
                     DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
                 );
+                if let Some(previous) = previous {
+                    let _ = SelectObject(item.hDC, previous);
+                }
             }
             if item.itemState.0 & ODS_FOCUS.0 != 0 {
                 let _ = DrawFocusRect(item.hDC, &item.rcItem);
@@ -1481,6 +1726,21 @@ impl App {
         }
     }
 }
+fn owner_button_icon(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "新しいファイル" => include_str!("../../assets/ui/icons/file-plus.svg"),
+        "新しいフォルダー" => include_str!("../../assets/ui/icons/folder-plus.svg"),
+        "前月" => include_str!("../../assets/ui/icons/chevron-left.svg"),
+        "翌月" => include_str!("../../assets/ui/icons/chevron-right.svg"),
+        "今日" => include_str!("../../assets/ui/icons/calendar.svg"),
+        "更新" => include_str!("../../assets/ui/icons/refresh.svg"),
+        "Stage" => include_str!("../../assets/ui/icons/add.svg"),
+        "Unstage" => include_str!("../../assets/ui/icons/remove.svg"),
+        "取消" => include_str!("../../assets/ui/icons/close.svg"),
+        _ => return None,
+    })
+}
+
 pub(super) unsafe fn draw_owner_button(
     tokens: Tokens,
     item: &DRAWITEMSTRUCT,
@@ -1527,12 +1787,25 @@ pub(super) unsafe fn draw_owner_button(
         }
         let _ = SetBkMode(item.hDC, TRANSPARENT);
         SetTextColor(item.hDC, rgb(foreground));
-        draw_gdi_text(
-            item.hDC,
-            &state.label,
-            &mut area,
-            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
+        if let Some(icon) = owner_button_icon(&state.label) {
+            draw_icon(item.hDC, &area, icon, dpi, foreground, background);
+        } else {
+            let font = HGDIOBJ(send(item.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let previous = if font != HGDIOBJ::default() {
+                Some(SelectObject(item.hDC, font))
+            } else {
+                None
+            };
+            draw_gdi_text(
+                item.hDC,
+                &state.label,
+                &mut area,
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            if let Some(previous) = previous {
+                let _ = SelectObject(item.hDC, previous);
+            }
+        }
         if state.focused {
             let inset = (3. * dpi).round() as i32;
             let focus = RECT {
@@ -1605,7 +1878,9 @@ impl App {
                         return Some(LRESULT(1));
                     }
                     if id != PALETTE
-                        && !(ACTIVITY..ACTIVITY + 5).contains(&id)
+                        && id != SHELL_MENU
+                        && ![CMD_NEW, CMD_OPEN, CMD_SAVE].contains(&id)
+                        && !(ACTIVITY..ACTIVITY + ACTIVITY_COUNT).contains(&id)
                         && !(HEADER..HEADER + 4).contains(&id)
                     {
                         return None;
@@ -1692,17 +1967,25 @@ impl App {
                 self.close_palette(true);
                 return true;
             }
-            if (ACTIVITY..ACTIVITY + 5).contains(&id) {
-                if id - ACTIVITY < 4 {
-                    self.shell.active_activity = id - ACTIVITY;
+            if id == SHELL_MENU {
+                if !self.composing && !self.feature_ime_active() {
+                    self.open_shell_menu(None);
                 }
-                match id - ACTIVITY {
-                    0 => self.set_search_pane_active(false),
+                return true;
+            }
+            if (ACTIVITY..ACTIVITY + ACTIVITY_COUNT).contains(&id) {
+                let index = id - ACTIVITY;
+                if index < ACTIVITY_COUNT - 1 {
+                    self.shell.active_activity = index;
+                }
+                match index {
+                    0 => self.toggle_toolbar_panel(PanelId::Explorer),
                     1 => {
                         self.command(5001);
                     }
-                    2 => self.show_panel(PanelId::Git),
-                    3 => self.show_panel(PanelId::Calendar),
+                    2 => self.toggle_toolbar_panel(PanelId::Calendar),
+                    3 => self.toggle_toolbar_panel(PanelId::Outline),
+                    4 => self.toggle_toolbar_panel(PanelId::Git),
                     _ => self.show_settings(),
                 };
                 return true;
@@ -1822,6 +2105,30 @@ impl App {
         self.presentation_changed();
         self.save_panel_layout();
     }
+    fn toggle_toolbar_panel(&mut self, id: PanelId) {
+        if id == PanelId::Explorer && self.search_pane_active() {
+            self.set_search_pane_active(false);
+            return;
+        }
+        let visible = if self.width < 760. {
+            self.shell.drawer == Some(id)
+        } else {
+            let state = self.shell.layout.get(id);
+            !state.hidden && !state.collapsed
+        };
+        if visible {
+            if self.width < 760. {
+                self.shell.drawer = None;
+                self.presentation_changed();
+            } else {
+                self.shell.layout.get_mut(id).hidden = true;
+                self.presentation_changed();
+                self.save_panel_layout();
+            }
+        } else {
+            self.show_panel(id);
+        }
+    }
     unsafe fn panel_menu(&mut self, id: PanelId) {
         unsafe {
             self.shell.active_panel = id;
@@ -1922,6 +2229,93 @@ impl App {
             self.save_panel_layout();
         }
     }
+    fn splitter_at(&self, x: f32, y: f32) -> Option<Splitter> {
+        for (id, r) in self.shell.panels {
+            if r.width == 0. {
+                continue;
+            }
+            let left = matches!(
+                self.shell.layout.get(id).slot,
+                Slot::LeftTop | Slot::LeftBottom
+            );
+            if self.width >= 760.
+                && (x - if left { r.x + r.width } else { r.x }).abs() < 5.
+                && y >= r.y
+                && y <= r.y + r.height
+            {
+                return Some(Splitter::Width(id));
+            }
+            if (y - (r.y + r.height)).abs() < 5. && r.contains(x, y - 5.) {
+                return Some(Splitter::Height(id));
+            }
+        }
+        None
+    }
+    pub(super) fn surface_cursor_at(&self, x: f32, y: f32) -> PCWSTR {
+        if !self.shell.enabled {
+            return if y < 74. {
+                IDC_HAND
+            } else if y < self.height - 24. && x < self.width - 20. {
+                IDC_IBEAM
+            } else {
+                IDC_ARROW
+            };
+        }
+        let editor_active =
+            self.shell.compact_window == HWND::default() || self.hwnd == self.shell.compact_window;
+        if self.hwnd == self.shell.main_window
+            && !self.composing
+            && !self.background_mutation_busy()
+        {
+            if let Some(splitter) = self.shell.splitter.or_else(|| self.splitter_at(x, y)) {
+                return match splitter {
+                    Splitter::Width(_) => IDC_SIZEWE,
+                    Splitter::Height(_) => IDC_SIZENS,
+                };
+            }
+            if self.features_actionable_at(x, y) {
+                return IDC_HAND;
+            }
+            if y < TOP_BAR_HEIGHT {
+                return IDC_HAND;
+            }
+        }
+        if editor_active
+            && !self.composing
+            && (TAB_STRIP_TOP..TAB_DIVIDER_Y + 1.).contains(&y)
+            && x >= self.editor_left()
+            && x <= self.editor_right()
+        {
+            let strip = self.tab_strip();
+            if x >= self.editor_right() - 24.
+                || (strip.overflow && (x < strip.left || x >= strip.right))
+                || (strip.tab_width > 0.
+                    && x >= strip.left
+                    && x < strip.right
+                    && ((x - strip.left) / strip.tab_width) < strip.visible_count as f32)
+            {
+                return IDC_HAND;
+            }
+        }
+        if editor_active
+            && x >= self.content_left()
+            && x <= self.content_left() + self.content_width()
+            && y >= self.editor_top()
+            && y < self.editor_top() + self.shell.editor.height
+        {
+            if !self.composing
+                && !self.background_mutation_busy()
+                && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0
+                && self
+                    .link_destination_at(self.hit_with_affinity(x, y).0)
+                    .is_some()
+            {
+                return IDC_HAND;
+            }
+            return IDC_IBEAM;
+        }
+        IDC_ARROW
+    }
     pub(super) unsafe fn shell_click(&mut self, x: f32, y: f32) {
         unsafe {
             if self.composing {
@@ -1930,27 +2324,14 @@ impl App {
             if self.shell.compact_window != HWND::default() && self.hwnd == self.shell.main_window {
                 return;
             }
+            if let Some(splitter) = self.splitter_at(x, y) {
+                self.shell.splitter = Some(splitter);
+                SetCapture(self.hwnd);
+                return;
+            }
             for (id, r) in self.shell.panels {
                 if r.width == 0. {
                     continue;
-                }
-                let left = matches!(
-                    self.shell.layout.get(id).slot,
-                    Slot::LeftTop | Slot::LeftBottom
-                );
-                if (self.width >= 760.)
-                    && (x - (if left { r.x + r.width } else { r.x })).abs() < 5.
-                    && y >= r.y
-                    && y <= r.y + r.height
-                {
-                    self.shell.splitter = Some(Splitter::Width(id));
-                    SetCapture(self.hwnd);
-                    return;
-                }
-                if (y - (r.y + r.height)).abs() < 5. && r.contains(x, y - 5.) {
-                    self.shell.splitter = Some(Splitter::Height(id));
-                    SetCapture(self.hwnd);
-                    return;
                 }
                 if r.contains(x, y) {
                     self.shell.active_panel = id;
@@ -1960,12 +2341,16 @@ impl App {
                     return;
                 }
             }
-            if y < 36. {
-                self.open_palette();
+            if y < TOP_BAR_HEIGHT {
+                if x <= 40. {
+                    self.open_shell_menu(None);
+                } else {
+                    self.open_palette();
+                }
                 return;
             }
-            if y < 76. {
-                if x >= self.editor_right() {
+            if y < TAB_DIVIDER_Y + 1. {
+                if x >= self.editor_right() - 24. {
                     self.command(CMD_NEW);
                     return;
                 }
@@ -2101,21 +2486,14 @@ impl App {
                 RESULTS,
                 WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
             );
-            let mut font_data = LOGFONTW {
-                lfHeight: -(16. * self.dpi) as i32,
-                ..Default::default()
-            };
-            let face = wide("Segoe UI");
-            font_data.lfFaceName[..face.len()].copy_from_slice(&face);
-            let font = CreateFontIndirectW(&font_data);
-            for child in [label, query, list] {
-                send(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            }
+            let font = control_style::UiFont::new(GetDpiForWindow(host), 14.)
+                .ok()
+                .and_then(|mut font| font.apply_to(host).ok().map(|()| font));
             send(
                 list,
                 LB_SETITEMHEIGHT,
                 WPARAM(0),
-                LPARAM((24. * self.dpi) as isize),
+                LPARAM((22. * self.dpi) as isize),
             );
             let composing = track_control_ime(query);
             self.shell.palette = Some(PaletteState {
@@ -2152,12 +2530,39 @@ impl App {
                 return;
             }
             let dpi = self.dpi.max(0.1);
-            let margin = (12. * dpi) as i32;
+            let margin = (8. * dpi) as i32;
             let width = (client.right - 2 * margin).max(1).min((600. * dpi) as i32);
-            let top = ((40. * dpi) as i32).min((client.bottom - 1).max(0));
-            let height = (client.bottom - top - margin)
+            let top = (((TOP_BAR_HEIGHT + 4.) * dpi) as i32).min((client.bottom - 1).max(0));
+            let max_height = (client.bottom - top - margin)
                 .max(1)
-                .min((380. * dpi) as i32);
+                .min((300. * dpi) as i32);
+            let pad = (6. * dpi) as i32;
+            let label_h = (18. * dpi) as i32;
+            let query_h = (28. * dpi) as i32;
+            let gap = (4. * dpi) as i32;
+            let row_h = (22. * dpi) as i32;
+            let rows = p.commands.len().clamp(1, 8) as i32;
+            let mut host_info = WINDOWINFO {
+                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            let mut list_info = host_info;
+            if GetWindowInfo(p.host, &mut host_info).is_err()
+                || GetWindowInfo(p.list, &mut list_info).is_err()
+            {
+                return;
+            }
+            let host_border_y = (host_info.rcWindow.bottom - host_info.rcWindow.top)
+                - (host_info.rcClient.bottom - host_info.rcClient.top);
+            let host_border_x = (host_info.rcWindow.right - host_info.rcWindow.left)
+                - (host_info.rcClient.right - host_info.rcClient.left);
+            let list_border_y = (list_info.rcWindow.bottom - list_info.rcWindow.top)
+                - (list_info.rcClient.bottom - list_info.rcClient.top);
+            // Integral-height LISTBOX sizing needs a complete client row plus
+            // its own native border, in addition to the host's native border.
+            let desired_height =
+                2 * pad + label_h + query_h + gap + rows * row_h + host_border_y + list_border_y;
+            let height = desired_height.min(max_height).max(1);
             let _ = SetWindowPos(
                 p.host,
                 Some(HWND_TOP),
@@ -2167,19 +2572,18 @@ impl App {
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            let pad = (8. * dpi) as i32;
-            let inner = (width - 2 * pad - 2).max(0);
-            let label_h = ((24. * dpi) as i32).min((height - 2 * pad).max(0));
-            let query_h = ((30. * dpi) as i32).min((height - 2 * pad - label_h).max(0));
+            let inner = (width - 2 * pad - host_border_x).max(0);
+            let label_h = label_h.min((height - host_border_y - 2 * pad).max(0));
+            let query_h = query_h.min((height - host_border_y - 2 * pad - label_h).max(0));
             let _ = position_child_control(p.label, pad, pad, inner, label_h);
             let _ = position_child_control(p.query, pad, pad + label_h, inner, query_h);
-            let list_y = pad + label_h + query_h + (6. * dpi) as i32;
+            let list_y = pad + label_h + query_h + gap;
             let _ = position_child_control(
                 p.list,
                 pad,
                 list_y,
                 inner,
-                (height - list_y - pad - 2).max(0),
+                (height - host_border_y - list_y - pad).max(0),
             );
         }
     }
@@ -2228,6 +2632,7 @@ impl App {
             }
             send(list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
             self.shell.palette.as_mut().unwrap().commands = commands;
+            self.position_palette();
         }
     }
     unsafe fn close_palette(&mut self, cancel: bool) {
@@ -2372,12 +2777,53 @@ impl App {
                     return false;
                 }
             }
-            if !self.shell.enabled || !matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            if !self.shell.enabled {
                 return false;
             }
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+            if msg.message == WM_SYSKEYDOWN
+                && msg.wParam.0 as u16 == VK_MENU.0
+                && !ctrl
+                && !shift
+                && !self.composing
+                && !self.feature_ime_active()
+            {
+                self.shell.alt_menu_pending = true;
+                return true;
+            }
+            if msg.message == WM_SYSKEYUP
+                && msg.wParam.0 as u16 == VK_MENU.0
+                && self.shell.alt_menu_pending
+            {
+                self.shell.alt_menu_pending = false;
+                if !self.composing && !self.feature_ime_active() {
+                    self.open_shell_menu(None);
+                }
+                return true;
+            }
+            if msg.message == WM_SYSKEYDOWN && self.shell.alt_menu_pending {
+                self.shell.alt_menu_pending = false;
+                let group = match msg.wParam.0 as u16 {
+                    0x46 | 0x66 => Some(0), // File
+                    0x56 | 0x76 => Some(1), // View
+                    0x57 | 0x77 => Some(2), // Workspace
+                    0x53 | 0x73 => Some(3), // Search
+                    0x47 | 0x67 => Some(4), // Git
+                    0x45 | 0x65 => Some(5), // Editor
+                    _ => None,
+                };
+                if let Some(group) = group {
+                    if !self.composing && !self.feature_ime_active() {
+                        self.open_shell_menu(Some(group));
+                    }
+                    return true;
+                }
+            }
+            if !matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                return false;
+            }
             if !self.feature_ime_active()
                 && !alt
                 && self.editor_actions.active_button(self) == msg.hwnd
@@ -2519,6 +2965,7 @@ impl App {
                 return;
             };
             self.shell.compact_window = compact;
+            self.update_surface_font(compact, GetDpiForWindow(compact));
             (*pointer).editor_window.set(compact);
             self.tabs[self.active].persistence.compact = true;
             self.select_surface(compact);
@@ -2558,6 +3005,7 @@ impl App {
                 (*pointer).editor_window.set(main);
             }
             let _ = DestroyWindow(compact);
+            self.shell.compact_font = None;
             self.dpi = GetDpiForWindow(main) as f32 / 96.;
             self.shell.controls_dirty = true;
             self.layout_key = None;
@@ -2698,8 +3146,8 @@ unsafe fn draw_icon(dc: HDC, area: &RECT, svg: &str, dpi: f32, fg: D2D1_COLOR_F,
         };
         SetDIBitsToDevice(
             dc,
-            (area.right - area.left - size as i32) / 2,
-            (area.bottom - area.top - size as i32) / 2,
+            area.left + (area.right - area.left - size as i32) / 2,
+            area.top + (area.bottom - area.top - size as i32) / 2,
             size,
             size,
             0,
@@ -2756,6 +3204,106 @@ pub(super) unsafe fn track_control_ime(hwnd: HWND) -> Box<Cell<bool>> {
 mod tests {
     use super::*;
     #[test]
+    fn shell_native_font_surfaces_and_cursor_regions_preserve_document() {
+        let window = super::super::tests::hidden_test_window_size(1280, 800);
+        let mut app = super::super::tests::composing_test_app("# 見出し\n\n本文\n");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().selection(),
+            app.doc().undo_count(),
+            app.doc().is_dirty(),
+        );
+        app.update_surface_font(window, 96);
+        unsafe {
+            let child = control(
+                window,
+                w!("EDIT"),
+                "検索語",
+                987,
+                WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            );
+            assert_eq!(
+                send(child, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                app.shell.main_font.as_ref().unwrap().handle().0 as isize
+            );
+            app.ensure_layout().unwrap();
+            let x = app.content_left() + 20.;
+            let y = app.editor_top() + 10.;
+            assert_eq!(app.surface_cursor_at(x, y).as_ptr(), IDC_IBEAM.as_ptr());
+            assert_eq!(
+                app.surface_cursor_at(app.editor_left() + 1., y).as_ptr(),
+                IDC_ARROW.as_ptr()
+            );
+            assert_eq!(
+                app.surface_cursor_at(app.editor_left() + 20., TAB_LABEL_TOP)
+                    .as_ptr(),
+                IDC_HAND.as_ptr()
+            );
+            let panel = app.shell.panels.iter().find(|(_, r)| r.width > 0.).unwrap();
+            let left = matches!(
+                app.shell.layout.get(panel.0).slot,
+                Slot::LeftTop | Slot::LeftBottom
+            );
+            assert_eq!(
+                app.surface_cursor_at(
+                    if left {
+                        panel.1.x + panel.1.width
+                    } else {
+                        panel.1.x
+                    },
+                    panel.1.y + 40.
+                )
+                .as_ptr(),
+                IDC_SIZEWE.as_ptr()
+            );
+            app.open_palette();
+            assert!(app.shell.palette.as_ref().unwrap().font.is_some());
+            app.update_surface_font(window, 150);
+            let main = app.shell.main_font.as_ref().unwrap().handle();
+            assert_eq!(
+                send(child, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                main.0 as isize
+            );
+            let palette = app.shell.palette.as_ref().unwrap();
+            let own = palette.font.as_ref().unwrap().handle();
+            assert_ne!(main, own);
+            for child in [palette.label, palette.query, palette.list] {
+                assert_eq!(
+                    send(child, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                    own.0 as isize
+                );
+            }
+            let mut data = LOGFONTW::default();
+            assert_ne!(
+                GetObjectW(
+                    own.into(),
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    Some((&mut data as *mut LOGFONTW).cast())
+                ),
+                0
+            );
+            assert_eq!(data.lfHeight, -(14_f32 * 150. / 96.).round() as i32);
+            app.shell.palette.take();
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().selection(),
+                app.doc().undo_count(),
+                app.doc().is_dirty()
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn shell_geometry_narrow_drawer_and_slot_swap_remain_reachable() {
         let mut layout = PanelLayout::default();
         for width in [320., 480., 760., 1100., 1440.] {
@@ -2788,9 +3336,12 @@ mod tests {
         app.shell.compact_window = compact;
         app.update_shell_geometry(480.);
 
-        assert_eq!(app.shell.editor.y, TOP);
+        assert_eq!(app.shell.editor.y, EDITOR_TOP);
         assert_eq!(app.shell.editor.y + app.shell.editor.height, 480. - 24.);
-        assert!(app.shell.editor.y >= 75., "compact tabs end at y=75 DIP");
+        assert!(
+            app.shell.editor.y >= TAB_STRIP_TOP + TAB_STRIP_HEIGHT,
+            "compact editor starts below the compact tab strip"
+        );
         unsafe {
             let _ = DestroyWindow(compact);
         }
@@ -2928,6 +3479,56 @@ mod tests {
         assert!(!app.command_enabled(Command::Source));
         assert!(!app.command_enabled(Command::Palette));
     }
+    #[test]
+    fn shell_palette_single_candidate_keeps_a_full_native_list_row() {
+        let window = super::super::tests::hidden_test_window_size(1100, 793);
+        let mut app = super::super::tests::composing_test_app("unchanged 本文");
+        app.clear_composition();
+        app.hwnd = window;
+        app.shell.enabled = true;
+        app.shell.main_window = window;
+        let document_state = |doc: &Document| {
+            (
+                doc.source().to_owned(),
+                doc.revision(),
+                doc.is_dirty(),
+                doc.undo_count(),
+                doc.redo_count(),
+                doc.selection(),
+            )
+        };
+        let before = document_state(app.doc());
+        unsafe {
+            for dpi in [1.0, 1.5625] {
+                app.dpi = dpi;
+                app.open_palette();
+                let query = app.shell.palette.as_ref().unwrap().query;
+                let query_text = wide("設定");
+                send(
+                    query,
+                    WM_SETTEXT,
+                    WPARAM(0),
+                    LPARAM(query_text.as_ptr() as isize),
+                );
+                app.filter_palette();
+                let palette = app.shell.palette.as_ref().unwrap();
+                assert_eq!(palette.commands.len(), 1);
+                let mut client = RECT::default();
+                GetClientRect(palette.list, &mut client).unwrap();
+                let item_height =
+                    send(palette.list, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0)).0 as i32;
+                assert!(
+                    client.bottom >= item_height,
+                    "dpi={dpi}: native list client {} must fit item {item_height}",
+                    client.bottom
+                );
+                app.close_palette(true);
+            }
+            DestroyWindow(window).unwrap();
+        }
+        assert_eq!(document_state(app.doc()), before);
+    }
+
     #[test]
     fn shell_palette_host_bounds_dismissal_and_invalid_focus_are_owned() {
         let window = super::super::tests::hidden_test_window_size(1100, 793);

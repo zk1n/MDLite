@@ -2,6 +2,7 @@
 //! WindowState lives until the message loop exits. Synchronous native reentry
 //! snapshots IME notifications outside App's borrow and drains them in order.
 
+mod control_style;
 mod diagnostics;
 mod editing;
 mod editor_actions;
@@ -10,6 +11,7 @@ mod features;
 mod git_ui;
 mod persistence;
 mod presentation;
+mod scrollbar_style;
 mod search_ui;
 mod settings_dialog;
 mod shell;
@@ -32,7 +34,7 @@ use mdlite::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -64,6 +66,8 @@ const TOP: f32 = 88.0;
 const LEFT: f32 = 44.0;
 const TAB_WIDTH: f32 = 170.0;
 const TAB_SCROLL_BUTTON: f32 = 28.0;
+const GUTTER_HORIZONTAL_PADDING: f32 = 12.0;
+const GUTTER_LABEL_LEFT: f32 = 4.0;
 const FONT: f32 = 17.0;
 const CF_TEXT_W: u32 = 13;
 const CMD_NEW: usize = 1;
@@ -215,6 +219,14 @@ struct TextView {
     marker: Option<(IDWriteTextLayout, f32)>,
     quoted: bool,
     thematic_break: bool,
+}
+#[derive(Clone, Copy, Debug)]
+struct GutterRow {
+    view_index: usize,
+    y: f32,
+    baseline: f32,
+    height: f32,
+    line_number: usize,
 }
 struct GutterPresentation {
     marker: Option<(IDWriteTextLayout, f32)>,
@@ -405,6 +417,9 @@ struct App {
     tab_scroll: usize,
     next_id: u64,
     views: Vec<TextView>,
+    source_line_starts: Vec<usize>,
+    gutter_rows: Vec<GutterRow>,
+    gutter_width: f32,
     visible_tokens: Vec<VisibleToken>,
     literal_blocks: Vec<Range<usize>>,
     tables: Vec<TableView>,
@@ -970,6 +985,9 @@ fn startup_window_state(
         tab_scroll: 0,
         next_id: 1,
         views: Vec::new(),
+        source_line_starts: Vec::new(),
+        gutter_rows: Vec::new(),
+        gutter_width: 0.0,
         visible_tokens: Vec::new(),
         literal_blocks: Vec::new(),
         tables: Vec::new(),
@@ -1042,7 +1060,7 @@ pub fn run() -> windows::core::Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_IBEAM)?,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: w!("MDLiteRustEditor"),
             ..Default::default()
         };
@@ -1601,6 +1619,18 @@ unsafe fn dispatch_window_message(
         }
         Some(match msg {
             WM_CREATE => LRESULT(0),
+            WM_SETCURSOR if wp.0 == hwnd.0 as usize && lp.0 as u16 == HTCLIENT as u16 => {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool() {
+                    let cursor =
+                        app.surface_cursor_at(point.x as f32 / app.dpi, point.y as f32 / app.dpi);
+                    if let Ok(cursor) = LoadCursorW(None, cursor) {
+                        SetCursor(Some(cursor));
+                        return Some(LRESULT(1));
+                    }
+                }
+                return None;
+            }
             value if value == WM_APP + 1 && app.diagnostic.is_some() => {
                 app.refresh();
                 LRESULT(1)
@@ -1648,6 +1678,7 @@ unsafe fn dispatch_window_message(
             }
             WM_DPICHANGED => {
                 app.dpi = (wp.0 & 0xffff) as f32 / 96.0;
+                app.update_surface_font(hwnd, (wp.0 & 0xffff) as u32);
                 app.discard_target();
                 let r = &*(lp.0 as *const RECT);
                 let _ = SetWindowPos(
@@ -1750,6 +1781,13 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
+                if GetCapture() == hwnd {
+                    let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                    let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                    if let Ok(cursor) = LoadCursorW(None, app.surface_cursor_at(x, y)) {
+                        SetCursor(Some(cursor));
+                    }
+                }
                 if app.shell.enabled {
                     let x = (lp.0 as u16 as i16) as f32 / app.dpi;
                     let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
@@ -2226,7 +2264,7 @@ impl App {
                     }
                     if self.shell.enabled {
                         document = RECT {
-                            left: (self.editor_left() * self.dpi).round() as i32,
+                            left: (self.content_left() * self.dpi).round() as i32,
                             top: (self.editor_top() * self.dpi).round() as i32,
                             right: (self.editor_right() * self.dpi).round() as i32,
                             bottom: (self.editor_bottom() * self.dpi).round() as i32,
@@ -3158,8 +3196,8 @@ impl App {
             }
             match key {
                 0x21 | 0x22 => {
-                    let page =
-                        (self.animation_viewport() - self.editor_top()).max(self.font_size() * 1.6);
+                    let page = (self.animation_viewport() - self.editor_top())
+                        .max(presentation::line_height(self.font_size()));
                     let (x, y, _) = self.caret_location();
                     let x = *self.preferred_x.get_or_insert(x);
                     let delta = if key == 0x21 { -page } else { page };
@@ -3339,8 +3377,17 @@ impl App {
             self.preferred_x = None;
         }
         let (mut target, mut affinity) = match key {
-            0x25 => (self.visible_step(p, true), BoundaryAffinity::After),
-            0x27 => (self.visible_step(p, false), BoundaryAffinity::After),
+            0x25 | 0x27 => {
+                let target = self.visible_step(p, key == 0x25);
+                (
+                    target,
+                    if target == p {
+                        self.doc().selection_affinity()
+                    } else {
+                        BoundaryAffinity::After
+                    },
+                )
+            }
             0x26 | 0x28 => {
                 let (x, _, _) = self.caret_location();
                 let x = *self.preferred_x.get_or_insert(x);
@@ -3392,7 +3439,7 @@ impl App {
         // DirectWrite visual line metrics account for wrapping and heading
         // heights; a guessed multiple of the current glyph height does not.
         let mut rows = Vec::new();
-        for view in &self.views {
+        for (view_index, view) in self.views.iter().enumerate() {
             let mut count = 0;
             unsafe {
                 let _ = view.layout.GetLineMetrics(None, &mut count);
@@ -3404,7 +3451,7 @@ impl App {
                 {
                     let mut top = view.y - scroll;
                     for line in lines {
-                        rows.push((top, top + line.height));
+                        rows.push((top, top + line.height, view_index));
                         top += line.height;
                     }
                 }
@@ -3412,28 +3459,72 @@ impl App {
         }
         let current_top = rows
             .iter()
-            .filter(|&&(top, bottom)| top <= y + 0.5 && y < bottom)
-            .map(|&(top, _)| top)
+            .filter(|&&(top, bottom, _)| top <= y + 0.5 && y < bottom)
+            .map(|&(top, _, _)| top)
             .max_by(f32::total_cmp)
             .unwrap_or(y);
-        let destination = rows
-            .into_iter()
-            .filter(|&(top, _)| {
-                if back {
-                    top < current_top - 0.5
-                } else {
-                    top > current_top + 0.5
+        rows.retain(|&(top, _, _)| {
+            if back {
+                top < current_top - 0.5
+            } else {
+                top > current_top + 0.5
+            }
+        });
+        let at_edge = rows.is_empty();
+        rows.sort_by(|a, b| {
+            (a.0 - current_top)
+                .abs()
+                .total_cmp(&(b.0 - current_top).abs())
+        });
+        let mut destination: Option<(f32, f32, usize, BoundaryAffinity)> = None;
+        for (top, bottom, view_index) in rows {
+            let vertical_distance = (top - current_top).abs();
+            if destination.is_some_and(|(distance, _, _, _)| vertical_distance > distance) {
+                break;
+            }
+            let view = &self.views[view_index];
+            for (byte, affinity) in self.view_hit_candidates(view, x, (top + bottom) * 0.5 + scroll)
+            {
+                let (target_x, target_y, _) = self.caret_location_at(byte, affinity);
+                // A projected trailing newline can share its After boundary
+                // with the next block. Use the side that maps back to this
+                // visual row; an unaddressable layout-only row is not a stop.
+                if target_y >= top - 0.5
+                    && target_y < bottom
+                    && if back {
+                        target_y < current_top - 0.5
+                    } else {
+                        target_y > current_top + 0.5
+                    }
+                {
+                    let horizontal_distance = (target_x - x).abs();
+                    // Several table cells can own the same destination row.
+                    // Keep the caret nearest preferred X, rather than the
+                    // first cell created left-to-right. Preserve affinity ties.
+                    if destination.is_none_or(|(_, distance, _, _)| horizontal_distance < distance)
+                    {
+                        destination =
+                            Some((vertical_distance, horizontal_distance, byte, affinity));
+                    }
                 }
-            })
-            .min_by(|a, b| {
-                (a.0 - current_top)
-                    .abs()
-                    .total_cmp(&(b.0 - current_top).abs())
-            });
-        destination.map_or(
-            (self.doc().selection().head, self.doc().selection_affinity()),
-            |(top, bottom)| self.hit_with_affinity(x, (top + bottom) * 0.5),
-        )
+            }
+        }
+        if let Some((_, _, byte, affinity)) = destination {
+            return (byte, affinity);
+        }
+        let edge = if back { 0 } else { self.doc().byte_len() };
+        if at_edge && edge != self.doc().selection().head {
+            (
+                edge,
+                if back {
+                    BoundaryAffinity::Before
+                } else {
+                    BoundaryAffinity::After
+                },
+            )
+        } else {
+            (self.doc().selection().head, self.doc().selection_affinity())
+        }
     }
     unsafe fn after_input(&mut self) {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -3452,13 +3543,9 @@ impl App {
                     .table_scroll
                     .get(&key)
                     .unwrap_or(&0.0);
-                let caret_x = self.composition_caret().0 - self.editor_left() + current;
-                let next = visible_table_offset(
-                    current,
-                    caret_x,
-                    (self.editor_width() - 12.0).max(1.0),
-                    content_width,
-                );
+                let caret_x = self.composition_caret().0 - self.content_left() + current;
+                let next =
+                    visible_table_offset(current, caret_x, self.content_width(), content_width);
                 if next != current {
                     self.tabs[self.active].table_scroll.insert(key, next);
                     self.layout_key = None;
@@ -3644,7 +3731,7 @@ impl App {
             return tab_strip_layout(self.width, self.tabs.len(), self.tab_scroll);
         }
         let left = self.editor_left() - 20.;
-        let right = self.editor_right() + 20. - 148.;
+        let right = self.editor_right() - 28.;
         let mut strip = tab_strip_layout(
             (right - left).max(1.) + LEFT * 2.,
             self.tabs.len(),
@@ -4014,18 +4101,33 @@ impl App {
         width: f32,
         size: f32,
     ) -> windows::core::Result<IDWriteTextLayout> {
+        let family = if self.shell.enabled {
+            &self.shell.settings.font_face
+        } else {
+            shell::UI_FONT_FAMILY
+        };
+        unsafe { self.text_layout_family(text, width, size, family) }
+    }
+    unsafe fn ui_text_layout(
+        &self,
+        text: &str,
+        width: f32,
+        size: f32,
+    ) -> windows::core::Result<IDWriteTextLayout> {
+        unsafe { self.text_layout_family(text, width, size, shell::UI_FONT_FAMILY) }
+    }
+    unsafe fn text_layout_family(
+        &self,
+        text: &str,
+        width: f32,
+        size: f32,
+        family: &str,
+    ) -> windows::core::Result<IDWriteTextLayout> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
             let format = self.graphics.write.CreateTextFormat(
-                PCWSTR(
-                    wide(if self.shell.enabled {
-                        &self.shell.settings.font_face
-                    } else {
-                        "Yu Gothic UI"
-                    })
-                    .as_ptr(),
-                ),
+                PCWSTR(wide(family).as_ptr()),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -4034,7 +4136,8 @@ impl App {
                 w!("ja-jp"),
             )?;
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-            format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, size * 1.6, size * 1.25)?;
+            let (line_height, baseline) = presentation::line_spacing(size);
+            format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line_height, baseline)?;
             self.graphics.write.CreateTextLayout(
                 &text.encode_utf16().collect::<Vec<_>>(),
                 &format,
@@ -4050,10 +4153,20 @@ impl App {
         height: f32,
     ) -> windows::core::Result<IDWriteTextLayout> {
         unsafe {
-            let layout = self.text_layout(label, width, 14.0)?;
+            let layout = self.ui_text_layout(label, width, 14.0)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             layout.SetMaxHeight(height)?;
             Ok(layout)
+        }
+    }
+    unsafe fn measure_gutter_width(&self, line_count: usize) -> windows::core::Result<f32> {
+        unsafe {
+            let sample = "9".repeat(presentation::line_number_digits(line_count));
+            let layout = self.text_layout(&sample, 1024.0, self.font_size())?;
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics)?;
+            Ok(metrics.widthIncludingTrailingWhitespace + GUTTER_HORIZONTAL_PADDING)
         }
     }
     unsafe fn gutter_presentation(
@@ -4128,7 +4241,7 @@ impl App {
             let layout = self.text_layout(text, width, size)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut metrics)?;
-            let height = metrics.height.max(size * 1.6);
+            let height = metrics.height.max(presentation::line_height(size));
             self.views.push(TextView {
                 layout,
                 text: text.encode_utf16().collect(),
@@ -4230,8 +4343,11 @@ impl App {
             self.tables.clear();
             self.images.clear();
             let source = self.doc().source_shared();
+            let line_starts = physical_line_starts(&source);
+            self.gutter_width = self.measure_gutter_width(line_starts.len())?;
             let mut y = self.editor_top();
-            let width = (self.editor_width() - 12.0).max(50.0);
+            let width = self.content_width();
+            self.gutter_rows.clear();
             if self.tabs[self.active].raw {
                 let mut start = 0;
                 for line in source.split_inclusive('\n') {
@@ -4241,7 +4357,7 @@ impl App {
                         text,
                         (map.clone(), map),
                         start..start + line.len(),
-                        (self.editor_left(), y, width),
+                        (self.content_left(), y, width),
                         self.font_size(),
                         None,
                     )?;
@@ -4253,7 +4369,7 @@ impl App {
                         "",
                         (vec![eof], vec![eof]),
                         eof..eof,
-                        (self.editor_left(), y, width),
+                        (self.content_left(), y, width),
                         self.font_size(),
                         None,
                     )?;
@@ -4483,9 +4599,9 @@ impl App {
                     let text = String::from_utf16_lossy(&utf16[block.display_utf16.clone()]);
                     let (map, before) =
                         projection_mapping(&projection, block.display_utf16.clone());
-                    let size = match block.kind {
+                    let size = match &block.kind {
                         BlockKind::Heading { level } => {
-                            self.font_size() + (7 - level.min(6) as i32) as f32 * 2.4
+                            self.font_size() * presentation::heading_scale(*level)
                         }
                         _ => self.font_size(),
                     };
@@ -4500,14 +4616,20 @@ impl App {
                     };
                     let indent = (block.depth.saturating_sub(1) as f32 * 12.0)
                         .max(marker.as_ref().map_or(0.0, |(_, width)| width + 8.0));
-                    y += self.push_view(
+                    let height = self.push_view(
                         &text,
                         (map, before),
                         block.source.clone(),
-                        (self.editor_left() + indent, y, width - indent),
+                        (self.content_left() + indent, y, width - indent),
                         size,
                         None,
-                    )? + 10.0;
+                    )?;
+                    y += height
+                        + if matches!(block.kind, BlockKind::Heading { .. }) {
+                            presentation::heading_gap(size)
+                        } else {
+                            0.0
+                        };
                     if let Some(view) = self.views.last_mut() {
                         view.marker = marker;
                         view.quoted = quoted;
@@ -4531,7 +4653,7 @@ impl App {
                     if let Some(view) = self.views.last_mut() {
                         let mut metrics = DWRITE_TEXT_METRICS::default();
                         view.layout.GetMetrics(&mut metrics)?;
-                        let height = metrics.height.max(size * 1.6);
+                        let height = metrics.height.max(presentation::line_height(size));
                         y += height - view.height;
                         view.height = height;
                     }
@@ -4555,11 +4677,11 @@ impl App {
                     "",
                     (vec![0], vec![0]),
                     0..0,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6;
+                y += presentation::line_height(self.font_size());
             }
             if !self.tabs[self.active].raw
                 && (self
@@ -4573,17 +4695,19 @@ impl App {
                     "",
                     (vec![eof], vec![eof]),
                     eof..eof,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6;
+                y += presentation::line_height(self.font_size());
             }
             if !self.tabs[self.active].raw {
-                y = self.layout_source_markers(&source, y, width)?;
+                y = self.layout_source_markers(&source, y, width, &line_starts)?;
             }
             self.views
                 .sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+            self.source_line_starts = line_starts;
+            self.rebuild_gutter_rows();
             self.height = y + 40.0;
             self.layout_key = Some(key);
             Ok(())
@@ -4632,84 +4756,194 @@ impl App {
         source: &str,
         mut bottom: f32,
         width: f32,
+        line_starts: &[usize],
     ) -> windows::core::Result<f32> {
         unsafe {
-            let mut markers: Vec<_> = physical_line_starts(source)
-                .into_iter()
-                .filter(|&p| {
-                    let end = source[p..]
-                        .find(['\r', '\n'])
-                        .map_or(source.len(), |offset| p + offset);
-                    source[p..end].trim().is_empty()
-                        && !self
-                            .tables
-                            .iter()
-                            .any(|table| table.table.range.contains(&p))
-                        && !self
-                            .views
-                            .iter()
-                            .any(|view| view.map.contains(&p) && !view.source.is_empty())
-                })
+            let existing_view_count = self.views.len();
+            let mut mapped_line_starts = Vec::new();
+            let mut empty_anchor_positions = Vec::new();
+            let mut source_y = Vec::with_capacity(existing_view_count);
+            for view in &self.views {
+                source_y.push((view.source.start, view.y));
+                if view.source.is_empty() {
+                    empty_anchor_positions.push(view.source.start);
+                    continue;
+                }
+                let first = line_starts.partition_point(|start| *start < view.source.start);
+                let last = line_starts.partition_point(|start| *start <= view.source.end);
+                mapped_line_starts.extend(
+                    line_starts[first..last]
+                        .iter()
+                        .copied()
+                        .filter(|start| view.map.binary_search(start).is_ok()),
+                );
+            }
+            mapped_line_starts.sort_unstable();
+            mapped_line_starts.dedup();
+            empty_anchor_positions.sort_unstable();
+            empty_anchor_positions.dedup();
+
+            source_y.sort_unstable_by_key(|(source_start, _)| *source_start);
+            let mut suffix_min_y = vec![0.0; source_y.len()];
+            for index in (0..source_y.len()).rev() {
+                suffix_min_y[index] = if index + 1 < source_y.len() {
+                    source_y[index].1.min(suffix_min_y[index + 1])
+                } else {
+                    source_y[index].1
+                };
+            }
+            let next_y = |position: usize| {
+                let index = source_y.partition_point(|(source_start, _)| *source_start < position);
+                suffix_min_y.get(index).copied()
+            };
+
+            let mut table_ranges: Vec<_> = self
+                .tables
+                .iter()
+                .map(|table| table.table.range.clone())
                 .collect();
+            table_ranges.sort_unstable_by_key(|range| range.start);
+            let mut markers = Vec::new();
+            for &position in line_starts {
+                let end = source[position..]
+                    .find(['\r', '\n'])
+                    .map_or(source.len(), |offset| position + offset);
+                if source[position..end].trim().is_empty()
+                    && mapped_line_starts.binary_search(&position).is_err()
+                {
+                    let table_index = table_ranges
+                        .partition_point(|range| range.start <= position)
+                        .saturating_sub(1);
+                    if !table_ranges
+                        .get(table_index)
+                        .is_some_and(|range| range.contains(&position))
+                    {
+                        markers.push((position, true));
+                    }
+                }
+            }
             markers.extend(self.tables.windows(2).filter_map(|tables| {
                 let p = tables[0].table.range.end;
                 let next_start = tables[1].table.range.start;
                 source
                     .get(p..next_start)
                     .filter(|gap| !gap.is_empty() && gap.trim().is_empty())
-                    .map(|_| p)
+                    .map(|_| (p, false))
             }));
-            // A source position after a closing fence is distinct from the last
-            // literal line even if the code block source range encloses both.
             markers.extend(
                 self.literal_blocks
                     .iter()
-                    .flat_map(|range| [range.start, range.end])
-                    .filter(|&p| source.is_char_boundary(p)),
+                    .flat_map(|range| [(range.start, true), (range.end, false)])
+                    .filter(|(p, _)| source.is_char_boundary(*p)),
             );
-            markers.sort_unstable();
-            markers.dedup();
-            for p in markers {
-                if self
-                    .views
-                    .iter()
-                    .any(|view| view.source.is_empty() && view.source.start == p)
+            markers.sort_by_key(|(p, _)| *p);
+            let mut unique_markers: Vec<(usize, bool)> = Vec::with_capacity(markers.len());
+            for (position, takes_row) in markers {
+                if let Some((previous, previous_takes_row)) = unique_markers.last_mut()
+                    && *previous == position
                 {
+                    *previous_takes_row |= takes_row;
+                } else {
+                    unique_markers.push((position, takes_row));
+                }
+            }
+            let mut row_positions = Vec::new();
+            let mut reused_row_anchors = Vec::new();
+            let row_height = presentation::line_height(self.font_size());
+            for (p, takes_row) in unique_markers {
+                if empty_anchor_positions.binary_search(&p).is_ok() {
+                    if takes_row {
+                        row_positions.push(p);
+                        reused_row_anchors.push(p);
+                    }
                     continue;
                 }
-                let next = self
-                    .views
-                    .iter()
-                    .filter(|view| view.source.start >= p)
-                    .map(|view| view.y)
-                    .min_by(f32::total_cmp);
-                let y = next.unwrap_or(bottom);
-                let height = self.font_size() * 1.6;
-                for view in &mut self.views {
-                    if view.y >= y {
-                        view.y += height;
-                    }
-                }
-                for image in &mut self.images {
-                    if image.y >= y {
-                        image.y += height;
-                    }
-                }
-                for table in &mut self.tables {
-                    if table.y >= y {
-                        table.y += height;
-                    }
-                }
+                let next_y = next_y(p);
+                let y = if takes_row {
+                    row_positions.push(p);
+                    next_y.unwrap_or(bottom)
+                } else {
+                    self.source_view_at(p, Some(BoundaryAffinity::After))
+                        .and_then(|view| {
+                            let position = view
+                                .map
+                                .partition_point(|&byte| byte < p)
+                                .min(view.map.len().saturating_sub(1));
+                            layout_caret(&view.layout, position as u32, false)
+                                .map(|(_, row_y, _)| view.y + row_y)
+                        })
+                        .or(next_y)
+                        .unwrap_or(bottom)
+                };
                 self.push_view(
                     "",
                     (vec![p], vec![p]),
                     p..p,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                bottom += height;
             }
+            for (index, view) in self.views.iter_mut().enumerate() {
+                let reused_row_anchor = index < existing_view_count
+                    && view.source.is_empty()
+                    && reused_row_anchors.binary_search(&view.source.start).is_ok();
+                let include_equal = index < existing_view_count && !reused_row_anchor;
+                let shifts = presentation::source_row_shift_count(
+                    &row_positions,
+                    view.source.start,
+                    include_equal,
+                );
+                view.y += shifts as f32 * row_height;
+            }
+            for image in &mut self.images {
+                let shifts =
+                    presentation::source_row_shift_count(&row_positions, image.source.start, true);
+                image.y += shifts as f32 * row_height;
+            }
+            for table in &mut self.tables {
+                let shifts = presentation::source_row_shift_count(
+                    &row_positions,
+                    table.table.range.start,
+                    true,
+                );
+                table.y += shifts as f32 * row_height;
+            }
+            let blank_row_y: HashMap<_, _> = self
+                .views
+                .iter()
+                .filter(|view| {
+                    view.source.is_empty()
+                        && row_positions.binary_search(&view.source.start).is_ok()
+                })
+                .map(|view| (view.source.start, view.y))
+                .collect();
+            let table_anchors_before_blank: HashMap<_, _> = self
+                .tables
+                .iter()
+                .filter_map(|table| {
+                    let table_line = line_start(source, table.table.range.start);
+                    let index = line_starts.binary_search(&table_line).ok()?;
+                    let previous_line = *line_starts.get(index.checked_sub(1)?)?;
+                    if source_line_is_blank(source, previous_line)
+                        && row_positions.binary_search(&previous_line).is_ok()
+                    {
+                        blank_row_y
+                            .get(&previous_line)
+                            .map(|&y| (table.table.range.start, y))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for view in &mut self.views {
+                if view.source.is_empty()
+                    && let Some(&y) = table_anchors_before_blank.get(&view.source.start)
+                {
+                    view.y = y;
+                }
+            }
+            bottom += row_positions.len() as f32 * row_height;
             let p = self.doc().selection().head;
             if !self
                 .tables
@@ -4738,7 +4972,7 @@ impl App {
                     text,
                     (map.clone(), map),
                     start..end,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
@@ -4761,6 +4995,99 @@ impl App {
             }
             Ok(bottom)
         }
+    }
+    fn rebuild_gutter_rows(&mut self) {
+        let mut rows = Vec::new();
+        let source = self.doc().source();
+        for (view_index, view) in self.views.iter().enumerate() {
+            let mut count = 0;
+            unsafe {
+                let _ = view.layout.GetLineMetrics(None, &mut count);
+            }
+            if count == 0 {
+                continue;
+            }
+            let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+            if unsafe { view.layout.GetLineMetrics(Some(&mut lines), &mut count) }.is_err() {
+                continue;
+            }
+            let mut position = 0usize;
+            let mut top = view.y;
+            let bottom = view.y + view.height;
+            for line in lines.into_iter().take(count as usize) {
+                if top >= bottom - 0.5 {
+                    break;
+                }
+                let byte = if view.source.is_empty() {
+                    view.source.start
+                } else {
+                    view.map
+                        .get(position)
+                        .or_else(|| view.before.get(position))
+                        .copied()
+                        .unwrap_or(view.source.end)
+                };
+                let represented_row = if view.source.is_empty() || view.text.is_empty() {
+                    presentation::is_source_line_start(&self.source_line_starts, byte)
+                        && source_line_is_blank(source, byte)
+                } else {
+                    !(line.length == 0 && position >= view.text.len())
+                };
+                if represented_row {
+                    let line_number =
+                        presentation::source_line_number(&self.source_line_starts, byte);
+                    rows.push(GutterRow {
+                        view_index,
+                        y: top,
+                        baseline: line.baseline,
+                        height: line.height,
+                        line_number,
+                    });
+                }
+                position = position.saturating_add(line.length as usize);
+                top += line.height;
+            }
+        }
+        let image_anchors: HashMap<_, _> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| view.source.is_empty())
+            .map(|(index, view)| (view.source.start, index))
+            .collect();
+        let (line_height, baseline) = presentation::line_spacing(self.font_size());
+        for image in &self.images {
+            if let Some(&view_index) = image_anchors.get(&image.source.start) {
+                rows.push(GutterRow {
+                    view_index,
+                    y: image.y,
+                    baseline,
+                    height: line_height,
+                    line_number: presentation::source_line_number(
+                        &self.source_line_starts,
+                        image.source.start,
+                    ),
+                });
+            }
+        }
+        rows.sort_by(|a: &GutterRow, b| {
+            a.y.total_cmp(&b.y)
+                .then(a.view_index.cmp(&b.view_index))
+                .then(a.line_number.cmp(&b.line_number))
+        });
+        let mut seen_lines = HashSet::new();
+        let mut seen_baselines = HashSet::new();
+        let mut unique_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let baseline_y = row.y + row.baseline;
+            if !seen_lines.insert(row.line_number)
+                || !seen_baselines.insert((baseline_y * 2.0).round() as i32)
+            {
+                continue;
+            }
+            unique_rows.push(row);
+        }
+        self.gutter_rows = unique_rows;
     }
     unsafe fn layout_list_item_fragments(
         &mut self,
@@ -4889,11 +5216,11 @@ impl App {
                 &text,
                 (map, before),
                 source,
-                (self.editor_left() + indent, y, width - indent),
+                (self.content_left() + indent, y, width - indent),
                 self.font_size(),
                 None,
             )?;
-            let minimum_line_height = self.font_size() * 1.6;
+            let minimum_line_height = presentation::line_height(self.font_size());
             if let Some(view) = self.views.last_mut() {
                 view.marker = marker;
                 view.quoted = quoted;
@@ -4903,7 +5230,7 @@ impl App {
                 height = metrics.height.max(minimum_line_height);
                 view.height = height;
             }
-            Ok(height + 10.0)
+            Ok(height)
         }
     }
     unsafe fn layout_image(
@@ -4926,7 +5253,7 @@ impl App {
                 indent,
             } =
                 self.gutter_presentation(projection, gutter_block, show_marker, self.font_size())?;
-            let x = self.editor_left() + indent;
+            let x = self.content_left() + indent;
             let available = (available - indent).max(1.0);
             let dir = self.tabs[self.active]
                 .file
@@ -4980,7 +5307,7 @@ impl App {
                 path: image_path,
                 source: source.clone(),
                 x,
-                y: y + self.font_size() * 1.6,
+                y,
                 width,
                 height,
                 quoted,
@@ -4993,11 +5320,11 @@ impl App {
                 "",
                 (vec![source.end], vec![source.end]),
                 source.end..source.end,
-                (x, y + self.font_size() * 1.6 + height, available),
+                (x, y + height, available),
                 self.font_size(),
                 None,
             )?;
-            Ok(y + height + self.font_size() * 3.2 + 15.0)
+            Ok(y + height)
         }
     }
     /// Decode/upload only visible images and one viewport of lookahead.
@@ -5178,7 +5505,7 @@ impl App {
     unsafe fn layout_table(
         &mut self,
         table: Arc<Table>,
-        mut y: f32,
+        y: f32,
         available: f32,
     ) -> windows::core::Result<f32> {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -5209,11 +5536,12 @@ impl App {
                     "",
                     (vec![marker], vec![marker]),
                     marker..marker,
-                    (self.editor_left(), y, available),
+                    (self.content_left(), y, available),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6 + 10.0;
+                // The table start marker shares the header-row baseline. Real
+                // blank source rows are inserted once after block layout.
             }
             let mut widths = vec![self.font_size() * 4.75; cols];
             for row in &table.rows {
@@ -5238,8 +5566,8 @@ impl App {
             let mut top = y;
             for row in &table.rows {
                 let first = self.views.len();
-                let mut x = self.editor_left() - offset;
-                let mut h = self.font_size() * 1.8;
+                let mut x = self.content_left() - offset;
+                let mut h = presentation::line_height(self.font_size()) + 6.0;
                 for (c, cell) in row.cells.iter().enumerate() {
                     let content = &source[cell.content_range.clone()];
                     let (text, map) = unescape_cell(content, cell.content_range.start);
@@ -5273,7 +5601,7 @@ impl App {
                 height: top - y,
                 width: total,
             });
-            Ok(top + 20.0)
+            Ok(top)
         }
     }
     fn discard_target(&mut self) {
@@ -5352,6 +5680,88 @@ impl App {
             Ok(target)
         }
     }
+    unsafe fn draw_gutter_numbers(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        scroll: f32,
+        viewport: f32,
+        composition: Option<&CompositionVisual>,
+        foreground: &ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let font_size = self.font_size();
+            let number_width = (self.gutter_width - GUTTER_HORIZONTAL_PADDING).max(1.0);
+            let label_baseline = presentation::line_spacing(font_size).1;
+            let top = self.editor_top();
+            let first = if let Some(visual) = composition {
+                let before_end = self
+                    .gutter_rows
+                    .partition_point(|row| row.view_index <= visual.view_index);
+                let first_before = self.gutter_rows[..before_end]
+                    .partition_point(|row| row.y + row.height < scroll + top);
+                if first_before < before_end {
+                    first_before
+                } else {
+                    let after_start = self
+                        .gutter_rows
+                        .partition_point(|row| row.view_index <= visual.end_view_index);
+                    after_start
+                        + self.gutter_rows[after_start..].partition_point(|row| {
+                            row.y + visual.growth + row.height < scroll + top
+                        })
+                }
+            } else {
+                self.gutter_rows
+                    .partition_point(|row| row.y + row.height < scroll + top)
+            };
+            for row in &self.gutter_rows[first..] {
+                let Some(view) = self.views.get(row.view_index) else {
+                    continue;
+                };
+                if composition.is_some_and(|visual| {
+                    row.view_index > visual.view_index && row.view_index <= visual.end_view_index
+                }) {
+                    continue;
+                }
+                let view_growth = composition.map_or(0.0, |visual| {
+                    if view.y >= visual.row_bottom - 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                let table_growth = composition.map_or(0.0, |visual| {
+                    if view.table.is_some() && (view.y - scroll - visual.y).abs() < 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                let row_y = row.y - scroll + view_growth + table_growth;
+                if row_y > viewport {
+                    if composition.is_none_or(|visual| row.view_index > visual.end_view_index) {
+                        break;
+                    }
+                    continue;
+                }
+                if row_y + row.height < top {
+                    continue;
+                }
+                let label =
+                    self.text_layout(&row.line_number.to_string(), number_width, font_size)?;
+                label.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                let label_y = row_y + row.baseline - label_baseline;
+                target.DrawTextLayout(
+                    point(self.editor_left() + GUTTER_LABEL_LEFT, label_y),
+                    &label,
+                    foreground,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
+            Ok(())
+        }
+    }
     unsafe fn paint(&mut self, damage: D2D_RECT_F) -> windows::core::Result<()> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
@@ -5414,7 +5824,7 @@ impl App {
             let mut x = self.editor_left();
             if !self.shell.enabled {
                 for (_, label, width) in TOOLBAR {
-                    let layout = self.text_layout(label, width - 8.0, 12.0)?;
+                    let layout = self.ui_text_layout(label, width - 8.0, 12.0)?;
                     t.DrawTextLayout(point(x, 4.0), &layout, &muted, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                     x += width;
                 }
@@ -5425,7 +5835,11 @@ impl App {
                 let tab = &self.tabs[i];
                 let x = strip.left + slot as f32 * strip.tab_width;
                 let (tab_top, tab_height, label_y) = if self.shell.enabled {
-                    (36.0, 36.0, 44.0)
+                    (
+                        shell::TAB_STRIP_TOP,
+                        shell::TAB_STRIP_HEIGHT,
+                        shell::TAB_LABEL_TOP,
+                    )
                 } else {
                     (28.0, 43.0, 34.0)
                 };
@@ -5449,26 +5863,29 @@ impl App {
                 frame.pop_clip();
             }
             if self.shell.enabled {
-                let close = self.text_layout("×", 18., 14.)?;
+                let close = self.ui_text_layout("×", 18., 14.)?;
                 for slot in 0..strip.visible_count {
                     t.DrawTextLayout(
-                        point(strip.left + (slot + 1) as f32 * strip.tab_width - 22., 44.),
+                        point(
+                            strip.left + (slot + 1) as f32 * strip.tab_width - 22.,
+                            shell::TAB_LABEL_TOP,
+                        ),
                         &close,
                         &muted,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     );
                 }
-                let add = self.text_layout("+", 24., 18.)?;
+                let add = self.ui_text_layout("+", 24., 18.)?;
                 t.DrawTextLayout(
-                    point(self.editor_right(), 40.),
+                    point(self.editor_right() - 24., shell::TAB_STRIP_TOP + 2.),
                     &add,
                     &muted,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
             }
             if strip.overflow {
-                let previous = self.text_layout("‹", 18.0, 18.0)?;
-                let next = self.text_layout("›", 18.0, 18.0)?;
+                let previous = self.ui_text_layout("‹", 18.0, 18.0)?;
+                let next = self.ui_text_layout("›", 18.0, 18.0)?;
                 let previous_brush = if strip.first > 0 { &text } else { &muted };
                 let next_brush = if strip.first + strip.visible_count < self.tabs.len() {
                     &text
@@ -5476,21 +5893,40 @@ impl App {
                     &muted
                 };
                 t.DrawTextLayout(
-                    point(self.editor_left() + 5.0, 32.0),
+                    point(
+                        strip.left - TAB_SCROLL_BUTTON + 5.0,
+                        if self.shell.enabled {
+                            shell::TAB_STRIP_TOP
+                        } else {
+                            32.0
+                        },
+                    ),
                     &previous,
                     previous_brush,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
                 t.DrawTextLayout(
-                    point(self.editor_right() - TAB_SCROLL_BUTTON + 5.0, 32.0),
+                    point(
+                        strip.right + 5.0,
+                        if self.shell.enabled {
+                            shell::TAB_STRIP_TOP
+                        } else {
+                            32.0
+                        },
+                    ),
                     &next,
                     next_brush,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
             }
+            let divider_y = if self.shell.enabled {
+                shell::TAB_DIVIDER_Y
+            } else {
+                75.0
+            };
             t.DrawLine(
-                point(self.editor_left(), 75.0),
-                point(self.editor_right(), 75.0),
+                point(self.editor_left(), divider_y),
+                point(self.editor_right(), divider_y),
                 &border,
                 1.0,
                 None,
@@ -5525,7 +5961,18 @@ impl App {
                 &rect(
                     self.editor_left() - 8.0,
                     self.editor_top(),
-                    self.editor_width() + 8.0,
+                    self.gutter_width + 8.0,
+                    (viewport - self.editor_top()).max(0.0),
+                ),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+            self.draw_gutter_numbers(&t, scroll, viewport, composition.as_ref(), &muted)?;
+            frame.pop_clip();
+            frame.push_clip(
+                &rect(
+                    self.content_left() - 8.0,
+                    self.editor_top(),
+                    (self.editor_right() - self.content_left() + 8.0).max(0.0),
                     (viewport - self.editor_top()).max(0.0),
                 ),
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -5792,7 +6239,8 @@ impl App {
             } else {
                 16.
             };
-            let layout = self.text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
+            let layout =
+                self.ui_text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             frame.push_clip(
                 &rect(
@@ -5828,13 +6276,19 @@ impl App {
             self.native_caret = NativeCaretState::default();
         }
     }
+    #[cfg(test)]
     fn caret_view(&self) -> Option<&TextView> {
         let byte = self.doc().selection().head;
         self.source_view(byte)
     }
     fn source_view(&self, byte: usize) -> Option<&TextView> {
-        if byte == self.doc().selection().head
-            && self.doc().selection_affinity() == BoundaryAffinity::After
+        self.source_view_at(
+            byte,
+            (byte == self.doc().selection().head).then(|| self.doc().selection_affinity()),
+        )
+    }
+    fn source_view_at(&self, byte: usize, affinity: Option<BoundaryAffinity>) -> Option<&TextView> {
+        if affinity == Some(BoundaryAffinity::After)
             && let Some(view) = self
                 .views
                 .iter()
@@ -5843,14 +6297,23 @@ impl App {
         {
             return Some(view);
         }
-        if byte == self.doc().selection().head
-            && self.doc().selection_affinity() == BoundaryAffinity::Before
+        if affinity == Some(BoundaryAffinity::Before)
             && let Some(view) = self
                 .views
                 .iter()
                 .filter(|view| !view.source.is_empty() && view.before.contains(&byte))
                 .min_by_key(|view| view.source.len())
         {
+            // A marker before a literal block owns the Before side of its
+            // start. The following block must not pull that caret downwards.
+            if view.source.start == byte
+                && let Some(marker) = self
+                    .views
+                    .iter()
+                    .find(|v| v.source.is_empty() && v.source.start == byte)
+            {
+                return Some(marker);
+            }
             return Some(view);
         }
         self.views
@@ -5860,7 +6323,12 @@ impl App {
                 self.views
                     .iter()
                     .filter(|view| view.map.contains(&byte) || view.before.contains(&byte))
-                    .min_by_key(|view| view.source.len())
+                    .min_by_key(|view| {
+                        (
+                            !(view.source.start <= byte && byte <= view.source.end),
+                            view.source.len(),
+                        )
+                    })
             })
             .or_else(|| {
                 self.views
@@ -5871,14 +6339,19 @@ impl App {
     }
     fn caret_location(&self) -> (f32, f32, f32) {
         let byte = self.doc().selection().head;
+        self.caret_location_at(byte, self.doc().selection_affinity())
+    }
+    fn caret_location_at(&self, byte: usize, affinity: BoundaryAffinity) -> (f32, f32, f32) {
         let scroll = self.tabs[self.active].scroll;
-        let candidate = self.caret_view().or_else(|| self.views.last());
+        let candidate = self
+            .source_view_at(byte, Some(affinity))
+            .or_else(|| self.views.last());
         if let Some(view) = candidate {
             let u = view
                 .map
                 .partition_point(|&p| p < byte)
                 .min(view.map.len().saturating_sub(1));
-            let trailing = self.doc().selection_affinity() == BoundaryAffinity::Before && u > 0;
+            let trailing = affinity == BoundaryAffinity::Before && u > 0;
             let position = if trailing {
                 view.before
                     .partition_point(|&p| p < byte)
@@ -5892,9 +6365,9 @@ impl App {
             }
         }
         (
-            self.editor_left(),
+            self.content_left(),
             self.editor_top(),
-            self.font_size() * 1.6,
+            presentation::line_height(self.font_size()),
         )
     }
     unsafe fn update_caret(&mut self) {
@@ -5925,7 +6398,7 @@ impl App {
                     self.editor_right()
                 };
                 let visible = caret_in_editor((x, y, height), right, self.animation_viewport())
-                    && x >= self.editor_left()
+                    && x >= self.content_left()
                     && y >= self.editor_top();
                 if self.native_caret.size.is_some() && visible != self.native_caret.visible {
                     let result = if visible {
@@ -6164,7 +6637,7 @@ impl App {
     fn horizontal_scroll(&mut self, delta: f32) {
         let byte = self.doc().selection().head;
         if let Some(t) = self.tables.iter().find(|t| t.table.range.contains(&byte)) {
-            let available = self.editor_width();
+            let available = self.content_width();
             let offset = self.tabs[self.active]
                 .table_scroll
                 .entry(t.table.range.start)
@@ -6215,6 +6688,14 @@ impl App {
         }) else {
             return (0, BoundaryAffinity::After);
         };
+        self.view_hit_candidates(view, x, y)[0]
+    }
+    fn view_hit_candidates(
+        &self,
+        view: &TextView,
+        x: f32,
+        y: f32,
+    ) -> [(usize, BoundaryAffinity); 2] {
         let mut trailing = windows::core::BOOL::default();
         let mut inside = windows::core::BOOL::default();
         let mut metrics = DWRITE_HIT_TEST_METRICS::default();
@@ -6233,20 +6714,22 @@ impl App {
             } else {
                 0
             };
-        let positions = if trailing.as_bool() {
-            &view.before
-        } else {
-            &view.map
+        let candidate = |before| {
+            let positions = if before { &view.before } else { &view.map };
+            let byte = *positions.get(u).unwrap_or(&view.source.end);
+            (
+                snap(self.doc().rope(), byte, false),
+                if before {
+                    BoundaryAffinity::Before
+                } else {
+                    BoundaryAffinity::After
+                },
+            )
         };
-        let byte = *positions.get(u).unwrap_or(&view.source.end);
-        (
-            snap(self.doc().rope(), byte, false),
-            if trailing.as_bool() {
-                BoundaryAffinity::Before
-            } else {
-                BoundaryAffinity::After
-            },
-        )
+        [
+            candidate(trailing.as_bool()),
+            candidate(!trailing.as_bool()),
+        ]
     }
     fn toggle_task_at(&mut self, x: f32, y: f32) -> bool {
         if self.composing || self.tabs[self.active].raw {
@@ -6309,7 +6792,7 @@ impl App {
         true
     }
     fn select_at(&mut self, x: f32, y: f32, extend: bool) {
-        if self.composing {
+        if self.composing || x < self.content_left() {
             return;
         }
         let (byte, affinity) = self.hit_with_affinity(x, y);
@@ -6337,6 +6820,13 @@ impl App {
         let ime_open_status = ime_open_status_diagnostic(self.hwnd);
         let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
         let mut data = data;
+        data["line_numbers"] = serde_json::json!({
+            "physical_line_count": self.source_line_starts.len(),
+            "gutter_row_count": self.gutter_rows.len(),
+            "gutter_width_dip": self.gutter_width,
+            "first_line": self.gutter_rows.first().map(|row| row.line_number),
+            "last_line": self.gutter_rows.last().map(|row| row.line_number),
+        });
         data["selection_affinity"] =
             serde_json::json!(format!("{:?}", self.doc().selection_affinity()));
         let (x, y, height) = self.composition_caret();
@@ -6345,6 +6835,16 @@ impl App {
             let _ = std::fs::write(path, data);
         }
     }
+}
+
+fn source_line_is_blank(source: &str, start: usize) -> bool {
+    if start > source.len() || !source.is_char_boundary(start) {
+        return false;
+    }
+    let end = source[start..]
+        .find(['\r', '\n'])
+        .map_or(source.len(), |offset| start + offset);
+    source[start..end].trim().is_empty()
 }
 
 /// Read presentation decisions from the existing parser block tree. Gutter
@@ -7630,6 +8130,31 @@ mod tests {
     }
 
     #[test]
+    fn ui_font_is_independent_of_configurable_editor_font_and_document_state() {
+        let mut app = composing_test_app("日本語 **本文** 👩‍💻\r\n");
+        app.clear_composition();
+        app.shell.enabled = true;
+        app.shell.settings.font_face = "Cascadia Mono".into();
+        let before = document_state(app.doc());
+        unsafe {
+            let editor = app.text_layout("本文", 300., FONT).unwrap();
+            let ui = app.ui_text_layout("アウトライン", 300., 12.).unwrap();
+            let mut editor_family = [0u16; 64];
+            let mut ui_family = [0u16; 64];
+            editor
+                .GetFontFamilyName(0, &mut editor_family, None)
+                .unwrap();
+            ui.GetFontFamilyName(0, &mut ui_family, None).unwrap();
+            let family = |name: &[u16]| {
+                String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap()])
+            };
+            assert_eq!(family(&editor_family), "Cascadia Mono");
+            assert_eq!(family(&ui_family), shell::UI_FONT_FAMILY);
+        }
+        assert_eq!(document_state(app.doc()), before);
+    }
+
+    #[test]
     fn tab_labels_stay_single_line_and_bounded_without_document_changes() {
         let directory = TestDirectory::new("tab-label-layout");
         let file_name = format!("{}{}.md", "日本語".repeat(12), "a".repeat(90));
@@ -7655,7 +8180,11 @@ mod tests {
             app.shell.enabled = shell_enabled;
             let strip = app.tab_strip();
             let width = (strip.tab_width - 32.0).max(1.0);
-            let height = if shell_enabled { 36.0 } else { 43.0 };
+            let height = if shell_enabled {
+                shell::TAB_STRIP_HEIGHT
+            } else {
+                43.0
+            };
             for label in &labels {
                 let wrapped = unsafe { app.text_layout(label, width, 14.0).unwrap() };
                 let mut wrapped_metrics = DWRITE_TEXT_METRICS::default();
@@ -8418,7 +8947,12 @@ mod tests {
                         "shifted table start {q} has no exact source-affine marker ({eol:?}, fixture {index})"
                     );
                     assert_eq!(app.caret_view().unwrap().source, q..q);
-                    assert!(app.caret_location().1 < app.tables[if index == 2 { 1 } else { 0 }].y);
+                    let caret_y = app.caret_location().1;
+                    let table_y = app.tables[if index == 2 { 1 } else { 0 }].y;
+                    assert!(
+                        caret_y < table_y,
+                        "inserted blank source row must provide a caret baseline before the table ({eol:?}, fixture {index}, caret y={caret_y}, table y={table_y})"
+                    );
                 }
                 fixture.message(WM_CHAR, '前' as usize);
                 let app = &mut *fixture.state.app.borrow_mut();
@@ -10082,6 +10616,162 @@ mod tests {
         assert_eq!(app.doc().source(), format!("{expected}続"));
     }
     #[test]
+    fn editor_live_front_matter_vertical_sequence_reaches_both_edges_without_cycle() {
+        let source = "---\ntitle: 架空の編集試料\n---\n\n# MDLite 編集基盤\n日本語と **太字**、*強調*、`code`、[リンク](#表)を編集します。\n絵文字 👩‍💻 と結合文字 e\u{301} の境界を保持します\n";
+        assert_vertical_sequence(source);
+        assert_vertical_sequence(&source.replace('\n', "\r\n"));
+    }
+    #[test]
+    fn editor_live_markdown_vertical_sequence_keeps_selection_and_edges() {
+        let source = "# Heading\n\nparagraph **bold** and *italic*, `code` and [link](url)\nnext 👩‍💻 e\u{301}\n\n- item\n- second\n\n> quote\n> next\n\n```rust\nlet n = 1;\n```\n\n| H | J |\n|---|---|\n| one | 日本語 |\n| two | next |\n\n![image](missing.png)\n\nlast\n";
+        assert_vertical_sequence(source);
+        assert_vertical_sequence(&source.replace('\n', "\r\n"));
+    }
+    fn assert_vertical_sequence(source: &str) {
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let before = (
+            app.doc().revision(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().is_dirty(),
+        );
+        app.doc_mut()
+            .set_selection(source.len(), source.len())
+            .unwrap();
+        unsafe {
+            app.after_input();
+        }
+        for (key, edge, extend) in [
+            (VK_UP.0, 0, false),
+            (VK_DOWN.0, source.len(), false),
+            (VK_UP.0, 0, true),
+        ] {
+            let anchor = app.doc().selection().head;
+            let mut visited = std::collections::HashSet::new();
+            let mut trace = Vec::new();
+            while app.doc().selection().head != edge {
+                let p = app.doc().selection().head;
+                let affinity = app.doc().selection_affinity();
+                let y = app.caret_location().1 + app.tabs[app.active].scroll;
+                let layout_before = app.layout_key;
+                let revealed_before = app.revealed_source.clone();
+                trace.push((p, format!("{affinity:?}"), y));
+                assert!(
+                    visited.insert((p, format!("{affinity:?}"))),
+                    "vertical cycle key={key}: {trace:?}"
+                );
+                app.move_caret(key, extend);
+                let target = app.doc().selection().head;
+                let target_affinity = app.doc().selection_affinity();
+                assert_eq!(app.layout_key, layout_before);
+                assert_eq!(app.revealed_source, revealed_before);
+                let chosen_y =
+                    app.caret_location_at(target, target_affinity).1 + app.tabs[app.active].scroll;
+                assert!(
+                    if key == VK_UP.0 {
+                        chosen_y < y || (target == edge && chosen_y <= y)
+                    } else {
+                        chosen_y > y || (target == edge && chosen_y >= y)
+                    },
+                    "same-layout visual direction key={key}: ({p}, {affinity:?}, {y}) -> ({target}, {target_affinity:?}, {chosen_y})"
+                );
+                unsafe {
+                    app.after_input();
+                }
+                if extend {
+                    assert_eq!(app.doc().selection().anchor, anchor);
+                }
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(
+                (
+                    app.doc().revision(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().is_dirty()
+                ),
+                before
+            );
+        }
+    }
+    #[test]
+    fn editor_live_vertical_marker_edges_keep_horizontal_affinity() {
+        let fixture = EditorFixture::new("---\nvalue: text\n---\n\n# body\n", false);
+        let mut app = fixture.state.app.borrow_mut();
+        app.doc_mut()
+            .set_selection_with_affinity(0, 0, BoundaryAffinity::Before)
+            .unwrap();
+        unsafe {
+            app.after_input();
+        }
+        let before = (app.doc().selection_affinity(), app.caret_location());
+        app.move_caret(VK_LEFT.0, false);
+        unsafe {
+            app.after_input();
+        }
+        assert_eq!(
+            (app.doc().selection_affinity(), app.caret_location()),
+            before
+        );
+    }
+    #[test]
+    fn editor_live_table_vertical_movement_retains_second_column_and_shift_anchor() {
+        let source = "| A | B |\n|---|---|\n| one | two |\n| three | four |\n";
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let two = source.find("two").unwrap();
+        let four = source.find("four").unwrap();
+        let before = (
+            app.doc().revision(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        app.doc_mut().set_selection(two, two).unwrap();
+        unsafe {
+            app.after_input();
+        }
+        let preferred_x = app.caret_location().0;
+        for (key, target, extend) in [
+            (VK_DOWN.0, four, false),
+            (VK_UP.0, two, false),
+            (VK_DOWN.0, four, true),
+            (VK_UP.0, two, true),
+        ] {
+            let y = app.caret_location().1 + app.tabs[app.active].scroll;
+            app.move_caret(key, extend);
+            unsafe {
+                app.after_input();
+            }
+            assert_eq!(
+                app.doc().selection().head,
+                target,
+                "key={key}, extend={extend}"
+            );
+            if extend {
+                assert_eq!(app.doc().selection().anchor, two);
+            }
+            assert!((app.caret_location().0 - preferred_x).abs() < 1.0);
+            let target_y = app.caret_location().1 + app.tabs[app.active].scroll;
+            assert!(if key == VK_UP.0 {
+                target_y < y
+            } else {
+                target_y > y
+            });
+        }
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(
+            (
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count()
+            ),
+            before
+        );
+    }
+    #[test]
     fn editor_visual_rows_keep_preferred_x_across_short_line() {
         let fixture = EditorFixture::new("abcdefghijk\nx\nabcdefghijk", true);
         let mut app = fixture.state.app.borrow_mut();
@@ -10888,6 +11578,9 @@ mod tests {
             tab_scroll: 0,
             next_id: 2,
             views: Vec::new(),
+            source_line_starts: Vec::new(),
+            gutter_rows: Vec::new(),
+            gutter_width: 0.0,
             visible_tokens: Vec::new(),
             literal_blocks: Vec::new(),
             tables: Vec::new(),
@@ -11695,6 +12388,294 @@ mod tests {
     }
 
     #[test]
+    fn live_blank_rows_measure_against_source_and_literal_dwrite_rows() {
+        fn source_row_y(app: &App, byte: usize) -> f32 {
+            let view = app
+                .source_view_at(byte, Some(BoundaryAffinity::After))
+                .expect("source byte should have a presentation row");
+            let position = view
+                .map
+                .iter()
+                .position(|&mapped| mapped == byte)
+                .or_else(|| view.before.iter().position(|&mapped| mapped == byte))
+                .expect("source byte should map to a DirectWrite position");
+            let (_, row_y, _) = layout_caret(&view.layout, position as u32, false)
+                .expect("DirectWrite should locate the source row");
+            view.y + row_y
+        }
+
+        let mut spacing = Vec::new();
+        for blank_lines in [0usize, 1, 2] {
+            let source = format!("before{}after", "\n".repeat(blank_lines + 1));
+            let mut gaps = Vec::new();
+            for raw in [true, false] {
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.tabs[0].raw = raw;
+                app.hwnd = hidden_test_window_size(720, 520);
+                let before = document_state(app.doc());
+                unsafe {
+                    app.ensure_layout().unwrap();
+                }
+                let before_y = source_row_y(&app, source.find("before").unwrap());
+                let after_y = source_row_y(&app, source.find("after").unwrap());
+                let gap = after_y - before_y;
+                let first_view = app
+                    .source_view_at(
+                        source.find("before").unwrap(),
+                        Some(BoundaryAffinity::After),
+                    )
+                    .unwrap();
+                let mut count = 0;
+                unsafe {
+                    let _ = first_view.layout.GetLineMetrics(None, &mut count);
+                }
+                let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+                unsafe {
+                    first_view
+                        .layout
+                        .GetLineMetrics(Some(&mut lines), &mut count)
+                        .unwrap();
+                }
+                let line_height = lines[0].height;
+                let expected_gap = line_height * (blank_lines + 1) as f32;
+                assert!(
+                    (gap - expected_gap).abs() <= 1.0,
+                    "raw={raw} blank_lines={blank_lines}: expected {expected_gap}px from DirectWrite rows, got {gap}px"
+                );
+                gaps.push(gap);
+                assert_eq!(document_state(app.doc()), before);
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+            assert!(
+                (gaps[0] - gaps[1]).abs() <= 1.0,
+                "blank_lines={blank_lines}: Live and source layout must share physical row spacing"
+            );
+            spacing.push(gaps[0]);
+        }
+        assert!(spacing[0] < spacing[1] && spacing[1] < spacing[2]);
+
+        let literal = "```text\nline\n```\n\nfollowing";
+        let mut app = composing_test_app(literal);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(app.source_line_starts, physical_line_starts(literal));
+        let code = app
+            .views
+            .iter()
+            .find(|view| String::from_utf16_lossy(&view.text).contains("line"))
+            .unwrap();
+        let mut count = 0;
+        unsafe {
+            let _ = code.layout.GetLineMetrics(None, &mut count);
+        }
+        let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+        unsafe {
+            code.layout
+                .GetLineMetrics(Some(&mut lines), &mut count)
+                .unwrap();
+        }
+        assert_eq!(
+            lines.len(),
+            2,
+            "the trailing DirectWrite newline row is real"
+        );
+        let following = app
+            .views
+            .iter()
+            .find(|view| String::from_utf16_lossy(&view.text).contains("following"))
+            .unwrap();
+        assert!(
+            (following.y - code.y - code.height - lines[0].height).abs() <= 1.0,
+            "the literal trailing row and one physical blank row should each occupy one baseline"
+        );
+        let closing_fence_boundary = [
+            app.source_view_at(16, Some(BoundaryAffinity::Before)),
+            app.source_view_at(16, Some(BoundaryAffinity::After)),
+        ];
+        assert!(closing_fence_boundary.iter().all(|view| {
+            view.is_some_and(|view| view.source.is_empty() && view.source.start == 16)
+        }));
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+
+        let table_source = "before\n\n| A | B |\n|---|---|\n| x | y |\n\nafter";
+        let mut app = composing_test_app(table_source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        let table = app.tables.first().unwrap();
+        let table_start = app
+            .source_view_at(table.table.range.start, Some(BoundaryAffinity::After))
+            .unwrap();
+        assert!(table_start.source.is_empty());
+        let line_height = presentation::line_height(app.font_size());
+        assert!(
+            (table.y - table_start.y - line_height).abs() <= 1.0,
+            "table-start anchor should share the preceding blank-row baseline"
+        );
+        let before_y = app
+            .views
+            .iter()
+            .find(|view| table_source[view.source.clone()].contains("before"))
+            .unwrap()
+            .y;
+        let after_y = app
+            .views
+            .iter()
+            .find(|view| table_source[view.source.clone()].contains("after"))
+            .unwrap()
+            .y;
+        assert!(
+            (table.y - before_y - 2.0 * line_height).abs() <= 1.0,
+            "table_start={} before_row={} line_height={}",
+            table.y,
+            before_y,
+            line_height
+        );
+        assert!((after_y - table.y - table.height - line_height).abs() <= 1.0);
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+
+        let image_source = "before\n\n![image](image.png)\n\nafter";
+        let mut app = composing_test_app(image_source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        let line_height = presentation::line_height(app.font_size());
+        let image = app.images.first().unwrap();
+        let before_y = app
+            .views
+            .iter()
+            .find(|view| image_source[view.source.clone()].contains("before"))
+            .unwrap()
+            .y;
+        let after_y = app
+            .views
+            .iter()
+            .find(|view| image_source[view.source.clone()].contains("after"))
+            .unwrap()
+            .y;
+        assert!((image.y - before_y - 2.0 * line_height).abs() <= 1.0);
+        let image_start = app
+            .source_view_at(image.source.start, Some(BoundaryAffinity::After))
+            .unwrap();
+        let image_end = app
+            .source_view_at(image.source.end, Some(BoundaryAffinity::After))
+            .unwrap();
+        assert!(image_start.source.is_empty());
+        assert!(image_end.source.is_empty());
+        assert!((image_start.y - image.y).abs() <= 1.0);
+        assert!(
+            (image_end.y - image.y - image.height).abs() <= 1.0,
+            "image_y={} height={} end_anchor_y={} following_y={} font_size={} row_height={}",
+            image.y,
+            image.height,
+            image_end.y,
+            after_y,
+            app.font_size(),
+            line_height
+        );
+        assert!((after_y - image.y - image.height - line_height).abs() <= 1.0);
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+    }
+
+    #[test]
+    fn gutter_width_and_rows_follow_physical_source_lines() {
+        let source = format!(
+            "{}\n\n| A | B | C | D | E |\n|---|---|---|---|---|\n| x | y | z | q | r |\n\n![image](image.png)",
+            "wrapped text ".repeat(80)
+        );
+        let mut app = composing_test_app(&source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(360, 480);
+        let (one_digit, six_digits) = unsafe {
+            (
+                app.measure_gutter_width(9).unwrap(),
+                app.measure_gutter_width(100_000).unwrap(),
+            )
+        };
+        assert!(six_digits > one_digit);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(app.source_line_starts, physical_line_starts(&source));
+        let labels: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+        assert!(!labels.is_empty());
+        assert!(
+            labels.windows(2).all(|pair| pair[0] < pair[1]),
+            "wraps, table cells, and image boundary markers share one label per physical source line: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|line| *line <= app.source_line_starts.len())
+        );
+
+        let content_left = app.content_left();
+        let table = app.tables.first().unwrap();
+        app.tabs[0]
+            .table_scroll
+            .insert(table.table.range.start, table.width);
+        app.layout_key = None;
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(
+            app.content_left(),
+            content_left,
+            "table scrolling keeps the gutter fixed"
+        );
+
+        let before_selection = app.doc().selection();
+        app.select_at(app.content_left() - 1.0, app.editor_top() + 5.0, false);
+        assert_eq!(
+            app.doc().selection(),
+            before_selection,
+            "the gutter is not interactive"
+        );
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+    }
+
+    #[test]
+    fn gutter_rows_skip_hidden_delimiters_and_unrepresented_trailing_metrics() {
+        fn assert_rows(source: &str, expected: &[usize], raw: bool) {
+            let mut app = composing_test_app(source);
+            app.clear_composition();
+            app.tabs[0].raw = raw;
+            app.hwnd = hidden_test_window_size(720, 520);
+            let before = document_state(app.doc());
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            let actual: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+            assert_eq!(actual, expected, "source={source:?} raw={raw}");
+            let mut baselines: Vec<_> = app
+                .gutter_rows
+                .iter()
+                .map(|row| row.y + row.baseline)
+                .collect();
+            baselines.sort_by(f32::total_cmp);
+            assert!(
+                baselines.windows(2).all(|pair| {
+                    (pair[0] * 2.0).round() as i32 != (pair[1] * 2.0).round() as i32
+                })
+            );
+            assert_eq!(document_state(app.doc()), before);
+            unsafe { DestroyWindow(app.hwnd).unwrap() };
+        }
+
+        assert_rows("```text\nline\n```\n\nfollowing\n", &[2, 4, 5, 6], false);
+        assert_rows("---\ntitle: note\n---\n\nbody\n", &[2, 4, 5, 6], false);
+        assert_rows("one\n\nthree\n", &[1, 2, 3, 4], true);
+    }
+
+    #[test]
     fn wrapped_code_image_fragments_use_post_style_metrics_for_layout() {
         let before_code = "iiiiiiii ".repeat(5);
         let after_code = "iiiiiiii ".repeat(6);
@@ -11727,7 +12708,12 @@ mod tests {
                 view.layout.GetMetrics(&mut metrics).unwrap();
             }
             assert!(metrics.height > FONT * 1.6, "inline code should wrap");
-            assert_eq!(view.height, metrics.height.max(FONT * 1.6));
+            assert_eq!(
+                view.height,
+                metrics
+                    .height
+                    .max(presentation::line_height(app.font_size()))
+            );
         }
         let mut family = [0u16; 64];
         unsafe {
@@ -11747,17 +12733,22 @@ mod tests {
             .iter()
             .find(|image| source[image.source.clone()].contains("![image]"))
             .unwrap();
-        assert!(image.y >= before_view.y + before_view.height + 10.0 + FONT * 1.6 - 0.01);
-        assert!(
-            after_view.y >= image.y + image.height + FONT * 1.6 + 15.0 - 0.01,
-            "trailing fragment must start below the image"
-        );
+        assert!(image.y >= before_view.y + before_view.height - 1.0);
+        assert!(after_view.y >= image.y + image.height - 1.0);
         let following = app
             .views
             .iter()
             .find(|view| source[view.source.clone()].contains("following paragraph"))
             .unwrap();
-        assert!(following.y >= after_view.y + after_view.height + 10.0 - 0.01);
+        assert!(
+            (following.y
+                - after_view.y
+                - after_view.height
+                - presentation::line_height(app.font_size()))
+            .abs()
+                <= 1.0,
+            "the physical blank row should provide exactly one following baseline"
+        );
         assert_eq!(document_state(app.doc()), before);
         unsafe {
             DestroyWindow(app.hwnd).unwrap();

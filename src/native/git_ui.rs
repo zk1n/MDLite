@@ -1,4 +1,4 @@
-//! Explicit Git and storage entry points. No worker starts from workspace synchronization.
+//! Explicit Git/storage mutations; trusted Workspace changes schedule read-only discovery.
 use super::*;
 use mdlite::{
     git::{
@@ -45,6 +45,7 @@ const OPEN_CONFLICT: usize = 6022;
 const UPLOAD: usize = 6023;
 const STORAGE_CONFIG: usize = 6024;
 const CONFLICTS: usize = 6025;
+const INITIALIZE: usize = 6026;
 const GIT_PANE_HOST: usize = 6508;
 const SUMMARY: usize = 6500;
 const FILES: usize = 6501;
@@ -56,6 +57,7 @@ const EXECUTE: usize = 6506;
 const INPUT_CANCEL: usize = 6507;
 pub(super) const COMMANDS: &[(usize, &str, Option<&str>)] = &[
     (REFRESH, "Git: 状態を更新", None),
+    (INITIALIZE, "Git: ローカルGitを準備 / 再試行…", None),
     (TRUST, "Workspaceをこの端末で信頼…", None),
     (UNTRUST, "Workspaceの信頼を解除…", None),
     (CANCEL, "Git / uploadを取消", None),
@@ -104,6 +106,7 @@ struct ConflictRequest {
 }
 enum Task {
     Refresh,
+    Initialize,
     Diff(PathBuf),
     Mutation(GitOperation),
     Conflict(ConflictRequest),
@@ -161,11 +164,24 @@ struct Controls {
     execute: HWND,
     input_cancel: HWND,
     buttons: Vec<(usize, HWND)>,
+    tooltip: HWND,
+    // Native tooltip text pointers remain valid for this control surface.
+    _tooltip_text: Vec<Vec<u16>>,
     ime: Box<Cell<bool>>,
+}
+impl Drop for Controls {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(Some(self.tooltip)).as_bool() {
+                let _ = DestroyWindow(self.tooltip);
+            }
+        }
+    }
 }
 pub(super) struct GitPane {
     workspace: Option<WorkspaceIdentity>,
     generation: u64,
+    refresh_pending: bool,
     trust: Option<TrustStore>,
     trusted: bool,
     git: PathBuf,
@@ -192,6 +208,7 @@ impl Default for GitPane {
         Self {
             workspace: None,
             generation: 0,
+            refresh_pending: false,
             trust: TrustStore::local().ok(),
             trusted: false,
             git: find_git(),
@@ -203,7 +220,7 @@ impl Default for GitPane {
             selected: vec![],
             visible: vec![],
             conflicts_only: false,
-            notice: "Workspaceを開くだけではGitを起動しません。明示的に更新してください。".into(),
+            notice: String::new(),
             diff: String::new(),
             list_dirty: true,
             diff_dirty: true,
@@ -222,6 +239,40 @@ impl Drop for GitPane {
     }
 }
 impl GitPane {
+    fn sync_workspace(&mut self, identity: Option<WorkspaceIdentity>) {
+        let changed = self.workspace != identity;
+        if changed {
+            if let Some(cancel) = &self.cancellation {
+                cancel.cancel();
+            }
+            self.generation = self.generation.wrapping_add(1);
+            self.workspace = identity;
+            self.status = None;
+            self.selected.clear();
+            self.visible.clear();
+            self.diff.clear();
+            self.list_dirty = true;
+            self.diff_dirty = true;
+            self.prompt = None;
+            self.notice.clear();
+        }
+        self.trusted = self
+            .workspace
+            .as_ref()
+            .zip(self.trust.as_ref())
+            .is_some_and(|(workspace, store)| store.token(&workspace.canonical).is_ok());
+        if changed {
+            self.refresh_pending = self.trusted;
+        }
+        if !self.trusted {
+            self.refresh_pending = false;
+            if self.status.take().is_some() {
+                self.list_dirty = true;
+                self.diff.clear();
+                self.diff_dirty = true;
+            }
+        }
+    }
     pub(super) unsafe fn owner_draw_button(
         &self,
         owner: HWND,
@@ -267,7 +318,32 @@ fn find_git() -> PathBuf {
         .unwrap_or_default()
 }
 fn process_notice(result: &ProcessResult) -> String {
-    match &result.outcome { ProcessOutcome::Exited(0)=>"Git操作が完了しました。本文とディスク指紋は自動再読込みしません。".into(),ProcessOutcome::Cancelled=>"取消しました。index / worktree / remoteの副作用はrollbackされません。状態を再確認します。".into(),ProcessOutcome::TimedOut=>"timeoutです。副作用はrollbackされません。状態を再確認します。".into(),other=>format!("Git失敗: {other:?}\n{}",String::from_utf8_lossy(&result.stderr).chars().take(1800).collect::<String>()) }
+    match &result.outcome {
+        ProcessOutcome::Exited(0) => "Git操作が完了しました。".into(),
+        ProcessOutcome::Cancelled => "取消しました。実行済み副作用は保持されます。".into(),
+        ProcessOutcome::TimedOut => "Gitがtimeoutしました。詳細欄を確認してください。".into(),
+        _ => "Git処理に失敗しました。詳細欄を確認してください。".into(),
+    }
+}
+fn process_detail(result: &ProcessResult) -> String {
+    format!(
+        "{:?}{}\r\n{}\r\n{}",
+        result.outcome,
+        if result.truncated { " (truncated)" } else { "" },
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
+    )
+}
+/// Canonical paths remain unchanged for identity and execution. Only labels use
+/// normal Windows spelling; slash separators also avoid yen-shaped backslashes.
+fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!("//{unc}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+    };
+    text.replace('\\', "/")
 }
 fn git_error(error: GitError) -> String {
     match error {
@@ -277,7 +353,7 @@ fn git_error(error: GitError) -> String {
         GitError::IncompleteOutput => {
             "Git一覧は不完全です。部分的な出力は正常一覧として反映しません。".into()
         }
-        GitError::Process(p) => process_notice(&p),
+        GitError::Process(p) => process_detail(&p),
     }
 }
 fn worker(
@@ -300,6 +376,12 @@ fn worker(
                 .token(&root)
                 .map_err(GitError::Untrusted)
                 .and_then(|token| client.refresh(&token, &cancel, generation)),
+        ),
+        Task::Initialize => Completed::Status(
+            trust
+                .token(&root)
+                .map_err(GitError::Untrusted)
+                .and_then(|token| client.discover_or_init(&token, &cancel, generation)),
         ),
         Task::Diff(path) => {
             let result = trust
@@ -469,7 +551,7 @@ impl App {
                 INPUT_CANCEL,
                 WINDOW_STYLE(BS_OWNERDRAW as u32),
             );
-            let buttons = [
+            let buttons: Vec<(usize, HWND)> = [
                 (REFRESH, "更新"),
                 (STAGE, "Stage"),
                 (UNSTAGE, "Unstage"),
@@ -489,6 +571,46 @@ impl App {
                 )
             })
             .collect();
+            let tooltip = CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                None,
+                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP),
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                Some(self.shell.main_window),
+                None,
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            let mut tooltip_text = Vec::new();
+            if tooltip != HWND::default() {
+                let _ = control_style::inherit_font(tooltip, self.shell.main_window);
+                for (id, child) in &buttons {
+                    let Some((_, label, _)) = COMMANDS.iter().find(|(command, _, _)| command == id)
+                    else {
+                        continue;
+                    };
+                    tooltip_text.push(wide(label));
+                    let mut tool = TTTOOLINFOW {
+                        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                        hwnd: self.shell.main_window,
+                        uId: child.0 as usize,
+                        lpszText: PWSTR(tooltip_text.last_mut().unwrap().as_mut_ptr()),
+                        ..Default::default()
+                    };
+                    let _ = shell::send(
+                        tooltip,
+                        TTM_ADDTOOLW,
+                        WPARAM(0),
+                        LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+                    );
+                }
+            }
             shell::send(diff, EM_SETLIMITTEXT, WPARAM(2 * 1024 * 1024), LPARAM(0));
             shell::send(input, EM_SETLIMITTEXT, WPARAM(4096), LPARAM(0));
             let ime = shell::track_control_ime(input);
@@ -503,6 +625,8 @@ impl App {
                 execute,
                 input_cancel,
                 buttons,
+                tooltip,
+                _tooltip_text: tooltip_text,
                 ime,
             });
         }
@@ -513,34 +637,7 @@ impl App {
             .persistence
             .workspace_root()
             .and_then(|root| WorkspaceIdentity::read(&root).ok());
-        if self.git_ui.workspace != identity {
-            if let Some(cancel) = &self.git_ui.cancellation {
-                cancel.cancel();
-            }
-            self.git_ui.generation = self.git_ui.generation.wrapping_add(1);
-            self.git_ui.workspace = identity;
-            self.git_ui.status = None;
-            self.git_ui.selected.clear();
-            self.git_ui.visible.clear();
-            self.git_ui.diff.clear();
-            self.git_ui.list_dirty = true;
-            self.git_ui.diff_dirty = true;
-            self.git_ui.prompt = None;
-            self.git_ui.notice =
-                "Workspaceが変わりました。Gitは未実行です。明示的に更新してください。".into();
-        }
-        self.git_ui.trusted = self
-            .git_ui
-            .workspace
-            .as_ref()
-            .zip(self.git_ui.trust.as_ref())
-            .is_some_and(|(workspace, store)| store.token(&workspace.canonical).is_ok());
-        if !self.git_ui.trusted && self.git_ui.status.is_some() {
-            self.git_ui.status = None;
-            self.git_ui.list_dirty = true;
-            self.git_ui.diff.clear();
-            self.git_ui.diff_dirty = true;
-        }
+        self.git_ui.sync_workspace(identity);
         let body = self.feature_panel_rect(PanelId::Git);
         if self.git_ui.list_dirty {
             self.git_rebuild_list();
@@ -716,7 +813,7 @@ impl App {
             .git_ui
             .workspace
             .as_ref()
-            .map(|i| i.canonical.display().to_string())
+            .map(|i| display_path(&i.canonical))
             .unwrap_or_else(|| "NoWorkspace".into());
         let state = if self.git_ui.workspace.is_none() {
             "NoWorkspace — 通常編集は続けられます".into()
@@ -726,8 +823,13 @@ impl App {
             "Untrusted — Git読取り / 外部実行には端末local Trustが必要".into()
         } else if let Some(s) = &self.git_ui.status {
             format!(
-                "{:?}  {}{}{}  index:{} / work:{} / conflict:{}",
-                s.state,
+                "{}  {}{}{}  index:{} / work:{} / conflict:{}",
+                match s.state {
+                    GitState::NoGit => "Git未導入",
+                    GitState::NoRepository => "repoなし（ローカルGitを準備 / 再試行）",
+                    GitState::NoRemote => "remote未設定（ローカルGit利用可）",
+                    GitState::Ready => "Git利用可",
+                },
                 s.branch,
                 if s.unborn { " (unborn)" } else { "" },
                 if s.detached { " (detached)" } else { "" },
@@ -736,7 +838,7 @@ impl App {
                 s.files.iter().filter(|f| f.conflicted).count()
             )
         } else {
-            "未更新 / UntrustedならTrustが必要".into()
+            "信頼済み・状態未確認".into()
         };
         let scope = self
             .git_ui
@@ -746,19 +848,27 @@ impl App {
             .map(|s| {
                 format!(
                     "Repository全体: {}\nWorkspace: {workspace}（外側のファイルも含み得ます）",
-                    s.repository_root.display()
+                    display_path(&s.repository_root)
                 )
             })
-            .unwrap_or_else(|| format!("Workspace: {workspace}"));
-        format!(
-            "{state}\r\n{scope}\r\n{}{}",
-            self.git_ui.notice,
-            self.git_ui
-                .receipt
-                .as_ref()
-                .map(|r| format!("\r\n最後のremote receipt（自動再uploadしません）: {r}"))
-                .unwrap_or_default()
-        )
+            .unwrap_or_else(|| {
+                if self.git_ui.workspace.is_some() {
+                    format!("Workspace: {workspace}")
+                } else {
+                    String::new()
+                }
+            });
+        let receipt = self
+            .git_ui
+            .receipt
+            .as_ref()
+            .map(|r| format!("最後のremote receipt（自動再uploadしません）: {r}"))
+            .unwrap_or_default();
+        [state, scope, self.git_ui.notice.clone(), receipt]
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\r\n")
     }
     fn git_rebuild_list(&mut self) {
         self.git_ui.visible = self
@@ -789,7 +899,7 @@ impl App {
                             file.index as char,
                             file.worktree as char,
                             if file.conflicted { "競合 " } else { "" },
-                            path.display()
+                            display_path(path)
                         );
                         shell::send(
                             c.files,
@@ -815,7 +925,8 @@ impl App {
                 && let Some(r) = self.feature_panel_rect(PanelId::Git)
             {
                 let brush = target.CreateSolidColorBrush(&self.shell.tokens.muted, None)?;
-                let text = self.text_layout("Git: 明示的に更新してください", r.width - 12., 12.)?;
+                let text =
+                    self.ui_text_layout("Git: 明示的に更新してください", r.width - 12., 12.)?;
                 target.DrawTextLayout(
                     point(r.x + 6., r.y + 5.),
                     &text,
@@ -849,13 +960,16 @@ impl App {
             self.git_ui.notice = format!("Untrusted: {e}");
             return false;
         }
-        let mutating = matches!(&task, Task::Mutation(_));
+        let mutating = matches!(&task, Task::Mutation(_) | Task::Initialize);
         let identity = RequestIdentity {
             generation: self.git_ui.generation,
             workspace: identity,
         };
         let cancel = Cancellation::default();
         let worker_cancel = cancel.clone();
+        if !self.git_ui.git.is_file() {
+            self.git_ui.git = find_git();
+        }
         let git = self.git_ui.git.clone();
         let (tx, rx) = mpsc::channel();
         match thread::Builder::new()
@@ -865,6 +979,7 @@ impl App {
                 let _ = tx.send(result);
             }) {
             Ok(_) => {
+                self.git_ui.refresh_pending = false;
                 if self.git_ui.restore_focus.is_none() {
                     self.git_ui.restore_focus = Some(unsafe { GetFocus() });
                 }
@@ -897,6 +1012,16 @@ impl App {
     }
     pub(super) fn git_tick(&mut self, _now: Instant) -> bool {
         self.git_sync();
+        // Drain outside git_sync: git_start calls git_sync itself. Never init
+        // from this lifecycle path, including already-trusted no-repo folders.
+        if self.git_ui.refresh_pending
+            && self.git_ui.worker.is_none()
+            && !self.search_busy()
+            && !self.feature_ime_active()
+        {
+            self.git_ui.refresh_pending = false;
+            return self.git_start(Task::Refresh);
+        }
         let result = match self.git_ui.worker.as_ref().map(Receiver::try_recv) {
             Some(Ok(v)) => v,
             Some(Err(TryRecvError::Disconnected)) => {
@@ -969,7 +1094,7 @@ impl App {
                     match diff {
                         Ok(diff) => {
                             self.git_ui.diff =
-                                format!("対象: {}\r\n{}", path.display(), diff_text(diff));
+                                format!("対象: {}\r\n{}", display_path(&path), diff_text(diff));
                             self.git_ui.diff_dirty = true;
                             self.git_ui.notice =
                                 "選択ファイルのread-only Diffです。本文・indexは変更していません。"
@@ -980,9 +1105,14 @@ impl App {
                 }
             }
             Completed::Mutation(operation) => {
+                self.git_ui.diff = match &operation {
+                    Ok(p) => process_detail(p),
+                    Err(e) => format!("{e:?}"),
+                };
+                self.git_ui.diff_dirty = true;
                 self.git_ui.notice = operation
                     .map(|p| process_notice(&p))
-                    .unwrap_or_else(git_error);
+                    .unwrap_or_else(|_| "Git処理に失敗しました。詳細欄を確認してください。".into());
                 let _ = self.git_start(Task::Refresh);
             }
             Completed::Conflict { status, request } => {
@@ -1101,10 +1231,23 @@ impl App {
     }
     fn git_apply_status(&mut self, status: Result<GitStatus, GitError>) {
         match status {
-            Ok(s) => self.git_ui.status = Some(s),
+            Ok(s) => {
+                self.git_ui.status = Some(s);
+                self.git_ui.notice.clear();
+            }
             Err(e) => {
                 self.git_ui.status = None;
-                self.git_ui.notice = git_error(e);
+                self.git_ui.notice = match &e {
+                    GitError::Untrusted(_) => {
+                        "Trustを確認してください。詳細欄を参照できます。".into()
+                    }
+                    GitError::Process(p) => process_notice(p),
+                    _ => "Git状態を取得できません。詳細欄を確認してください。".into(),
+                };
+                // Machine output is strict UTF-8 in GitClient. Human diagnostics
+                // may contain arbitrary hook/tool bytes; retain lossy detail here.
+                self.git_ui.diff = git_error(e);
+                self.git_ui.diff_dirty = true;
             }
         }
         self.git_ui.list_dirty = true;
@@ -1291,7 +1434,7 @@ impl App {
             .git_ui
             .status
             .as_ref()
-            .map(|s| s.repository_root.display().to_string())
+            .map(|s| display_path(&s.repository_root))
             .unwrap_or_default();
         let saved_note = if operation.needs_presave() {
             "この確認を「いいえ」にしても先に完了した保存は残ります。\n"
@@ -1516,12 +1659,32 @@ impl App {
             REFRESH => {
                 let _ = self.git_start(Task::Refresh);
             }
+            INITIALIZE => {
+                if self.git_confirm("ローカルGitを準備", "既存repositoryを利用し、見つからない場合だけWorkspace rootでgit initします。remoteやcommitは作成しません。") {
+                    let _ = self.git_start(Task::Initialize);
+                }
+            }
             TRUST | UNTRUST => {
                 let Some(root) = self.git_ui.workspace.as_ref().map(|i| i.canonical.clone()) else {
                     return true;
                 };
                 let grant = id == TRUST;
-                if self.git_confirm("端末local Trust",&format!("Workspace: {}\n{}\nTrustはOS sandboxではありません。Workspaceファイルから自己信頼できません。変更しますか？",root.display(),if grant{"Gitの読取りと外部adapterの明示実行を許可します。"}else{"この端末での外部実行許可を解除します。"})){self.git_ui.notice=match self.git_ui.trust.as_ref().ok_or("Trust registry unavailable".into()).and_then(|s|s.set_trusted(&root,grant)){Ok(())=>"Trustを変更しました。Gitは自動実行しません。".into(),Err(e)=>e};if !grant{self.git_ui.status=None;self.git_ui.list_dirty=true;self.git_ui.diff.clear();self.git_ui.diff_dirty=true;}}
+                if self.git_confirm("端末local Trust", &format!("Workspace: {}\n{}\nTrustはOS sandboxではありません。変更しますか？", display_path(&root), if grant { "外部Git実行とadapterの明示実行を許可します。repositoryがなければlocal initします。remoteやcommitは作成しません。" } else { "この端末での外部実行許可を解除します。" })) {
+                    match self.git_ui.trust.as_ref().ok_or("Trust registry unavailable".into()).and_then(|s| s.set_trusted(&root, grant)) {
+                        Ok(()) => {
+                            self.git_ui.generation = self.git_ui.generation.wrapping_add(1);
+                            self.git_ui.status = None;
+                            self.git_ui.list_dirty = true;
+                            self.git_ui.diff.clear();
+                            self.git_ui.diff_dirty = true;
+                            self.git_ui.notice = "Trustを変更しました。".into();
+                            if grant {
+                                let _ = self.git_start(Task::Initialize);
+                            }
+                        }
+                        Err(e) => self.git_ui.notice = e,
+                    }
+                }
             }
             CANCEL => {
                 if let Some(c) = &self.git_ui.cancellation {
@@ -1545,7 +1708,7 @@ impl App {
                     if id == UNSTAGE { "Unstage" } else { "Stage" },
                     paths
                         .iter()
-                        .map(|p| p.display().to_string())
+                        .map(|p| display_path(p))
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
@@ -1570,7 +1733,7 @@ impl App {
                     } else if unsafe { self.save(false) } {
                         self.git_operation(
                             GitOperation::StageResolved(path.clone()),
-                            &format!("保存済みの一ファイルだけ解決済みStage: {}", path.display()),
+                            &format!("保存済みの一ファイルだけ解決済みStage: {}", display_path(&path)),
                         );
                     } else {
                         self.git_ui.notice = "保存失敗 / 取消のためStageしません。".into();
@@ -1646,7 +1809,7 @@ impl App {
         if id == UPLOAD {
             return self.image_directory().is_some() && self.git_image_selected();
         }
-        if id == REFRESH {
+        if [REFRESH, INITIALIZE].contains(&id) {
             return true;
         }
         let Some(status) = &self.git_ui.status else {
@@ -1746,7 +1909,7 @@ impl App {
             _ => {}
         }
         if [FETCH, PULL, PUSH].contains(&id) && status.remotes.is_empty() {
-            return "NoRemote: 既存remoteがありません";
+            return "NoRemote: remote未設定（ローカルGit利用可）";
         }
         if [DIFF, OPEN_CONFLICT].contains(&id) && self.git_ui.selected.len() != 1 {
             return "ファイルを一つ選択してください";
@@ -2054,6 +2217,103 @@ fn selection_after_source_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn git_display_paths_and_utf8_diagnostics_preserve_internal_values() {
+        for (internal, display) in [
+            (
+                r"\\?\E:\空白 workspace\日本語.md",
+                "E:/空白 workspace/日本語.md",
+            ),
+            (r"\\?\UNC\server\share\日本語", "//server/share/日本語"),
+            (r"E:\ordinary\note.md", "E:/ordinary/note.md"),
+        ] {
+            let path = PathBuf::from(internal);
+            assert_eq!(display_path(&path), display);
+            assert_eq!(path.as_os_str(), internal);
+        }
+        let result = ProcessResult {
+            outcome: ProcessOutcome::Exited(128),
+            stdout: vec![],
+            stderr: "fatal: 権限がありません".as_bytes().to_vec(),
+            truncated: false,
+            generation: 1,
+        };
+        assert!(process_detail(&result).contains("権限がありません"));
+        assert!(!process_notice(&result).contains("権限がありません"));
+    }
+
+    #[test]
+    fn git_trusted_summary_refresh_and_retry_states_are_coherent() {
+        let f = Fixture::new();
+        let mut app = super::super::tests::composing_test_app("本文");
+        app.composing = false;
+        app.preedit.clear();
+        app.ime_owner = None;
+        app.git_ui.workspace = Some(WorkspaceIdentity::read(&f.repo).unwrap());
+        app.git_ui.trust = Some(f.trust.clone());
+        app.git_ui.trusted = true;
+        app.git_ui.notice.clear();
+        assert!(!app.git_summary().contains("Untrusted"));
+        assert!(app.git_enabled(INITIALIZE));
+        app.git_ui.notice = "古い失敗".into();
+        app.git_apply_status(Ok(GitStatus {
+            state: GitState::NoRemote,
+            repository_root: f.repo.clone(),
+            ..Default::default()
+        }));
+        assert!(!app.git_summary().contains("古い失敗"));
+        assert!(
+            app.git_summary()
+                .contains("remote未設定（ローカルGit利用可）")
+        );
+        assert!(!app.git_enabled(FETCH));
+        assert!(app.git_enabled(CREATE));
+        app.git_apply_status(Err(GitError::Invalid("初期化失敗の詳細".into())));
+        assert!(app.git_ui.trusted);
+        assert!(app.git_enabled(INITIALIZE));
+        assert!(app.git_ui.diff.contains("初期化失敗の詳細"));
+        assert!(!app.git_summary().contains("初期化失敗の詳細"));
+        assert_eq!(app.doc().source(), "本文");
+    }
+
+    #[test]
+    fn git_workspace_open_schedules_only_trusted_discovery_and_rejects_old_results() {
+        let f = Fixture::new();
+        let workspace = f.root.join("open-no-repo");
+        fs::create_dir(&workspace).unwrap();
+        let identity = WorkspaceIdentity::read(&workspace).unwrap();
+        let mut pane = GitPane::default();
+        pane.trust.replace(f.trust.clone());
+        pane.sync_workspace(Some(identity.clone()));
+        assert!(!pane.trusted);
+        assert!(!pane.refresh_pending);
+        assert!(pane.worker.is_none());
+        f.trust.set_trusted(&workspace, true).unwrap();
+        pane.sync_workspace(None);
+        pane.sync_workspace(Some(identity.clone()));
+        assert!(pane.refresh_pending);
+        let request = RequestIdentity {
+            generation: pane.generation,
+            workspace: identity,
+        };
+        let completion = worker(
+            request.clone(),
+            Task::Refresh,
+            f.trust.clone(),
+            f.git.clone(),
+            Cancellation::default(),
+        );
+        let Completed::Status(Ok(status)) = completion.result else {
+            panic!("read-only discovery failed")
+        };
+        assert_eq!(status.state, GitState::NoRepository);
+        assert!(!workspace.join(".git").exists());
+        let cancelled = Cancellation::default();
+        pane.cancellation = Some(cancelled.clone());
+        pane.sync_workspace(Some(WorkspaceIdentity::read(&f.repo).unwrap()));
+        assert!(cancelled.is_cancelled());
+        assert!(!request.is_current(pane.generation, &f.repo, &workspace));
+    }
     struct Fixture {
         root: PathBuf,
         repo: PathBuf,

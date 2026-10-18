@@ -2901,6 +2901,56 @@ function Get-UiPanelGeometry($ParentRoot, [string]$PanelId) {
     return $matches[0]
 }
 
+function Test-UiActivityPanelVisible($ParentRoot, [int]$ActivityId) {
+    $panelId = $null
+    $checkSearch = $false
+    $expectedSearch = $false
+    switch ($ActivityId) {
+        110 { $panelId = 'explorer'; $checkSearch = $true }
+        111 { $panelId = 'explorer'; $checkSearch = $true; $expectedSearch = $true }
+        112 { $panelId = 'calendar' }
+        113 { $panelId = 'outline' }
+        114 { $panelId = 'git' }
+        default { throw [System.ArgumentOutOfRangeException]::new('ActivityId') }
+    }
+    if ($checkSearch) {
+        $searchProperty = $ParentRoot.PSObject.Properties['search_active']
+        if ($null -eq $searchProperty -or $null -eq $searchProperty.Value) {
+            throw [System.NotSupportedException]::new('SEARCH_ACTIVITY_STATE_UNAVAILABLE')
+        }
+        if ([bool]$searchProperty.Value -ne $expectedSearch) { return $false }
+    }
+
+    try { $panel = Get-UiPanelGeometry $ParentRoot $panelId }
+    catch [System.NotSupportedException] {
+        if ($_.Exception.Message -ceq 'PANEL_GEOMETRY_UNAVAILABLE') { return $false }
+        throw
+    }
+    if ($null -eq $panel.PSObject.Properties['hidden'] -or
+        $null -eq $panel.PSObject.Properties['collapsed'] -or
+        $null -eq $panel.PSObject.Properties['body']) {
+        throw [System.NotSupportedException]::new('PANEL_VISIBILITY_METADATA_UNAVAILABLE')
+    }
+    $rect = $panel.rect
+    $body = $panel.body
+    return (-not [bool]$panel.hidden -and -not [bool]$panel.collapsed -and
+        $null -ne $rect -and [double]$rect.width -gt 0 -and [double]$rect.height -gt 0 -and
+        $null -ne $body -and [double]$body.width -gt 0 -and [double]$body.height -gt 0)
+}
+
+function Ensure-UiActivityPanel([int]$ActivityId) {
+    $state = Read-Diagnostic
+    $parent = Get-UiParentRoot $state
+    if (Test-UiActivityPanelVisible $parent $ActivityId) { return $state }
+
+    Invoke-UiControlById $script:WindowHandle $ActivityId
+    return Wait-UiState {
+        param($value)
+        $parent = Get-UiParentRoot $value
+        Test-UiActivityPanelVisible $parent $ActivityId
+    } ('activity {0} opens its intended panel' -f $ActivityId)
+}
+
 function Set-UiActivePanelFromHeader([int]$HeaderControlId) {
     Invoke-UiControlById $script:WindowHandle $HeaderControlId
     $menu = Wait-UiThreadWindow '#32768' '' 1500
@@ -3346,7 +3396,25 @@ function Get-UiTextSha256([string]$Text) {
 function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     Assert-UiOwnedWindow $Window
     Set-OwnedForeground -Window $Window
-    $bounds = [int[]][MdliteRustAcceptanceNative]::WindowRect($Window)
+    Assert-UiOwnedWindow $Window
+    if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
+        throw 'ENVIRONMENT_BLOCKED: exact owned HWND was not foreground before client capture.'
+    }
+    $clientRect = [MdliteRustAcceptanceNative+RECT]::new()
+    if (-not [MdliteRustAcceptanceNative]::GetClientRect($Window, [ref]$clientRect)) {
+        throw 'ENVIRONMENT_BLOCKED: owned window client bounds were unavailable before capture.'
+    }
+    $topLeft = [MdliteRustAcceptanceNative+POINT]::new()
+    $topLeft.X = $clientRect.Left; $topLeft.Y = $clientRect.Top
+    if (-not [MdliteRustAcceptanceNative]::ClientToScreen($Window, [ref]$topLeft)) {
+        throw 'ENVIRONMENT_BLOCKED: owned client origin could not be converted to screen coordinates.'
+    }
+    $bottomRight = [MdliteRustAcceptanceNative+POINT]::new()
+    $bottomRight.X = $clientRect.Right; $bottomRight.Y = $clientRect.Bottom
+    if (-not [MdliteRustAcceptanceNative]::ClientToScreen($Window, [ref]$bottomRight)) {
+        throw 'ENVIRONMENT_BLOCKED: owned client bounds could not be converted to screen coordinates.'
+    }
+    $bounds = [int[]]@($topLeft.X, $topLeft.Y, $bottomRight.X, $bottomRight.Y)
     $width = $bounds[2] - $bounds[0]
     $height = $bounds[3] - $bounds[1]
     if ($width -lt 1 -or $height -lt 1 -or $width -gt 7680 -or $height -gt 4320) {
@@ -3356,15 +3424,44 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     $bitmap = [System.Drawing.Bitmap]::new($width, $height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
+        Assert-UiOwnedWindow $Window
+        if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
+            throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground before client capture.'
+        }
         $graphics.CopyFromScreen(
             $bounds[0], $bounds[1], 0, 0,
             [System.Drawing.Size]::new($width, $height),
             [System.Drawing.CopyPixelOperation]::SourceCopy)
+        Assert-UiOwnedWindow $Window
+        if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
+            throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground during client capture.'
+        }
+        $afterClientRect = [MdliteRustAcceptanceNative+RECT]::new()
+        if (-not [MdliteRustAcceptanceNative]::GetClientRect($Window, [ref]$afterClientRect)) {
+            throw 'ENVIRONMENT_BLOCKED: owned window client bounds were unavailable after capture.'
+        }
+        $afterTopLeft = [MdliteRustAcceptanceNative+POINT]::new()
+        $afterTopLeft.X = $afterClientRect.Left; $afterTopLeft.Y = $afterClientRect.Top
+        if (-not [MdliteRustAcceptanceNative]::ClientToScreen($Window, [ref]$afterTopLeft)) {
+            throw 'ENVIRONMENT_BLOCKED: owned client origin could not be reconfirmed after capture.'
+        }
+        $afterBottomRight = [MdliteRustAcceptanceNative+POINT]::new()
+        $afterBottomRight.X = $afterClientRect.Right; $afterBottomRight.Y = $afterClientRect.Bottom
+        if (-not [MdliteRustAcceptanceNative]::ClientToScreen($Window, [ref]$afterBottomRight)) {
+            throw 'ENVIRONMENT_BLOCKED: owned client bounds could not be reconfirmed after capture.'
+        }
+        $afterBounds = [int[]]@($afterTopLeft.X, $afterTopLeft.Y, $afterBottomRight.X, $afterBottomRight.Y)
+        for ($index = 0; $index -lt $bounds.Length; $index++) {
+            if ($afterBounds[$index] -ne $bounds[$index]) {
+                throw 'ENVIRONMENT_BLOCKED: owned client bounds changed during capture.'
+            }
+        }
         $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
     } finally {
         $graphics.Dispose()
         $bitmap.Dispose()
     }
+    return [pscustomobject]@{ capture_kind='client'; bounds=$bounds; width=$width; height=$height }
 }
 
 function Wait-UiFileState(
@@ -3639,8 +3736,9 @@ function Invoke-UiParitySuite {
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        Capture-UiOwnedWindow $script:WindowHandle $script:UiCapturePath
+        $initialCapture = Capture-UiOwnedWindow $script:WindowHandle $script:UiCapturePath
         $script:Report.initial_window_capture = '.codex-runtime/editor-acceptance/' + $runId + '/initial-window.png'
+        $script:Report.initial_window_capture_kind = [string]$initialCapture.capture_kind
         Add-Observation ($script:Report.suite + ' startup') $initial
 
         if ($StartupSmoke) {
@@ -3743,15 +3841,13 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'SHELL_ACTIVITY_PANEL_SLOT_COLLAPSE_RESET_RESIZE_PALETTE_CANCEL' {
-            $state = Read-Diagnostic
-            $parent = Get-UiParentRoot $state
-            foreach ($activityId in @(110, 111, 112, 113)) {
-                Invoke-UiControlById $script:WindowHandle $activityId
+            foreach ($activityId in @(110, 111, 114, 112)) {
+                $state = Ensure-UiActivityPanel $activityId
                 switch ($activityId) {
                     110 { [void](Get-UiControlById $script:WindowHandle 4800 'BUTTON' -RequireVisible) }
                     111 { [void](Get-UiControlById $script:WindowHandle 5602 'EDIT' -RequireVisible) }
-                    112 { [void](Get-UiControlById $script:WindowHandle 6000 'BUTTON' -RequireVisible) }
-                    113 {
+                    114 { [void](Get-UiControlById $script:WindowHandle 6000 'BUTTON' -RequireVisible) }
+                    112 {
                         $calendarButtons = @(Get-UiOwnedChildren $script:WindowHandle | Where-Object {
                             $_.Class -ceq 'BUTTON' -and $_.Visible -and $_.Enabled -and $_.Id -in @(4812, 4818)
                         })
@@ -3760,9 +3856,29 @@ function Invoke-UiParitySuite {
                         }
                     }
                 }
+                Invoke-UiControlById $script:WindowHandle $activityId
+                if ($activityId -eq 111) {
+                    $state = Wait-UiState {
+                        param($value)
+                        Test-UiActivityPanelVisible (Get-UiParentRoot $value) 111
+                    } 'Search activity remains open on repeated activation'
+                    continue
+                }
+                [void](Wait-UiState {
+                    param($value)
+                    $parent = Get-UiParentRoot $value
+                    -not (Test-UiActivityPanelVisible $parent $activityId)
+                } ('activity {0} hides its panel on activation' -f $activityId))
+                Invoke-UiControlById $script:WindowHandle $activityId
+                $state = Wait-UiState {
+                    param($value)
+                    $parent = Get-UiParentRoot $value
+                    Test-UiActivityPanelVisible $parent $activityId
+                } ('activity {0} restores its panel on activation' -f $activityId)
             }
             Invoke-UiPaletteCancel 'no-matching-command-ui-parity'
 
+            $parent = Get-UiParentRoot (Read-Diagnostic)
             $initialPanel = Get-UiPanelGeometry $parent 'explorer'
             $initialSlotKey = ([string]$initialPanel.slot).ToLowerInvariant().Replace('_', '').Replace('-', '')
             Invoke-UiControlById $script:WindowHandle 130
@@ -3844,7 +3960,7 @@ function Invoke-UiParitySuite {
         [void](Invoke-UiParityCase 'SETTINGS_APPLY_CANCEL_KEYBINDING_REMAP' {
             $settingsPath = Join-Path $script:UiLocalAppData 'MDLite/settings.toml'
             $baselineHash = Get-UiSafeFileHash $settingsPath
-            Invoke-UiControlById $script:WindowHandle 114
+            Invoke-UiControlById $script:WindowHandle 115
             $settings = Wait-UiThreadWindow 'MDLiteSettings' '' 3000
             Set-UiEditText $settings 205 '19'
             Invoke-UiDialogButton $settings 211
@@ -3853,7 +3969,7 @@ function Invoke-UiParitySuite {
                 throw [System.InvalidOperationException]::new('SETTINGS_CANCEL_WROTE_COMMON_FILE')
             }
 
-            Invoke-UiControlById $script:WindowHandle 114
+            Invoke-UiControlById $script:WindowHandle 115
             $settings = Wait-UiThreadWindow 'MDLiteSettings' '' 3000
             $autoSave = Get-UiControlById $settings 201 'COMBOBOX' -RequireVisible -RequireEnabled
             Invoke-UiControlClick $settings $autoSave
@@ -3884,7 +4000,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'EXPLORER_NEW_RENAME_INTERNAL_COPY_PASTE_OPEN_REFUSAL' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             $explorerList = Get-UiControlById $script:WindowHandle 4690 'LISTBOX' -RequireVisible -RequireEnabled
             Invoke-UiControlById $script:WindowHandle 4801
             Set-UiEditText $script:WindowHandle 4701 'created-ui-parity.md'
@@ -3941,7 +4057,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'QUICK_OPEN_BLANK_LIMIT_AND_MORE' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             Invoke-UiControlById $script:WindowHandle 4800
             $query = Get-UiControlById $script:WindowHandle 4700 'EDIT' -RequireVisible -RequireEnabled
             Set-UiEditText $script:WindowHandle 4700 ''
@@ -3967,7 +4083,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'QUICK_OPEN_LATE_FILE_QUERY_201_PLUS' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             Invoke-UiControlById $script:WindowHandle 4800
             Set-UiEditText $script:WindowHandle 4700 'zz-quick-204.md'
             $count = Wait-UiListCount $script:WindowHandle 4691 1 15000
@@ -3984,7 +4100,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'OUTLINE_JUMP_MOVE_SECTION_UNDO' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 113)
             $doc0 = [string]$script:UiDocumentSources['doc-00.md']
             [void](Switch-UiSource $doc0 32)
             $state = Read-Diagnostic
@@ -4015,7 +4131,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'CALENDAR_SELECTED_DAILY_AND_PROFILE_CREATE' {
-            Invoke-UiControlById $script:WindowHandle 113
+            [void](Ensure-UiActivityPanel 112)
             $state = Read-Diagnostic
             $parent = Get-UiParentRoot $state
             $today = Get-Date
@@ -4074,7 +4190,7 @@ function Invoke-UiParitySuite {
         [void](Invoke-UiParityCase 'CALENDAR_INVALID_HOLIDAY_CSV' {
             $cachePath = Join-Path $script:UiFixtureRoot '.mdlite/.cache/holidays.csv'
             $beforeCache = Get-UiSafeFileHash $cachePath
-            Invoke-UiControlById $script:WindowHandle 113
+            [void](Ensure-UiActivityPanel 112)
             $managerButtons = @(Get-UiOwnedChildren $script:WindowHandle | Where-Object {
                 $_.Class -ceq 'BUTTON' -and $_.Id -eq 4822 -and $_.Visible
             })
@@ -4122,7 +4238,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'SEARCH_DIRTY_DOCUMENT_AND_WORKSPACE' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             $original = [string]$script:UiDocumentSources['doc-01.md']
             [void](Switch-UiSource $original 32)
             Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
@@ -4130,7 +4246,7 @@ function Invoke-UiParitySuite {
             $dirtySource = $original + 'dirty-marker'
             [void](Wait-UiSource $dirtySource $true)
 
-            Invoke-UiControlById $script:WindowHandle 111
+            [void](Ensure-UiActivityPanel 111)
             Invoke-UiControlById $script:WindowHandle 5600
             Set-UiEditText $script:WindowHandle 5602 'dirty-marker'
             $documentResultCount = Wait-UiListCount $script:WindowHandle 5612 1 7000
@@ -4149,7 +4265,7 @@ function Invoke-UiParitySuite {
             }
             Invoke-UiControlById $script:WindowHandle 5009
 
-            Invoke-UiControlById $script:WindowHandle 111
+            [void](Ensure-UiActivityPanel 111)
             Set-UiEditText $script:WindowHandle 5602 'workspace-marker'
             $workspaceResultCount = Wait-UiListCount $script:WindowHandle 5612 3 10000
             $results = Get-UiControlById $script:WindowHandle 5612 'LISTBOX' -RequireVisible -RequireEnabled
@@ -4167,7 +4283,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'REPLACE_PREVIEW_AND_JOURNAL_RESTORE' {
-            Invoke-UiControlById $script:WindowHandle 111
+            [void](Ensure-UiActivityPanel 111)
             Set-UiEditText $script:WindowHandle 5602 'replace-token'
             Set-UiEditText $script:WindowHandle 5603 'restored-token'
             [void](Wait-UiListCount $script:WindowHandle 5612 1 10000)
@@ -4196,7 +4312,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'GIT_UNTRUSTED_GATE_AND_LOCAL_STAGE_UNSTAGE_COMMIT' {
-            Invoke-UiControlById $script:WindowHandle 112
+            [void](Ensure-UiActivityPanel 114)
             $summary = Get-UiControlById $script:WindowHandle 6500 'EDIT' -RequireVisible
             $summaryText = [MdliteRustAcceptanceNative]::OwnedControlText($summary.Handle, $script:ProcessId)
             if ($summaryText.IndexOf('Untrusted', [StringComparison]::OrdinalIgnoreCase) -lt 0) {
@@ -4301,7 +4417,7 @@ function Invoke-UiParitySuite {
         })
 
         [void](Invoke-UiParityCase 'COMPACT_EDIT_UNDO_CLOSE_RETURN' {
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             $source = [string]$script:UiDocumentSources['doc-02.md']
             [void](Switch-UiSource $source 64)
             Invoke-UiPaletteCommand 'Compactへ移す'
@@ -4337,7 +4453,7 @@ function Invoke-UiParitySuite {
 
         [void](Invoke-UiParityCase 'DIRTY_CLOSE_CANCEL_RESTART_RECOVERY_NORMAL_CLOSE' {
             $script:InputWindowHandle = $script:WindowHandle
-            Invoke-UiControlById $script:WindowHandle 110
+            [void](Ensure-UiActivityPanel 110)
             $source = [string]$script:UiDocumentSources['doc-08.md']
             [void](Switch-UiSource $source 64)
             Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
@@ -4674,7 +4790,7 @@ function Save-EditorRecoveryEvidence([string]$CaseId, [string]$Phase) {
     Copy-Item -LiteralPath $script:DiagnosticPath -Destination $diagnostic -Force
     $sourceBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$state.source)
     [IO.File]::WriteAllBytes($sourcePath, $sourceBytes)
-    Capture-UiOwnedWindow $script:WindowHandle $screen
+    $capture = Capture-UiOwnedWindow $script:WindowHandle $screen
     if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $script:WindowHandle) {
         throw 'ENVIRONMENT_BLOCKED: owned Editor was not foreground for visible capture.'
     }
@@ -4686,6 +4802,7 @@ function Save-EditorRecoveryEvidence([string]$CaseId, [string]$Phase) {
         executable_path = [string]$script:Report.executable_path; executable_sha256 = [string]$script:Report.executable_sha256_before
         git_head = [string]$script:Report.git_head; harness_sha256 = [string]$script:Report.harness_sha256
         dpi = [int][MdliteRustAcceptanceNative]::GetDpiForWindow($script:WindowHandle)
+        capture_kind = [string]$capture.capture_kind
         window_bounds = $bounds; client_size = @(($client[2] - $client[0]), ($client[3] - $client[1]))
         diagnostic_path = $diagnostic.Substring($ProjectRoot.Length).TrimStart('\').Replace('\','/')
         source_snapshot_path = $sourcePath.Substring($ProjectRoot.Length).TrimStart('\').Replace('\','/')
@@ -7637,7 +7754,7 @@ $e12SettingsWindow=[IntPtr]::Zero
 
 # Workspace session 1: stage only size/theme, apply, close, and capture the
 # actual temporary rendering after App::show_settings reloads persisted state.
-Invoke-UiControlById $script:WindowHandle 114
+Invoke-UiControlById $script:WindowHandle 115
 $e12SettingsWindow=Wait-UiThreadWindow 'MDLiteSettings' '' 3000
 Assert-UiOwnedWindow $e12SettingsWindow
 [uint32]$e12DialogPid=0
@@ -7891,7 +8008,7 @@ if ((Get-EditorRecoveryBytesSha256 ([IO.File]::ReadAllBytes($e12WorkspacePath)))
     (Get-EditorRecoveryBytesSha256 $e12ExpectedTemporaryBytes)) {
     throw 'SETUP_FAILURE: E12 restore session requires the exact temporary Workspace file.'
 }
-Invoke-UiControlById $script:WindowHandle 114
+Invoke-UiControlById $script:WindowHandle 115
 $e12SettingsWindow=Wait-UiThreadWindow 'MDLiteSettings' '' 3000
 Assert-UiOwnedWindow $e12SettingsWindow
 [uint32]$e12DialogPidB=0
@@ -8170,7 +8287,7 @@ Set-EditorRecoveryCase 'E12' 'NOT_RUN' @{
         font_size_after_restore=$e12FontAfterRestore
     }
     edit205_child_focus=[ordered]@{status='PASS';session1=$e12Edit205FocusEvidenceA;session2=$e12Edit205FocusEvidenceB}
-    control_evidence=$e12ControlEvidence; captures=$e12Captures
+    control_evidence=$e12ControlEvidence; captures=$e12Captures; capture_kind='client'
     rendered_font_family='UNOBSERVED'; rendered_font_identity='UNOBSERVED'
     visual_review='ROOT_REQUIRED'
     not_run=@('Root review of temporary and restored D2D screenshots before any E12 pass',
@@ -8678,7 +8795,7 @@ Set-EditorRecoveryCase 'E14' 'NOT_RUN' @{
         $workspaceSettingsBeforeHash=(Get-FileHash -LiteralPath $script:EditorRecoveryWorkspaceSettingsPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $commonSettingsPath=Join-Path $script:UiLocalAppData 'MDLite/settings.toml'
         $commonSettingsBeforeHash=Get-UiSafeFileHash $commonSettingsPath
-        Invoke-UiControlById $script:WindowHandle 114
+        Invoke-UiControlById $script:WindowHandle 115
         $e13SettingsWindow=Wait-UiThreadWindow 'MDLiteSettings' '' 3000
         Assert-UiOwnedWindow $e13SettingsWindow
         [uint32]$e13SettingsOwnerPid=0

@@ -6,7 +6,7 @@
 use super::{App, shell};
 use mdlite::{
     calendar::{
-        CalendarDate, CalendarInteraction, CalendarListRequest, CalendarListResult,
+        CalendarCell, CalendarDate, CalendarInteraction, CalendarListRequest, CalendarListResult,
         CalendarListState, CalendarMonthGrid, HolidayCalendar, HolidayStatus, daily_file_marker,
         decorate_month, month_grid,
     },
@@ -317,6 +317,39 @@ fn calendar_day_label(day: i32, daily_file: bool, holiday: bool) -> String {
         if daily_file { "•" } else { "" },
         if holiday { "祝" } else { "" }
     )
+}
+
+fn calendar_cell_color(tokens: shell::Tokens, cell: &CalendarCell) -> super::D2D1_COLOR_F {
+    if tokens.high_contrast && (cell.marks.selected || cell.marks.focused) {
+        let rgb = unsafe {
+            windows::Win32::Graphics::Gdi::GetSysColor(
+                windows::Win32::Graphics::Gdi::COLOR_HIGHLIGHTTEXT,
+            )
+        };
+        return super::color(
+            (rgb & 255) as f32 / 255.,
+            ((rgb >> 8) & 255) as f32 / 255.,
+            ((rgb >> 16) & 255) as f32 / 255.,
+        );
+    }
+    let ink = if cell.marks.holiday || cell.marks.sunday {
+        tokens.weekend_red
+    } else if cell.marks.saturday {
+        tokens.weekend_blue
+    } else {
+        tokens.foreground
+    };
+    if cell.in_displayed_month || cell.marks.selected || cell.marks.focused || tokens.high_contrast
+    {
+        ink
+    } else {
+        // Dim adjacent months without replacing the weekend hue with grey.
+        super::color(
+            ink.r * 0.7 + tokens.panel.r * 0.3,
+            ink.g * 0.7 + tokens.panel.g * 0.3,
+            ink.b * 0.7 + tokens.panel.b * 0.3,
+        )
+    }
 }
 
 fn calendar_day_font_size(label: &str, width: f32) -> f32 {
@@ -1825,6 +1858,9 @@ impl FeaturePanes {
         );
         let width = ((body.width - 10.) / 7.).max(1.0);
         let x0 = body.x + 5.;
+        let tokens = app.shell.tokens;
+        let red = unsafe { target.CreateSolidColorBrush(&tokens.weekend_red, None)? };
+        let blue = unsafe { target.CreateSolidColorBrush(&tokens.weekend_blue, None)? };
         for (column, label) in ["日", "月", "火", "水", "木", "金", "土"]
             .iter()
             .enumerate()
@@ -1837,7 +1873,11 @@ impl FeaturePanes {
                 body.y + (layout.grid_top - 18.0).max(0.0),
                 width,
                 11.,
-                muted,
+                match column {
+                    0 => &red,
+                    6 => &blue,
+                    _ => muted,
+                },
             )?;
         }
         for (index, cell) in cells.iter().enumerate() {
@@ -1870,18 +1910,15 @@ impl FeaturePanes {
             }
             if let Some(date) = cell.date {
                 let label = calendar_day_label(date.day, cell.marks.daily_file, cell.marks.holiday);
-                let brush = if cell.marks.sunday || cell.marks.holiday {
-                    accent
-                } else {
-                    foreground
-                };
+                let ink = calendar_cell_color(tokens, cell);
+                let brush = unsafe { target.CreateSolidColorBrush(&ink, None)? };
                 draw_feature_text_single_line(
                     app,
                     target,
                     &label,
                     bounds.label,
                     calendar_day_font_size(&label, bounds.label.width),
-                    brush,
+                    &brush,
                 )?;
             }
         }
@@ -2482,7 +2519,7 @@ fn draw_feature_text(
     size: f32,
     brush: &ID2D1SolidColorBrush,
 ) -> windows::core::Result<()> {
-    let layout = unsafe { app.text_layout(text, width.max(1.), size)? };
+    let layout = unsafe { app.ui_text_layout(text, width.max(1.), size)? };
     unsafe {
         target.DrawTextLayout(
             super::point(x, y),
@@ -2502,7 +2539,7 @@ fn draw_feature_text_single_line(
     size: f32,
     brush: &ID2D1SolidColorBrush,
 ) -> windows::core::Result<()> {
-    let layout = unsafe { app.text_layout(text, bounds.width.max(1.0), size)? };
+    let layout = unsafe { app.ui_text_layout(text, bounds.width.max(1.0), size)? };
     unsafe {
         layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         layout.SetMaxHeight(bounds.height.max(1.0))?;
@@ -2868,6 +2905,82 @@ impl App {
         } else {
             true
         }
+    }
+
+    pub(super) fn features_actionable_at(&self, x: f32, y: f32) -> bool {
+        if self.feature_ime_active() || self.background_mutation_busy() {
+            return false;
+        }
+        if let Some(body) = self
+            .feature_panel_rect(PanelId::Outline)
+            .filter(|r| r.contains(x, y))
+        {
+            if y < body.y + 8. {
+                return false;
+            }
+            let row = ((y - body.y - 8.) / OUTLINE_ROW_HEIGHT) as usize;
+            return row < outline_visible_rows(body.height)
+                && self
+                    .features
+                    .outline
+                    .as_ref()
+                    .filter(|outline| outline.is_current(self.doc()))
+                    .is_some_and(|outline| {
+                        self.features.outline_scroll + row < outline.headings.len()
+                    });
+        }
+        let Some(body) = self
+            .feature_panel_rect(PanelId::Calendar)
+            .filter(|r| r.contains(x, y))
+        else {
+            return false;
+        };
+        if self.features.form.is_some() {
+            return false;
+        }
+        if self.features.profiles.manager_open {
+            let layout = profile_list_layout(body.height);
+            if y < body.y + layout.rows_top {
+                return false;
+            }
+            let row = ((y - body.y - layout.rows_top) / CALENDAR_ROW_HEIGHT) as usize;
+            return row < layout.visible_rows
+                && self.features.calendar.scroll + row < self.features.profiles.effective.len();
+        }
+        if body.height < CALENDAR_MIN_BODY_HEIGHT {
+            return false;
+        }
+        let layout = calendar_layout(body.height);
+        if self.features.calendar.current_month.is_some_and(|grid| {
+            grid.cells.iter().enumerate().any(|(index, date)| {
+                date.is_some()
+                    && calendar_cell_draw_bounds(body, layout, index)
+                        .is_some_and(|bounds| bounds.cell.contains(x, y))
+            })
+        }) {
+            return true;
+        }
+        if y < body.y + layout.rows_top {
+            return false;
+        }
+        let row = ((y - body.y - layout.rows_top) / CALENDAR_ROW_HEIGHT) as usize;
+        if row >= layout.visible_rows {
+            return false;
+        }
+        let (Some(workspace), Some(request), Some(listing)) = (
+            &self.features.workspace,
+            &self.features.calendar.request,
+            &self.features.calendar.listing,
+        ) else {
+            return false;
+        };
+        request.matches(
+            workspace,
+            self.features.calendar.list_generation,
+            request.date,
+        ) && self.features.calendar.interaction.selected() == Some(request.date)
+            && listing.matches(workspace, request.generation, request.date)
+            && self.features.calendar.scroll + row < listing.files.len()
     }
 
     pub(super) fn features_pointer_move(&mut self, x: f32, y: f32) -> bool {
@@ -5114,8 +5227,8 @@ impl App {
 fn localized_label(command: usize, label: &str) -> String {
     match command {
         4000 => "検索".to_owned(),
-        4001 => "新ファ".to_owned(),
-        4002 => "新フォ".to_owned(),
+        4001 => "新しいファイル".to_owned(),
+        4002 => "新しいフォルダー".to_owned(),
         4003 => "コピー".to_owned(),
         4004 => "貼付".to_owned(),
         4005 => "改名".to_owned(),
@@ -5656,6 +5769,55 @@ mod tests {
             let after_minute = (after.hour, after.minute);
             assert!(before_minute <= actual_minute && actual_minute <= after_minute);
         }
+    }
+
+    #[test]
+    fn calendar_weekend_holiday_and_adjacent_month_colors_follow_date_marks() {
+        let march = CalendarDate::new(2027, 3, 1).unwrap();
+        let holiday = CalendarDate::new(2027, 3, 20).unwrap();
+        let cells = decorate_month(
+            month_grid(march).unwrap(),
+            march,
+            None,
+            None,
+            None,
+            &BTreeSet::from([holiday]),
+            &BTreeSet::new(),
+        );
+        let tokens = shell::Tokens::default();
+        let cell = |month, day| {
+            cells
+                .iter()
+                .find(|cell| cell.date == CalendarDate::new(2027, month, day))
+                .unwrap()
+        };
+        let red = calendar_cell_color(tokens, cell(3, 20));
+        assert!(cell(3, 20).marks.saturday && cell(3, 20).marks.holiday);
+        assert!(red.r > red.b, "a Saturday holiday uses the red holiday hue");
+        let sunday = calendar_cell_color(tokens, cell(3, 21));
+        assert_eq!((red.r, red.g, red.b), (sunday.r, sunday.g, sunday.b));
+        let saturday = calendar_cell_color(tokens, cell(3, 27));
+        let adjacent = calendar_cell_color(tokens, cell(4, 3));
+        assert!(saturday.b > saturday.r && adjacent.b > adjacent.r);
+        assert!(
+            adjacent.b < saturday.b,
+            "adjacent months dim while retaining weekend hue"
+        );
+        let mut selected = *cell(4, 3);
+        selected.marks.selected = true;
+        let selected_ink = calendar_cell_color(tokens, &selected);
+        assert_eq!(
+            selected_ink.b, saturday.b,
+            "selection retains full text contrast"
+        );
+        let high_contrast = shell::Tokens {
+            high_contrast: true,
+            weekend_red: tokens.foreground,
+            weekend_blue: tokens.foreground,
+            ..tokens
+        };
+        let ink = calendar_cell_color(high_contrast, cell(4, 3));
+        assert_eq!(ink.r, high_contrast.foreground.r);
     }
 
     #[test]

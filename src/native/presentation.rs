@@ -10,6 +10,52 @@ use std::ops::Range;
 const STATUS_MAX_CHARS: usize = 260;
 const STATUS_NAME_CHARS: usize = 32;
 const MAX_INLINE_CODE_RECTS: usize = 128;
+const LINE_HEIGHT_EM: f32 = 1.6;
+const LINE_BASELINE_EM: f32 = 1.25;
+const HEADING_GAP_EM: f32 = 0.12;
+
+pub(super) fn line_height(size: f32) -> f32 {
+    size * LINE_HEIGHT_EM
+}
+
+pub(super) fn line_spacing(size: f32) -> (f32, f32) {
+    (line_height(size), size * LINE_BASELINE_EM)
+}
+
+pub(super) fn heading_scale(level: u8) -> f32 {
+    [1.55, 1.4, 1.3, 1.2, 1.1, 1.05][level.saturating_sub(1).min(5) as usize]
+}
+
+pub(super) fn heading_gap(size: f32) -> f32 {
+    size * HEADING_GAP_EM
+}
+
+pub(super) fn line_number_digits(line_count: usize) -> usize {
+    line_count.max(1).to_string().len()
+}
+
+pub(super) fn source_line_number(line_starts: &[usize], byte: usize) -> usize {
+    line_starts
+        .partition_point(|start| *start <= byte)
+        .saturating_sub(1)
+        + 1
+}
+
+pub(super) fn is_source_line_start(line_starts: &[usize], byte: usize) -> bool {
+    line_starts.binary_search(&byte).is_ok()
+}
+
+pub(super) fn source_row_shift_count(
+    row_positions: &[usize],
+    source_start: usize,
+    include_equal: bool,
+) -> usize {
+    if include_equal {
+        row_positions.partition_point(|position| *position <= source_start)
+    } else {
+        row_positions.partition_point(|position| *position < source_start)
+    }
+}
 
 pub(super) struct StatusEolSummary {
     summary: String,
@@ -419,6 +465,93 @@ mod tests {
         let eol = eol_summary(document.rope());
         assert_eq!(line_column(&document, &eol), (3, 6));
         assert_eq!(eol.line_starts.as_deref(), Some(&[0, 4, 9, 15][..]));
+    }
+
+    #[test]
+    fn line_numbers_use_physical_mixed_eol_starts_and_scale_to_six_digits() {
+        let source = "a\r\nb\rc\n";
+        let starts = super::super::physical_line_starts(source);
+        assert_eq!(starts, [0, 3, 5, 7]);
+        assert_eq!(source_line_number(&starts, 0), 1);
+        assert_eq!(source_line_number(&starts, 4), 2);
+        assert_eq!(source_line_number(&starts, 6), 3);
+        assert_eq!(source_line_number(&starts, source.len()), 4);
+        assert!(is_source_line_start(&starts, 7));
+        assert!(!is_source_line_start(&starts, 6));
+
+        let many = format!("{}x", "x\n".repeat(99_999));
+        let starts = super::super::physical_line_starts(&many);
+        assert_eq!(starts.len(), 100_000);
+        assert_eq!(line_number_digits(starts.len()), 6);
+        assert_eq!(
+            source_line_number(&starts, *starts.last().unwrap()),
+            100_000
+        );
+    }
+
+    #[test]
+    fn batched_source_rows_match_sequential_equal_position_anchor_order() {
+        let height = 27.2;
+        let candidates = [10, 20, 30, 40, 50];
+        let existing_empty_anchors = [20, 30, 40]; // literal, image start, image end
+        let row_positions: Vec<_> = candidates
+            .into_iter()
+            .filter(|position| existing_empty_anchors.binary_search(position).is_err())
+            .collect();
+        assert_eq!(row_positions, [10, 50]);
+
+        let original = [
+            ("text", 10),
+            ("literal", 20),
+            ("image-start", 30),
+            ("image-end", 40),
+            ("text", 50),
+        ];
+        let mut sequential: Vec<_> = original
+            .iter()
+            .map(|(kind, source_start)| (*kind, *source_start, 100.0))
+            .collect();
+        for position in candidates {
+            if existing_empty_anchors.binary_search(&position).is_ok() {
+                continue;
+            }
+            for (_, source_start, y) in &mut sequential {
+                if *source_start >= position {
+                    *y += height;
+                }
+            }
+        }
+        let batched: Vec<_> = original
+            .iter()
+            .map(|(kind, source_start)| {
+                (
+                    *kind,
+                    *source_start,
+                    100.0
+                        + source_row_shift_count(&row_positions, *source_start, true) as f32
+                            * height,
+                )
+            })
+            .collect();
+        assert_eq!(batched, sequential);
+
+        for (position, expected_y) in [(10, 100.0), (50, 127.2)] {
+            assert_eq!(
+                100.0 + source_row_shift_count(&row_positions, position, false) as f32 * height,
+                expected_y,
+                "a new empty row anchor excludes its own source position"
+            );
+        }
+
+        let many_blank_rows: Vec<_> = (0..100_000).map(|index| index * 2).collect();
+        assert_eq!(
+            source_row_shift_count(&many_blank_rows, 199_998, true),
+            100_000
+        );
+        assert_eq!(
+            source_row_shift_count(&many_blank_rows, 199_998, false),
+            99_999
+        );
     }
 
     #[test]

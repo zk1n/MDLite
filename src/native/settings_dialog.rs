@@ -1066,7 +1066,7 @@ impl FormWindow {
                 self.buttons[1],
                 "未適用の下書きを保存せず閉じます。すでに適用した設定は残ります。",
             );
-            self.add_tooltip(self.buttons[2], "この層で指定した管理項目を継承へ戻し、確認後に適用します。未知の設定は保持します。");
+            self.add_tooltip(self.buttons[2], "この層の管理項目を下書きで継承へ戻します。保存するには「適用」を押してください。未知の設定は保持します。");
             self.add_tooltip(self.buttons[3], "現在の設定ファイルを詳細編集で開きます。普段の色やキー割当には各項目のフォームを使ってください。");
             self.add_tooltip(self.scope, "編集対象の層を選びます。ユーザー共通の下書きはWorkspaceへ切り替えても保持されます。");
             self.layout_controls();
@@ -1426,7 +1426,6 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     let selected = form.selected;
                     form.forms[selected].draft = vec![None; form.fields.len()];
                     form.show_draft();
-                    form.apply();
                 } else if wp.0 >> 16 == BN_CLICKED as usize && lp.0 != 0 {
                     let control = HWND(lp.0 as *mut _);
                     if let Some(index) = form.rows.iter().position(|row| row.inherit == control) {
@@ -2790,6 +2789,188 @@ mod tests {
             draft_state(&fields[index("bind.file.save")], Some("NONE")),
             "解除"
         );
+    }
+
+    #[test]
+    fn settings_form_reset_keeps_selected_changes_draft_only_until_apply() {
+        const RESET_TIMER: usize = 794;
+        struct ResetProbe {
+            root: HWND,
+            notice_seen: Cell<bool>,
+        }
+        struct ResetTimer(HWND);
+        impl Drop for ResetTimer {
+            fn drop(&mut self) {
+                unsafe {
+                    // Invalidate first: KillTimer alone leaves queued WM_TIMER
+                    // callbacks that must not access the scoped probe.
+                    let _ = RemovePropW(self.0, w!("MDLiteSettingsResetTestProbe"));
+                    let _ = KillTimer(Some(self.0), RESET_TIMER);
+                }
+            }
+        }
+        unsafe extern "system" fn dismiss_unexpected_notice(hwnd: HWND, _: u32, id: usize, _: u32) {
+            unsafe {
+                if id != RESET_TIMER {
+                    return;
+                }
+                let property = GetPropW(hwnd, w!("MDLiteSettingsResetTestProbe"));
+                if property.0.is_null() {
+                    return;
+                }
+                let probe = &*(property.0 as *const ResetProbe);
+                if hwnd != probe.root {
+                    return;
+                }
+                let popup = GetLastActivePopup(hwnd);
+                let mut class = [0u16; 32];
+                let length = GetClassNameW(popup, &mut class);
+                let mut pid = 0;
+                GetWindowThreadProcessId(popup, Some(&mut pid));
+                if popup != hwnd
+                    && GetWindow(popup, GW_OWNER).ok() == Some(hwnd)
+                    && pid == std::process::id()
+                    && String::from_utf16_lossy(&class[..length.max(0) as usize]) == "#32770"
+                {
+                    probe.notice_seen.set(true);
+                    // An old RESET implementation enters MessageBoxW's nested pump.
+                    // End only this fixture's own notice, so the regression fails
+                    // rather than waiting for a person to dismiss it.
+                    let _ = EndDialog(popup, 1);
+                }
+            }
+        }
+
+        let root = SettingsTempDir::new();
+        let common_path = root.0.join("common.toml");
+        let workspace_path = root.0.join("workspace.toml");
+        let common_bytes = b"schema_version = 1\nauto_save_delay_ms = 750\nfont_face = \"Segoe UI\"\n# common sentinel\nunknown_common = \"retain\"\n";
+        let workspace_bytes = b"schema_version = 1\nauto_save = false\nauto_save_delay_ms = 1200\nfont_face = \"Yu Gothic\"\n# workspace sentinel\nunknown_workspace = \"retain\"\n";
+        fs::write(&common_path, common_bytes).unwrap();
+        fs::write(&workspace_path, workspace_bytes).unwrap();
+        let fields = field_specs();
+        let font_index = fields
+            .iter()
+            .position(|field| field.key == "font_face")
+            .unwrap();
+        let fixture = FormFixture::new();
+        unsafe {
+            {
+                let mut form = fixture.state.form.borrow_mut();
+                form.fields = fields.clone();
+                for path in [&common_path, &workspace_path] {
+                    let file = CapturedSettings::capture(path).unwrap();
+                    let baseline = values(&file, &fields);
+                    form.forms.push(Form {
+                        file,
+                        expected: raw(path).unwrap(),
+                        baseline: baseline.clone(),
+                        draft: baseline,
+                    });
+                }
+                form.forms[0].draft[font_index] = Some("Common draft retained".into());
+                form.selected = 1;
+                form.create_controls();
+            }
+            let (baselines, expected, other_draft, reset, cancel, font_edit) = {
+                let form = fixture.state.form.borrow();
+                (
+                    form.forms
+                        .iter()
+                        .map(|f| f.baseline.clone())
+                        .collect::<Vec<_>>(),
+                    form.forms
+                        .iter()
+                        .map(|f| f.expected.clone())
+                        .collect::<Vec<_>>(),
+                    form.forms[0].draft.clone(),
+                    form.buttons[2],
+                    form.buttons[1],
+                    form.rows[font_index].input,
+                )
+            };
+            SetWindowTextW(
+                font_edit,
+                PCWSTR(wide("Workspace unapplied draft").as_ptr()),
+            )
+            .unwrap();
+            let probe = ResetProbe {
+                root: fixture.hwnd,
+                notice_seen: Cell::new(false),
+            };
+            SetPropW(
+                fixture.hwnd,
+                w!("MDLiteSettingsResetTestProbe"),
+                Some(HANDLE((&probe as *const ResetProbe).cast_mut().cast())),
+            )
+            .unwrap();
+            let timer = ResetTimer(fixture.hwnd);
+            assert_ne!(
+                SetTimer(
+                    Some(fixture.hwnd),
+                    RESET_TIMER,
+                    50,
+                    Some(dismiss_unexpected_notice)
+                ),
+                0
+            );
+            // No form borrow is held across the actual command's synchronous
+            // reentry or an old implementation's nested notice loop.
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((BN_CLICKED as usize) << 16) | RESET)),
+                Some(LPARAM(reset.0 as isize)),
+            );
+            drop(timer);
+            assert!(
+                GetPropW(fixture.hwnd, w!("MDLiteSettingsResetTestProbe"))
+                    .0
+                    .is_null()
+            );
+            // Simulate queued callbacks after invalidation, including the exact
+            // old timer ID. Neither path may interpret an ID as an address.
+            dismiss_unexpected_notice(fixture.hwnd, WM_TIMER, RESET_TIMER, 0);
+            dismiss_unexpected_notice(fixture.hwnd, WM_TIMER, usize::MAX, 0);
+            assert!(
+                !probe.notice_seen.get(),
+                "Reset must not Apply or open a save notice"
+            );
+            {
+                let form = fixture.state.form.borrow();
+                assert_eq!(form.selected, 1);
+                assert!(form.forms[1].draft.iter().all(Option::is_none));
+                assert_eq!(form.forms[0].draft, other_draft);
+                for (index, layer) in form.forms.iter().enumerate() {
+                    assert_eq!(layer.baseline, baselines[index]);
+                    assert_eq!(layer.expected, expected[index]);
+                    assert_eq!(values(&layer.file, &fields), baselines[index]);
+                }
+                for (field, row) in form.fields.iter().zip(&form.rows) {
+                    if matches!(field.kind, FieldKind::Boolean | FieldKind::Theme) {
+                        assert_eq!(
+                            shell::send(row.input, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
+                            0
+                        );
+                    } else {
+                        assert_eq!(shell::text_of(row.input), "");
+                    }
+                    assert!(shell::text_of(row.effective).ends_with(" / 継承"));
+                }
+            }
+            assert_eq!(fs::read(&common_path).unwrap(), common_bytes);
+            assert_eq!(fs::read(&workspace_path).unwrap(), workspace_bytes);
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((BN_CLICKED as usize) << 16) | CANCEL)),
+                Some(LPARAM(cancel.0 as isize)),
+            );
+            assert!(fixture.state.closed.get());
+            assert!(!IsWindow(Some(fixture.hwnd)).as_bool());
+            assert_eq!(fs::read(&common_path).unwrap(), common_bytes);
+            assert_eq!(fs::read(&workspace_path).unwrap(), workspace_bytes);
+        }
     }
 
     #[test]

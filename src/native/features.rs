@@ -72,7 +72,7 @@ const QUICK_OPEN_LIST: usize = 4691;
 const CONTROL_BASE: usize = 4800;
 const BUTTON_OWNERDRAW: u32 = 0x0000000B;
 const BUTTON_NOTIFY: u32 = 0x00000400;
-const CALENDAR_GRID_TOP: f32 = 98.0;
+const CALENDAR_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_HEIGHT: f32 = 273.0;
 const CALENDAR_MIN_BODY_HEIGHT: f32 = 180.0;
@@ -1610,10 +1610,7 @@ impl FeaturePanes {
                 continue;
             };
             match panel {
-                PanelId::Explorer if !app.search_pane_active() => {
-                    self.draw_explorer(app, target, body, &foreground)?
-                }
-                PanelId::Explorer => {}
+                PanelId::Explorer => self.draw_explorer(app, target, body, &foreground)?,
                 PanelId::Calendar => self.draw_calendar(
                     app,
                     target,
@@ -1627,7 +1624,7 @@ impl FeaturePanes {
                 PanelId::Outline => {
                     self.draw_outline(app, target, body, &foreground, &muted, &selected, &border)?
                 }
-                PanelId::Git => {}
+                PanelId::Git | PanelId::Search => {}
             }
         }
         if self.quick_open.open {
@@ -1883,7 +1880,7 @@ impl FeaturePanes {
             body.x + 8.,
             body.y + (layout.grid_top - 41.0).max(0.0),
             body.width - 16.,
-            14.,
+            shell::UI_FONT_SIZE,
             foreground,
         )?;
         let Some(grid) = self.calendar.current_month else {
@@ -2477,7 +2474,7 @@ impl FeaturePanes {
                 KEY_RETURN => Some(FeatureAction::Command(4040)),
                 _ => None,
             },
-            PanelId::Git => None,
+            PanelId::Git | PanelId::Search => None,
         }
     }
 
@@ -2762,11 +2759,7 @@ impl FeatureControlLayout {
                 width: app.editor_width(),
                 height: (app.editor_bottom() - app.editor_top()).max(0.),
             },
-            explorer: if app.search_pane_active() {
-                None
-            } else {
-                app.feature_panel_rect(PanelId::Explorer)
-            },
+            explorer: app.feature_panel_rect(PanelId::Explorer),
             calendar: app.feature_panel_rect(PanelId::Calendar),
             form: app.features.form.as_ref().map(|form| form.mode),
         }
@@ -2808,7 +2801,7 @@ enum FeatureAction {
 }
 
 impl App {
-    pub(super) fn feature_test_geometry(&self, panels: &[(PanelId, Rect); 4]) -> serde_json::Value {
+    pub(super) fn feature_test_geometry(&self, panels: &[(PanelId, Rect); 5]) -> serde_json::Value {
         let body = |id: PanelId| {
             let r = panels[id as usize].1;
             Rect {
@@ -3339,7 +3332,7 @@ impl App {
 
     pub(super) unsafe fn features_control(&mut self, id: usize, notification: u16) -> bool {
         unsafe {
-            if self.search_pane_active()
+            if self.feature_panel_rect(PanelId::Explorer).is_none()
                 && (id == EXPLORER_LIST
                     || (id == PROMPT_EDIT
                         && self.features.form.as_ref().is_some_and(|form| {
@@ -3508,7 +3501,7 @@ impl App {
                 return true;
             }
             if message.message == WM_KEYDOWN
-                && !self.search_pane_active()
+                && self.feature_panel_rect(PanelId::Explorer).is_some()
                 && self.features.controls.explorer_list != HWND::default()
                 && GetFocus() == self.features.controls.explorer_list
                 && !self.feature_ime_active()
@@ -3518,7 +3511,7 @@ impl App {
                 self.refresh();
                 return true;
             }
-            if self.search_pane_active() && !self.features.quick_open.open {
+            if self.shell.active_panel() == PanelId::Search && !self.features.quick_open.open {
                 return false;
             }
             let was_quick_open = self.features.quick_open.open;
@@ -4286,6 +4279,9 @@ impl App {
             return false;
         };
         let offset = heading.source.start;
+        if self.doc().selection().anchor != offset || self.doc().selection().head != offset {
+            self.record_navigation();
+        }
         let _ = self.doc_mut().set_selection(offset, offset);
         unsafe {
             self.after_input();
@@ -5250,6 +5246,7 @@ impl App {
         if self.feature_ime_active() || !self.is_markdown_document() {
             return;
         }
+        let origin_document = self.doc().id();
         let document_path = self.tabs[self.active]
             .file
             .as_ref()
@@ -5260,6 +5257,9 @@ impl App {
                 let outline = Outline::build(self.doc(), &projection);
                 match outline.anchor(&anchor) {
                     Ok(offset) => {
+                        if self.doc().selection() != super::Selection::caret(offset) {
+                            self.record_navigation();
+                        }
                         let _ = self.doc_mut().set_selection(offset, offset);
                         unsafe {
                             self.after_input();
@@ -5304,6 +5304,11 @@ impl App {
                     let outline = Outline::build(self.doc(), &projection);
                     match outline.anchor(&anchor) {
                         Ok(offset) => {
+                            if self.doc().id() == origin_document
+                                && self.doc().selection() != super::Selection::caret(offset)
+                            {
+                                self.record_navigation();
+                            }
                             let _ = self.doc_mut().set_selection(offset, offset);
                             unsafe {
                                 self.after_input();
@@ -6287,7 +6292,10 @@ mod tests {
         assert_eq!(calendar_layout(270.0).visible_rows, 2);
         assert_eq!(calendar_layout(250.0).status_height, 0.0);
         assert_eq!(calendar_layout(273.0).grid_top, CALENDAR_GRID_TOP);
-        assert_eq!(calendar_layout(320.0).visible_rows, 3);
+        let default = calendar_layout(320.0);
+        assert_eq!(default.visible_rows, 4);
+        assert!(default.rows_top + 4.0 * CALENDAR_ROW_HEIGHT <= 320.0);
+        assert!(default.rows_top + 5.0 * CALENDAR_ROW_HEIGHT > 320.0);
     }
 
     #[test]
@@ -6980,11 +6988,21 @@ mod tests {
             .into_iter()
             .find(|entry| entry.name == "folder")
             .unwrap();
-        let owner = super::super::tests::hidden_test_window_size(220, 80);
+        let owner = super::super::tests::hidden_test_window_size(900, 480);
         let list = explorer_list_for_test(owner);
         let mut app = super::super::tests::composing_test_app("# heading\n");
         app.composing = false;
         app.hwnd = owner;
+        app.shell.main_window = owner;
+        // This list-event fixture supplies Main geometry without enabling
+        // full-shell persistence synchronization for its synthetic Workspace.
+        app.shell.panels[PanelId::Explorer as usize].1 = Rect {
+            x: 0.,
+            y: 0.,
+            width: 180.,
+            height: 480.,
+        };
+        assert!(app.feature_panel_rect(PanelId::Explorer).is_some());
         app.features.controls.owner = owner;
         app.features.controls.explorer_list = list;
         app.features.workspace = Some(workspace.clone());
@@ -7062,9 +7080,20 @@ mod tests {
             .find(|entry| entry.name == "folder")
             .unwrap();
         let hidden = folder.path.join("hidden.md");
-        let owner = super::super::tests::hidden_test_window_size(220, 80);
+        let owner = super::super::tests::hidden_test_window_size(900, 480);
         let list = explorer_list_for_test(owner);
         let mut app = super::super::tests::composing_test_app("# heading\n");
+        app.hwnd = owner;
+        app.shell.main_window = owner;
+        // This list-event fixture supplies Main geometry without enabling
+        // full-shell persistence synchronization for its synthetic Workspace.
+        app.shell.panels[PanelId::Explorer as usize].1 = Rect {
+            x: 0.,
+            y: 0.,
+            width: 180.,
+            height: 480.,
+        };
+        assert!(app.feature_panel_rect(PanelId::Explorer).is_some());
         app.features.controls.owner = owner;
         app.features.controls.explorer_list = list;
         app.features.workspace = Some(workspace.clone());

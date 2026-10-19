@@ -3,32 +3,47 @@
 Rust版の操作入口を記録する。最終buildで実施した操作と未確認条件は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を参照する。
 
-2026年10月19日Rev2の変更は未統合候補。以下の追加契約を公開developや
+2026年10月19日Rev3の変更は未統合候補。以下の追加契約を公開developや
 実GUI／Human受入済みと扱わない。
 
 ## 画面とNavigation
 
-中央の文書tabとEditorを、Explorer/Search、Calendar、Outline、Gitの4パネルが囲む。
-パネル見出しから折り畳み・非表示・slot移動を選べる。Ctrl+Alt+1〜4で対象パネルを
-移し、Ctrl+Alt+上下で高さを調整する。狭幅時は中央の幅を優先しdrawerで開く。
+左と右は独立した領域で、Explorer、Search、Calendar、Outline、Gitをグループ単位で切り替える。
+新規配置は全viewが左所属の単独グループでExplorerを選択し、空の右幅は確保しない。
+左Explorer＋Calendar／右Outline＋Gitの旧配置は左右のグループとして幅・比率・非表示状態を移行する。
+左のSearchへ切り替えると左全体がSearchになり、Explorerへ戻すと組合せを復元する。右は変更しない。
+左活動barには左所属の各グループの代表だけを置き、Explorer＋Calendarの入口はExplorer一つとする。
+右側のグループは右の見出しメニューや右領域toggleのcontext menuから選択できる。
+パネル見出しの配置メニューでview／groupの左右移動、既存グループへの追加、独立グループ化を行う。
+別viewを暗黙にswapしない。Ctrl+Alt+1〜4も左独立／左追加／右独立／右追加へ対応し、Ctrl+Alt+上下で高さを調整する。
+狭幅時は中央の幅を優先し、選択グループ全体をdrawerで開く。
 配置resetは表示メニューにある。Compactは同じ文書・選択・履歴の別windowで、
 ×は主windowへ戻す。主windowの終了は全tabの未保存確認を行う。
 
-Rev2候補では機能入口を左の縦活動barに置く。上部はハンバーガー・新規・保存、
+Rev3候補の上部はハンバーガー・新規・保存・戻る／進む、
 中央のコマンドquery、左右領域の表示切替。領域全体を独立して隠す4状態でeditor幅を戻す。
-領域状態は個別panelのhidden／collapsed／slot／幅と別に保存し、復帰時に配置を保持する。
-旧panel-layout schema1は追加keyなしでも両側表示として読む。配置resetは領域表示も戻す。
-活動iconは対象側を表示してfocusし、領域を隠す操作とは区別する。
+領域表示、active group、viewのhidden／collapsed、内部順序・比率・幅を区別してschema2に保存する。
+旧panel-layout schema1を互換読込みし、新規初期値へ無断resetしない。配置resetは領域表示も戻す。
+活動iconは左所属グループを表示してfocusし、領域を隠す操作とは区別する。
+戻る／進むは明示的な文書・Outline・検索・リンク移動の履歴で、本文Undo／Redoとは独立する。
+一文字移動を履歴に加えず、閉じた文書は再生成しない。戻った後の新しい移動は進む分岐を整理する。
 
 statusはWorkspace、明示取得したbranch、保存/外部変更、行列、encoding/EOL、文書種類を示す。
 Ln/Colは1起算で、Colは行頭からのUnicode scalar数に1を加える。UTF-8 byte、UTF-16 unit、
 graphemeや表示上の横位置とは別。外部変更は検出済みと未確認を区別し、Gitを自動起動しない。
 
-Ctrl+Kまたは上部のqueryへ直接入力し、直下に候補だけを表示する（Rev2候補）。
-Main／Compactともqueryを別popupへ複製しない。無効な操作も理由付きで表示し、
+Ctrl+Kまたは上部のqueryへ直接入力し、直下に候補だけを表示する。
+pointer起動は描画したquery矩形内だけで、左右余白や他buttonへ広げない。
+Main／Compactともqueryを別popupへ複製しない。menuは短いlabelと独立shortcut列を使い、
+説明・disabled理由はhover／keyboard選択時の補助表示へ分離する。
 実効keybindingをヒントに使う。設定は共通/Workspaceの層を選び、空欄は継承する。
 Applyは開始時snapshotと照合し、外部変更・不明schema・書込み失敗ではフォームを保持する。
 詳細編集では未知の行を保持する。変更可能bindingと固定Editor/表/パネル操作の衝突を拒否する。
+Rev3候補の設定は一般／保存、表示／テーマ、カスタム色、キー割当の折りたたみカテゴリを持つ。
+実装済みregistryの色とcommandを個別に列挙し、短い日本語名、key、実効値とこの層の指定を区別する。
+hoverとkeyboard focusの補助説明から許容範囲・継承を確認できる。
+継承へ戻す操作、空pathの明示指定、shortcutの解除を分け、false・0・空文字を継承へ暗黙変換しない。
+折りたたみや層切替では未適用draftを保持し、適用は既存snapshot照合とSettingsPatchの検証を通す。
 
 Ctrl+Pは相対path/filenameでQuick Openを絞る。表示は200件までで、queryは走査対象全体へ
 適用する。候補の続きと走査未完了を表示する。Explorerのcopy/pasteは選択file一覧を

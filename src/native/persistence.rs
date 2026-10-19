@@ -1033,7 +1033,7 @@ impl App {
         self.persistence.autosave = result.settings.auto_save;
         self.persistence.delay =
             Duration::from_millis(u64::from(result.settings.auto_save_delay_ms));
-        if self.shell.enabled {
+        if self.shell.enabled && self.shell.settings != result.settings {
             unsafe {
                 self.apply_shell_settings(result.settings.clone());
             }
@@ -1150,6 +1150,70 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn persistence_settings_reload_preserves_unchanged_appearance() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join(".mdlite/settings.toml");
+        fs::write(&path, "schema_version = 1\ntheme = \"light\"\n").unwrap();
+        let mut app = fixture.app();
+        app.hwnd = super::super::tests::hidden_test_window_size(640, 480);
+        app.shell.enabled = true;
+        app.shell.main_window = app.hwnd;
+        let state = Box::new(WindowState::new(app));
+        let hwnd = state.app.borrow().hwnd;
+        state.main_window.set(hwnd);
+        unsafe {
+            SetWindowLongPtrW(
+                hwnd,
+                GWLP_USERDATA,
+                (&*state as *const WindowState) as isize,
+            );
+        }
+        let mut app = state.app.borrow_mut();
+        app.load_persistence_settings();
+        let colors = state.control_colors.borrow().as_ref().unwrap().clone();
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        let layout = app.layout_key;
+        let source = app.doc().source_shared();
+        let selection = app.doc().selection();
+        let document_before = (
+            app.doc().revision(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        app.load_persistence_settings();
+        assert!(Rc::ptr_eq(
+            &colors,
+            state.control_colors.borrow().as_ref().unwrap()
+        ));
+        assert_eq!(app.layout_key, layout);
+        fs::write(&path, "schema_version = 1\ntheme = \"dark\"\n").unwrap();
+        app.load_persistence_settings();
+        assert!(!Rc::ptr_eq(
+            &colors,
+            state.control_colors.borrow().as_ref().unwrap()
+        ));
+        assert!(app.layout_key.is_none());
+        assert_eq!(app.doc().source(), &*source);
+        assert_eq!(app.doc().selection(), selection);
+        assert_eq!(
+            (
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count()
+            ),
+            document_before
+        );
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
+
     #[test]
     fn persistence_autosave_defers_ime_and_preserves_peer_changes() {
         let fixture = Fixture::new();

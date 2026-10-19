@@ -961,8 +961,13 @@ mod tests {
         }
     }
 
+    // Stock LISTBOX partial H-wheel deltas are shared across these native probes.
+    // Keep their balanced sequences exclusive; custom offsets remain per control.
+    static NATIVE_HORIZONTAL_WHEEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn explorer_horizontal_native_increments_and_real_content() {
+        let _wheel = NATIVE_HORIZONTAL_WHEEL.lock().unwrap();
         let f = Fixture::with_style(50, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS);
         unsafe {
             let font = GetStockObject(DEFAULT_GUI_FONT);
@@ -1079,6 +1084,7 @@ mod tests {
     }
     #[test]
     fn explorer_horizontal_units_match_stock_ui_and_scaled_assigned_fonts() {
+        let _wheel = NATIVE_HORIZONTAL_WHEEL.lock().unwrap();
         let f = Fixture::explorer(50);
         unsafe {
             set_horizontal_extent(f.adapted, 1800).unwrap();
@@ -1139,6 +1145,7 @@ mod tests {
 
     #[test]
     fn explorer_horizontal_messages_wheel_and_viewport_match_native() {
+        let _wheel = NATIVE_HORIZONTAL_WHEEL.lock().unwrap();
         let f = Fixture::explorer(50);
         unsafe {
             set_horizontal_extent(f.adapted, 1800).unwrap();
@@ -1206,7 +1213,7 @@ mod tests {
                     WPARAM(((delta as u16 as usize) << 16) | flags),
                     LPARAM(0),
                 );
-                check("horizontal wheel");
+                check(&format!("horizontal wheel delta={delta} flags={flags}"));
             }
             for key in [VK_DOWN, VK_UP, VK_NEXT, VK_PRIOR, VK_END, VK_HOME] {
                 f.send_both(WM_KEYDOWN, WPARAM(key.0 as usize), LPARAM(0));

@@ -412,6 +412,13 @@ impl Drop for DrawFrame<'_> {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaintedFrame {
+    hwnd: usize,
+    document_id: u64,
+    revision: u64,
+    sequence: u64,
+}
 struct App {
     hwnd: HWND,
     graphics: Graphics,
@@ -430,6 +437,7 @@ struct App {
     image_cache: HashMap<PathBuf, CachedImage>,
     minimized: bool,
     full_paint: bool,
+    painted_frame: Option<PaintedFrame>,
     paint_retry_pending: bool,
     animation_timer_armed: bool,
     height: f32,
@@ -1030,6 +1038,22 @@ fn required_caret_change(
         move_position: recreate || current.position != Some(position),
     }
 }
+fn native_caret_owner() -> Option<HWND> {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // A thread has one caret, which native EDIT controls manage themselves.
+    // Thread zero would inspect the foreground thread instead of this owner.
+    unsafe {
+        GetGUIThreadInfo(
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            &mut info,
+        )
+        .ok()?;
+    }
+    Some(info.hwndCaret)
+}
 fn caret_intersects_damage(caret: (f32, f32, f32), damage: D2D_RECT_F) -> bool {
     damage.left <= caret.0 + 2.0
         && damage.right >= caret.0
@@ -1074,6 +1098,7 @@ fn startup_window_state(
         image_cache: HashMap::new(),
         minimized: false,
         full_paint: true,
+        painted_frame: None,
         paint_retry_pending: false,
         animation_timer_armed: false,
         height: 0.0,
@@ -3849,6 +3874,7 @@ impl App {
                 self.return_from_compact();
             }
         }
+        self.record_navigation();
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(Tab {
@@ -3886,6 +3912,7 @@ impl App {
         }
         match FileSnapshot::open(&path) {
             Ok(loaded) => {
+                self.record_navigation();
                 let id = self.next_id;
                 self.next_id += 1;
                 self.tabs.push(Tab {
@@ -4012,6 +4039,10 @@ impl App {
         if self.composing {
             return;
         }
+        if index >= self.tabs.len() || index == self.active {
+            return;
+        }
+        self.record_navigation();
         if self.shell.compact_window != HWND::default() {
             unsafe {
                 self.return_from_compact();
@@ -4507,10 +4538,7 @@ impl App {
                     .filter(|block| {
                         matches!(
                             block.kind,
-                            BlockKind::Paragraph
-                                | BlockKind::Heading { .. }
-                                | BlockKind::ListItem
-                                | BlockKind::ThematicBreak
+                            BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem
                         ) && block.source.start <= head
                             && (head < block.source.end
                                 || (head == self.doc().byte_len() && block.source.end == head))
@@ -4788,9 +4816,31 @@ impl App {
                         )?;
                         continue;
                     }
-                    let text = String::from_utf16_lossy(&utf16[block.display_utf16.clone()]);
-                    let (map, before) =
-                        projection_mapping(&projection, block.display_utf16.clone());
+                    // A literal block's terminating EOL belongs to the source
+                    // boundary, not an extra DirectWrite row before the next
+                    // physical line. Internal blank lines remain in the layout.
+                    let mut display_range = block.display_utf16.clone();
+                    if matches!(block.kind, BlockKind::Code { fenced: true, .. })
+                        && display_range.end > display_range.start
+                        && utf16[display_range.end - 1] == b'\n' as u16
+                    {
+                        display_range.end -= 1;
+                    }
+                    let text = String::from_utf16_lossy(&utf16[display_range.clone()]);
+                    let (map, before) = if display_range.is_empty()
+                        && matches!(block.kind, BlockKind::Heading { .. })
+                    {
+                        // Empty headings share a display boundary with the next
+                        // block. That global boundary may already point beyond
+                        // this row; its insertion point belongs before its EOL.
+                        let point = block.source.start
+                            + source[block.source.clone()]
+                                .trim_end_matches(['\r', '\n'])
+                                .len();
+                        (vec![point], vec![point])
+                    } else {
+                        projection_mapping(&projection, display_range.clone())
+                    };
                     let size = match &block.kind {
                         BlockKind::Heading { level } => {
                             self.font_size() * presentation::heading_scale(*level)
@@ -4838,7 +4888,7 @@ impl App {
                             Self::apply_projection_styles(
                                 &view.layout,
                                 &projection,
-                                block.display_utf16.clone(),
+                                display_range,
                             )?;
                         }
                     }
@@ -5040,7 +5090,13 @@ impl App {
                 self.literal_blocks
                     .iter()
                     .flat_map(|range| [(range.start, true), (range.end, false)])
-                    .filter(|(p, _)| source.is_char_boundary(*p)),
+                    .filter(|(p, _)| {
+                        source.is_char_boundary(*p)
+                            && !self
+                                .views
+                                .iter()
+                                .any(|view| view.map.binary_search(p).is_ok())
+                    }),
             );
             markers.sort_by_key(|(p, _)| *p);
             let mut unique_markers: Vec<(usize, bool)> = Vec::with_capacity(markers.len());
@@ -6309,13 +6365,18 @@ impl App {
                 }
                 if view.thematic_break {
                     let line_y = y + view.height * 0.5;
-                    t.DrawLine(
-                        point(view.x, line_y),
-                        point(view.x + view.width, line_y),
-                        &border,
-                        1.5,
-                        None,
-                    );
+                    let mut metrics = DWRITE_TEXT_METRICS::default();
+                    view.layout.GetMetrics(&mut metrics)?;
+                    let line_x = view.x + metrics.widthIncludingTrailingWhitespace + 8.0;
+                    if line_x < view.x + view.width {
+                        t.DrawLine(
+                            point(line_x, line_y),
+                            point(view.x + view.width, line_y),
+                            &border,
+                            1.5,
+                            None,
+                        );
+                    }
                 }
                 if let Some(visual) = composition
                     .as_ref()
@@ -6481,6 +6542,14 @@ impl App {
             drop(hidden_caret);
             draw_result?;
             self.full_paint = false;
+            self.painted_frame = Some(PaintedFrame {
+                hwnd: self.hwnd.0 as usize,
+                document_id: self.doc().id(),
+                revision: self.doc().revision(),
+                sequence: self
+                    .painted_frame
+                    .map_or(1, |frame| frame.sequence.saturating_add(1)),
+            });
             self.sync_animations();
             self.diagnostic();
             Ok(())
@@ -6490,7 +6559,16 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
-            let _ = DestroyCaret();
+            // Focus loss can be queued until a child EDIT has already created
+            // its caret. DestroyCaret has no HWND argument: only destroy a
+            // caret currently owned by one of our editor surfaces.
+            if native_caret_owner().is_some_and(|owner| {
+                owner != HWND::default()
+                    && [self.hwnd, self.shell.main_window, self.shell.compact_window]
+                        .contains(&owner)
+            }) {
+                let _ = DestroyCaret();
+            }
             self.native_caret = NativeCaretState::default();
         }
     }
@@ -6520,7 +6598,15 @@ impl App {
                 .views
                 .iter()
                 .filter(|view| !view.source.is_empty() && view.before.contains(&byte))
-                .min_by_key(|view| view.source.len())
+                .min_by_key(|view| {
+                    // Adjacent blocks share projection boundaries. A following
+                    // short block may retain this byte in before[] even though
+                    // the preceding block owns its source and caret geometry.
+                    (
+                        !(view.source.start <= byte && byte <= view.source.end),
+                        view.source.len(),
+                    )
+                })
         {
             // A marker before a literal block owns the Before side of its
             // start. The following block must not pull that caret downwards.
@@ -6595,6 +6681,9 @@ impl App {
             self.caret = self.caret_location();
             let (x, y, height) = self.composition_caret();
             if GetFocus() == self.hwnd && self.hwnd == self.editing_window() {
+                if native_caret_owner() != Some(self.hwnd) {
+                    self.native_caret = NativeCaretState::default();
+                }
                 let size = caret_pixel_size(height, self.dpi);
                 let position = ((x * self.dpi).round() as i32, (y * self.dpi).round() as i32);
                 let change = required_caret_change(self.native_caret, size, position);
@@ -6821,7 +6910,6 @@ impl App {
             self.paint_retry_pending = false;
             let _ = self.ensure_layout();
             self.restore_pending_view();
-            self.update_caret();
             let mut r = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut r);
             let page = (self.editor_bottom() - self.editor_top()).max(1.0);
@@ -6834,6 +6922,10 @@ impl App {
                 .scroll
                 .clamp(0.0, (height - self.editor_top() - page).max(0.0));
             self.tabs[self.active].scroll = scroll;
+            // Reveal, resize, or restoration can reduce the scroll extent.
+            // Native caret coordinates and visibility must use that final
+            // viewport, rather than retaining a pre-clamp offscreen position.
+            self.update_caret();
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             self.sync_animations();
             self.diagnostic();
@@ -7043,7 +7135,13 @@ impl App {
                 ime_open_status_diagnostic(self.hwnd),
             )
         };
-        let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
+        let painted_frame = self.painted_frame.map(|frame| {
+            serde_json::json!({
+                "hwnd": frame.hwnd, "document_id": frame.document_id,
+                "revision": frame.revision, "sequence": frame.sequence,
+            })
+        });
+        let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"painted_frame":painted_frame,"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
         let mut data = data;
         data["line_numbers"] = serde_json::json!({
             "physical_line_count": self.source_line_starts.len(),
@@ -9661,7 +9759,7 @@ mod tests {
         }
     }
     #[test]
-    fn editor_wrapped_source_fallback_reserves_measured_height() {
+    fn editor_wrapped_full_fence_source_reserves_measured_height() {
         let opening = format!("```{}", "long-info ".repeat(24));
         let source = format!("{opening}\nx\n```\n\nafter");
         let mut app = composing_test_app(&source);
@@ -9673,27 +9771,170 @@ mod tests {
         unsafe {
             app.ensure_layout().unwrap();
         }
-        let fallback = app
+        let fence = app
             .views
             .iter()
-            .find(|view| view.source == (0..opening.len()) && view.text.len() == opening.len())
-            .expect("hidden fence interior needs an editable source-line fallback");
-        assert!(fallback.height > app.font_size() * 1.6 * 2.0);
+            .find(|view| {
+                view.source.start == 0
+                    && view
+                        .text
+                        .starts_with(&opening.encode_utf16().collect::<Vec<_>>())
+            })
+            .expect("the full fenced source must remain directly editable");
+        let displayed = String::from_utf16(&fence.text).unwrap();
+        assert_eq!(displayed, format!("{opening}\nx\n```"));
+        assert_eq!(
+            source[fence.source.clone()].trim_end_matches(['\r', '\n']),
+            displayed
+        );
+        assert_eq!(fence.map.first(), Some(&0));
+        // Interior UTF-16 boundaries map to the literal source; the terminal
+        // projection boundary may also own the following blank-line anchor.
+        for (index, byte) in fence.map.iter().take(fence.text.len()).enumerate() {
+            assert_eq!(*byte, index);
+        }
+        assert!(fence.height > app.font_size() * 1.6 * 2.0);
         let following = app
             .views
             .iter()
-            .filter(|view| !view.source.is_empty() && view.source.start > fallback.source.start)
+            .filter(|view| !view.source.is_empty() && view.source.start > fence.source.start)
             .min_by(|a, b| a.y.total_cmp(&b.y))
             .unwrap();
         assert!(
-            following.y >= fallback.y + fallback.height - 0.01,
-            "fallback bottom {} overlaps following view at {}",
-            fallback.y + fallback.height,
+            following.y >= fence.y + fence.height - 0.01,
+            "fence bottom {} overlaps following view at {}",
+            fence.y + fence.height,
             following.y
         );
         assert_eq!(document_state(app.doc()), before);
         unsafe {
             DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn native_caret_ownership_preserves_focused_query_through_palette_and_diagnostic() {
+        let fixture = EditorFixture::new("selected body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        let directory = TestDirectory::new("native-caret-ownership");
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.start_shell();
+            let settings = app.shell.settings.clone();
+            app.apply_shell_settings(settings);
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            let query = GetDlgItem(Some(fixture.hwnd), 150).unwrap();
+            app.diagnostic = Some(directory.path().join("diagnostic.json"));
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert!(app.native_caret.size.is_some());
+            let cached_editor_caret = app.native_caret;
+            let before = document_state(app.doc());
+
+            SetFocus(Some(query)).unwrap();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(
+                native_caret_owner(),
+                Some(query),
+                "native EDIT must first create its real caret"
+            );
+            // Click ingress already focuses the toolbar query before opening
+            // candidates. Opening and deferred editor focus loss may not destroy
+            // that native caret or depend on a second focus transition.
+            app.open_palette();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(
+                native_caret_owner(),
+                Some(query),
+                "open_palette destroyed the focused EDIT caret"
+            );
+            app.native_notification(NativeNotification::FocusLost);
+            assert_eq!(native_caret_owner(), Some(query));
+            app.refresh();
+            app.diagnostic();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(native_caret_owner(), Some(query));
+            println!(
+                "native query ownership pid={} editor={:?} query={query:?} focus={:?} caret={:?}",
+                std::process::id(),
+                fixture.hwnd,
+                GetFocus(),
+                native_caret_owner()
+            );
+            assert!(directory.path().join("diagnostic.json").exists());
+            assert_eq!(document_state(app.doc()), before);
+
+            // Simulate stale cached geometry after native child ownership. The
+            // editor must recreate its own caret even at unchanged size/position.
+            app.native_caret = cached_editor_caret;
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert!(app.native_caret.size.is_some());
+            app.release_caret();
+            assert_eq!(native_caret_owner(), Some(HWND::default()));
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert_eq!(document_state(app.doc()), before);
+            app.release_caret();
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
+        }
+    }
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn native_caret_ownership_tracks_main_compact_and_native_edit_children() {
+        let fixture = EditorFixture::new("main and Compact source", false);
+        let compact = EditorFixture::new("unused fixture source", false);
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact.hwnd;
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(compact.hwnd, SW_SHOWNOACTIVATE);
+            app.select_surface(compact.hwnd);
+            SetFocus(Some(compact.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(compact.hwnd));
+            let before = document_state(app.doc());
+            let input = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                4,
+                4,
+                200,
+                24,
+                Some(compact.hwnd),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetFocus(Some(input)).unwrap();
+            assert_eq!(native_caret_owner(), Some(input));
+            app.release_caret();
+            assert_eq!(native_caret_owner(), Some(input));
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(input));
+            SetFocus(Some(compact.hwnd)).unwrap();
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(compact.hwnd));
+            app.release_caret();
+            app.shell.compact_window = HWND::default();
+            app.select_surface(fixture.hwnd);
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert_eq!(document_state(app.doc()), before);
+            app.release_caret();
+            let _ = ShowWindow(compact.hwnd, SW_HIDE);
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
         }
     }
     #[test]
@@ -10147,7 +10388,10 @@ mod tests {
                     ),
                     LRESULT(1)
                 );
-                assert!(measure.itemWidth > 100 && measure.itemHeight == 28);
+                assert!(
+                    measure.itemWidth > 100
+                        && measure.itemHeight == shell::UI_ROW_HEIGHT.round() as u32
+                );
                 assert_eq!(
                     window_proc(
                         fixture.hwnd,
@@ -10742,6 +10986,67 @@ mod tests {
     }
 
     #[test]
+    fn paint_recovery_frame_identity_tracks_only_successful_editor_frames() {
+        let mut seed = composing_test_app("frame body");
+        seed.clear_composition();
+        let mut fixture = MessagePumpFixture::new(seed);
+        let compact = fixture.create_compact();
+        PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.select_surface(fixture.hwnd);
+            assert_eq!(app.painted_frame, None);
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            let first = app.painted_frame.unwrap();
+            assert_eq!(first.hwnd, fixture.hwnd.0 as usize);
+            assert_eq!(first.document_id, app.doc().id());
+            assert_eq!(first.revision, app.doc().revision());
+            app.doc_mut().replace_selection("new ").unwrap();
+            assert_ne!(first.revision, app.doc().revision());
+            let before = document_state(app.doc());
+            app.refresh();
+            assert_eq!(
+                app.painted_frame,
+                Some(first),
+                "refresh is not a rendered frame"
+            );
+            app.minimized = true;
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame, Some(first));
+            app.minimized = false;
+            PAINT_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.fault = Some(PaintFault::EndDraw);
+                state.failures = 1;
+            });
+            assert!(app.paint(rect(0., 0., 450., 480.)).is_err());
+            assert_eq!(
+                app.painted_frame,
+                Some(first),
+                "failed EndDraw cannot certify a frame"
+            );
+            app.discard_target();
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame.unwrap().sequence, first.sequence + 1);
+            assert_eq!(app.painted_frame.unwrap().revision, app.doc().revision());
+            let editor_frame = app.painted_frame;
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact;
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(
+                app.painted_frame, editor_frame,
+                "main placeholder is not the editor"
+            );
+            app.select_surface(compact);
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame.unwrap().hwnd, compact.0 as usize);
+            assert_eq!(app.painted_frame.unwrap().sequence, first.sequence + 2);
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+
+    #[test]
     fn paint_recovery_resize_invalidates_frame_and_discards_failed_target() {
         let fixture = EditorFixture::new("resize body", false);
         let before = document_state(fixture.state.app.borrow().doc());
@@ -11172,6 +11477,121 @@ mod tests {
             app.character('続' as u16);
         }
         assert_eq!(app.doc().source(), format!("{expected}続"));
+    }
+    #[test]
+    fn live_heading_end_before_affinity_keeps_owning_view_and_direct_pointer_hit() {
+        let source = "# Heading 日本語\n\n---\n\n```rust\n# literal\n\n---\n```\n\nSetext\n---\n";
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let end = source.find('\n').unwrap();
+        assert_eq!(end, 19);
+        unsafe { app.key_with_modifiers(VK_END.0, false, false) };
+        assert_eq!(app.doc().selection(), Selection::caret(end));
+        assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::Before);
+        let heading = app
+            .views
+            .iter()
+            .find(|view| view.source == (0..20))
+            .unwrap();
+        let rule = app.views.iter().find(|view| view.thematic_break).unwrap();
+        assert!(heading.before.contains(&end));
+        assert!(
+            rule.before.contains(&end),
+            "the global shared boundary is a legitimate Before choice"
+        );
+        assert!(!rule.source.contains(&end));
+        println!(
+            "heading end={end} chosen={:?} rule_before={:?}",
+            app.source_view(end).unwrap().source,
+            rule.before
+        );
+        assert_eq!(app.source_view(end).unwrap().source, heading.source);
+        let (x, y, height) = app.caret_location();
+        assert!(y >= heading.y && y < heading.y + heading.height);
+        // Match the registered harness's rounded native-caret pixel point.
+        let click_x = x.round();
+        let click_y = y.round() + (height.round() / 2.0).floor();
+        let before = document_state(app.doc());
+        app.select_at(click_x, click_y, false);
+        assert_eq!(app.doc().selection(), Selection::caret(end));
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().revision(), before.2);
+        assert_eq!(app.doc().undo_count(), before.4);
+        assert_eq!(app.doc().redo_count(), before.5);
+        assert_eq!(app.doc().is_dirty(), before.3);
+    }
+    #[test]
+    fn live_heading_direct_hit_reveal_and_scroll_refresh_keep_caret_geometry() {
+        for level in 1..=6 {
+            for title in [
+                "",
+                "日本語 👩‍💻 é heading",
+                "wrapped 日本語 ".repeat(18).as_str(),
+            ] {
+                let source = format!("before\n\n{} {title}\n\nafter\n", "#".repeat(level));
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.tabs[0].scroll = 0.0;
+                app.hwnd = hidden_test_window_size(450, 480);
+                unsafe { app.ensure_layout().unwrap() };
+                let heading = app
+                    .cached_projection()
+                    .blocks
+                    .iter()
+                    .find(|block| matches!(block.kind, BlockKind::Heading { .. }))
+                    .unwrap()
+                    .clone();
+                // Probe the actual display hit-test before raw heading reveal,
+                // then follow selection -> layout -> caret -> input. No focus
+                // or activation API is used by this hidden geometry regression.
+                let view = app
+                    .views
+                    .iter()
+                    .find(|view| view.source == heading.source)
+                    .unwrap();
+                let mut points = Vec::new();
+                for u in [0, view.text.len() / 2, view.text.len()] {
+                    if let Some((x, y, h)) = layout_caret(&view.layout, u as u32, false) {
+                        points.push((view.x + x + 0.1, view.y + y + h * 0.5));
+                    }
+                }
+                for (x, y) in points {
+                    app.doc_mut().set_selection(0, 0).unwrap();
+                    unsafe { app.ensure_layout().unwrap() };
+                    app.select_at(x, y, false);
+                    let p = app.doc().selection().head;
+                    assert!(
+                        heading.source.contains(&p) || p == heading.source.end,
+                        "level={level} title={title:?} p={p}"
+                    );
+                    unsafe { app.refresh() };
+                    assert_eq!(app.caret, app.caret_location());
+                    let (cx, cy, h) = app.caret_location();
+                    assert!(cx.is_finite() && cy.is_finite() && h > 0.0);
+                    assert!(app.source_view(p).is_some());
+                    for inserted in ["A", "字"] {
+                        let before = document_state(app.doc());
+                        app.edit(inserted);
+                        let mut expected = source.clone();
+                        expected.insert_str(p, inserted);
+                        assert_eq!(app.doc().source(), expected);
+                        assert!(app.doc_mut().undo());
+                        assert_eq!(app.doc().source(), source);
+                        assert_eq!(app.doc().selection(), Selection::caret(p));
+                        assert_eq!(app.doc().undo_count(), before.4);
+                        unsafe { app.ensure_layout().unwrap() };
+                    }
+                }
+                app.tabs[0].scroll = app.height;
+                unsafe { app.refresh() };
+                assert_eq!(
+                    app.caret,
+                    app.caret_location(),
+                    "refresh must commit caret after scroll clamp: level={level} title={title:?}"
+                );
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+        }
     }
     #[test]
     fn editor_live_front_matter_vertical_sequence_reaches_both_edges_without_cycle() {
@@ -12195,6 +12615,7 @@ mod tests {
             image_cache: HashMap::new(),
             minimized: false,
             full_paint: true,
+            painted_frame: None,
             paint_retry_pending: false,
             animation_timer_armed: false,
             height: 0.0,
@@ -13088,8 +13509,8 @@ mod tests {
         }
         assert_eq!(
             lines.len(),
-            2,
-            "the trailing DirectWrite newline row is real"
+            3,
+            "opening fence, body, and closing fence each occupy one physical row"
         );
         let following = app
             .views
@@ -13100,13 +13521,9 @@ mod tests {
             (following.y - code.y - code.height - lines[0].height).abs() <= 1.0,
             "the literal trailing row and one physical blank row should each occupy one baseline"
         );
-        let closing_fence_boundary = [
-            app.source_view_at(16, Some(BoundaryAffinity::Before)),
-            app.source_view_at(16, Some(BoundaryAffinity::After)),
-        ];
-        assert!(closing_fence_boundary.iter().all(|view| {
-            view.is_some_and(|view| view.source.is_empty() && view.source.start == 16)
-        }));
+        assert!(
+            (source_row_y(&app, 13) - source_row_y(&app, 0) - 2.0 * lines[0].height).abs() <= 1.0
+        );
         unsafe { DestroyWindow(app.hwnd).unwrap() };
 
         let table_source = "before\n\n| A | B |\n|---|---|\n| x | y |\n\nafter";
@@ -13251,7 +13668,7 @@ mod tests {
     }
 
     #[test]
-    fn gutter_rows_skip_hidden_delimiters_and_unrepresented_trailing_metrics() {
+    fn gutter_rows_include_literal_delimiters_and_skip_unrepresented_trailing_metrics() {
         fn assert_rows(source: &str, expected: &[usize], raw: bool) {
             let mut app = composing_test_app(source);
             app.clear_composition();
@@ -13278,13 +13695,112 @@ mod tests {
             unsafe { DestroyWindow(app.hwnd).unwrap() };
         }
 
-        assert_rows("```text\nline\n```\n\nfollowing\n", &[2, 4, 5, 6], false);
+        assert_rows(
+            "```text\nline\n```\n\nfollowing\n",
+            &[1, 2, 3, 4, 5, 6],
+            false,
+        );
         assert_rows(
             "---\ntitle: note\n---\n\nbody\n",
             &[1, 2, 3, 4, 5, 6],
             false,
         );
         assert_rows("one\n\nthree\n", &[1, 2, 3, 4], true);
+    }
+
+    #[test]
+    fn live_fenced_source_rows_hit_edit_language_delimiters_and_restore_exact_history() {
+        for eol in ["\n", "\r\n"] {
+            for info in ["", "rust", "unknown-language"] {
+                let source = format!(
+                    "````{info}{eol}# literal **raw** | --- 👩‍💻 é{eol}{eol}{}{eol}```{eol}````{eol}{eol}~~~{eol}{eol}~~~{eol}",
+                    "long raw code ".repeat(35)
+                );
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.hwnd = hidden_test_window_size(450, 480);
+                let before = document_state(app.doc());
+                unsafe { app.ensure_layout().unwrap() };
+                assert_eq!(document_state(app.doc()), before);
+                let rows: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+                assert_eq!(
+                    rows,
+                    (1..=physical_line_starts(&source).len()).collect::<Vec<_>>()
+                );
+                assert!(app.tables.is_empty() && app.images.is_empty());
+                assert_eq!(
+                    app.cached_projection()
+                        .blocks
+                        .iter()
+                        .filter(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+                        .count(),
+                    2
+                );
+                assert!(
+                    app.views
+                        .iter()
+                        .filter(|view| !view.source.is_empty())
+                        .all(|view| !view.thematic_break)
+                );
+                // Fence and info-string positions use the same source map as
+                // text and the gutter; editing is one ordinary source transaction.
+                for p in [
+                    0,
+                    2,
+                    4,
+                    4 + info.len(),
+                    source.find("# literal").unwrap(),
+                    source.find("````").unwrap() + 1,
+                    source.rfind("~~~").unwrap() + 2,
+                ] {
+                    app.doc_mut().set_selection(p, p).unwrap();
+                    unsafe { app.ensure_layout().unwrap() };
+                    let (x, y, h) = app.caret_location();
+                    assert_eq!(
+                        app.hit(x + 0.1, y + h * 0.5),
+                        p,
+                        "{eol:?} info={info:?} p={p}"
+                    );
+                    app.select_at(x + 0.1, y + h * 0.5, false);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    app.edit("字");
+                    let mut expected = source.clone();
+                    expected.insert(p, '字');
+                    assert_eq!(app.doc().source(), expected);
+                    assert!(app.doc_mut().undo());
+                    assert_eq!(app.doc().source(), source);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    assert!(app.doc_mut().redo());
+                    assert_eq!(app.doc().source(), expected);
+                    assert!(app.doc_mut().undo());
+                }
+                let opening_info = 4..4 + info.len();
+                app.edit_range(opening_info.clone(), "python");
+                assert_eq!(&app.doc().source()[4..10], "python");
+                assert!(app.doc_mut().undo());
+                app.edit_range(opening_info, "");
+                assert!(app.doc().source().starts_with(&format!("````{eol}")));
+                if !info.is_empty() {
+                    assert!(app.doc_mut().undo());
+                }
+                assert_eq!(app.doc().source(), source);
+                let closing = source.find(&format!("````{eol}{eol}")).unwrap();
+                app.doc_mut().set_selection(closing, closing + 4).unwrap();
+                app.edit("");
+                assert!(!app.doc().source().contains(&format!("````{eol}{eol}")));
+                unsafe { app.ensure_layout().unwrap() };
+                assert!(app.doc_mut().undo());
+                assert_eq!(app.doc().source(), source);
+                assert_eq!(
+                    app.doc().selection(),
+                    Selection {
+                        anchor: closing,
+                        head: closing + 4
+                    }
+                );
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+        }
     }
 
     #[test]
@@ -13388,20 +13904,17 @@ mod tests {
             assert!(rule_views[0].width > 100.0);
             let rule_start = source.find(syntax).unwrap();
             assert!(source[rule_views[0].source.clone()].starts_with(syntax));
-            let rule = app
-                .visible_tokens
-                .iter()
-                .find(|token| {
-                    token.spans.len() == 1
-                        && token.spans[0] == (rule_start..rule_start + syntax.len())
+            assert_eq!(String::from_utf16_lossy(&rule_views[0].text), syntax);
+            assert!((rule_start..rule_start + syntax.len()).all(|byte| {
+                app.visible_tokens.iter().any(|token| {
+                    !token.atomic
+                        && token.spans.as_slice() == std::slice::from_ref(&(byte..byte + 1))
                 })
-                .unwrap();
-            assert!(rule.atomic);
-            assert_eq!(rule.text.as_deref(), Some("─"));
-            assert_eq!(rule.display_utf16.end - rule.display_utf16.start, 1);
+            }));
+            let geometry = (rule_views[0].y, rule_views[0].height);
             assert_eq!(
                 live_horizontal_step(&source, &app.visible_tokens, &[], &[], rule_start, false,),
-                rule_start + syntax.len()
+                rule_start + 1
             );
             assert_eq!(
                 live_horizontal_step(
@@ -13412,8 +13925,17 @@ mod tests {
                     rule_start + syntax.len(),
                     true,
                 ),
-                rule_start
+                rule_start + syntax.len() - 1
             );
+            for byte in rule_start..=rule_start + syntax.len() {
+                app.doc_mut().set_selection(byte, byte).unwrap();
+                unsafe { app.ensure_layout().unwrap() };
+                let view = app.views.iter().find(|view| view.thematic_break).unwrap();
+                assert_eq!((view.y, view.height), geometry);
+                assert_eq!(String::from_utf16_lossy(&view.text), syntax);
+                let (x, y, h) = app.caret_location();
+                assert_eq!(app.hit(x + 0.1, y + h * 0.5), byte);
+            }
 
             app.doc_mut()
                 .set_selection(rule_start, rule_start + syntax.len())
@@ -15296,7 +15818,7 @@ mod tests {
         }
     }
     #[test]
-    fn first_fence_text_backspace_keeps_hidden_opening_line_ending() {
+    fn first_fence_text_backspace_edits_visible_opening_line_ending_and_undo_restores_it() {
         let source = "```\nfirst\n```\n";
         let projection = DisplayProjection::parse(source);
         let tokens = projected_tokens(source);
@@ -15311,17 +15833,18 @@ mod tests {
             })
             .map(|block| block.source.clone())
             .collect();
-        let first = tokens[0].spans[0].start;
-        assert_eq!(first, 4);
+        let first = source.find("first").unwrap();
         let mut doc = Document::new(34, source.into());
         doc.set_selection(first, first).unwrap();
         let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
-        assert!(plan.range.is_empty());
+        assert_eq!(plan.range, 3..4);
         apply_plan(&mut doc, plan);
+        assert_eq!(doc.source(), "```first\n```\n");
+        assert_eq!(doc.selection().head, 3);
+        assert_eq!(doc.undo_count(), 1);
+        assert!(doc.undo());
         assert_eq!(doc.source(), source);
         assert_eq!(doc.selection().head, first);
-        assert_eq!(doc.undo_count(), 0);
-        assert_eq!(doc.revision(), 0);
     }
     #[test]
     fn real_image_token_and_exact_layout_markers_keep_before_after_insertions_and_undo() {

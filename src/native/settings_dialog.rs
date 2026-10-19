@@ -1,7 +1,9 @@
 //! A native, snapshot-bound common/Workspace settings form.
 use super::*;
-use mdlite::settings::{CapturedSettings, SettingValue, SettingsPatch, ThemeMode};
-use std::{collections::BTreeMap, fs, io};
+use mdlite::settings::{
+    CapturedSettings, EffectiveSettings, SettingValue, SettingsPatch, ThemeMode,
+};
+use std::{fs, io, ops::Range};
 use windows::Win32::UI::Controls::*;
 const APPLY: usize = 210;
 const CANCEL: usize = 211;
@@ -10,26 +12,73 @@ const DETAIL: usize = 213;
 const ENSURE_VISIBLE: u32 = WM_APP + 51;
 const RAIL_REQUEST: u32 = WM_APP + 52;
 const FONT_REFRESH: u32 = WM_APP + 53;
-const KEYS: [&str; 6] = [
-    "auto_save",
-    "auto_save_delay_ms",
-    "theme",
-    "font_face",
-    "font_size_pt",
-    "default_memo_workspace",
-];
+const CATEGORY_BASE: usize = 300;
+const INHERIT_BASE: usize = 1_000;
+const ACTION_BASE: usize = 2_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldKind {
+    Boolean,
+    Integer,
+    Theme,
+    Text,
+    Path,
+    Color,
+    Shortcut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Category {
+    General,
+    Appearance,
+    Colors,
+    Keys,
+}
+
+#[derive(Clone)]
+struct Field {
+    key: String,
+    label: String,
+    help: String,
+    kind: FieldKind,
+    category: Category,
+}
+
+struct FieldControls {
+    label: HWND,
+    effective: HWND,
+    input: HWND,
+    inherit: HWND,
+    action: Option<HWND>,
+}
+
+struct CategoryControls {
+    title: &'static str,
+    help: &'static str,
+    button: HWND,
+    fields: Range<usize>,
+    expanded: bool,
+}
 struct Form {
     file: CapturedSettings,
     expected: Option<Vec<u8>>,
-    baseline: Vec<String>,
-    draft: Vec<String>,
+    baseline: Vec<Option<String>>,
+    draft: Vec<Option<String>>,
 }
 struct FormWindow {
     forms: Vec<Form>,
     selected: usize,
-    controls: Vec<HWND>,
+    fields: Vec<Field>,
+    rows: Vec<FieldControls>,
+    categories: Vec<CategoryControls>,
     ime: Vec<(HWND, Box<Cell<bool>>)>,
     scope: HWND,
+    note: HWND,
+    help: HWND,
+    headers: [HWND; 3],
+    buttons: [HWND; 4],
+    tooltip: HWND,
+    tooltip_text: Vec<Vec<u16>>,
     detail: Option<PathBuf>,
     tokens: shell::Tokens,
     brush: HBRUSH,
@@ -123,109 +172,291 @@ fn raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(e) => Err(e),
     }
 }
-fn values(file: &CapturedSettings) -> Vec<String> {
-    let layer = file.parsed().layer;
-    vec![
-        layer.auto_save.map(|v| v.to_string()).unwrap_or_default(),
-        layer
-            .auto_save_delay_ms
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        layer
-            .theme
-            .map(|v| {
-                match v {
-                    ThemeMode::System => "system",
-                    ThemeMode::Light => "light",
-                    ThemeMode::Dark => "dark",
-                    ThemeMode::Custom => "custom",
-                }
-                .into()
-            })
-            .unwrap_or_default(),
-        layer.font_face.unwrap_or_default(),
-        layer
-            .font_size_pt
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        layer
-            .default_memo_workspace
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-        layer
-            .colors
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("\r\n"),
-        layer
-            .keybindings
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("\r\n"),
-    ]
-}
-fn map_lines(text: &str) -> Result<BTreeMap<String, String>, String> {
-    let mut result = BTreeMap::new();
-    for line in text.lines().filter(|s| !s.trim().is_empty()) {
-        let (k, v) = line
-            .split_once('=')
-            .ok_or("色とbindingは name=value の行で指定してください")?;
-        if result.insert(k.trim().into(), v.trim().into()).is_some() {
-            return Err("nameが重複しています".into());
-        }
+fn field_specs() -> Vec<Field> {
+    let mut fields = vec![
+        Field {
+            key: "auto_save".into(),
+            label: "自動保存".into(),
+            help: "文書の変更を自動で保存します。有効／無効を指定できます。未指定なら下の設定層を継承します。".into(),
+            kind: FieldKind::Boolean,
+            category: Category::General,
+        },
+        Field {
+            key: "auto_save_delay_ms".into(),
+            label: "自動保存までの待機時間".into(),
+            help: "入力後、自動保存を始めるまでの時間です。単位は ms、範囲は 100～60000 です。空欄は継承です。".into(),
+            kind: FieldKind::Integer,
+            category: Category::General,
+        },
+        Field {
+            key: "default_memo_workspace".into(),
+            label: "既定のメモWorkspace".into(),
+            help: "既定で開くメモWorkspaceの絶対パスです。空欄は継承、「空を指定」はこの層の既定先を消します。".into(),
+            kind: FieldKind::Path,
+            category: Category::General,
+        },
+        Field {
+            key: "theme".into(),
+            label: "テーマ".into(),
+            help: "画面の配色です。システム／ライト／ダーク／カスタムから選べます。空欄は継承です。".into(),
+            kind: FieldKind::Theme,
+            category: Category::Appearance,
+        },
+        Field {
+            key: "font_face".into(),
+            label: "フォント名".into(),
+            help: "アプリの表示に使うフォント名です。空欄は継承です。".into(),
+            kind: FieldKind::Text,
+            category: Category::Appearance,
+        },
+        Field {
+            key: "font_size_pt".into(),
+            label: "文字サイズ".into(),
+            help: "アプリ表示の文字サイズです。単位は pt、範囲は 6～96 です。0 は有効値にならず、空欄は継承です。".into(),
+            kind: FieldKind::Integer,
+            category: Category::Appearance,
+        },
+    ];
+    for name in mdlite::settings::COLOR_NAMES {
+        let label = match *name {
+            "background" => "背景",
+            "foreground" => "本文文字",
+            "link" => "リンク",
+            "heading" => "見出し",
+            "marker" => "マーカー",
+            "code_background" => "コード背景",
+            "table_background" => "表背景",
+            _ => name,
+        };
+        fields.push(Field {
+            key: format!("color.{name}"),
+            label: format!("{label}  [color.{name}]"),
+            help: format!("{label}の色です。#RRGGBB の6桁16進数で指定します。カスタムテーマで使われ、空欄または継承ボタンで下の層へ戻ります。"),
+            kind: FieldKind::Color,
+            category: Category::Colors,
+        });
     }
-    Ok(result)
+    for (command, label) in shell::configurable_commands() {
+        if !mdlite::settings::COMMAND_NAMES.contains(&command) {
+            continue;
+        }
+        fields.push(Field {
+            key: format!("bind.{command}"),
+            label: format!("{label}  [bind.{command}]"),
+            help: format!("{label}のキー割当です。Ctrl／Shift／Alt と A～Z、0～9、F1～F24を指定します。空欄／継承は下の層を使い、「解除」は割当なしにします。予約キーや他の項目との重複はApply時に拒否します。"),
+            kind: FieldKind::Shortcut,
+            category: Category::Keys,
+        });
+    }
+    fields
 }
-fn form_patch(before: &[String], after: &[String]) -> Result<SettingsPatch, String> {
+
+fn value_for_field(field: &Field, layer: &mdlite::settings::SettingsLayer) -> Option<String> {
+    match field.key.as_str() {
+        "auto_save" => layer.auto_save.map(|value| value.to_string()),
+        "auto_save_delay_ms" => layer.auto_save_delay_ms.map(|value| value.to_string()),
+        "theme" => layer.theme.map(|value| {
+            match value {
+                ThemeMode::System => "system",
+                ThemeMode::Light => "light",
+                ThemeMode::Dark => "dark",
+                ThemeMode::Custom => "custom",
+            }
+            .to_owned()
+        }),
+        "font_face" => layer.font_face.clone(),
+        "font_size_pt" => layer.font_size_pt.map(|value| value.to_string()),
+        "default_memo_workspace" => layer
+            .default_memo_workspace
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        key if key.starts_with("color.") => layer.colors.get(&key[6..]).cloned(),
+        key if key.starts_with("bind.") => layer.keybindings.get(&key[5..]).cloned(),
+        _ => None,
+    }
+}
+
+fn values(file: &CapturedSettings, fields: &[Field]) -> Vec<Option<String>> {
+    let layer = file.parsed().layer;
+    fields
+        .iter()
+        .map(|field| value_for_field(field, &layer))
+        .collect()
+}
+
+fn form_patch(
+    before: &[Option<String>],
+    after: &[Option<String>],
+    fields: &[Field],
+) -> Result<SettingsPatch, String> {
+    if before.len() != fields.len() || after.len() != fields.len() {
+        return Err("設定フォームの項目数が一致しません".into());
+    }
     let mut patch = SettingsPatch::default();
-    for (i, key) in KEYS.iter().enumerate() {
-        if before[i] == after[i] {
+    for ((old, new), field) in before.iter().zip(after).zip(fields) {
+        if old == new {
             continue;
         }
-        let value = after[i].trim();
-        if value.is_empty() {
-            patch.inherit(*key);
+        let Some(raw) = new else {
+            patch.inherit(field.key.clone());
             continue;
-        }
-        let setting = match i {
-            0 => SettingValue::Bool(value.parse().map_err(|_| "auto_saveが不正です")?),
-            1 | 4 => SettingValue::Integer(value.parse().map_err(|_| "数値が不正です")?),
-            2 => SettingValue::Theme(match value {
+        };
+        let normalized = if matches!(field.kind, FieldKind::Path | FieldKind::Text) {
+            raw.clone()
+        } else {
+            raw.trim().to_owned()
+        };
+        let value = &normalized;
+        let setting = match field.kind {
+            FieldKind::Boolean => SettingValue::Bool(
+                value
+                    .parse()
+                    .map_err(|_| "自動保存は有効または無効を選んでください")?,
+            ),
+            FieldKind::Integer => {
+                SettingValue::Integer(value.parse().map_err(|_| "整数を入力してください")?)
+            }
+            FieldKind::Theme => SettingValue::Theme(match value.as_str() {
                 "system" => ThemeMode::System,
                 "light" => ThemeMode::Light,
                 "dark" => ThemeMode::Dark,
                 "custom" => ThemeMode::Custom,
-                _ => return Err("themeが不正です".into()),
+                _ => return Err("テーマを選んでください".into()),
             }),
-            3 => SettingValue::Text(value.into()),
-            _ => SettingValue::Path(PathBuf::from(value)),
+            FieldKind::Text => SettingValue::Text(value.clone()),
+            FieldKind::Path => SettingValue::Path(PathBuf::from(value)),
+            FieldKind::Color | FieldKind::Shortcut => SettingValue::Text(value.clone()),
         };
-        patch.set(*key, setting);
-    }
-    for (index, prefix) in [(6, "color."), (7, "bind.")] {
-        let original = map_lines(&before[index])?;
-        let updated = map_lines(&after[index])?;
-        for key in original.keys().chain(updated.keys()) {
-            if original.get(key) == updated.get(key) {
-                continue;
-            }
-            let name = format!("{prefix}{key}");
-            if let Some(value) = updated.get(key) {
-                patch.set(name, SettingValue::Text(value.clone()));
-            } else {
-                patch.inherit(name);
-            }
-        }
+        patch.set(field.key.clone(), setting);
     }
     Ok(patch)
 }
+
+fn merged_settings(forms: &[Form]) -> EffectiveSettings {
+    let mut settings = EffectiveSettings::default();
+    for form in forms {
+        settings.overlay(&form.file.parsed().layer);
+    }
+    settings
+}
+
+fn theme_label(theme: ThemeMode) -> &'static str {
+    match theme {
+        ThemeMode::System => "システム",
+        ThemeMode::Light => "ライト",
+        ThemeMode::Dark => "ダーク",
+        ThemeMode::Custom => "カスタム",
+    }
+}
+
+fn color_hex(value: D2D1_COLOR_F) -> String {
+    let rgb = shell::rgb(value).0;
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (rgb >> 16) & 255,
+        (rgb >> 8) & 255,
+        rgb & 255
+    )
+}
+
+fn effective_color(name: &str, settings: &EffectiveSettings, tokens: shell::Tokens) -> String {
+    if settings.theme == ThemeMode::Custom
+        && let Some(value) = settings.colors.get(name)
+    {
+        return value.clone();
+    }
+    let value = match (settings.theme, name) {
+        (ThemeMode::Light, "background") => return "#F9F9F9".into(),
+        (ThemeMode::Light, "foreground") => return "#1E2630".into(),
+        (ThemeMode::Light, "link") => return "#285EAA".into(),
+        (ThemeMode::Light, "heading") => return "#1E4C99".into(),
+        (ThemeMode::Light, "marker") => return "#636D7A".into(),
+        (ThemeMode::Light, "code_background") => return "#EDF2F7".into(),
+        (ThemeMode::Light, "table_background") => return "#EFF2F4".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "background") => return "#1D1F23".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "foreground") => return "#D1D8E0".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "link") => return "#7CAFF4".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "heading") => return "#B2D1FC".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "marker") => return "#8E99A5".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "code_background") => return "#21262D".into(),
+        (ThemeMode::Dark | ThemeMode::Custom, "table_background") => return "#23272C".into(),
+        (_, "background") => tokens.background,
+        (_, "foreground") => tokens.foreground,
+        (_, "link") => tokens.accent,
+        (_, "heading") => tokens.heading,
+        (_, "marker") => tokens.muted,
+        (_, "code_background") => tokens.code_background,
+        (_, "table_background") => tokens.panel,
+        _ => return "—".into(),
+    };
+    color_hex(value)
+}
+
+fn effective_value(field: &Field, settings: &EffectiveSettings, tokens: shell::Tokens) -> String {
+    match field.key.as_str() {
+        "auto_save" => if settings.auto_save {
+            "有効"
+        } else {
+            "無効"
+        }
+        .into(),
+        "auto_save_delay_ms" => format!("{} ms", settings.auto_save_delay_ms),
+        "theme" => theme_label(settings.theme).into(),
+        "font_face" => settings.font_face.clone(),
+        "font_size_pt" => format!("{} pt", settings.font_size_pt),
+        "default_memo_workspace" => {
+            if settings.default_memo_workspace.as_os_str().is_empty() {
+                "未指定".into()
+            } else {
+                settings.default_memo_workspace.display().to_string()
+            }
+        }
+        key if key.starts_with("color.") => effective_color(&key[6..], settings, tokens),
+        key if key.starts_with("bind.") => settings.keybindings.get(&key[5..]).map_or_else(
+            || "未割当".into(),
+            |value| {
+                if value.eq_ignore_ascii_case("none") {
+                    "解除".into()
+                } else {
+                    value.clone()
+                }
+            },
+        ),
+        _ => "—".into(),
+    }
+}
+
+fn draft_state(field: &Field, value: Option<&str>) -> &'static str {
+    match value {
+        None => "継承",
+        Some("") if field.kind == FieldKind::Path => "空を指定",
+        Some(value) if field.kind == FieldKind::Shortcut && value.eq_ignore_ascii_case("none") => {
+            "解除"
+        }
+        Some(_) => "上書き",
+    }
+}
+
+fn combo_options(kind: FieldKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        FieldKind::Boolean => &[("継承", ""), ("有効", "true"), ("無効", "false")],
+        FieldKind::Theme => &[
+            ("継承", ""),
+            ("システム", "system"),
+            ("ライト", "light"),
+            ("ダーク", "dark"),
+            ("カスタム", "custom"),
+        ],
+        _ => &[],
+    }
+}
+
 impl FormWindow {
     unsafe fn content_extent(&self) -> i32 {
         unsafe {
             children(self.hwnd)
                 .into_iter()
+                .filter(|child| GetWindowLongW(*child, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0)
                 .filter_map(|child| {
                     let mut r = RECT::default();
                     GetWindowRect(child, &mut r).ok()?;
@@ -313,38 +544,86 @@ impl FormWindow {
     unsafe fn capture_draft(&mut self) {
         unsafe {
             let mut draft = Vec::new();
-            for (i, h) in self.controls.iter().enumerate() {
-                if i == 0 || i == 2 {
-                    let n = shell::send(*h, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                    let value = if i == 0 {
-                        ["", "true", "false"].get(n as usize)
-                    } else {
-                        ["", "system", "light", "dark", "custom"].get(n as usize)
-                    };
-                    draft.push(value.unwrap_or(&"").to_string());
+            for (index, (field, row)) in self.fields.iter().zip(&self.rows).enumerate() {
+                if matches!(field.kind, FieldKind::Boolean | FieldKind::Theme) {
+                    let selected = shell::send(row.input, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+                    draft.push(
+                        combo_options(field.kind)
+                            .get(selected as usize)
+                            .and_then(|(_, value)| {
+                                (!value.is_empty()).then(|| (*value).to_owned())
+                            }),
+                    );
                 } else {
-                    draft.push(shell::text_of(*h));
+                    let text = shell::text_of(row.input);
+                    let previous = self.forms[self.selected].draft[index].as_deref();
+                    draft.push(
+                        if text.is_empty() && field.kind == FieldKind::Path && previous == Some("")
+                        {
+                            Some(String::new())
+                        } else {
+                            (!text.is_empty()).then_some(text)
+                        },
+                    );
                 }
             }
             self.forms[self.selected].draft = draft;
+            self.update_row_summaries();
         }
     }
     unsafe fn show_draft(&self) {
         unsafe {
-            for (i, h) in self.controls.iter().enumerate() {
-                let value = &self.forms[self.selected].draft[i];
-                if i == 0 || i == 2 {
-                    let options = if i == 0 {
-                        vec!["", "true", "false"]
-                    } else {
-                        vec!["", "system", "light", "dark", "custom"]
-                    };
-                    let index = options.iter().position(|v| *v == value).unwrap_or(0);
-                    shell::send(*h, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+            for (index, (field, row)) in self.fields.iter().zip(&self.rows).enumerate() {
+                let value = self.forms[self.selected].draft[index].as_deref();
+                if matches!(field.kind, FieldKind::Boolean | FieldKind::Theme) {
+                    let selected = combo_options(field.kind)
+                        .iter()
+                        .position(|(_, option)| Some(*option) == value)
+                        .unwrap_or(0);
+                    shell::send(row.input, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
                 } else {
-                    let _ = SetWindowTextW(*h, PCWSTR(wide(value).as_ptr()));
+                    let _ =
+                        SetWindowTextW(row.input, PCWSTR(wide(value.unwrap_or_default()).as_ptr()));
                 }
             }
+            self.update_row_summaries();
+        }
+    }
+    unsafe fn update_row_summaries(&self) {
+        unsafe {
+            let effective = merged_settings(&self.forms);
+            for (index, (field, row)) in self.fields.iter().zip(&self.rows).enumerate() {
+                let value = effective_value(field, &effective, self.tokens);
+                let state = draft_state(field, self.forms[self.selected].draft[index].as_deref());
+                let text = format!("{value} / {state}");
+                let _ = SetWindowTextW(row.effective, PCWSTR(wide(&text).as_ptr()));
+            }
+        }
+    }
+    unsafe fn update_help(&self, control: HWND) {
+        unsafe {
+            let help = self
+                .rows
+                .iter()
+                .zip(&self.fields)
+                .find(|(row, _)| {
+                    [row.label, row.effective, row.input, row.inherit, row.action.unwrap_or_default()]
+                        .contains(&control)
+                })
+                .map(|(_, field)| field.help.as_str())
+                .or_else(|| {
+                    self.categories
+                        .iter()
+                        .find(|category| category.button == control)
+                        .map(|category| category.help)
+                })
+                .or_else(|| {
+                    (control == self.scope).then_some(
+                        "編集対象の層を選びます。ユーザー共通の下書きはWorkspaceへ切り替えても保持されます。",
+                    )
+                })
+                .unwrap_or("設定の項目へTabで移動すると、ここに補足を表示します。hoverでも同じ説明を確認できます。");
+            let _ = SetWindowTextW(self.help, PCWSTR(wide(help).as_ptr()));
         }
     }
     fn peer_check(&self) -> Result<(), String> {
@@ -362,6 +641,7 @@ impl FormWindow {
                 form_patch(
                     &self.forms[self.selected].baseline,
                     &self.forms[self.selected].draft,
+                    &self.fields,
                 )
             });
             let patch = match result {
@@ -395,6 +675,7 @@ impl FormWindow {
                     form.expected =
                         raw(form.file.target()).unwrap_or_else(|_| form.expected.clone());
                     form.baseline = form.draft.clone();
+                    self.update_row_summaries();
                     self.message(
                         "設定",
                         "保存しました。Workspace/Commonの編集対象は変更していません。",
@@ -442,29 +723,145 @@ impl FormWindow {
             }
         }
     }
+    unsafe fn add_tooltip(&mut self, control: HWND, text: &str) {
+        unsafe {
+            if self.tooltip == HWND::default() {
+                self.tooltip = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    TOOLTIPS_CLASSW,
+                    None,
+                    WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    Some(self.hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_default();
+                if self.tooltip != HWND::default() {
+                    shell::send(
+                        self.tooltip,
+                        TTM_SETMAXTIPWIDTH,
+                        WPARAM(0),
+                        LPARAM((360. * self.dpi as f32 / 96.) as isize),
+                    );
+                }
+            }
+            if self.tooltip == HWND::default() || control == HWND::default() {
+                return;
+            }
+            self.tooltip_text.push(wide(text));
+            let text = self.tooltip_text.last_mut().unwrap();
+            let mut tool = TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                hwnd: self.hwnd,
+                uId: control.0 as usize,
+                lpszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            };
+            shell::send(
+                self.tooltip,
+                TTM_ADDTOOLW,
+                WPARAM(0),
+                LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+            );
+        }
+    }
+    unsafe fn place(&self, control: HWND, x: i32, y: i32, width: i32, height: i32, visible: bool) {
+        unsafe {
+            let dpi = self.dpi as f32 / 96.;
+            let flags = SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | if visible {
+                    SWP_SHOWWINDOW
+                } else {
+                    SWP_HIDEWINDOW
+                };
+            let _ = SetWindowPos(
+                control,
+                None,
+                (x as f32 * dpi).round() as i32,
+                ((y + self.scroll) as f32 * dpi).round() as i32,
+                (width as f32 * dpi).round() as i32,
+                (height as f32 * dpi).round() as i32,
+                flags,
+            );
+        }
+    }
+    unsafe fn layout_controls(&mut self) {
+        unsafe {
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut client);
+            let scale = self.dpi as f32 / 96.;
+            let width = (client.right as f32 / scale).round() as i32;
+            self.place(self.scope, 128, 12, 220, 28, true);
+            self.place(self.note, 366, 10, (width - 382).max(180), 38, true);
+            self.place(self.help, 16, 48, (width - 32).max(220), 34, true);
+            self.place(self.headers[0], 16, 84, 280, 22, true);
+            self.place(self.headers[1], 304, 84, 190, 22, true);
+            self.place(self.headers[2], 502, 84, (width - 534).max(220), 22, true);
+
+            let right = width - 16;
+            let inherit_x = right - 72;
+            let action_x = inherit_x - 80;
+            let mut y = 112;
+            let row_height = shell::UI_ROW_HEIGHT.round() as i32 + 10;
+            for category in &self.categories {
+                self.place(category.button, 16, y, (width - 32).max(240), 28, true);
+                y += 34;
+                for index in category.fields.clone() {
+                    let row = &self.rows[index];
+                    let visible = category.expanded;
+                    self.place(row.label, 16, y, 280, row_height, visible);
+                    self.place(row.effective, 304, y, 190, row_height, visible);
+                    let has_action = row.action.is_some();
+                    let input_right = if has_action {
+                        action_x - 8
+                    } else {
+                        inherit_x - 8
+                    };
+                    self.place(
+                        row.input,
+                        502,
+                        y + 2,
+                        (input_right - 502).max(80),
+                        row_height - 4,
+                        visible,
+                    );
+                    self.place(row.inherit, inherit_x, y + 2, 72, row_height - 4, visible);
+                    if let Some(action) = row.action {
+                        self.place(action, action_x, y + 2, 72, row_height - 4, visible);
+                    }
+                    y += row_height;
+                }
+                if !category.expanded {
+                    y -= (category.fields.len() as i32) * row_height;
+                }
+            }
+            y += 8;
+            let button_width = ((width - 32 - 24) / 4).max(120);
+            for (index, button) in self.buttons.iter().enumerate() {
+                self.place(
+                    *button,
+                    16 + index as i32 * (button_width + 8),
+                    y,
+                    button_width,
+                    36,
+                    true,
+                );
+            }
+        }
+    }
     unsafe fn create_controls(&mut self) {
         unsafe {
             self.dpi = GetDpiForWindow(self.hwnd).max(96);
-            let dpi = self.dpi as f32 / 96.;
-            let pos = |h: HWND, x: f32, y: f32, w: f32, hgt: f32| {
-                let _ = SetWindowPos(
-                    h,
-                    None,
-                    (x * dpi) as i32,
-                    (y * dpi) as i32,
-                    (w * dpi) as i32,
-                    (hgt * dpi) as i32,
-                    SWP_NOZORDER,
-                );
-            };
-            let label = shell::control(
-                self.hwnd,
-                w!("STATIC"),
-                "編集する層（空欄・inheritは下の層を継承）",
-                0,
-                WINDOW_STYLE(0),
-            );
-            pos(label, 16., 12., 600., 22.);
+            let scope_label =
+                shell::control(self.hwnd, w!("STATIC"), "編集する層", 0, WINDOW_STYLE(0));
+            self.place(scope_label, 16, 12, 104, 28, true);
             self.scope = shell::control(
                 self.hwnd,
                 w!("COMBOBOX"),
@@ -472,7 +869,6 @@ impl FormWindow {
                 200,
                 WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_VSCROLL,
             );
-            pos(self.scope, 16., 36., 620., 180.);
             for name in ["ユーザー共通", "Workspace"]
                 .into_iter()
                 .take(self.forms.len())
@@ -485,96 +881,195 @@ impl FormWindow {
                 );
             }
             shell::send(self.scope, CB_SETCURSEL, WPARAM(self.selected), LPARAM(0));
-            let labels = [
-                "自動保存",
-                "保存待機 ms (100–60000)",
-                "テーマ",
-                "フォント",
-                "サイズ pt (6–96)",
-                "既定のメモWorkspace",
-                "Custom色 (name=#RRGGBB)",
-                "キー割当て (command=Ctrl+Key)",
+            self.note = shell::control(
+                self.hwnd,
+                w!("STATIC"),
+                "共通設定の後にWorkspace設定が適用されます。列は実効値／この層の下書きです。空欄は継承、falseや0は指定値です。",
+                0,
+                WINDOW_STYLE(0),
+            );
+            self.help = shell::control(
+                self.hwnd,
+                w!("STATIC"),
+                "項目へTabで移動すると補足を表示します。hoverでも同じ説明を確認できます。",
+                0,
+                WINDOW_STYLE(0),
+            );
+            self.headers = [
+                shell::control(
+                    self.hwnd,
+                    w!("STATIC"),
+                    "項目 / 識別キー",
+                    0,
+                    WINDOW_STYLE(0),
+                ),
+                shell::control(
+                    self.hwnd,
+                    w!("STATIC"),
+                    "実効値 / この層の下書き",
+                    0,
+                    WINDOW_STYLE(0),
+                ),
+                shell::control(self.hwnd, w!("STATIC"), "この層の値", 0, WINDOW_STYLE(0)),
             ];
-            for (i, name) in labels.into_iter().enumerate() {
-                let y = 76.
-                    + if i < 6 {
-                        i as f32 * 42.
-                    } else {
-                        252. + (i - 6) as f32 * 98.
-                    };
-                let label = shell::control(self.hwnd, w!("STATIC"), name, 0, WINDOW_STYLE(0));
-                pos(label, 16., y + 4., 215., 24.);
-                let combo = i == 0 || i == 2;
-                let style = if combo {
-                    WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_VSCROLL
-                } else if i >= 6 {
-                    WS_BORDER
-                        | WS_VSCROLL
-                        | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32)
-                } else {
-                    WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32)
-                };
-                let control = shell::control(
+            let category_specs = [
+                (
+                    Category::General,
+                    "一般／保存",
+                    "保存待機や既定Workspaceを設定します。共通設定の後にWorkspace設定が優先されます。",
+                    true,
+                ),
+                (
+                    Category::Appearance,
+                    "表示／テーマ",
+                    "テーマと文字表示を設定します。適用前の値は下書きとして保持されます。",
+                    true,
+                ),
+                (
+                    Category::Colors,
+                    "カスタム色",
+                    "実装済みの色項目だけを編集します。色は#RRGGBBで入力し、カスタムテーマで使います。",
+                    false,
+                ),
+                (
+                    Category::Keys,
+                    "キー割当",
+                    "登録済みcommandだけを編集します。解除は下の層の割当を継承せず、割当なしを指定します。",
+                    false,
+                ),
+            ];
+            for (index, (category, title, help, expanded)) in category_specs.into_iter().enumerate()
+            {
+                let start = self
+                    .fields
+                    .iter()
+                    .position(|field| field.category == category)
+                    .unwrap_or(self.fields.len());
+                let end = self
+                    .fields
+                    .iter()
+                    .rposition(|field| field.category == category)
+                    .map_or(start, |last| last + 1);
+                let label = format!("{}  {title}", if expanded { "−" } else { "＋" });
+                let button = shell::control(
+                    self.hwnd,
+                    w!("BUTTON"),
+                    &label,
+                    CATEGORY_BASE + index,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                );
+                self.categories.push(CategoryControls {
+                    title,
+                    help,
+                    button,
+                    fields: start..end,
+                    expanded,
+                });
+                self.add_tooltip(button, help);
+            }
+            let fields = self.fields.clone();
+            for (index, field) in fields.iter().enumerate() {
+                let label =
+                    shell::control(self.hwnd, w!("STATIC"), &field.label, 0, WINDOW_STYLE(0));
+                let effective = shell::control(self.hwnd, w!("STATIC"), "", 0, WINDOW_STYLE(0));
+                let combo = matches!(field.kind, FieldKind::Boolean | FieldKind::Theme);
+                let input = shell::control(
                     self.hwnd,
                     if combo { w!("COMBOBOX") } else { w!("EDIT") },
-                    name,
-                    201 + i,
-                    style,
-                );
-                pos(
-                    control,
-                    236.,
-                    y,
-                    400.,
+                    "",
+                    400 + index,
                     if combo {
-                        180.
-                    } else if i >= 6 {
-                        90.
+                        WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_VSCROLL
                     } else {
-                        28.
+                        WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32)
                     },
                 );
                 if combo {
-                    let options = if i == 0 {
-                        vec!["inherit", "true", "false"]
-                    } else {
-                        vec!["inherit", "system", "light", "dark", "custom"]
-                    };
-                    for value in options {
+                    for (display, _) in combo_options(field.kind) {
                         shell::send(
-                            control,
+                            input,
                             CB_ADDSTRING,
                             WPARAM(0),
-                            LPARAM(wide(value).as_ptr() as isize),
+                            LPARAM(wide(display).as_ptr() as isize),
                         );
                     }
+                } else {
+                    self.ime.push((input, shell::track_control_ime(input)));
                 }
-                if !combo {
-                    self.ime.push((control, shell::track_control_ime(control)));
+                let inherit = shell::control(
+                    self.hwnd,
+                    w!("BUTTON"),
+                    "継承",
+                    INHERIT_BASE + index,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                );
+                let action = match field.kind {
+                    FieldKind::Path => Some("空を指定"),
+                    FieldKind::Shortcut => Some("解除"),
+                    _ => None,
                 }
-                self.controls.push(control);
-                if let Err(error) = edit_scroll::set_explorer_theme(control) {
+                .map(|label| {
+                    shell::control(
+                        self.hwnd,
+                        w!("BUTTON"),
+                        label,
+                        ACTION_BASE + index,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    )
+                });
+                self.rows.push(FieldControls {
+                    label,
+                    effective,
+                    input,
+                    inherit,
+                    action,
+                });
+                if let Err(error) = edit_scroll::set_explorer_theme(input) {
                     eprintln!("Settings control theme failed: {error}");
                 }
+                self.add_tooltip(label, &field.help);
+                self.add_tooltip(effective, &field.help);
+                self.add_tooltip(input, &field.help);
+                self.add_tooltip(inherit, &field.help);
+                if let Some(action) = action {
+                    let help = match field.kind {
+                        FieldKind::Path => {
+                            "この層の既定Workspaceを空にします。継承ボタンで下の層へ戻ります。"
+                        }
+                        FieldKind::Shortcut => {
+                            "このcommandのショートカットを解除します。下の層から継承したい場合は継承ボタンを使います。"
+                        }
+                        _ => "",
+                    };
+                    self.add_tooltip(action, help);
+                }
             }
-            for (i, (id, label)) in [
-                (APPLY, "Apply"),
-                (CANCEL, "閉じる / Cancel"),
-                (RESET, "この層をReset"),
+            for (index, (id, label)) in [
+                (APPLY, "適用"),
+                (CANCEL, "閉じる（キャンセル）"),
+                (RESET, "この層をリセット"),
                 (DETAIL, "詳細編集…"),
             ]
             .into_iter()
             .enumerate()
             {
-                let h = shell::control(
+                self.buttons[index] = shell::control(
                     self.hwnd,
                     w!("BUTTON"),
                     label,
                     id,
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
                 );
-                pos(h, 16. + i as f32 * 160., 536., 148., 34.);
             }
+            self.add_tooltip(self.buttons[0], "この層の変更を検証し、安全に保存します。競合や不正値がある場合は入力を保持します。");
+            self.add_tooltip(
+                self.buttons[1],
+                "未適用の下書きを保存せず閉じます。すでに適用した設定は残ります。",
+            );
+            self.add_tooltip(self.buttons[2], "この層で指定した管理項目を継承へ戻し、確認後に適用します。未知の設定は保持します。");
+            self.add_tooltip(self.buttons[3], "現在の設定ファイルを詳細編集で開きます。普段の色やキー割当には各項目のフォームを使ってください。");
+            self.add_tooltip(self.scope, "編集対象の層を選びます。ユーザー共通の下書きはWorkspaceへ切り替えても保持されます。");
+            self.layout_controls();
             self.show_draft();
             for child in children(self.hwnd) {
                 let mut name = [0u16; 32];
@@ -662,6 +1157,7 @@ unsafe fn change_dpi(state: &Window, dpi: u32) {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        state.form.borrow_mut().layout_controls();
         update_font(state);
         scroll_window(state, 0);
     }
@@ -681,10 +1177,10 @@ fn update_font(state: &Window) {
     let mut font = { state.font.borrow_mut().take() };
     match font.as_mut() {
         Some(font) => {
-            let _ = font.replace_on(hwnd, dpi, 16.);
+            let _ = font.replace_on(hwnd, dpi, shell::UI_FONT_SIZE);
         }
         None => {
-            if let Ok(mut created) = control_style::UiFont::new(dpi, 16.)
+            if let Ok(mut created) = control_style::UiFont::new(dpi, shell::UI_FONT_SIZE)
                 && created.apply_to(hwnd).is_ok()
             {
                 font = Some(created);
@@ -715,6 +1211,17 @@ unsafe fn drain_rail_request(state: &Window, wp: WPARAM, lp: LPARAM) {
         {
             scroll_window(state, position);
         }
+    }
+}
+unsafe fn close_window(hwnd: HWND, state: &Window) {
+    unsafe {
+        state.closed.set(true);
+        // Keep an eligible activation target while Windows destroys the modal
+        // surface instead of leaving its owner disabled during activation handoff.
+        if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+            let _ = EnableWindow(owner, true);
+        }
+        let _ = DestroyWindow(hwnd);
     }
 }
 unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -768,8 +1275,8 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_GETMINMAXINFO => {
                 let limits = &mut *(lp.0 as *mut MINMAXINFO);
                 limits.ptMinTrackSize = POINT {
-                    x: (680. * form.dpi as f32 / 96.).round() as i32,
-                    y: (200. * form.dpi as f32 / 96.).round() as i32,
+                    x: (820. * form.dpi as f32 / 96.).round() as i32,
+                    y: (240. * form.dpi as f32 / 96.).round() as i32,
                 };
                 LRESULT(0)
             }
@@ -810,6 +1317,7 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_SIZE => {
+                form.layout_controls();
                 let position = form.scroll;
                 drop(form);
                 if (*pointer).font_pending.get() {
@@ -862,9 +1370,8 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_CLOSE => {
-                (*pointer).closed.set(true);
                 drop(form);
-                let _ = DestroyWindow(hwnd);
+                close_window(hwnd, &*pointer);
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -877,7 +1384,9 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 .contains(&(wp.0 >> 16))
                     && lp.0 != 0
                 {
-                    let position = form.ensure_visible(HWND(lp.0 as *mut _));
+                    let control = HWND(lp.0 as *mut _);
+                    form.update_help(control);
+                    let position = form.ensure_visible(control);
                     drop(form);
                     if let Some(position) = position {
                         scroll_window(&*pointer, position);
@@ -892,19 +1401,57 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         form.selected = selected;
                         form.show_draft();
                     }
+                } else if id >= CATEGORY_BASE
+                    && id < CATEGORY_BASE + form.categories.len()
+                    && wp.0 >> 16 == BN_CLICKED as usize
+                {
+                    form.capture_draft();
+                    let category = &mut form.categories[id - CATEGORY_BASE];
+                    category.expanded = !category.expanded;
+                    let title = format!(
+                        "{}  {}",
+                        if category.expanded { "−" } else { "＋" },
+                        category.title
+                    );
+                    let _ = SetWindowTextW(category.button, PCWSTR(wide(&title).as_ptr()));
+                    form.layout_controls();
                 } else if id == APPLY && wp.0 >> 16 == BN_CLICKED as usize {
                     form.apply();
                 } else if id == CANCEL && wp.0 >> 16 == BN_CLICKED as usize {
-                    (*pointer).closed.set(true);
                     drop(form);
-                    let _ = DestroyWindow(hwnd);
+                    close_window(hwnd, &*pointer);
                     return LRESULT(0);
                 } else if id == RESET && wp.0 >> 16 == BN_CLICKED as usize {
                     form.capture_draft();
                     let selected = form.selected;
-                    form.forms[selected].draft = vec![String::new(); 8];
+                    form.forms[selected].draft = vec![None; form.fields.len()];
                     form.show_draft();
                     form.apply();
+                } else if wp.0 >> 16 == BN_CLICKED as usize && lp.0 != 0 {
+                    let control = HWND(lp.0 as *mut _);
+                    if let Some(index) = form.rows.iter().position(|row| row.inherit == control) {
+                        let selected = form.selected;
+                        form.forms[selected].draft[index] = None;
+                        form.show_draft();
+                    } else if let Some(index) =
+                        form.rows.iter().position(|row| row.action == Some(control))
+                    {
+                        let value = match form.fields[index].kind {
+                            FieldKind::Path => Some(String::new()),
+                            FieldKind::Shortcut => Some("NONE".into()),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            let selected = form.selected;
+                            form.forms[selected].draft[index] = Some(value);
+                            form.show_draft();
+                        }
+                    }
+                } else if (EN_CHANGE as usize == wp.0 >> 16 || CBN_SELCHANGE as usize == wp.0 >> 16)
+                    && id >= 400
+                    && id < 400 + form.rows.len()
+                {
+                    form.capture_draft();
                 } else if id == DETAIL && wp.0 >> 16 == BN_CLICKED as usize {
                     if let Err(e) = form.peer_check() {
                         form.message("詳細編集を開けません", &e);
@@ -928,9 +1475,8 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         match result {
                             Ok(()) => {
                                 form.detail = Some(path);
-                                (*pointer).closed.set(true);
                                 drop(form);
-                                let _ = DestroyWindow(hwnd);
+                                close_window(hwnd, &*pointer);
                                 return LRESULT(0);
                             }
                             Err(e) => form.message("詳細編集を開けません", &e.to_string()),
@@ -1007,6 +1553,7 @@ impl App {
                 self.status = "共通設定の保存先を取得できません".into();
                 return;
             };
+            let fields = field_specs();
             let mut forms = Vec::new();
             for path in std::iter::once(common).chain(
                 self.persistence
@@ -1027,7 +1574,7 @@ impl App {
                         return;
                     }
                 };
-                let baseline = values(&file);
+                let baseline = values(&file, &fields);
                 forms.push(Form {
                     file,
                     expected,
@@ -1045,9 +1592,17 @@ impl App {
                 form: RefCell::new(FormWindow {
                     forms,
                     selected: 0,
-                    controls: Vec::new(),
+                    fields,
+                    rows: Vec::new(),
+                    categories: Vec::new(),
                     ime: Vec::new(),
                     scope: HWND::default(),
+                    note: HWND::default(),
+                    help: HWND::default(),
+                    headers: [HWND::default(); 3],
+                    buttons: [HWND::default(); 4],
+                    tooltip: HWND::default(),
+                    tooltip_text: Vec::new(),
                     detail: None,
                     tokens: self.shell.tokens,
                     brush,
@@ -1073,8 +1628,8 @@ impl App {
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                (680. * self.dpi) as i32,
-                (630. * self.dpi) as i32,
+                (960. * self.dpi) as i32,
+                (700. * self.dpi) as i32,
                 Some(self.hwnd),
                 None,
                 Some(class.hInstance),
@@ -1124,14 +1679,17 @@ impl App {
                 }
             }
             let _ = EnableWindow(owner, true);
-            let _ = SetFocus(Some(owner));
             if IsWindow(Some(hwnd)).as_bool() {
                 let _ = DestroyWindow(hwnd);
             }
+            let _ = SetFocus(Some(owner));
             let detail = state.form.borrow_mut().detail.take();
             let _ = DeleteObject(brush.into());
+            let previous_settings = self.shell.settings.clone();
             self.load_persistence_settings();
-            self.install_shell_menu();
+            if self.shell.settings != previous_settings {
+                self.install_shell_menu();
+            }
             if let Some(path) = detail {
                 self.open_path(path);
             }
@@ -1150,6 +1708,26 @@ mod tests {
         state: Box<Window>,
         hwnd: HWND,
     }
+    struct SettingsTempDir(PathBuf);
+    impl SettingsTempDir {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mdlite-settings-form-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for SettingsTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     impl FormFixture {
         fn new() -> Self {
             unsafe {
@@ -1162,9 +1740,17 @@ mod tests {
                     form: RefCell::new(FormWindow {
                         forms: Vec::new(),
                         selected: 0,
-                        controls: Vec::new(),
+                        fields: Vec::new(),
+                        rows: Vec::new(),
+                        categories: Vec::new(),
                         ime: Vec::new(),
                         scope: HWND::default(),
+                        note: HWND::default(),
+                        help: HWND::default(),
+                        headers: [HWND::default(); 3],
+                        buttons: [HWND::default(); 4],
+                        tooltip: HWND::default(),
+                        tooltip_text: Vec::new(),
                         detail: None,
                         tokens: shell::Tokens::default(),
                         brush: CreateSolidBrush(COLORREF(0)),
@@ -1240,6 +1826,57 @@ mod tests {
                 }
                 let _ = DeleteObject(self.state.form.borrow().brush.into());
             }
+        }
+    }
+
+    #[test]
+    fn settings_close_reenables_owner_before_destroying_modal_window() {
+        thread_local! {
+            static EVENTS: RefCell<Vec<(u32, bool)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn probe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            owner: usize,
+        ) -> LRESULT {
+            unsafe {
+                if matches!(msg, WM_DESTROY | WM_NCDESTROY) {
+                    let enabled = IsWindowEnabled(HWND(owner as *mut _)).as_bool();
+                    EVENTS.with(|events| events.borrow_mut().push((msg, enabled)));
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        for command in [None, Some(CANCEL)] {
+            let owner = FormFixture::new();
+            let fixture = FormFixture::new();
+            EVENTS.with(|events| events.borrow_mut().clear());
+            unsafe {
+                SetWindowLongPtrW(fixture.hwnd, GWLP_HWNDPARENT, owner.hwnd.0 as isize);
+                assert!(
+                    SetWindowSubclass(fixture.hwnd, Some(probe), 1, owner.hwnd.0 as usize)
+                        .as_bool()
+                );
+                let _ = EnableWindow(owner.hwnd, false);
+                if let Some(id) = command {
+                    SendMessageW(fixture.hwnd, WM_COMMAND, Some(WPARAM(id)), Some(LPARAM(0)));
+                } else {
+                    SendMessageW(fixture.hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            }
+            EVENTS.with(|events| {
+                println!(
+                    "settings-close command={command:?} destruction={:?}",
+                    events.borrow()
+                );
+                assert_eq!(
+                    &*events.borrow(),
+                    &[(WM_DESTROY, true), (WM_NCDESTROY, true)]
+                );
+            });
         }
     }
 
@@ -1515,7 +2152,8 @@ mod tests {
             );
             assert_eq!(
                 data.lfHeight,
-                -(16. * fixture.state.form.borrow().dpi as f32 / 96.).round() as i32
+                -(shell::UI_FONT_SIZE * fixture.state.form.borrow().dpi as f32 / 96.).round()
+                    as i32
             );
             assert_eq!(
                 shell::send(rail, WM_GETFONT, WPARAM(0), LPARAM(0)),
@@ -1743,20 +2381,20 @@ mod tests {
     }
     #[test]
     fn settings_form_patch_only_changes_edited_layer_fields() {
-        let before = vec![
-            "true".into(),
-            "750".into(),
-            "dark".into(),
-            "Segoe UI".into(),
-            "11".into(),
-            String::new(),
-            "background=#112233".into(),
-            "file.save=Ctrl+S".into(),
-        ];
+        let fields = field_specs();
+        let index = |key: &str| fields.iter().position(|field| field.key == key).unwrap();
+        let mut before = vec![None; fields.len()];
+        before[index("auto_save")] = Some("true".into());
+        before[index("auto_save_delay_ms")] = Some("750".into());
+        before[index("theme")] = Some("dark".into());
+        before[index("font_face")] = Some("Segoe UI".into());
+        before[index("font_size_pt")] = Some("11".into());
+        before[index("color.background")] = Some("#112233".into());
+        before[index("bind.file.save")] = Some("Ctrl+S".into());
         let mut after = before.clone();
-        after[1] = "1250".into();
-        after[2].clear();
-        let patch = form_patch(&before, &after).unwrap();
+        after[index("auto_save_delay_ms")] = Some("1250".into());
+        after[index("theme")] = None;
+        let patch = form_patch(&before, &after, &fields).unwrap();
         assert_eq!(patch.changes.len(), 2);
         assert_eq!(
             patch.changes["auto_save_delay_ms"],
@@ -1764,5 +2402,191 @@ mod tests {
         );
         assert_eq!(patch.changes["theme"], None);
         assert!(!patch.changes.contains_key("font_face"));
+    }
+
+    #[test]
+    fn settings_form_fields_come_from_supported_registries() {
+        let fields = field_specs();
+        let colors = fields
+            .iter()
+            .filter(|field| field.kind == FieldKind::Color)
+            .map(|field| field.key.strip_prefix("color.").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(colors, mdlite::settings::COLOR_NAMES);
+        let commands = fields
+            .iter()
+            .filter(|field| field.kind == FieldKind::Shortcut)
+            .map(|field| field.key.strip_prefix("bind.").unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = shell::configurable_commands()
+            .into_iter()
+            .filter_map(|(key, _)| {
+                mdlite::settings::COMMAND_NAMES
+                    .contains(&key)
+                    .then_some(key)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(commands, registered);
+        assert!(
+            fields
+                .iter()
+                .filter(|field| field.kind == FieldKind::Color || field.kind == FieldKind::Shortcut)
+                .all(|field| field.label.contains('[') && !field.help.is_empty())
+        );
+    }
+
+    #[test]
+    fn settings_form_keeps_false_zero_empty_and_unbind_separate_from_inherit() {
+        let fields = field_specs();
+        let index = |key: &str| fields.iter().position(|field| field.key == key).unwrap();
+        let before = vec![None; fields.len()];
+        let mut after = before.clone();
+        after[index("auto_save")] = Some("false".into());
+        after[index("auto_save_delay_ms")] = Some("0".into());
+        after[index("default_memo_workspace")] = Some(String::new());
+        after[index("bind.file.save")] = Some("NONE".into());
+        let patch = form_patch(&before, &after, &fields).unwrap();
+        assert_eq!(patch.changes["auto_save"], Some(SettingValue::Bool(false)));
+        assert_eq!(
+            patch.changes["auto_save_delay_ms"],
+            Some(SettingValue::Integer(0))
+        );
+        assert_eq!(
+            patch.changes["default_memo_workspace"],
+            Some(SettingValue::Path(PathBuf::new()))
+        );
+        assert_eq!(
+            patch.changes["bind.file.save"],
+            Some(SettingValue::Text("NONE".into()))
+        );
+        let inherited = form_patch(&after, &before, &fields).unwrap();
+        assert_eq!(inherited.changes["default_memo_workspace"], None);
+        assert_eq!(inherited.changes["bind.file.save"], None);
+        assert_eq!(
+            draft_state(&fields[index("default_memo_workspace")], Some("")),
+            "空を指定"
+        );
+        assert_eq!(
+            draft_state(&fields[index("bind.file.save")], Some("NONE")),
+            "解除"
+        );
+    }
+
+    #[test]
+    fn settings_form_drafts_survive_scope_collapse_resize_and_dpi() {
+        let root = SettingsTempDir::new();
+        let common_dir = root.0.join("common");
+        let workspace_dir = root.0.join("workspace/.mdlite");
+        fs::create_dir_all(&common_dir).unwrap();
+        fs::create_dir_all(&workspace_dir).unwrap();
+        let fields = field_specs();
+        let common = CapturedSettings::capture(common_dir.join("settings.toml")).unwrap();
+        let workspace = CapturedSettings::capture(workspace_dir.join("settings.toml")).unwrap();
+        let common_values = values(&common, &fields);
+        let workspace_values = values(&workspace, &fields);
+        let fixture = FormFixture::new();
+        unsafe {
+            {
+                let mut form = fixture.state.form.borrow_mut();
+                form.fields = fields.clone();
+                form.forms = vec![
+                    Form {
+                        file: common,
+                        expected: None,
+                        baseline: common_values.clone(),
+                        draft: common_values,
+                    },
+                    Form {
+                        file: workspace,
+                        expected: None,
+                        baseline: workspace_values.clone(),
+                        draft: workspace_values,
+                    },
+                ];
+                form.create_controls();
+            }
+            let font_index = fields
+                .iter()
+                .position(|field| field.key == "font_face")
+                .unwrap();
+            let font_edit = fixture.state.form.borrow().rows[font_index].input;
+            SetWindowTextW(font_edit, PCWSTR(wide("Meiryo").as_ptr())).unwrap();
+            fixture.state.form.borrow_mut().capture_draft();
+            assert_eq!(
+                fixture.state.form.borrow().forms[0].draft[font_index].as_deref(),
+                Some("Meiryo")
+            );
+
+            let appearance_button = fixture.state.form.borrow().categories[1].button;
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((BN_CLICKED as usize) << 16) | (CATEGORY_BASE + 1))),
+                Some(LPARAM(appearance_button.0 as isize)),
+            );
+            assert_eq!(
+                GetWindowLongW(font_edit, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "collapsing a section hides its controls"
+            );
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((BN_CLICKED as usize) << 16) | (CATEGORY_BASE + 1))),
+                Some(LPARAM(appearance_button.0 as isize)),
+            );
+            assert_eq!(shell::text_of(font_edit), "Meiryo");
+
+            let scope = fixture.state.form.borrow().scope;
+            shell::send(scope, CB_SETCURSEL, WPARAM(1), LPARAM(0));
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((CBN_SELCHANGE as usize) << 16) | 200)),
+                Some(LPARAM(scope.0 as isize)),
+            );
+            assert_eq!(fixture.state.form.borrow().selected, 1);
+            assert_eq!(shell::text_of(font_edit), "");
+            SetWindowTextW(font_edit, PCWSTR(wide("Yu Gothic").as_ptr())).unwrap();
+            fixture.state.form.borrow_mut().capture_draft();
+
+            shell::send(scope, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((CBN_SELCHANGE as usize) << 16) | 200)),
+                Some(LPARAM(scope.0 as isize)),
+            );
+            assert_eq!(shell::text_of(font_edit), "Meiryo");
+
+            SetWindowTextW(font_edit, PCWSTR(wide("Meiryo Pro").as_ptr())).unwrap();
+            fixture.state.form.borrow_mut().capture_draft();
+            SetWindowPos(
+                fixture.hwnd,
+                None,
+                0,
+                0,
+                1000,
+                700,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            assert_eq!(shell::text_of(font_edit), "Meiryo Pro");
+            change_dpi(&fixture.state, 150);
+            assert_eq!(shell::text_of(font_edit), "Meiryo Pro");
+            assert_eq!(
+                fixture.state.form.borrow().forms[0].draft[font_index].as_deref(),
+                Some("Meiryo Pro")
+            );
+
+            shell::send(scope, CB_SETCURSEL, WPARAM(1), LPARAM(0));
+            SendMessageW(
+                fixture.hwnd,
+                WM_COMMAND,
+                Some(WPARAM(((CBN_SELCHANGE as usize) << 16) | 200)),
+                Some(LPARAM(scope.0 as isize)),
+            );
+            assert_eq!(shell::text_of(font_edit), "Yu Gothic");
+        }
     }
 }

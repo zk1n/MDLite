@@ -1,5 +1,21 @@
 # Rust UI・周辺機能の実装記録
 
+## 2026年10月19日・Rev3候補（作業中・未統合）
+
+左右独立のpanel group、単独Search、schema1配置の互換移行、代表icon、右local切替を実装した。
+fenceの区切り／info／空行を含む全原文表示、安定した水平線の編集位置、空見出しのhit mappingと
+scroll確定後のcaret更新、query実矩形、文書位置の戻る／進む、短いmenuと補助説明、
+Gitの1行toolbar／狭幅overflow、Calendarの不要な予約領域除去、項目別の折畳み設定を追加した。
+Alt+F4がSearch menuへ誤配される仮想キー解釈も修正した。
+native queryのcaretをeditor側で破棄しない所有照合と、見出し末尾のBefore側caretを
+隣の水平線へ引かないsource所有viewの優先を追加した。
+
+最終sourceのDebug／Release通常BINは各294成功・8 ignored、両LIB150成功は同一binary hashを
+照合して再利用した。fmt、両構成strict Clippy、登録Release buildと独立限定再reviewは通過。
+製品GUI受入は継続中。旧Rev2 EXEでの3起動、実入力・保存・正常終了、paint fenceの比較は
+検証経路の復旧証拠であり、Rev3製品／150 DPI／実IME／Humanの合格証拠ではない。
+現時点でdevelop統合・配送・公開は行っていない。
+
 ## 2026年10月19日・Rev2方向修正（未統合checkpoint）
 
 製品source local commit: `7847b04688b57a9216a9c402d7ef88fac65f6cd5`。

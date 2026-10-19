@@ -352,14 +352,12 @@ impl<'a> ProjectionBuilder<'a> {
             Event::Start(tag) => self.start_tag(&tag, range),
             Event::End(tag) => self.end_tag(&tag, range),
             Event::Text(value) => {
-                // Metadata was projected from its complete source range at
-                // Start, including both delimiters. Parser Text events contain
-                // only its body and would duplicate those editable positions.
-                if self
-                    .open_blocks
-                    .iter()
-                    .any(|block| block.end_tag == EndTag::FrontMatter)
-                {
+                // Metadata and fenced code own their complete source range at
+                // Start, including delimiters. Body events must not project it twice.
+                if self.open_blocks.iter().any(|block| {
+                    block.end_tag == EndTag::FrontMatter
+                        || matches!(block.kind, BlockKind::Code { fenced: true, .. })
+                }) {
                     return;
                 }
                 let kinds = self.current_kinds();
@@ -403,7 +401,15 @@ impl<'a> ProjectionBuilder<'a> {
                 let display_start = self.display_utf16;
                 let rule_line = self.source.get(range.clone()).unwrap_or_default();
                 let marker_end = range.start + rule_line.trim_end_matches(['\r', '\n']).len();
-                self.append_visible("─", range.start..marker_end, vec![InlineKind::Text]);
+                // Keep every delimiter position editable in both idle and active
+                // views. Collapsing the source to one glyph made reveal change
+                // the row geometry and turn the delimiter into an atomic token.
+                self.append_literal(
+                    &rule_line[..marker_end - range.start],
+                    range.start..marker_end,
+                    vec![InlineKind::Text],
+                    '\n',
+                );
                 self.hidden(&range);
                 self.blocks.push(ProjectionBlock {
                     kind: BlockKind::ThematicBreak,
@@ -440,6 +446,11 @@ impl<'a> ProjectionBuilder<'a> {
                 let (fenced, language) = code_block_info(kind);
                 self.open_block(BlockKind::Code { fenced, language }, EndTag::Code, &range);
                 self.inline_stack.push(InlineKind::Code);
+                if fenced {
+                    let raw = self.source.get(range.clone()).unwrap_or_default();
+                    let visible = raw.replace("\r\n", "\n").replace('\r', "\n");
+                    self.append_literal(&visible, range, vec![InlineKind::Code], '\n');
+                }
             }
             Tag::MetadataBlock(_) => {
                 self.open_block(BlockKind::FrontMatter, EndTag::FrontMatter, &range);
@@ -1476,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn thematic_breaks_keep_one_visible_atomic_source_mapped_marker() {
+    fn thematic_breaks_keep_every_raw_source_mapped_delimiter() {
         for syntax in ["***", "---", "___"] {
             let source = format!("before\n\n{syntax}\n\nafter");
             let projection = DisplayProjection::parse(&source);
@@ -1486,18 +1497,98 @@ mod tests {
                 .find(|block| matches!(block.kind, BlockKind::ThematicBreak))
                 .expect("thematic-break block");
             assert!(source[block.source.clone()].starts_with(syntax));
-            let text_before = projection.text[..]
-                .split_once('─')
-                .map(|(before, _)| before.encode_utf16().count())
-                .expect("visible thematic-break marker");
-            assert_eq!(block.display_utf16, text_before..text_before + 1);
-            assert_eq!(projection.text.matches('─').count(), 1);
-            let run = projection
-                .runs
-                .iter()
-                .find(|run| run.display_utf16 == block.display_utf16)
-                .expect("source-backed marker run");
-            assert_eq!(&source[run.source.clone()], syntax);
+            let display: Vec<_> = projection.text.encode_utf16().collect();
+            assert_eq!(
+                String::from_utf16_lossy(&display[block.display_utf16.clone()]),
+                syntax
+            );
+            for byte in block.source.start..block.source.start + syntax.len() {
+                let position = projection
+                    .utf16_at_source_byte(byte, BoundaryAffinity::After)
+                    .unwrap();
+                assert_eq!(
+                    projection.source_byte_at_utf16(position, BoundaryAffinity::After),
+                    Some(byte)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_code_exposes_delimiters_info_blank_lines_and_literal_scalar_mapping_once() {
+        for eol in ["\n", "\r\n"] {
+            for (open, close) in [("```", "```"), ("````", "`````"), ("~~~", "~~~~")] {
+                for info in ["", "rust", "unknown-language extra"] {
+                    for body in ["", "\n\n", "# raw **text** | ---\na\\*b &amp; 👩‍💻 é\n\n"]
+                    {
+                        for closed in [false, true] {
+                            let raw = format!(
+                                "{open}{info}{eol}{}{}",
+                                body.replace('\n', eol),
+                                if closed {
+                                    format!("{close}{eol}")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            let source = if closed {
+                                format!("{raw}{eol}# after")
+                            } else {
+                                raw.clone()
+                            };
+                            let projection = DisplayProjection::parse(&source);
+                            let block = projection
+                                .blocks
+                                .iter()
+                                .find(|block| {
+                                    matches!(block.kind, BlockKind::Code { fenced: true, .. })
+                                })
+                                .unwrap();
+                            let display: Vec<_> = projection.text.encode_utf16().collect();
+                            assert_eq!(
+                                String::from_utf16_lossy(&display[block.display_utf16.clone()]),
+                                source[block.source.clone()].replace("\r\n", "\n"),
+                                "{source:?}"
+                            );
+                            assert!(
+                                projection.blocks.iter().all(|other| other == block
+                                    || other.source.start >= block.source.end)
+                            );
+                            for (byte, _) in source[block.source.clone()].char_indices() {
+                                let byte = block.source.start + byte;
+                                if byte > 0
+                                    && source.as_bytes()[byte] == b'\n'
+                                    && source.as_bytes()[byte - 1] == b'\r'
+                                {
+                                    continue;
+                                }
+                                let expected =
+                                    source[..byte].replace("\r\n", "\n").encode_utf16().count();
+                                for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After]
+                                {
+                                    assert_eq!(
+                                        projection.utf16_at_source_byte(byte, affinity),
+                                        Some(expected),
+                                        "{source:?} byte={byte}"
+                                    );
+                                    assert_eq!(
+                                        projection.source_byte_at_utf16(expected, affinity),
+                                        Some(byte),
+                                        "{source:?} byte={byte}"
+                                    );
+                                }
+                            }
+                            assert!(
+                                projection
+                                    .runs
+                                    .iter()
+                                    .filter(|run| run.source.start < block.source.end)
+                                    .all(|run| run.kinds == [InlineKind::Code])
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1506,6 +1597,7 @@ mod tests {
         let source = concat!(
             "---\ntitle: ---\n---\n\n",
             "```md\n---\n***\n```\n\n",
+            "Setext\n---\n\n",
             "`---` and \\***\n\n",
             "| A | B |\n| --- | --- |\n| x --- y | `---` |\n",
         );
@@ -1531,6 +1623,12 @@ mod tests {
         assert!(projection.text.contains("title: ---"));
         assert!(projection.text.contains("---\n***"));
         assert!(projection.text.contains("x --- y"));
+        assert!(
+            projection
+                .blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Heading { level: 2 })
+        );
     }
 
     #[test]

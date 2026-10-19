@@ -33,6 +33,9 @@ pub(super) struct MenuPaint {
     background: HBRUSH,
     menus: Vec<(HMENU, HBRUSH)>,
     entries: Vec<Entry>,
+    help: Vec<(usize, Vec<u16>)>,
+    tooltip: HWND,
+    styled: bool,
 }
 impl MenuPaint {
     fn px(&self, dip: f32) -> i32 {
@@ -48,6 +51,9 @@ impl MenuPaint {
 impl Drop for MenuPaint {
     fn drop(&mut self) {
         unsafe {
+            if self.tooltip != HWND::default() {
+                let _ = DestroyWindow(self.tooltip);
+            }
             let _ = DeleteObject(self.background.into());
         }
     }
@@ -67,9 +73,19 @@ impl<'a> MenuScope<'a> {
         tokens: shell::Tokens,
         scale: f32,
     ) -> Option<Self> {
+        unsafe { Self::with_help(state, owner, menu, tokens, scale, &[]) }
+    }
+    unsafe fn with_help(
+        state: &'a WindowState,
+        owner: HWND,
+        menu: HMENU,
+        tokens: shell::Tokens,
+        scale: f32,
+        help: &[(usize, String)],
+    ) -> Option<Self> {
         unsafe {
-            if tokens.high_contrast
-                || high_contrast()
+            let styled = !tokens.high_contrast && !high_contrast();
+            if (!styled && help.is_empty())
                 || !scale.is_finite()
                 || scale <= 0.
                 || GetWindowLongPtrW(owner, GWLP_USERDATA) != state as *const _ as isize
@@ -77,7 +93,9 @@ impl<'a> MenuScope<'a> {
             {
                 return None;
             }
-            let font = control_style::UiFont::new((96. * scale).round() as u32, 14.).ok()?;
+            let font =
+                control_style::UiFont::new((96. * scale).round() as u32, shell::UI_FONT_SIZE)
+                    .ok()?;
             let background = CreateSolidBrush(shell::rgb(tokens.panel));
             if background == HBRUSH::default() {
                 return None;
@@ -90,6 +108,9 @@ impl<'a> MenuScope<'a> {
                 background,
                 menus: Vec::new(),
                 entries: Vec::new(),
+                help: help.iter().map(|(id, text)| (*id, wide(text))).collect(),
+                tooltip: HWND::default(),
+                styled,
             };
             collect(&mut paint, menu)?;
             if state
@@ -101,13 +122,46 @@ impl<'a> MenuScope<'a> {
                 return None;
             }
             measure(&mut paint);
+            if !paint.help.is_empty() {
+                paint.tooltip = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    TOOLTIPS_CLASSW,
+                    None,
+                    WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    Some(owner),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_default();
+                if paint.tooltip != HWND::default() {
+                    let _ = control_style::inherit_font(paint.tooltip, owner);
+                    let mut tool = help_tool(owner, PWSTR(paint.help[0].1.as_mut_ptr()));
+                    shell::send(
+                        paint.tooltip,
+                        TTM_ADDTOOLW,
+                        WPARAM(0),
+                        LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+                    );
+                    shell::send(
+                        paint.tooltip,
+                        TTM_SETMAXTIPWIDTH,
+                        WPARAM(0),
+                        LPARAM((360. * scale) as isize),
+                    );
+                }
+            }
             // No entries are added after this point: their addresses are stable
             // opaque keys throughout the tracking scope, including callbacks.
             let scope = Self {
                 state,
                 paint: Rc::new(paint),
             };
-            for (menu, _) in &scope.paint.menus {
+            for (menu, _) in scope.paint.menus.iter().filter(|_| scope.paint.styled) {
                 let info = MENUINFO {
                     cbSize: std::mem::size_of::<MENUINFO>() as u32,
                     fMask: MIM_BACKGROUND,
@@ -118,7 +172,7 @@ impl<'a> MenuScope<'a> {
                     return None;
                 }
             }
-            for entry in &scope.paint.entries {
+            for entry in scope.paint.entries.iter().filter(|_| scope.paint.styled) {
                 let item = MENUITEMINFOW {
                     cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
                     fMask: MIIM_FTYPE | MIIM_DATA,
@@ -248,7 +302,11 @@ unsafe fn measure(paint: &mut MenuPaint) {
             entry.width = (label_width + rect.right - rect.left
                 + ((if entry.shortcut.is_empty() { 60. } else { 88. }) * scale).round() as i32)
                 .max(1) as u32;
-            entry.height = ((if entry.separator() { 9. } else { 28. }) * scale)
+            entry.height = ((if entry.separator() {
+                7.
+            } else {
+                shell::UI_ROW_HEIGHT
+            }) * scale)
                 .round()
                 .max(1.) as u32;
         }
@@ -295,6 +353,39 @@ pub(super) unsafe fn track_popup(
     }
 }
 
+fn help_tool(owner: HWND, text: PWSTR) -> TTTOOLINFOW {
+    TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_TRACK | TTF_ABSOLUTE,
+        hwnd: owner,
+        uId: 1,
+        lpszText: text,
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn track_popup_help(
+    owner: HWND,
+    menu: HMENU,
+    flags: TRACK_POPUP_MENU_FLAGS,
+    x: i32,
+    y: i32,
+    tokens: shell::Tokens,
+    scale: f32,
+    help: &[(usize, String)],
+) -> windows::core::BOOL {
+    unsafe {
+        let pointer = GetWindowLongPtrW(owner, GWLP_USERDATA) as *const WindowState;
+        let _scope = if pointer.is_null() {
+            None
+        } else {
+            MenuScope::with_help(&*pointer, owner, menu, tokens, scale, help)
+        };
+        TrackPopupMenu(menu, flags, x, y, None, owner, None)
+    }
+}
+
 pub(super) unsafe fn window_message(
     state: &WindowState,
     owner: HWND,
@@ -304,7 +395,7 @@ pub(super) unsafe fn window_message(
 ) -> Option<LRESULT> {
     if !matches!(
         msg,
-        WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR
+        WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR | WM_MENUSELECT
     ) {
         return None;
     }
@@ -313,7 +404,63 @@ pub(super) unsafe fn window_message(
     for paint in active.iter().rev().filter(|paint| paint.owner == owner) {
         unsafe {
             match msg {
-                WM_INITMENUPOPUP if paint.owns(HMENU(wp.0 as *mut _)) => return Some(LRESULT(0)),
+                WM_MENUSELECT if paint.tooltip != HWND::default() => {
+                    let mut tool = help_tool(owner, PWSTR::null());
+                    shell::send(
+                        paint.tooltip,
+                        TTM_TRACKACTIVATE,
+                        WPARAM(0),
+                        LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+                    );
+                    let id = wp.0 & 0xffff;
+                    let flags = (wp.0 >> 16) as u32;
+                    if flags & (MF_POPUP.0 | MF_SEPARATOR.0) == 0
+                        && let Some((_, text)) = paint.help.iter().find(|(key, _)| *key == id)
+                    {
+                        tool.lpszText = PWSTR(text.as_ptr() as *mut u16);
+                        let mut item = RECT::default();
+                        if GetMenuItemRect(
+                            Some(owner),
+                            HMENU(lp.0 as *mut _),
+                            paint
+                                .entries
+                                .iter()
+                                .find(|entry| {
+                                    entry.menu.0 as isize == lp.0
+                                        && entry.original.wID as usize == id
+                                })
+                                .map_or(0, |entry| entry.position),
+                            &mut item,
+                        )
+                        .is_ok()
+                        {
+                            shell::send(
+                                paint.tooltip,
+                                TTM_UPDATETIPTEXTW,
+                                WPARAM(0),
+                                LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+                            );
+                            let x = item.left;
+                            let y = item.bottom + paint.px(3.);
+                            shell::send(
+                                paint.tooltip,
+                                TTM_TRACKPOSITION,
+                                WPARAM(0),
+                                LPARAM(((y as u32 & 0xffff) << 16 | (x as u32 & 0xffff)) as isize),
+                            );
+                            shell::send(
+                                paint.tooltip,
+                                TTM_TRACKACTIVATE,
+                                WPARAM(1),
+                                LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+                            );
+                        }
+                    }
+                    // Win32 retains menu selection/accessibility processing.
+                }
+                WM_INITMENUPOPUP if paint.styled && paint.owns(HMENU(wp.0 as *mut _)) => {
+                    return Some(LRESULT(0));
+                }
                 WM_MEASUREITEM if wp.0 == 0 && lp.0 != 0 => {
                     let item = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
                     if item.CtlType == ODT_MENU
@@ -334,7 +481,7 @@ pub(super) unsafe fn window_message(
                         return Some(LRESULT(1));
                     }
                 }
-                WM_MENUCHAR if paint.owns(HMENU(lp.0 as *mut _)) => {
+                WM_MENUCHAR if paint.styled && paint.owns(HMENU(lp.0 as *mut _)) => {
                     return Some(menu_char(paint, HMENU(lp.0 as *mut _), wp.0 as u16));
                 }
                 _ => {}

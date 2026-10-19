@@ -46,6 +46,7 @@ const UPLOAD: usize = 6023;
 const STORAGE_CONFIG: usize = 6024;
 const CONFLICTS: usize = 6025;
 const INITIALIZE: usize = 6026;
+const MORE: usize = 6027;
 const GIT_PANE_HOST: usize = 6508;
 const SUMMARY: usize = 6500;
 const FILES: usize = 6501;
@@ -56,6 +57,7 @@ const INPUT_LABEL: usize = 6505;
 const EXECUTE: usize = 6506;
 const INPUT_CANCEL: usize = 6507;
 pub(super) const COMMANDS: &[(usize, &str, Option<&str>)] = &[
+    (MORE, "Git操作…", None),
     (REFRESH, "Git: 状態を更新", None),
     (INITIALIZE, "Git: ローカルGitを準備 / 再試行…", None),
     (TRUST, "Workspaceをこの端末で信頼…", None),
@@ -556,6 +558,7 @@ impl App {
                 (STAGE, "Stage"),
                 (UNSTAGE, "Unstage"),
                 (CANCEL, "取消"),
+                (MORE, "その他のGit操作"),
             ]
             .into_iter()
             .map(|(id, label)| {
@@ -648,6 +651,12 @@ impl App {
         };
         unsafe {
             let show = body.is_some() && self.shell.enabled;
+            let compact_toolbar = body.is_some_and(|r| r.width - 10. < 120.);
+            let primary_toolbar = if self.git_ui.worker.is_some() {
+                CANCEL
+            } else {
+                REFRESH
+            };
             let prompting = self.git_ui.prompt.is_some();
             let remote_needed = self
                 .git_ui
@@ -667,8 +676,12 @@ impl App {
             for (h, visible) in all {
                 let _ = shell::show_child_control(h, visible);
             }
-            for (_, h) in &c.buttons {
-                let _ = shell::show_child_control(*h, show && self.git_ui.prompt.is_none());
+            for (id, h) in &c.buttons {
+                let _ = shell::show_child_control(
+                    *h,
+                    show && self.git_ui.prompt.is_none()
+                        && (!compact_toolbar || *id == primary_toolbar || *id == MORE),
+                );
             }
             if !show {
                 return;
@@ -690,18 +703,28 @@ impl App {
                     x,
                     y,
                     width,
-                    height: 64.,
+                    height: 40.,
                 },
                 self.dpi,
             );
             for (i, (id, h)) in c.buttons.iter().enumerate() {
+                let column = if compact_toolbar {
+                    usize::from(*id == MORE)
+                } else {
+                    i
+                };
+                let count = if compact_toolbar {
+                    2.
+                } else {
+                    c.buttons.len() as f32
+                };
                 position(
                     *h,
                     Rect {
-                        x: x + (i % 2) as f32 * (width / 2.),
-                        y: y + 66. + (i / 2) as f32 * 25.,
-                        width: width / 2. - 3.,
-                        height: 23.,
+                        x: x + column as f32 * (width / count).min(28.),
+                        y: y + 42.,
+                        width: (width / count).min(28.) - 2.,
+                        height: shell::UI_ROW_HEIGHT,
                     },
                     self.dpi,
                 );
@@ -719,9 +742,9 @@ impl App {
                 );
             }
             let content_y = y + if self.git_ui.prompt.is_some() {
-                66.
+                42.
             } else {
-                118.
+                68.
             };
             let remaining = (r.y + r.height - content_y - 4.).max(1.);
             if self.git_ui.prompt.is_some() {
@@ -1647,6 +1670,12 @@ impl App {
         if !COMMANDS.iter().any(|c| c.0 == id) {
             return false;
         }
+        if id == MORE {
+            unsafe {
+                self.panel_menu(PanelId::Git);
+            }
+            return true;
+        }
         self.show_panel(PanelId::Git);
         self.git_sync();
         if !self.git_enabled(id) {
@@ -1782,6 +1811,9 @@ impl App {
     pub(super) fn git_enabled(&self, id: usize) -> bool {
         if !COMMANDS.iter().any(|c| c.0 == id) {
             return false;
+        }
+        if id == MORE {
+            return !self.feature_ime_active();
         }
         if id == CANCEL {
             return self.git_ui.worker.is_some();
@@ -2155,7 +2187,7 @@ fn is_git_control_id(id: usize) -> bool {
 fn is_git_owner_draw_id(id: usize) -> bool {
     matches!(
         id,
-        REFRESH | STAGE | UNSTAGE | CANCEL | EXECUTE | INPUT_CANCEL
+        REFRESH | STAGE | UNSTAGE | CANCEL | MORE | EXECUTE | INPUT_CANCEL
     )
 }
 unsafe fn git_host_child(host: HWND, child: HWND, id: usize) -> bool {
@@ -3181,10 +3213,11 @@ mod tests {
             app.search_ui = super::super::SearchPane::pending_mutation_fixture(restoring);
             assert!(app.search_busy());
             for &(id, _, _) in COMMANDS {
-                if id != CANCEL {
+                if id != CANCEL && id != MORE {
                     assert!(!app.git_enabled(id), "{id}");
                 }
             }
+            assert!(app.git_enabled(MORE));
             assert!(!app.git_start(Task::Refresh));
             assert!(app.git_ui.worker.is_none());
             let (_, receiver) = mpsc::channel();

@@ -12,7 +12,7 @@ use std::{
 };
 
 const SCHEMA_VERSION: &str = "1";
-const COLOR_NAMES: &[&str] = &[
+pub const COLOR_NAMES: &[&str] = &[
     "background",
     "foreground",
     "link",
@@ -21,7 +21,7 @@ const COLOR_NAMES: &[&str] = &[
     "code_background",
     "table_background",
 ];
-const COMMAND_NAMES: &[&str] = &[
+pub const COMMAND_NAMES: &[&str] = &[
     "file.new",
     "file.open",
     "file.save",

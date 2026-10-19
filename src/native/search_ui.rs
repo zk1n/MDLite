@@ -569,9 +569,7 @@ impl SearchPane {
             if !self.initialized {
                 return;
             }
-            let area = app
-                .feature_panel_rect(PanelId::Explorer)
-                .unwrap_or_default();
+            let area = app.feature_panel_rect(PanelId::Search).unwrap_or_default();
             let visible = app.search_pane_active() && area.width > 0.0 && area.height > 0.0;
             let dpi = app.dpi.max(0.1);
             let position = |hwnd: HWND, r: Rect| {
@@ -1490,6 +1488,12 @@ impl SearchPane {
         {
             return self.stale_result("文書が検索後に変更されました — 再検索してください");
         }
+        if tab_index != app.active
+            || app.doc().selection().anchor != range.start
+            || app.doc().selection().head != range.end
+        {
+            app.record_navigation();
+        }
         if tab_index != app.active {
             app.switch_tab(tab_index);
         }
@@ -2003,10 +2007,10 @@ impl SearchPane {
     }
 
     fn click(&mut self, app: &App, panel: PanelId, x: f32, y: f32) -> bool {
-        if panel != PanelId::Explorer || !app.search_pane_active() {
+        if panel != PanelId::Search || !app.search_pane_active() {
             return false;
         }
-        app.feature_panel_rect(PanelId::Explorer)
+        app.feature_panel_rect(PanelId::Search)
             .is_some_and(|area| area.contains(x, y))
     }
 
@@ -3100,6 +3104,14 @@ impl App {
         }
     }
 
+    pub(super) fn focus_search_pane_input(&mut self) {
+        let pane = std::mem::take(&mut self.search_ui);
+        unsafe {
+            pane.focus_search_input();
+        }
+        self.search_ui = pane;
+    }
+
     pub(super) fn search_sync(&mut self) {
         let pane = std::mem::take(&mut self.search_ui);
         pane.position_controls(self);
@@ -3316,6 +3328,12 @@ mod tests {
                 assert!(app.search_control(CONTROL_RESULTS, LBN_SELCHANGE as u16));
                 assert_eq!(shell::text_of(query), "preserved query");
             }
+            app.search_ui.scope = Scope::Document;
+            app.search_ui.journal_mode = true;
+            assert!(app.shell_command(111));
+            assert_eq!(app.search_ui.scope, Scope::Document);
+            assert!(app.search_ui.journal_mode);
+            assert_eq!(shell::text_of(query), "preserved query");
             app.set_search_pane_active(true);
             app.search_ui.scope = Scope::Workspace;
             app.search_ui.details_open = true;

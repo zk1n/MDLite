@@ -286,6 +286,126 @@ pub fn preview_profile_path(
     })
 }
 
+/// Match only destinations whose path is fully determined by literal/date tokens.
+/// User-input tokens do not establish Daily identity and remain visible.
+pub fn is_daily_profile_destination(profile: &ProfileDefinition, relative: &Path) -> bool {
+    if matches_daily_destination(profile, relative) {
+        return true;
+    }
+    if profile.collision != ProfileCollision::Sequence {
+        return false;
+    }
+    let Some(stem) = relative.file_stem().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let Some((base, suffix)) = stem.rsplit_once('_') else {
+        return false;
+    };
+    let Ok(sequence) = suffix.parse::<usize>() else {
+        return false;
+    };
+    if !(1..=9999).contains(&sequence) || suffix != format!("{sequence:02}") {
+        return false;
+    }
+    let filename = if let Some(extension) = relative.extension().and_then(OsStr::to_str) {
+        format!("{base}.{extension}")
+    } else {
+        base.to_owned()
+    };
+    matches_daily_destination(profile, &relative.with_file_name(filename))
+}
+
+fn matches_daily_destination(profile: &ProfileDefinition, relative: &Path) -> bool {
+    if profile.id != "daily" || validate_profile(profile).is_err() {
+        return false;
+    }
+    let pattern = profile
+        .directory
+        .join(&profile.filename)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let candidate = relative.to_string_lossy().replace('\\', "/");
+    let mut remaining = candidate.as_str();
+    let mut offset = 0;
+    let mut values = [None; 5];
+    while let Some(open) = pattern[offset..].find("{{").map(|i| offset + i) {
+        let literal = &pattern[offset..open];
+        if !remaining
+            .get(..literal.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(literal))
+        {
+            return false;
+        }
+        remaining = &remaining[literal.len()..];
+        let Some(close) = pattern[open..].find("}}").map(|i| open + i + 2) else {
+            return false;
+        };
+        let token = &pattern[open..close];
+        let Some(format) = token
+            .strip_prefix("{{date:")
+            .and_then(|s| s.strip_suffix("}}"))
+        else {
+            return false;
+        };
+        let mut at = 0;
+        let mut format_remaining = format;
+        while !format_remaining.is_empty() {
+            if let Some((field, key, width)) = [
+                (0, "yyyy", 4),
+                (1, "MM", 2),
+                (2, "dd", 2),
+                (3, "HH", 2),
+                (4, "mm", 2),
+            ]
+            .into_iter()
+            .find(|(_, key, _)| format_remaining.starts_with(key))
+            {
+                let Some(raw) = remaining.get(at..at + width) else {
+                    return false;
+                };
+                if !raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return false;
+                }
+                let Ok(value) = raw.parse::<i32>() else {
+                    return false;
+                };
+                if values[field].is_some_and(|old| old != value) {
+                    return false;
+                }
+                values[field] = Some(value);
+                at += width;
+                format_remaining = &format_remaining[key.len()..];
+            } else {
+                let separator = &format_remaining[..1];
+                if remaining.get(at..at + 1) != Some(separator) {
+                    return false;
+                }
+                at += 1;
+                format_remaining = &format_remaining[1..];
+            }
+        }
+        remaining = &remaining[at..];
+        offset = close;
+    }
+    let Some(date) = CalendarDate::new(
+        values[0].unwrap_or(2000),
+        values[1].unwrap_or(1),
+        values[2].unwrap_or(1),
+    ) else {
+        return false;
+    };
+    let Ok(time) = ProfileDateTime::new(
+        date,
+        values[3].unwrap_or(0) as u8,
+        values[4].unwrap_or(0) as u8,
+    ) else {
+        return false;
+    };
+    // Re-render to check repeated fields, supported tokens, and path spelling together.
+    render_fragment(&pattern, profile, time, &ProfileValues::new(), false)
+        .is_ok_and(|rendered| rendered.text.eq_ignore_ascii_case(&candidate))
+}
+
 pub fn render_profile_body(
     profile: &ProfileDefinition,
     template: &str,
@@ -1446,6 +1566,47 @@ mod tests {
 
     fn sample_time() -> ProfileDateTime {
         ProfileDateTime::new(CalendarDate::new(2026, 3, 4).unwrap(), 9, 7).unwrap()
+    }
+
+    #[test]
+    fn daily_destination_matches_date_grammar_without_filename_guessing() {
+        let mut daily = default_profiles().remove(0);
+        for path in [
+            "Dairy/2001/200102/20010203.md",
+            "Dairy/2024/202402/20240229.md",
+        ] {
+            assert!(is_daily_profile_destination(&daily, Path::new(path)));
+        }
+        for path in [
+            "Meeting/2001/200102/20010203.md",
+            "20010203.md",
+            "Dairy/2001/200103/20010203.md",
+            "Dairy/2023/202302/20230229.md",
+        ] {
+            assert!(!is_daily_profile_destination(&daily, Path::new(path)));
+        }
+        daily.directory = "Custom/{{date:yyyy}}".into();
+        daily.filename = "{{date:yyyy-MM-dd HH-mm}}.md".into();
+        assert!(is_daily_profile_destination(
+            &daily,
+            Path::new("Custom/2001/2001-02-03 09-07.md")
+        ));
+        daily.collision = ProfileCollision::Sequence;
+        assert!(is_daily_profile_destination(
+            &daily,
+            Path::new("Custom/2001/2001-02-03 09-07_02.md")
+        ));
+        daily.inputs.push(ProfileInputDefinition {
+            id: "title".into(),
+            label: "Title".into(),
+            default_value: "x".into(),
+            required: true,
+        });
+        daily.filename = "{{title}}.md".into();
+        assert!(!is_daily_profile_destination(
+            &daily,
+            Path::new("Custom/2001/x.md")
+        ));
     }
 
     #[test]

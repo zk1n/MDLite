@@ -3,10 +3,10 @@
 //! This module owns pane state and child controls. It never owns document text
 //! and all source edits go through Document transactions on the UI thread.
 
-use super::{App, shell};
+use super::{App, explorer_icons::ExplorerPaint, shell};
 use mdlite::{
     calendar::{
-        CalendarDate, CalendarInteraction, CalendarListRequest, CalendarListResult,
+        CalendarCell, CalendarDate, CalendarInteraction, CalendarListRequest, CalendarListResult,
         CalendarListState, CalendarMonthGrid, HolidayCalendar, HolidayStatus, daily_file_marker,
         decorate_month, month_grid,
     },
@@ -24,10 +24,11 @@ use mdlite::{
     workspace_search::{QuickOpen, quick_open},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     fs,
     path::{Component, Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -66,12 +67,12 @@ const QUERY_EDIT: usize = 4700;
 const PROMPT_EDIT: usize = 4701;
 const PROFILE_FIELD_BASE: usize = 4710;
 const TEMPLATE_EDIT: usize = 4720;
-const EXPLORER_LIST: usize = 4690;
+pub(super) const EXPLORER_LIST: usize = 4690;
 const QUICK_OPEN_LIST: usize = 4691;
 const CONTROL_BASE: usize = 4800;
 const BUTTON_OWNERDRAW: u32 = 0x0000000B;
 const BUTTON_NOTIFY: u32 = 0x00000400;
-const CALENDAR_GRID_TOP: f32 = 98.0;
+const CALENDAR_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_HEIGHT: f32 = 273.0;
 const CALENDAR_MIN_BODY_HEIGHT: f32 = 180.0;
@@ -247,8 +248,16 @@ struct CalendarPane {
     holiday_loaded: bool,
     daily_markers: BTreeSet<CalendarDate>,
     selected_file: usize,
+    file_focused: bool,
+    click_target: Option<CalendarClickTarget>,
     scroll: usize,
     current_month: Option<CalendarMonthGrid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CalendarClickTarget {
+    Date(CalendarDate),
+    File(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -317,6 +326,39 @@ fn calendar_day_label(day: i32, daily_file: bool, holiday: bool) -> String {
         if daily_file { "•" } else { "" },
         if holiday { "祝" } else { "" }
     )
+}
+
+fn calendar_cell_color(tokens: shell::Tokens, cell: &CalendarCell) -> super::D2D1_COLOR_F {
+    if tokens.high_contrast && (cell.marks.selected || cell.marks.focused) {
+        let rgb = unsafe {
+            windows::Win32::Graphics::Gdi::GetSysColor(
+                windows::Win32::Graphics::Gdi::COLOR_HIGHLIGHTTEXT,
+            )
+        };
+        return super::color(
+            (rgb & 255) as f32 / 255.,
+            ((rgb >> 8) & 255) as f32 / 255.,
+            ((rgb >> 16) & 255) as f32 / 255.,
+        );
+    }
+    let ink = if cell.marks.holiday || cell.marks.sunday {
+        tokens.weekend_red
+    } else if cell.marks.saturday {
+        tokens.weekend_blue
+    } else {
+        tokens.foreground
+    };
+    if cell.in_displayed_month || cell.marks.selected || cell.marks.focused || tokens.high_contrast
+    {
+        ink
+    } else {
+        // Dim adjacent months without replacing the weekend hue with grey.
+        super::color(
+            ink.r * 0.7 + tokens.panel.r * 0.3,
+            ink.g * 0.7 + tokens.panel.g * 0.3,
+            ink.b * 0.7 + tokens.panel.b * 0.3,
+        )
+    }
 }
 
 fn calendar_day_font_size(label: &str, width: f32) -> f32 {
@@ -451,6 +493,8 @@ impl Default for CalendarPane {
             holiday_loaded: false,
             daily_markers: BTreeSet::new(),
             selected_file: 0,
+            file_focused: false,
+            click_target: None,
             scroll: 0,
             current_month: None,
         }
@@ -513,12 +557,25 @@ impl Default for FeatureControls {
     }
 }
 
+pub(super) type ExplorerPaintSlot = Rc<RefCell<Option<Rc<ExplorerPaint>>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExplorerPaintKey {
+    hwnd: HWND,
+    font: isize,
+    dpi: u32,
+    colors: [u32; 3],
+    icons: u64,
+}
+
 pub(super) struct FeaturePanes {
     initialized: bool,
     workspace: Option<Workspace>,
     workspace_identity: Option<WorkspaceIdentity>,
     explorer: ExplorerState,
     explorer_list_dirty: bool,
+    explorer_paint: ExplorerPaintSlot,
+    explorer_paint_key: Option<ExplorerPaintKey>,
     quick_open: QuickOpenState,
     outline: Option<Outline>,
     outline_selected: usize,
@@ -551,6 +608,8 @@ impl Default for FeaturePanes {
             workspace_identity: None,
             explorer: ExplorerState::default(),
             explorer_list_dirty: true,
+            explorer_paint: Rc::new(RefCell::new(None)),
+            explorer_paint_key: None,
             quick_open: QuickOpenState::default(),
             outline: None,
             outline_selected: 0,
@@ -579,6 +638,8 @@ impl Default for FeaturePanes {
 
 impl Drop for FeaturePanes {
     fn drop(&mut self) {
+        let retired = self.explorer_paint.replace(None);
+        drop(retired);
         if let Some(worker) = self.quick_open.worker.take() {
             worker.cancel.store(true, Ordering::Release);
         }
@@ -637,6 +698,9 @@ const PROFILE_BUTTONS: [usize; 6] = [4080, 4081, 4082, 4083, 4084, 4088];
 const FORM_BUTTONS: [usize; 3] = [4085, 4086, 4087];
 
 impl FeaturePanes {
+    pub(super) fn explorer_paint_handle(&self) -> ExplorerPaintSlot {
+        Rc::clone(&self.explorer_paint)
+    }
     pub(super) unsafe fn owner_draw_button(
         &self,
         owner: HWND,
@@ -788,6 +852,7 @@ impl FeaturePanes {
             )
             .unwrap_or_default();
             if self.controls.tooltip != HWND::default() {
+                let _ = super::control_style::inherit_font(self.controls.tooltip, owner);
                 for (_, command, hwnd, _) in &self.controls.buttons {
                     let Some((_, label, _)) = COMMANDS.iter().find(|(id, _, _)| id == command)
                     else {
@@ -1313,6 +1378,9 @@ impl FeaturePanes {
                 self.profiles.effective = default_profiles();
             }
         }
+        self.calendar.list_generation = self.calendar.list_generation.wrapping_add(1);
+        self.calendar.listing = None;
+        self.calendar.click_target = None;
         self.profiles.selected = self
             .profiles
             .selected
@@ -1351,6 +1419,7 @@ impl FeaturePanes {
     }
 
     fn start_calendar_list(&mut self, date: CalendarDate) {
+        self.calendar.file_focused = false;
         self.calendar.scroll = 0;
         self.calendar.selected_file = 0;
         self.calendar.listing = None;
@@ -1363,7 +1432,7 @@ impl FeaturePanes {
             self.calendar.retired.push(worker.handle);
         }
         self.calendar.list_generation = self.calendar.list_generation.wrapping_add(1);
-        let request =
+        let mut request =
             match CalendarListRequest::new(&workspace, self.calendar.list_generation, date) {
                 Ok(request) => request,
                 Err(error) => {
@@ -1371,6 +1440,12 @@ impl FeaturePanes {
                     return;
                 }
             };
+        request.daily_profile = self
+            .profiles
+            .effective
+            .iter()
+            .find(|profile| profile.id == "daily")
+            .cloned();
         self.calendar.request = Some(request.clone());
         self.calendar.listing = Some(request.loading_result());
         let worker_request = request.clone();
@@ -1479,7 +1554,18 @@ impl FeaturePanes {
                         workspace,
                         self.calendar.list_generation,
                         worker.request.date,
-                    ) && self.calendar.interaction.selected() == Some(worker.request.date)
+                    ) && worker.request.daily_profile.as_ref()
+                        == self
+                            .profiles
+                            .effective
+                            .iter()
+                            .find(|profile| profile.id == "daily")
+                        && result.matches(
+                            workspace,
+                            self.calendar.list_generation,
+                            worker.request.date,
+                        )
+                        && self.calendar.interaction.selected() == Some(worker.request.date)
                         && self.workspace_identity.as_ref().is_some_and(|identity| {
                             identity.same_workspace(&result.workspace_identity)
                         })
@@ -1524,10 +1610,7 @@ impl FeaturePanes {
                 continue;
             };
             match panel {
-                PanelId::Explorer if !app.search_pane_active() => {
-                    self.draw_explorer(app, target, body, &foreground)?
-                }
-                PanelId::Explorer => {}
+                PanelId::Explorer => self.draw_explorer(app, target, body, &foreground)?,
                 PanelId::Calendar => self.draw_calendar(
                     app,
                     target,
@@ -1541,7 +1624,7 @@ impl FeaturePanes {
                 PanelId::Outline => {
                     self.draw_outline(app, target, body, &foreground, &muted, &selected, &border)?
                 }
-                PanelId::Git => {}
+                PanelId::Git | PanelId::Search => {}
             }
         }
         if self.quick_open.open {
@@ -1797,7 +1880,7 @@ impl FeaturePanes {
             body.x + 8.,
             body.y + (layout.grid_top - 41.0).max(0.0),
             body.width - 16.,
-            14.,
+            shell::UI_FONT_SIZE,
             foreground,
         )?;
         let Some(grid) = self.calendar.current_month else {
@@ -1825,6 +1908,9 @@ impl FeaturePanes {
         );
         let width = ((body.width - 10.) / 7.).max(1.0);
         let x0 = body.x + 5.;
+        let tokens = app.shell.tokens;
+        let red = unsafe { target.CreateSolidColorBrush(&tokens.weekend_red, None)? };
+        let blue = unsafe { target.CreateSolidColorBrush(&tokens.weekend_blue, None)? };
         for (column, label) in ["日", "月", "火", "水", "木", "金", "土"]
             .iter()
             .enumerate()
@@ -1837,7 +1923,11 @@ impl FeaturePanes {
                 body.y + (layout.grid_top - 18.0).max(0.0),
                 width,
                 11.,
-                muted,
+                match column {
+                    0 => &red,
+                    6 => &blue,
+                    _ => muted,
+                },
             )?;
         }
         for (index, cell) in cells.iter().enumerate() {
@@ -1870,18 +1960,15 @@ impl FeaturePanes {
             }
             if let Some(date) = cell.date {
                 let label = calendar_day_label(date.day, cell.marks.daily_file, cell.marks.holiday);
-                let brush = if cell.marks.sunday || cell.marks.holiday {
-                    accent
-                } else {
-                    foreground
-                };
+                let ink = calendar_cell_color(tokens, cell);
+                let brush = unsafe { target.CreateSolidColorBrush(&ink, None)? };
                 draw_feature_text_single_line(
                     app,
                     target,
                     &label,
                     bounds.label,
                     calendar_day_font_size(&label, bounds.label.width),
-                    brush,
+                    &brush,
                 )?;
             }
         }
@@ -2022,6 +2109,43 @@ impl FeaturePanes {
         Ok(())
     }
 
+    fn calendar_file_action(&self) -> Option<FeatureAction> {
+        let workspace = self.workspace.as_ref()?;
+        let request = self.calendar.request.as_ref()?;
+        let listing = self.calendar.listing.as_ref()?;
+        if !request.matches(workspace, self.calendar.list_generation, request.date)
+            || self.calendar.interaction.selected() != Some(request.date)
+            || !listing.matches(workspace, request.generation, request.date)
+        {
+            return None;
+        }
+        let file = listing.files.get(self.calendar.selected_file)?;
+        Some(FeatureAction::OpenCalendarFile {
+            request: Box::new(request.clone()),
+            relative_path: file.relative_path.clone(),
+        })
+    }
+
+    fn double_click(
+        &mut self,
+        panel: PanelId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Option<FeatureAction> {
+        let previous = self.calendar.click_target.take();
+        self.click(panel, x, y, width, height);
+        let current = self.calendar.click_target.take();
+        if previous.is_none() || previous != current {
+            return Some(FeatureAction::Refresh);
+        }
+        match current? {
+            CalendarClickTarget::Date(date) => Some(FeatureAction::OpenDaily(date)),
+            CalendarClickTarget::File(_) => self.calendar_file_action(),
+        }
+    }
+
     fn click(
         &mut self,
         panel: PanelId,
@@ -2030,6 +2154,7 @@ impl FeaturePanes {
         panel_width: f32,
         panel_height: f32,
     ) -> Option<FeatureAction> {
+        self.calendar.click_target = None;
         if panel == PanelId::Outline {
             let row_top = y - 8.;
             if row_top < 0. {
@@ -2088,18 +2213,11 @@ impl FeaturePanes {
                     .current_month
                     .and_then(|grid| grid.cells[index])
                 {
-                    if self.profiles.manager_open {
-                        let _ = self.calendar.interaction.set_selection(Some(date));
-                    } else {
-                        let _ = self.calendar.interaction.click_date(date);
-                    }
-                    self.calendar.selected_file = 0;
+                    self.calendar.interaction.click_date(date);
+                    self.calendar.file_focused = false;
                     self.start_calendar_list(date);
-                    return Some(if self.profiles.manager_open {
-                        FeatureAction::Refresh
-                    } else {
-                        FeatureAction::OpenDaily(date)
-                    });
+                    self.calendar.click_target = Some(CalendarClickTarget::Date(date));
+                    return Some(FeatureAction::Refresh);
                 }
                 return None;
             }
@@ -2119,10 +2237,11 @@ impl FeaturePanes {
                     return None;
                 }
                 let file = listing.files.get(index)?;
-                return Some(FeatureAction::OpenCalendarFile {
-                    request: request.clone(),
-                    relative_path: file.relative_path.clone(),
-                });
+                self.calendar.selected_file = index;
+                self.calendar.file_focused = true;
+                self.calendar.click_target =
+                    Some(CalendarClickTarget::File(file.relative_path.clone()));
+                return Some(FeatureAction::Refresh);
             }
         }
         None
@@ -2251,39 +2370,46 @@ impl FeaturePanes {
             return None;
         }
         match active {
-            PanelId::Calendar => match key {
-                KEY_LEFT => {
-                    self.calendar.interaction.move_focus_days(-1);
-                    Some(FeatureAction::Refresh)
+            PanelId::Calendar => {
+                self.calendar.click_target = None;
+                if key != KEY_RETURN {
+                    self.calendar.file_focused = false;
                 }
-                KEY_RIGHT => {
-                    self.calendar.interaction.move_focus_days(1);
-                    Some(FeatureAction::Refresh)
+                match key {
+                    KEY_LEFT => {
+                        self.calendar.interaction.move_focus_days(-1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_RIGHT => {
+                        self.calendar.interaction.move_focus_days(1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_UP => {
+                        self.calendar.interaction.move_focus_days(-7);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_DOWN => {
+                        self.calendar.interaction.move_focus_days(7);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_PAGE_UP => {
+                        self.calendar.interaction.navigate_months(-1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_PAGE_DOWN => {
+                        self.calendar.interaction.navigate_months(1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_RETURN if self.calendar.file_focused => self.calendar_file_action(),
+                    KEY_RETURN => Some(FeatureAction::OpenDaily(
+                        self.calendar
+                            .interaction
+                            .focused()
+                            .unwrap_or(self.calendar.interaction.today()),
+                    )),
+                    _ => None,
                 }
-                KEY_UP => {
-                    self.calendar.interaction.move_focus_days(-7);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_DOWN => {
-                    self.calendar.interaction.move_focus_days(7);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_PAGE_UP => {
-                    self.calendar.interaction.navigate_months(-1);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_PAGE_DOWN => {
-                    self.calendar.interaction.navigate_months(1);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_RETURN => Some(FeatureAction::OpenDaily(
-                    self.calendar
-                        .interaction
-                        .focused()
-                        .unwrap_or(self.calendar.interaction.today()),
-                )),
-                _ => None,
-            },
+            }
             PanelId::Explorer => match key {
                 KEY_UP => {
                     self.explorer.selected = self
@@ -2348,7 +2474,7 @@ impl FeaturePanes {
                 KEY_RETURN => Some(FeatureAction::Command(4040)),
                 _ => None,
             },
-            PanelId::Git => None,
+            PanelId::Git | PanelId::Search => None,
         }
     }
 
@@ -2482,7 +2608,7 @@ fn draw_feature_text(
     size: f32,
     brush: &ID2D1SolidColorBrush,
 ) -> windows::core::Result<()> {
-    let layout = unsafe { app.text_layout(text, width.max(1.), size)? };
+    let layout = unsafe { app.ui_text_layout(text, width.max(1.), size)? };
     unsafe {
         target.DrawTextLayout(
             super::point(x, y),
@@ -2502,7 +2628,7 @@ fn draw_feature_text_single_line(
     size: f32,
     brush: &ID2D1SolidColorBrush,
 ) -> windows::core::Result<()> {
-    let layout = unsafe { app.text_layout(text, bounds.width.max(1.0), size)? };
+    let layout = unsafe { app.ui_text_layout(text, bounds.width.max(1.0), size)? };
     unsafe {
         layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         layout.SetMaxHeight(bounds.height.max(1.0))?;
@@ -2633,11 +2759,7 @@ impl FeatureControlLayout {
                 width: app.editor_width(),
                 height: (app.editor_bottom() - app.editor_top()).max(0.),
             },
-            explorer: if app.search_pane_active() {
-                None
-            } else {
-                app.feature_panel_rect(PanelId::Explorer)
-            },
+            explorer: app.feature_panel_rect(PanelId::Explorer),
             calendar: app.feature_panel_rect(PanelId::Calendar),
             form: app.features.form.as_ref().map(|form| form.mode),
         }
@@ -2672,14 +2794,14 @@ enum FeatureAction {
     Command(usize),
     OpenFile(PathBuf),
     OpenCalendarFile {
-        request: CalendarListRequest,
+        request: Box<CalendarListRequest>,
         relative_path: PathBuf,
     },
     OpenDaily(CalendarDate),
 }
 
 impl App {
-    pub(super) fn feature_test_geometry(&self, panels: &[(PanelId, Rect); 4]) -> serde_json::Value {
+    pub(super) fn feature_test_geometry(&self, panels: &[(PanelId, Rect); 5]) -> serde_json::Value {
         let body = |id: PanelId| {
             let r = panels[id as usize].1;
             Rect {
@@ -2801,11 +2923,57 @@ impl App {
             self.features
                 .ensure_outline_selection_visible(outline_visible_rows(body.height));
         }
+        let explorer_changed = self.features.explorer_list_dirty;
         self.features.sync_explorer_control();
         let layout = FeatureControlLayout::capture(self);
         self.features.position_controls(self, layout);
+        self.features_refresh_explorer_paint(explorer_changed);
         if let Some(status) = self.features.status.take() {
             self.status = status;
+        }
+    }
+
+    pub(super) fn features_refresh_explorer_paint(&mut self, force: bool) {
+        let list = self.features.controls.explorer_list;
+        if list == HWND::default() || !unsafe { IsWindow(Some(list)).as_bool() } {
+            self.features.explorer_paint_key = None;
+            let retired = self.features.explorer_paint.replace(None);
+            drop(retired);
+            return;
+        }
+        let tokens = self.shell.tokens;
+        let mut key = ExplorerPaintKey {
+            hwnd: list,
+            font: unsafe { shell::send(list, WM_GETFONT, WPARAM(0), LPARAM(0)).0 },
+            dpi: unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(list) },
+            colors: [
+                shell::rgb(tokens.panel).0,
+                shell::rgb(tokens.selected).0,
+                shell::rgb(tokens.foreground).0,
+            ],
+            icons: self.explorer_icons.generation(),
+        };
+        if !force && self.features.explorer_paint_key == Some(key) {
+            return;
+        }
+        let geometry_changed = force
+            || self.features.explorer_paint_key.is_none_or(|previous| {
+                previous.hwnd != key.hwnd || previous.font != key.font || previous.dpi != key.dpi
+            });
+        // Preparation may reenter; the old immutable snapshot remains available.
+        let next = self
+            .explorer_icons
+            .paint_snapshot(list, tokens)
+            .map(Rc::new);
+        key.icons = self.explorer_icons.generation();
+        self.features.explorer_paint_key = next.as_ref().map(|_| key);
+        // Retiring font/icon handles can make native calls. Never drop them
+        // while the publication slot is borrowed by a synchronous callback.
+        let retired = self.features.explorer_paint.replace(next);
+        drop(retired);
+        // Native H geometry changes can synchronously request painting.
+        if geometry_changed && let Some(extent) = self.explorer_icons.measure_extent(list) {
+            let _ = unsafe { super::control_scroll::set_horizontal_extent(list, extent) };
         }
     }
 
@@ -2823,6 +2991,37 @@ impl App {
         target: &ID2D1HwndRenderTarget,
     ) -> windows::core::Result<()> {
         self.features.draw(self, target)
+    }
+
+    pub(super) fn features_reset_calendar_click(&mut self) {
+        self.features.calendar.click_target = None;
+    }
+
+    pub(super) unsafe fn features_double_click(&mut self, panel: PanelId, x: f32, y: f32) -> bool {
+        if panel != PanelId::Calendar {
+            return false;
+        }
+        if self.feature_ime_active() || self.background_mutation_busy() {
+            return true;
+        }
+        let Some(body) = self.feature_panel_rect(panel) else {
+            return false;
+        };
+        if x < body.x || y < body.y || x >= body.x + body.width || y >= body.y + body.height {
+            return false;
+        }
+        self.focus_feature_body(panel);
+        if let Some(action) =
+            self.features
+                .double_click(panel, x - body.x, y - body.y, body.width, body.height)
+        {
+            self.run_feature_action(action);
+            self.features_sync();
+            unsafe {
+                self.refresh();
+            }
+        }
+        true
     }
 
     pub(super) unsafe fn features_click(&mut self, panel: PanelId, x: f32, y: f32) -> bool {
@@ -2868,6 +3067,82 @@ impl App {
         } else {
             true
         }
+    }
+
+    pub(super) fn features_actionable_at(&self, x: f32, y: f32) -> bool {
+        if self.feature_ime_active() || self.background_mutation_busy() {
+            return false;
+        }
+        if let Some(body) = self
+            .feature_panel_rect(PanelId::Outline)
+            .filter(|r| r.contains(x, y))
+        {
+            if y < body.y + 8. {
+                return false;
+            }
+            let row = ((y - body.y - 8.) / OUTLINE_ROW_HEIGHT) as usize;
+            return row < outline_visible_rows(body.height)
+                && self
+                    .features
+                    .outline
+                    .as_ref()
+                    .filter(|outline| outline.is_current(self.doc()))
+                    .is_some_and(|outline| {
+                        self.features.outline_scroll + row < outline.headings.len()
+                    });
+        }
+        let Some(body) = self
+            .feature_panel_rect(PanelId::Calendar)
+            .filter(|r| r.contains(x, y))
+        else {
+            return false;
+        };
+        if self.features.form.is_some() {
+            return false;
+        }
+        if self.features.profiles.manager_open {
+            let layout = profile_list_layout(body.height);
+            if y < body.y + layout.rows_top {
+                return false;
+            }
+            let row = ((y - body.y - layout.rows_top) / CALENDAR_ROW_HEIGHT) as usize;
+            return row < layout.visible_rows
+                && self.features.calendar.scroll + row < self.features.profiles.effective.len();
+        }
+        if body.height < CALENDAR_MIN_BODY_HEIGHT {
+            return false;
+        }
+        let layout = calendar_layout(body.height);
+        if self.features.calendar.current_month.is_some_and(|grid| {
+            grid.cells.iter().enumerate().any(|(index, date)| {
+                date.is_some()
+                    && calendar_cell_draw_bounds(body, layout, index)
+                        .is_some_and(|bounds| bounds.cell.contains(x, y))
+            })
+        }) {
+            return true;
+        }
+        if y < body.y + layout.rows_top {
+            return false;
+        }
+        let row = ((y - body.y - layout.rows_top) / CALENDAR_ROW_HEIGHT) as usize;
+        if row >= layout.visible_rows {
+            return false;
+        }
+        let (Some(workspace), Some(request), Some(listing)) = (
+            &self.features.workspace,
+            &self.features.calendar.request,
+            &self.features.calendar.listing,
+        ) else {
+            return false;
+        };
+        request.matches(
+            workspace,
+            self.features.calendar.list_generation,
+            request.date,
+        ) && self.features.calendar.interaction.selected() == Some(request.date)
+            && listing.matches(workspace, request.generation, request.date)
+            && self.features.calendar.scroll + row < listing.files.len()
     }
 
     pub(super) fn features_pointer_move(&mut self, x: f32, y: f32) -> bool {
@@ -3057,7 +3332,7 @@ impl App {
 
     pub(super) unsafe fn features_control(&mut self, id: usize, notification: u16) -> bool {
         unsafe {
-            if self.search_pane_active()
+            if self.feature_panel_rect(PanelId::Explorer).is_none()
                 && (id == EXPLORER_LIST
                     || (id == PROMPT_EDIT
                         && self.features.form.as_ref().is_some_and(|form| {
@@ -3226,7 +3501,7 @@ impl App {
                 return true;
             }
             if message.message == WM_KEYDOWN
-                && !self.search_pane_active()
+                && self.feature_panel_rect(PanelId::Explorer).is_some()
                 && self.features.controls.explorer_list != HWND::default()
                 && GetFocus() == self.features.controls.explorer_list
                 && !self.feature_ime_active()
@@ -3236,7 +3511,7 @@ impl App {
                 self.refresh();
                 return true;
             }
-            if self.search_pane_active() && !self.features.quick_open.open {
+            if self.shell.active_panel() == PanelId::Search && !self.features.quick_open.open {
                 return false;
             }
             let was_quick_open = self.features.quick_open.open;
@@ -3411,14 +3686,14 @@ impl App {
             }
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_ok() {
-                let selected = TrackPopupMenu(
+                let selected = super::menu_style::track_popup(
+                    self.hwnd,
                     menu,
                     TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
                     point.x,
                     point.y,
-                    None,
-                    self.hwnd,
-                    None,
+                    self.shell.tokens,
+                    self.dpi,
                 )
                 .0;
                 let _ = DestroyMenu(menu);
@@ -3827,7 +4102,14 @@ impl App {
                 workspace,
                 self.features.calendar.list_generation,
                 request.date,
-            ) && request_is_current
+            ) && request.daily_profile.as_ref()
+                == self
+                    .features
+                    .profiles
+                    .effective
+                    .iter()
+                    .find(|profile| profile.id == "daily")
+                && request_is_current
                 && self.features.calendar.interaction.selected() == Some(request.date)
                 && self
                     .features
@@ -3969,12 +4251,14 @@ impl App {
     }
 
     fn navigate_month(&mut self, amount: i32) -> bool {
+        self.features_reset_calendar_click();
         self.features.calendar.interaction.navigate_months(amount);
         self.features_sync();
         true
     }
 
     fn select_today(&mut self) -> bool {
+        self.features_reset_calendar_click();
         self.features.calendar.interaction.select_today();
         self.features_sync();
         true
@@ -3995,6 +4279,9 @@ impl App {
             return false;
         };
         let offset = heading.source.start;
+        if self.doc().selection().anchor != offset || self.doc().selection().head != offset {
+            self.record_navigation();
+        }
         let _ = self.doc_mut().set_selection(offset, offset);
         unsafe {
             self.after_input();
@@ -4959,6 +5246,7 @@ impl App {
         if self.feature_ime_active() || !self.is_markdown_document() {
             return;
         }
+        let origin_document = self.doc().id();
         let document_path = self.tabs[self.active]
             .file
             .as_ref()
@@ -4969,6 +5257,9 @@ impl App {
                 let outline = Outline::build(self.doc(), &projection);
                 match outline.anchor(&anchor) {
                     Ok(offset) => {
+                        if self.doc().selection() != super::Selection::caret(offset) {
+                            self.record_navigation();
+                        }
                         let _ = self.doc_mut().set_selection(offset, offset);
                         unsafe {
                             self.after_input();
@@ -5013,6 +5304,11 @@ impl App {
                     let outline = Outline::build(self.doc(), &projection);
                     match outline.anchor(&anchor) {
                         Ok(offset) => {
+                            if self.doc().id() == origin_document
+                                && self.doc().selection() != super::Selection::caret(offset)
+                            {
+                                self.record_navigation();
+                            }
                             let _ = self.doc_mut().set_selection(offset, offset);
                             unsafe {
                                 self.after_input();
@@ -5082,7 +5378,7 @@ impl App {
                 request,
                 relative_path,
             } => {
-                self.open_calendar_file(request, relative_path);
+                self.open_calendar_file(*request, relative_path);
                 return;
             }
             FeatureAction::OpenDaily(date) => {
@@ -5114,8 +5410,8 @@ impl App {
 fn localized_label(command: usize, label: &str) -> String {
     match command {
         4000 => "検索".to_owned(),
-        4001 => "新ファ".to_owned(),
-        4002 => "新フォ".to_owned(),
+        4001 => "新しいファイル".to_owned(),
+        4002 => "新しいフォルダー".to_owned(),
         4003 => "コピー".to_owned(),
         4004 => "貼付".to_owned(),
         4005 => "改名".to_owned(),
@@ -5610,6 +5906,282 @@ mod tests {
         }
     }
 
+    struct ExplorerPaintFixture {
+        main: super::super::tests::MessagePumpFixture,
+        list: HWND,
+        dc: windows::Win32::Graphics::Gdi::HDC,
+        bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+        previous: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    }
+    impl ExplorerPaintFixture {
+        fn new() -> Self {
+            use windows::Win32::Graphics::Gdi::*;
+            let mut app = super::super::tests::composing_test_app("# 原文\n本文 e\u{301} 👩‍💻\n");
+            app.clear_composition();
+            let main = super::super::tests::MessagePumpFixture::new(app);
+            let list;
+            unsafe {
+                let mut app = main.state.app.borrow_mut();
+                app.shell.enabled = true;
+                app.shell.main_window = main.hwnd;
+                app.features.controls.owner = main.hwnd;
+                list = shell::control(
+                    main.hwnd,
+                    w!("LISTBOX"),
+                    "Explorer paint",
+                    EXPLORER_LIST,
+                    WINDOW_STYLE(
+                        (LBS_OWNERDRAWFIXED
+                            | LBS_HASSTRINGS
+                            | LBS_EXTENDEDSEL
+                            | LBS_NOINTEGRALHEIGHT) as u32,
+                    ),
+                );
+                app.features.controls.explorer_list = list;
+                app.features.explorer.entries.push(ExplorerEntry {
+                    name: "fixture_日本語.md".into(),
+                    path: PathBuf::from("synthetic/fixture_日本語.md"),
+                    kind: ExplorerEntryKind::File,
+                });
+                app.features.explorer.depths.push(0);
+                app.features_sync();
+                SetWindowPos(list, None, 0, 0, 160, 32, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            }
+            unsafe {
+                let source = GetDC(Some(main.hwnd));
+                let dc = CreateCompatibleDC(Some(source));
+                let bitmap = CreateCompatibleBitmap(source, 160, 32);
+                ReleaseDC(Some(main.hwnd), source);
+                let previous = SelectObject(dc, bitmap.into());
+                Self {
+                    main,
+                    list,
+                    dc,
+                    bitmap,
+                    previous,
+                }
+            }
+        }
+        fn item(&self) -> DRAWITEMSTRUCT {
+            DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::ODT_LISTBOX,
+                CtlID: EXPLORER_LIST as u32,
+                itemID: 0,
+                hwndItem: self.list,
+                hDC: self.dc,
+                itemData: 0,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 160,
+                    bottom: 32,
+                },
+                ..Default::default()
+            }
+        }
+        fn draw(&self, owner: HWND, id: usize, item: &DRAWITEMSTRUCT) -> LRESULT {
+            unsafe {
+                super::super::window_proc(
+                    owner,
+                    WM_DRAWITEM,
+                    WPARAM(id),
+                    LPARAM((item as *const DRAWITEMSTRUCT) as isize),
+                )
+            }
+        }
+    }
+    impl Drop for ExplorerPaintFixture {
+        fn drop(&mut self) {
+            use windows::Win32::Graphics::Gdi::*;
+            unsafe {
+                SelectObject(self.dc, self.previous);
+                let _ = DeleteObject(self.bitmap.into());
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
+
+    #[test]
+    fn explorer_runtime_snapshot_paints_reentrant_reset_and_rejects_foreign_routes() {
+        use windows::Win32::Graphics::Gdi::GetPixel;
+        struct Probe {
+            slot: ExplorerPaintSlot,
+            calls: Cell<usize>,
+            released: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                if msg == LB_GETTEXTLEN {
+                    let probe = &*(data as *const Probe);
+                    probe.calls.set(probe.calls.get() + 1);
+                    probe
+                        .released
+                        .set(probe.released.get() && probe.slot.try_borrow_mut().is_ok());
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let fixture = ExplorerPaintFixture::new();
+        let probe = Probe {
+            slot: Rc::clone(&fixture.main.state.explorer_paint),
+            calls: Cell::new(0),
+            released: Cell::new(true),
+        };
+        unsafe {
+            SetWindowSubclass(
+                fixture.list,
+                Some(observe),
+                776,
+                (&probe as *const Probe) as usize,
+            )
+            .unwrap();
+        }
+        let mut item = fixture.item();
+        let app = fixture.main.state.app.borrow_mut();
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().selection(),
+        );
+        assert_eq!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        assert!(probe.calls.get() > 0 && probe.released.get());
+        assert!(!fixture.main.state.deferred_control_redraw.get());
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST + 1, &item),
+            LRESULT(1)
+        );
+        item.CtlID += 1;
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        item.CtlID -= 1;
+        item.CtlType = ODT_BUTTON;
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        item.CtlType = windows::Win32::UI::Controls::ODT_LISTBOX;
+        unsafe {
+            SetWindowLongPtrW(fixture.list, GWLP_ID, (EXPLORER_LIST + 1) as isize);
+            assert_ne!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+                LRESULT(1)
+            );
+            SetWindowLongPtrW(fixture.list, GWLP_ID, EXPLORER_LIST as isize);
+            let other = super::super::tests::hidden_test_window_size(160, 32);
+            assert_ne!(fixture.draw(other, EXPLORER_LIST, &item), LRESULT(1));
+            DestroyWindow(other).unwrap();
+            shell::send(fixture.list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+            assert_eq!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+                LRESULT(1)
+            );
+            let background = shell::rgb(app.shell.tokens.panel);
+            assert!((0..32).all(|y| (0..160).all(|x| GetPixel(fixture.dc, x, y) == background)));
+            let _ =
+                windows::Win32::UI::Shell::RemoveWindowSubclass(fixture.list, Some(observe), 776);
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+                app.doc().selection()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn explorer_runtime_snapshot_refreshes_content_cache_theme_and_font() {
+        let fixture = ExplorerPaintFixture::new();
+        let original = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.features_refresh_explorer_paint(false);
+        }
+        assert!(Rc::ptr_eq(
+            &original,
+            fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+        ));
+        let mut font = super::super::control_style::UiFont::new(96, 28.).unwrap();
+        font.apply_to(fixture.main.hwnd).unwrap();
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.features_refresh_explorer_paint(false);
+        }
+        let changed_font = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&original, &changed_font));
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.shell.tokens.panel = super::super::color(0.2, 0.3, 0.4);
+            app.features_refresh_explorer_paint(false);
+        }
+        let changed_theme = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&changed_font, &changed_theme));
+        unsafe {
+            shell::send(
+                fixture.list,
+                LB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(super::super::wide("  fresh.cache_generation_test").as_ptr() as isize),
+            );
+        }
+        let mut item = fixture.item();
+        item.itemID = 1;
+        assert_eq!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        let changed_icons = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&changed_theme, &changed_icons));
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            assert_eq!(
+                app.features.explorer_paint_key.unwrap().icons,
+                app.explorer_icons.generation()
+            );
+            app.features_refresh_explorer_paint(false);
+            assert!(Rc::ptr_eq(
+                &changed_icons,
+                fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+            ));
+            app.features.explorer_list_dirty = true;
+            app.features_sync();
+        }
+        assert!(!Rc::ptr_eq(
+            &changed_icons,
+            fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+        ));
+        {
+            let _app = fixture.main.state.app.borrow_mut();
+            assert_eq!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &fixture.item()),
+                LRESULT(1)
+            );
+        }
+        unsafe {
+            DestroyWindow(fixture.main.hwnd).unwrap();
+        }
+        assert!(fixture.main.state.explorer_paint.borrow().is_none());
+    }
+
     fn send_explorer_key(app: &mut App, list: HWND, key: u16) -> bool {
         let message = MSG {
             hwnd: list,
@@ -5659,6 +6231,55 @@ mod tests {
     }
 
     #[test]
+    fn calendar_weekend_holiday_and_adjacent_month_colors_follow_date_marks() {
+        let march = CalendarDate::new(2027, 3, 1).unwrap();
+        let holiday = CalendarDate::new(2027, 3, 20).unwrap();
+        let cells = decorate_month(
+            month_grid(march).unwrap(),
+            march,
+            None,
+            None,
+            None,
+            &BTreeSet::from([holiday]),
+            &BTreeSet::new(),
+        );
+        let tokens = shell::Tokens::default();
+        let cell = |month, day| {
+            cells
+                .iter()
+                .find(|cell| cell.date == CalendarDate::new(2027, month, day))
+                .unwrap()
+        };
+        let red = calendar_cell_color(tokens, cell(3, 20));
+        assert!(cell(3, 20).marks.saturday && cell(3, 20).marks.holiday);
+        assert!(red.r > red.b, "a Saturday holiday uses the red holiday hue");
+        let sunday = calendar_cell_color(tokens, cell(3, 21));
+        assert_eq!((red.r, red.g, red.b), (sunday.r, sunday.g, sunday.b));
+        let saturday = calendar_cell_color(tokens, cell(3, 27));
+        let adjacent = calendar_cell_color(tokens, cell(4, 3));
+        assert!(saturday.b > saturday.r && adjacent.b > adjacent.r);
+        assert!(
+            adjacent.b < saturday.b,
+            "adjacent months dim while retaining weekend hue"
+        );
+        let mut selected = *cell(4, 3);
+        selected.marks.selected = true;
+        let selected_ink = calendar_cell_color(tokens, &selected);
+        assert_eq!(
+            selected_ink.b, saturday.b,
+            "selection retains full text contrast"
+        );
+        let high_contrast = shell::Tokens {
+            high_contrast: true,
+            weekend_red: tokens.foreground,
+            weekend_blue: tokens.foreground,
+            ..tokens
+        };
+        let ink = calendar_cell_color(high_contrast, cell(4, 3));
+        assert_eq!(ink.r, high_contrast.foreground.r);
+    }
+
+    #[test]
     fn calendar_layout_reserves_grid_and_rows_at_compact_and_default_heights() {
         for body_height in [180.0, 200.0, 234.0, 250.0, 270.0, 273.0, 320.0] {
             let layout = calendar_layout(body_height);
@@ -5671,7 +6292,10 @@ mod tests {
         assert_eq!(calendar_layout(270.0).visible_rows, 2);
         assert_eq!(calendar_layout(250.0).status_height, 0.0);
         assert_eq!(calendar_layout(273.0).grid_top, CALENDAR_GRID_TOP);
-        assert_eq!(calendar_layout(320.0).visible_rows, 3);
+        let default = calendar_layout(320.0);
+        assert_eq!(default.visible_rows, 4);
+        assert!(default.rows_top + 4.0 * CALENDAR_ROW_HEIGHT <= 320.0);
+        assert!(default.rows_top + 5.0 * CALENDAR_ROW_HEIGHT > 320.0);
     }
 
     #[test]
@@ -6069,6 +6693,81 @@ mod tests {
     }
 
     #[test]
+    fn calendar_discards_async_result_after_profile_change() {
+        let root = std::env::temp_dir().join(format!(
+            "mdlite-calendar-profile-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let date = local_now().date;
+        let mut features = FeaturePanes::default();
+        features.workspace = Some(workspace.clone());
+        features.workspace_identity = Some(workspace.identity().clone());
+        features.profiles.effective = default_profiles();
+        let mut request = CalendarListRequest::new(&workspace, 1, date).unwrap();
+        request.daily_profile = Some(features.profiles.effective[0].clone());
+        features.calendar.list_generation = 1;
+        features.calendar.interaction.set_selection(Some(date));
+        let (sender, receiver) = mpsc::channel();
+        sender.send(request.loading_result()).unwrap();
+        features.calendar.worker = Some(CalendarWorker {
+            request,
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+            handle: thread::spawn(|| {}),
+        });
+        features.profiles.effective[0].directory = "Changed".into();
+        assert!(features.poll_workers().is_empty());
+        assert!(features.calendar.listing.is_none());
+        drop(features);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn calendar_click_requires_os_doubleclick_same_target_and_reset() {
+        let mut features = FeaturePanes::default();
+        let date = CalendarDate::new(2026, 10, 19).unwrap();
+        let grid = month_grid(date).unwrap();
+        features.calendar.current_month = Some(grid);
+        let index = grid
+            .cells
+            .iter()
+            .position(|cell| *cell == Some(date))
+            .unwrap();
+        let width = 260.0;
+        let cell_width = (width - 10.0) / 7.0;
+        let layout = calendar_layout(320.0);
+        let x = 5.0 + (index % 7) as f32 * cell_width + 2.0;
+        let y = layout.grid_top + (index / 7) as f32 * layout.week_step + 1.0;
+        for _ in 0..2 {
+            assert!(matches!(
+                features.click(PanelId::Calendar, x, y, width, 320.0),
+                Some(FeatureAction::Refresh)
+            ));
+        }
+        assert!(matches!(
+            features.double_click(PanelId::Calendar, x + cell_width, y, width, 320.0),
+            Some(FeatureAction::Refresh)
+        ));
+        features.click(PanelId::Calendar, x, y, width, 320.0);
+        features.calendar.click_target = None;
+        assert!(matches!(
+            features.double_click(PanelId::Calendar, x, y, width, 320.0),
+            Some(FeatureAction::Refresh)
+        ));
+        features.click(PanelId::Calendar, x, y, width, 320.0);
+        assert!(
+            matches!(features.double_click(PanelId::Calendar, x, y, width, 320.0), Some(FeatureAction::OpenDaily(day)) if day == date)
+        );
+        assert!(features.calendar.click_target.is_none());
+    }
+
+    #[test]
     fn calendar_daily_click_uses_midnight_while_today_and_generic_routes_capture_local_now() {
         let nonce = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6100,6 +6799,12 @@ mod tests {
         let action = click_app
             .features
             .click(PanelId::Calendar, x, y, 260.0, 320.0)
+            .unwrap();
+        assert!(matches!(&action, FeatureAction::Refresh));
+        assert_eq!(click_app.features.pending_daily, None);
+        let action = click_app
+            .features
+            .double_click(PanelId::Calendar, x, y, 260.0, 320.0)
             .unwrap();
         assert!(matches!(&action, FeatureAction::OpenDaily(date) if *date == past));
         click_app.run_feature_action(action);
@@ -6192,6 +6897,8 @@ mod tests {
                 .features
                 .click(PanelId::Calendar, 0.0, layout.rows_top + 1.0, 260.0, 320.0)
                 .unwrap();
+            assert!(matches!(action, FeatureAction::Refresh));
+            let action = app.features.calendar_file_action().unwrap();
             assert!(matches!(action, FeatureAction::OpenCalendarFile { .. }));
 
             match scenario {
@@ -6281,11 +6988,21 @@ mod tests {
             .into_iter()
             .find(|entry| entry.name == "folder")
             .unwrap();
-        let owner = super::super::tests::hidden_test_window_size(220, 80);
+        let owner = super::super::tests::hidden_test_window_size(900, 480);
         let list = explorer_list_for_test(owner);
         let mut app = super::super::tests::composing_test_app("# heading\n");
         app.composing = false;
         app.hwnd = owner;
+        app.shell.main_window = owner;
+        // This list-event fixture supplies Main geometry without enabling
+        // full-shell persistence synchronization for its synthetic Workspace.
+        app.shell.panels[PanelId::Explorer as usize].1 = Rect {
+            x: 0.,
+            y: 0.,
+            width: 180.,
+            height: 480.,
+        };
+        assert!(app.feature_panel_rect(PanelId::Explorer).is_some());
         app.features.controls.owner = owner;
         app.features.controls.explorer_list = list;
         app.features.workspace = Some(workspace.clone());
@@ -6363,9 +7080,20 @@ mod tests {
             .find(|entry| entry.name == "folder")
             .unwrap();
         let hidden = folder.path.join("hidden.md");
-        let owner = super::super::tests::hidden_test_window_size(220, 80);
+        let owner = super::super::tests::hidden_test_window_size(900, 480);
         let list = explorer_list_for_test(owner);
         let mut app = super::super::tests::composing_test_app("# heading\n");
+        app.hwnd = owner;
+        app.shell.main_window = owner;
+        // This list-event fixture supplies Main geometry without enabling
+        // full-shell persistence synchronization for its synthetic Workspace.
+        app.shell.panels[PanelId::Explorer as usize].1 = Rect {
+            x: 0.,
+            y: 0.,
+            width: 180.,
+            height: 480.,
+        };
+        assert!(app.feature_panel_rect(PanelId::Explorer).is_some());
         app.features.controls.owner = owner;
         app.features.controls.explorer_list = list;
         app.features.workspace = Some(workspace.clone());

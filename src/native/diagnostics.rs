@@ -282,11 +282,16 @@ struct DiagnosticsWindowState {
     foreground: COLORREF,
     brush: HBRUSH,
     owns_brush: bool,
+    tokens: shell::Tokens,
+    font: Option<control_style::UiFont>,
+    updating_font: bool,
     released: Rc<Cell<bool>>,
 }
 
 impl DiagnosticsWindowState {
-    fn new(owner: HWND, text: String, background: COLORREF, foreground: COLORREF) -> Self {
+    fn new(owner: HWND, text: String, tokens: shell::Tokens) -> Self {
+        let background = COLORREF(color_ref(tokens.panel));
+        let foreground = COLORREF(color_ref(tokens.foreground));
         let brush = unsafe { CreateSolidBrush(background) };
         let owns_brush = !brush.0.is_null();
         Self {
@@ -302,6 +307,9 @@ impl DiagnosticsWindowState {
                 unsafe { windows::Win32::Graphics::Gdi::GetSysColorBrush(COLOR_WINDOW) }
             },
             owns_brush,
+            tokens,
+            font: None,
+            updating_font: false,
             released: Rc::new(Cell::new(false)),
         }
     }
@@ -335,6 +343,63 @@ impl Drop for DiagnosticsWindowState {
     }
 }
 
+unsafe fn diagnostics_state_is_live(hwnd: HWND, pointer: *mut DiagnosticsWindowState) -> bool {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) == pointer as isize }
+}
+
+unsafe fn update_diagnostics_font(hwnd: HWND, pointer: *mut DiagnosticsWindowState, dpi: u32) {
+    unsafe {
+        if (*pointer).updating_font {
+            return;
+        }
+        (*pointer).updating_font = true;
+        // UiFont publishes/reassigns references synchronously. Move ownership out
+        // of window state so WM_SETFONT reentry never aliases a state borrow.
+        let mut font = (*pointer).font.take();
+        let result = if let Some(font) = &mut font {
+            font.replace_on(hwnd, dpi, 14.)
+        } else {
+            control_style::UiFont::new(dpi, 14.).and_then(|mut replacement| {
+                replacement.apply_to(hwnd)?;
+                font = Some(replacement);
+                Ok(())
+            })
+        };
+        if diagnostics_state_is_live(hwnd, pointer) {
+            (*pointer).font = font;
+            (*pointer).updating_font = false;
+        }
+        if let Err(error) = result {
+            eprintln!("Diagnostics UI font: {error}");
+        }
+    }
+}
+
+unsafe fn refresh_diagnostics_rails(hwnd: HWND, tokens: shell::Tokens) {
+    unsafe {
+        if let Err(error) = shell::refresh_native_scrollbars(hwnd, tokens) {
+            eprintln!("Diagnostics scrollbar fallback: {error}");
+        }
+    }
+}
+
+unsafe fn layout_diagnostics(hwnd: HWND, edit: HWND, refresh: HWND) {
+    unsafe {
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.;
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let _ = shell::position_child_control(refresh, px(12.), px(10.), px(92.), px(30.));
+        let _ = shell::position_child_control(
+            edit,
+            px(12.),
+            px(48.),
+            (client.right - px(24.)).max(px(80.)),
+            (client.bottom - px(60.)).max(px(80.)),
+        );
+    }
+}
+
 unsafe extern "system" fn diagnostics_window_proc(
     hwnd: HWND,
     message: u32,
@@ -360,79 +425,72 @@ unsafe extern "system" fn diagnostics_window_proc(
         if pointer.is_null() {
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
-        let state = &mut *pointer;
         match message {
             WM_CREATE => {
-                let instance = match GetModuleHandleW(None) {
-                    Ok(module) => Some(module.into()),
-                    Err(_) => return LRESULT(-1),
-                };
-                let edit = CreateWindowExW(
-                    WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0),
+                update_diagnostics_font(hwnd, pointer, GetDpiForWindow(hwnd));
+                if !diagnostics_state_is_live(hwnd, pointer) {
+                    return LRESULT(-1);
+                }
+                let text = std::mem::take(&mut (*pointer).text);
+                let edit = shell::control(
+                    hwnd,
                     w!("EDIT"),
-                    PCWSTR::null(),
+                    &text,
+                    OUTPUT_EDIT_ID,
                     WINDOW_STYLE(
-                        WS_CHILD.0
-                            | WS_VISIBLE.0
-                            | WS_TABSTOP.0
-                            | ES_MULTILINE as u32
+                        ES_MULTILINE as u32
                             | ES_AUTOVSCROLL as u32
                             | ES_READONLY as u32
                             | WS_VSCROLL.0,
                     ),
-                    12,
-                    48,
-                    720,
-                    520,
-                    Some(hwnd),
-                    Some(HMENU(OUTPUT_EDIT_ID as *mut _)),
-                    instance,
-                    None,
                 );
-                let Ok(edit) = edit else { return LRESULT(-1) };
-                state.edit = edit;
-                let button = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    w!("BUTTON"),
-                    w!("更新"),
-                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-                    12,
-                    10,
-                    92,
-                    30,
-                    Some(hwnd),
-                    Some(HMENU(REFRESH_BUTTON_ID as *mut _)),
-                    instance,
-                    None,
-                );
-                let Ok(button) = button else {
+                if !diagnostics_state_is_live(hwnd, pointer) || edit == HWND::default() {
                     return LRESULT(-1);
-                };
-                state.refresh = button;
-                let text = super::wide(&state.text);
-                let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
-                state.text.clear();
+                }
+                (*pointer).edit = edit;
+                // The common factory owns the EDIT adapter; retain this pane's
+                // original client edge without changing native scroll styles.
+                let extended = GetWindowLongPtrW(edit, GWL_EXSTYLE) as u32;
+                SetWindowLongPtrW(edit, GWL_EXSTYLE, (extended | WS_EX_CLIENTEDGE.0) as isize);
+                let _ = SetWindowPos(
+                    edit,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+                if !diagnostics_state_is_live(hwnd, pointer) {
+                    return LRESULT(-1);
+                }
+                let button = shell::control(
+                    hwnd,
+                    w!("BUTTON"),
+                    "更新",
+                    REFRESH_BUTTON_ID,
+                    WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                );
+                if !diagnostics_state_is_live(hwnd, pointer) || button == HWND::default() {
+                    return LRESULT(-1);
+                }
+                (*pointer).refresh = button;
+                let tokens = (*pointer).tokens;
+                refresh_diagnostics_rails(hwnd, tokens);
+                if diagnostics_state_is_live(hwnd, pointer) {
+                    layout_diagnostics(hwnd, edit, button);
+                }
                 LRESULT(0)
             }
             WM_SIZE => {
-                let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
-                let width = client.right - client.left;
-                let height = client.bottom - client.top;
-                let _ = MoveWindow(state.refresh, 12, 10, 92, 30, true);
-                let _ = MoveWindow(
-                    state.edit,
-                    12,
-                    48,
-                    (width - 24).max(80),
-                    (height - 60).max(80),
-                    true,
-                );
+                let (edit, refresh) = ((*pointer).edit, (*pointer).refresh);
+                layout_diagnostics(hwnd, edit, refresh);
                 LRESULT(0)
             }
             WM_COMMAND if wparam.0 & 0xffff == REFRESH_BUTTON_ID => {
+                let owner = (*pointer).owner;
                 let _ = PostMessageW(
-                    Some(state.owner),
+                    Some(owner),
                     WM_COMMAND,
                     WPARAM(DIAGNOSTICS_COMMAND_ID),
                     LPARAM(0),
@@ -440,21 +498,63 @@ unsafe extern "system" fn diagnostics_window_proc(
                 LRESULT(0)
             }
             WM_UPDATE_THEME => {
-                state.set_theme(COLORREF(wparam.0 as u32), COLORREF(lparam.0 as u32));
+                let tokens = *(lparam.0 as *const shell::Tokens);
+                (*pointer).tokens = tokens;
+                (*pointer).set_theme(
+                    COLORREF(color_ref(tokens.panel)),
+                    COLORREF(color_ref(tokens.foreground)),
+                );
+                refresh_diagnostics_rails(hwnd, tokens);
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 LRESULT(0)
             }
+            WM_SETTINGCHANGE | WM_THEMECHANGED => {
+                let (owner, tokens) = ((*pointer).owner, (*pointer).tokens);
+                refresh_diagnostics_rails(hwnd, tokens);
+                // Ask the authoritative shell to republish its complete theme.
+                // Do not forward WM_SETTINGCHANGE's borrowed string pointer.
+                let _ = PostMessageW(Some(owner), WM_THEMECHANGED, WPARAM(0), LPARAM(0));
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                let suggested = *(lparam.0 as *const RECT);
+                update_diagnostics_font(hwnd, pointer, (wparam.0 & 0xffff) as u32);
+                if diagnostics_state_is_live(hwnd, pointer) {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                if diagnostics_state_is_live(hwnd, pointer) {
+                    let (edit, refresh, tokens) =
+                        ((*pointer).edit, (*pointer).refresh, (*pointer).tokens);
+                    layout_diagnostics(hwnd, edit, refresh);
+                    refresh_diagnostics_rails(hwnd, tokens);
+                }
+                LRESULT(0)
+            }
             WM_ERASEBKGND => {
+                let brush = (*pointer).brush;
                 let mut client = RECT::default();
                 let _ = GetClientRect(hwnd, &mut client);
-                let _ = FillRect(HDC(wparam.0 as *mut _), &client, state.brush);
+                let _ = FillRect(HDC(wparam.0 as *mut _), &client, brush);
                 LRESULT(1)
             }
             WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+                let (foreground, background, brush) = (
+                    (*pointer).foreground,
+                    (*pointer).background,
+                    (*pointer).brush,
+                );
                 let dc = HDC(wparam.0 as *mut _);
-                let _ = SetTextColor(dc, state.foreground);
-                let _ = SetBkColor(dc, state.background);
-                LRESULT(state.brush.0 as isize)
+                let _ = SetTextColor(dc, foreground);
+                let _ = SetBkColor(dc, background);
+                LRESULT(brush.0 as isize)
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -483,12 +583,24 @@ fn ensure_window_class() -> bool {
 }
 
 impl DiagnosticsPane {
+    pub(super) fn refresh_theme(&self, tokens: shell::Tokens) {
+        unsafe {
+            if self.hwnd != HWND::default() && IsWindow(Some(self.hwnd)).as_bool() {
+                let _ = SendMessageW(
+                    self.hwnd,
+                    WM_UPDATE_THEME,
+                    None,
+                    Some(LPARAM((&tokens as *const shell::Tokens) as isize)),
+                );
+            }
+        }
+    }
+
     unsafe fn show_or_refresh(
         &mut self,
         owner: HWND,
         text: &str,
-        background: COLORREF,
-        foreground: COLORREF,
+        tokens: shell::Tokens,
         dpi: f32,
     ) -> bool {
         unsafe {
@@ -497,12 +609,7 @@ impl DiagnosticsPane {
                     let text = super::wide(text);
                     let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
                 }
-                let _ = SendMessageW(
-                    self.hwnd,
-                    WM_UPDATE_THEME,
-                    Some(WPARAM(background.0 as usize)),
-                    Some(LPARAM(foreground.0 as isize)),
-                );
+                self.refresh_theme(tokens);
                 let _ = ShowWindow(self.hwnd, SW_SHOW);
                 let _ = SetForegroundWindow(self.hwnd);
                 return true;
@@ -514,12 +621,7 @@ impl DiagnosticsPane {
             let scale = dpi.max(1.0);
             let width = (760.0 * scale).round() as i32;
             let height = (620.0 * scale).round() as i32;
-            let state = Box::new(DiagnosticsWindowState::new(
-                owner,
-                text.to_owned(),
-                background,
-                foreground,
-            ));
+            let state = Box::new(DiagnosticsWindowState::new(owner, text.to_owned(), tokens));
             let released = Rc::clone(&state.released);
             let pointer = Box::into_raw(state);
             let window = CreateWindowExW(
@@ -563,13 +665,8 @@ impl App {
             self.hwnd
         };
         unsafe {
-            self.diagnostics.show_or_refresh(
-                owner,
-                &snapshot,
-                COLORREF(color_ref(self.shell.tokens.panel)),
-                COLORREF(color_ref(self.shell.tokens.foreground)),
-                self.dpi,
-            )
+            self.diagnostics
+                .show_or_refresh(owner, &snapshot, self.shell.tokens, self.dpi)
         }
     }
 }
@@ -577,6 +674,108 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::Controls::{EM_CANUNDO, EM_GETSEL, EM_SETSEL};
+
+    #[test]
+    fn output_edit_keeps_native_contract_across_theme_dpi_and_close() {
+        unsafe {
+            assert!(ensure_window_class());
+            let text = "Diagnostics synthetic output\r\n第二行";
+            let state = Box::new(DiagnosticsWindowState::new(
+                HWND::default(),
+                text.into(),
+                shell::Tokens::default(),
+            ));
+            let released = Rc::clone(&state.released);
+            let pointer = Box::into_raw(state);
+            let result = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("MDLiteDiagnosticsWindow"),
+                w!("MDLite hidden diagnostics test"),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                0,
+                0,
+                760,
+                620,
+                None,
+                None,
+                GetModuleHandleW(None).ok().map(Into::into),
+                Some(pointer.cast()),
+            );
+            if result.is_err() && !released.get() {
+                drop(Box::from_raw(pointer));
+            }
+            struct Window(HWND);
+            impl Drop for Window {
+                fn drop(&mut self) {
+                    unsafe {
+                        if IsWindow(Some(self.0)).as_bool() {
+                            let _ = DestroyWindow(self.0);
+                        }
+                    }
+                }
+            }
+            let window = Window(result.expect("hidden diagnostics window"));
+            let edit = GetDlgItem(Some(window.0), OUTPUT_EDIT_ID as i32).unwrap();
+            assert_eq!(GetParent(edit).unwrap(), window.0);
+            let style = GetWindowLongPtrW(edit, GWL_STYLE) as u32;
+            assert_ne!(style & ES_MULTILINE as u32, 0);
+            assert_ne!(style & ES_READONLY as u32, 0);
+            assert_ne!(style & WS_VSCROLL.0, 0);
+            assert_eq!(style & WS_HSCROLL.0, 0);
+            assert_ne!(
+                GetWindowLongPtrW(edit, GWL_EXSTYLE) as u32 & WS_EX_CLIENTEDGE.0,
+                0
+            );
+            assert_ne!(SendMessageW(edit, WM_GETFONT, None, None).0, 0);
+            assert_eq!(shell::text_of(edit), text);
+            let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(3)), Some(LPARAM(8)));
+            let tokens = shell::Tokens {
+                high_contrast: true,
+                ..Default::default()
+            };
+            let pane = DiagnosticsPane { hwnd: window.0 };
+            pane.refresh_theme(tokens);
+            assert!((*pointer).tokens.high_contrast);
+            assert!(edit_scroll::refresh(edit, tokens).unwrap());
+            let suggested = RECT {
+                left: 0,
+                top: 0,
+                right: 1140,
+                bottom: 930,
+            };
+            let _ = SendMessageW(
+                window.0,
+                WM_DPICHANGED,
+                Some(WPARAM(144 | (144 << 16))),
+                Some(LPARAM((&suggested as *const RECT) as isize)),
+            );
+            let mut font = LOGFONTW::default();
+            let handle = HFONT(SendMessageW(edit, WM_GETFONT, None, None).0 as *mut _);
+            assert_ne!(
+                GetObjectW(
+                    handle.into(),
+                    std::mem::size_of::<LOGFONTW>() as i32,
+                    Some((&mut font as *mut LOGFONTW).cast())
+                ),
+                0
+            );
+            assert_eq!(font.lfHeight, -21);
+            assert_eq!(shell::text_of(edit), text);
+            let mut start = 0u32;
+            let mut end = 0u32;
+            let _ = SendMessageW(
+                edit,
+                EM_GETSEL,
+                Some(WPARAM((&mut start as *mut u32) as usize)),
+                Some(LPARAM((&mut end as *mut u32) as isize)),
+            );
+            assert_eq!((start, end), (3, 8));
+            assert_eq!(SendMessageW(edit, EM_CANUNDO, None, None).0, 0);
+            let _ = SendMessageW(window.0, WM_CLOSE, None, None);
+            assert!(released.get());
+        }
+    }
 
     #[test]
     fn snapshot_omits_synthetic_note_query_and_absolute_path_canaries() {

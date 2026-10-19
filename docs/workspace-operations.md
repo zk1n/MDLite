@@ -3,22 +3,47 @@
 Rust版の操作入口を記録する。最終buildで実施した操作と未確認条件は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を参照する。
 
+2026年10月19日Rev3の変更は未統合候補。以下の追加契約を公開developや
+実GUI／Human受入済みと扱わない。
+
 ## 画面とNavigation
 
-中央の文書tabとEditorを、Explorer/Search、Calendar、Outline、Gitの4パネルが囲む。
-パネル見出しから折り畳み・非表示・slot移動を選べる。Ctrl+Alt+1〜4で対象パネルを
-移し、Ctrl+Alt+上下で高さを調整する。狭幅時は中央の幅を優先しdrawerで開く。
+左と右は独立した領域で、Explorer、Search、Calendar、Outline、Gitをグループ単位で切り替える。
+新規配置は全viewが左所属の単独グループでExplorerを選択し、空の右幅は確保しない。
+左Explorer＋Calendar／右Outline＋Gitの旧配置は左右のグループとして幅・比率・非表示状態を移行する。
+左のSearchへ切り替えると左全体がSearchになり、Explorerへ戻すと組合せを復元する。右は変更しない。
+左活動barには左所属の各グループの代表だけを置き、Explorer＋Calendarの入口はExplorer一つとする。
+右側のグループは右の見出しメニューや右領域toggleのcontext menuから選択できる。
+パネル見出しの配置メニューでview／groupの左右移動、既存グループへの追加、独立グループ化を行う。
+別viewを暗黙にswapしない。Ctrl+Alt+1〜4も左独立／左追加／右独立／右追加へ対応し、Ctrl+Alt+上下で高さを調整する。
+狭幅時は中央の幅を優先し、選択グループ全体をdrawerで開く。
 配置resetは表示メニューにある。Compactは同じ文書・選択・履歴の別windowで、
 ×は主windowへ戻す。主windowの終了は全tabの未保存確認を行う。
+
+Rev3候補の上部はハンバーガー・新規・保存・戻る／進む、
+中央のコマンドquery、左右領域の表示切替。領域全体を独立して隠す4状態でeditor幅を戻す。
+領域表示、active group、viewのhidden／collapsed、内部順序・比率・幅を区別してschema2に保存する。
+旧panel-layout schema1を互換読込みし、新規初期値へ無断resetしない。配置resetは領域表示も戻す。
+活動iconは左所属グループを表示してfocusし、領域を隠す操作とは区別する。
+戻る／進むは明示的な文書・Outline・検索・リンク移動の履歴で、本文Undo／Redoとは独立する。
+一文字移動を履歴に加えず、閉じた文書は再生成しない。戻った後の新しい移動は進む分岐を整理する。
 
 statusはWorkspace、明示取得したbranch、保存/外部変更、行列、encoding/EOL、文書種類を示す。
 Ln/Colは1起算で、Colは行頭からのUnicode scalar数に1を加える。UTF-8 byte、UTF-16 unit、
 graphemeや表示上の横位置とは別。外部変更は検出済みと未確認を区別し、Gitを自動起動しない。
 
-Ctrl+Kとタイトルの入口でコマンド検索を開く。無効な操作も理由付きで表示し、
+Ctrl+Kまたは上部のqueryへ直接入力し、直下に候補だけを表示する。
+pointer起動は描画したquery矩形内だけで、左右余白や他buttonへ広げない。
+Main／Compactともqueryを別popupへ複製しない。menuは短いlabelと独立shortcut列を使い、
+説明・disabled理由はhover／keyboard選択時の補助表示へ分離する。
 実効keybindingをヒントに使う。設定は共通/Workspaceの層を選び、空欄は継承する。
 Applyは開始時snapshotと照合し、外部変更・不明schema・書込み失敗ではフォームを保持する。
 詳細編集では未知の行を保持する。変更可能bindingと固定Editor/表/パネル操作の衝突を拒否する。
+Rev3候補の設定は一般／保存、表示／テーマ、カスタム色、キー割当の折りたたみカテゴリを持つ。
+実装済みregistryの色とcommandを個別に列挙し、短い日本語名、key、実効値とこの層の指定を区別する。
+hoverとkeyboard focusの補助説明から許容範囲・継承を確認できる。
+継承へ戻す操作、空pathの明示指定、shortcutの解除を分け、false・0・空文字を継承へ暗黙変換しない。
+折りたたみや層切替では未適用draftを保持し、適用は既存snapshot照合とSettingsPatchの検証を通す。
 
 Ctrl+Pは相対path/filenameでQuick Openを絞る。表示は200件までで、queryは走査対象全体へ
 適用する。候補の続きと走査未完了を表示する。Explorerのcopy/pasteは選択file一覧を
@@ -35,7 +60,13 @@ stale revision・自己内部・IME中を拒否する。リンクはCtrl+click�
 ## ノートとCalendar
 
 Calendarは日曜始まり42セル。月移動・今日の選択と、日付のDaily起動を区別する。
+Rev2候補では1クリックは日付選択・一覧更新だけ。同じcellのOSダブルクリック、
+日付focusのEnter、明示Daily操作だけが起動する。一覧行のEnter／ダブルクリックは対象fileを開く。
 日別一覧はWindows作成日時のローカル日付であり、更新日時やfilenameの日付ではない。
+既定Dairyと解決済みdaily profileの保存先に一致するDailyを一覧・件数から除外し、
+実file、tab、Explorer、Daily markerは保持する。過去日のDailyを今日作った場合も除外する。
+入力値／titleに依存してDailyと確定できない保存先は一般fileの誤除外を避けて表示を残す。
+日付形式filenameやMeetingという理由だけでは除外しない。
 祝日は同梱データと明示local CSV取込みを使い、起動や月移動でHTTPを行わない。
 高さが小さいpaneでは「操作…」から同じCalendarコマンドを開く。profile管理中は専用一覧・formを
 同じpaneに表示する。日別一覧から開く直前に、Workspace・作成日・file種類を再確認する。
@@ -50,7 +81,7 @@ profile管理から追加・編集・複製・上書き定義の削除・templat
 同IDは定義全体でoverlayする。組込みprofileの上書きを削除すると下位定義へ戻る。
 必須入力の空defaultは定義保存とpreviewでは許し、実作成時に検査する。
 unknown token、複数cursor、衝突、危険pathは本文作成前に拒否する。
-日付click/選択日のDailyはその日の0時。「今日のDairy」と通常profile作成は現在local日時を使う。
+選択日のDaily起動はその日の0時。「今日のDairy」と通常profile作成は現在local日時を使う。
 入力formが必要な場合も、作成開始時の日時をpreviewから送信まで保持する。
 
 ## 検索・置換
@@ -69,8 +100,15 @@ open文書は文書ごと1 Undo。journal復元はopen tabと後続編集を拒�
 
 ## Trust・Git・storage
 
-Workspaceを開くだけではGitやadapterを実行しない。Status/Diffも端末local Trustが必要。
+Status/Diffも端末local Trustが必要。未TrustのWorkspaceではGitを起動しない。
+Trust済みWorkspaceを開いた際は、既存repositoryを読取りで検出しStatusを更新する。
 Trustはcanonical pathと物理directory identityへ結び付け、Workspace内の設定で自己信頼しない。
+明示的なTrust付与・再試行では、親repositoryとworktreeを含むGitの検出結果を優先する。
+repositoryがないことを直前に再確認できた場合だけWorkspace rootでlocal initする。
+既定branch設定を尊重し、remote、user設定、initial commitを作らない。init失敗でも
+Trustは維持し、原因と再試行を表示する。通常のrefreshだけではinitしない。
+remote未設定でもStatus、Diff、Stage、Unstage、Commit、branch等のlocal操作を利用できる。
+Fetch/Pull/Pushは開始前に無効にし、短い理由を表示する。
 Gitは選択だけのStage/Unstage、indexだけのCommitを行う。通常操作で暗黙の保存・stage・
 commit・pushを連鎖しない。branch/worktree変更の事前保存とGit確認は別段階である。
 fetch/ff-only pull/pushは既存remoteと明示確認を使う。forceや自動rebaseを追加しない。

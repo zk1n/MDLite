@@ -2,14 +2,19 @@
 //! WindowState lives until the message loop exits. Synchronous native reentry
 //! snapshots IME notifications outside App's borrow and drains them in order.
 
+mod control_scroll;
+mod control_style;
 mod diagnostics;
+mod edit_scroll;
 mod editing;
 mod editor_actions;
 mod explorer_icons;
 mod features;
 mod git_ui;
+mod menu_style;
 mod persistence;
 mod presentation;
+mod scrollbar_style;
 mod search_ui;
 mod settings_dialog;
 mod shell;
@@ -32,7 +37,7 @@ use mdlite::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -64,6 +69,8 @@ const TOP: f32 = 88.0;
 const LEFT: f32 = 44.0;
 const TAB_WIDTH: f32 = 170.0;
 const TAB_SCROLL_BUTTON: f32 = 28.0;
+const GUTTER_HORIZONTAL_PADDING: f32 = 12.0;
+const GUTTER_LABEL_LEFT: f32 = 4.0;
 const FONT: f32 = 17.0;
 const CF_TEXT_W: u32 = 13;
 const CMD_NEW: usize = 1;
@@ -215,6 +222,14 @@ struct TextView {
     marker: Option<(IDWriteTextLayout, f32)>,
     quoted: bool,
     thematic_break: bool,
+}
+#[derive(Clone, Copy, Debug)]
+struct GutterRow {
+    view_index: usize,
+    y: f32,
+    baseline: f32,
+    height: f32,
+    line_number: usize,
 }
 struct GutterPresentation {
     marker: Option<(IDWriteTextLayout, f32)>,
@@ -397,6 +412,13 @@ impl Drop for DrawFrame<'_> {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaintedFrame {
+    hwnd: usize,
+    document_id: u64,
+    revision: u64,
+    sequence: u64,
+}
 struct App {
     hwnd: HWND,
     graphics: Graphics,
@@ -405,6 +427,9 @@ struct App {
     tab_scroll: usize,
     next_id: u64,
     views: Vec<TextView>,
+    source_line_starts: Vec<usize>,
+    gutter_rows: Vec<GutterRow>,
+    gutter_width: f32,
     visible_tokens: Vec<VisibleToken>,
     literal_blocks: Vec<Range<usize>>,
     tables: Vec<TableView>,
@@ -412,6 +437,7 @@ struct App {
     image_cache: HashMap<PathBuf, CachedImage>,
     minimized: bool,
     full_paint: bool,
+    painted_frame: Option<PaintedFrame>,
     paint_retry_pending: bool,
     animation_timer_armed: bool,
     height: f32,
@@ -443,6 +469,7 @@ struct App {
     close_after_composition: Option<(u32, WPARAM, LPARAM)>,
     pending_surrogate: Option<u16>,
     diagnostic: Option<PathBuf>,
+    phase_trace: Option<Rc<PhaseTrace>>,
     caret: (f32, f32, f32),
     native_caret: NativeCaretState,
     status: String,
@@ -455,11 +482,13 @@ struct App {
     editor_actions: EditorActions,
     diagnostics: DiagnosticsPane,
     close_target: Option<HWND>,
+    settings_requested: bool,
 }
 
 // App is never mutably aliased. Only owned, synchronous notification snapshots
 // may be queued while a modal/native callback holds its RefCell borrow.
 struct WindowState {
+    phase_trace: Option<Rc<PhaseTrace>>,
     app: RefCell<App>,
     notifications: RefCell<VecDeque<(ImeEnvelope, NativeNotification)>>,
     document_id: Cell<u64>,
@@ -469,9 +498,12 @@ struct WindowState {
     compact_window: Cell<HWND>,
     workspace_message: Cell<u32>,
     deferred_persistence: Cell<bool>,
+    settings_open: Cell<bool>,
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
+    menu_paint: RefCell<Vec<Rc<menu_style::MenuPaint>>>,
+    explorer_paint: features::ExplorerPaintSlot,
     deferred_paints: Cell<[Option<(HWND, RECT)>; 2]>,
     ime_input: Cell<Option<ImeInputContext>>,
     ime_dispatch_key: Cell<Option<(HWND, u32, usize, isize)>>,
@@ -480,7 +512,10 @@ impl WindowState {
     fn new(app: App) -> Self {
         let document_id = Cell::new(app.doc().id());
         let ime_ingress = Rc::clone(&app.ime_ingress);
+        let phase_trace = app.phase_trace.clone();
+        let explorer_paint = app.features.explorer_paint_handle();
         Self {
+            phase_trace,
             app: RefCell::new(app),
             notifications: RefCell::new(VecDeque::new()),
             document_id,
@@ -490,9 +525,12 @@ impl WindowState {
             compact_window: Cell::new(HWND::default()),
             workspace_message: Cell::new(0),
             deferred_persistence: Cell::new(false),
+            settings_open: Cell::new(false),
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
+            menu_paint: RefCell::new(Vec::new()),
+            explorer_paint,
             deferred_paints: Cell::new([None, None]),
             ime_input: Cell::new(None),
             ime_dispatch_key: Cell::new(None),
@@ -569,6 +607,72 @@ impl WindowState {
                 && IsWindow(Some(hwnd)).as_bool()
                 && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == self as *const WindowState as isize
         }
+    }
+}
+
+// Opt-in, constant-size phase records. No document text, paths or maps enter
+// this sidecar; never overwrite an earlier run's evidence or affect editing.
+struct PhaseTrace {
+    started: Instant,
+    file: RefCell<std::fs::File>,
+    dropped: Cell<u64>,
+}
+impl PhaseTrace {
+    fn open(diagnostic: &Path) -> Option<Rc<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(diagnostic.with_extension("phases.jsonl"))
+            .ok()?;
+        let trace = Rc::new(Self {
+            started: Instant::now(),
+            file: RefCell::new(file),
+            dropped: Cell::new(0),
+        });
+        trace.record("trace", "opened");
+        Some(trace)
+    }
+    fn record(&self, phase: &'static str, event: &'static str) {
+        use std::io::Write;
+        let Ok(mut file) = self.file.try_borrow_mut() else {
+            self.dropped.set(self.dropped.get().saturating_add(1));
+            return;
+        };
+        if writeln!(
+            file,
+            "{{\"t_us\":{},\"phase\":\"{}\",\"event\":\"{}\",\"dropped_total\":{}}}",
+            self.started.elapsed().as_micros(),
+            phase,
+            event,
+            self.dropped.get()
+        )
+        .is_err()
+        {
+            self.dropped.set(self.dropped.get().saturating_add(1));
+        }
+    }
+}
+fn record_phase(trace: &Option<Rc<PhaseTrace>>, phase: &'static str, event: &'static str) {
+    if let Some(trace) = trace {
+        trace.record(phase, event);
+    }
+}
+struct PhaseSpan {
+    trace: Option<Rc<PhaseTrace>>,
+    phase: &'static str,
+}
+impl PhaseSpan {
+    fn new(trace: &Option<Rc<PhaseTrace>>, phase: &'static str) -> Self {
+        record_phase(trace, phase, "begin");
+        Self {
+            trace: trace.clone(),
+            phase,
+        }
+    }
+}
+impl Drop for PhaseSpan {
+    fn drop(&mut self) {
+        record_phase(&self.trace, self.phase, "end");
     }
 }
 
@@ -937,6 +1041,22 @@ fn required_caret_change(
         move_position: recreate || current.position != Some(position),
     }
 }
+fn native_caret_owner() -> Option<HWND> {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // A thread has one caret, which native EDIT controls manage themselves.
+    // Thread zero would inspect the foreground thread instead of this owner.
+    unsafe {
+        GetGUIThreadInfo(
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            &mut info,
+        )
+        .ok()?;
+    }
+    Some(info.hwndCaret)
+}
 fn caret_intersects_damage(caret: (f32, f32, f32), damage: D2D_RECT_F) -> bool {
     damage.left <= caret.0 + 2.0
         && damage.right >= caret.0
@@ -962,6 +1082,7 @@ fn startup_window_state(
     diagnostic: Option<PathBuf>,
     paths: Vec<PathBuf>,
 ) -> WindowState {
+    let phase_trace = diagnostic.as_deref().and_then(PhaseTrace::open);
     let mut app = App {
         hwnd: HWND::default(),
         graphics,
@@ -970,6 +1091,9 @@ fn startup_window_state(
         tab_scroll: 0,
         next_id: 1,
         views: Vec::new(),
+        source_line_starts: Vec::new(),
+        gutter_rows: Vec::new(),
+        gutter_width: 0.0,
         visible_tokens: Vec::new(),
         literal_blocks: Vec::new(),
         tables: Vec::new(),
@@ -977,6 +1101,7 @@ fn startup_window_state(
         image_cache: HashMap::new(),
         minimized: false,
         full_paint: true,
+        painted_frame: None,
         paint_retry_pending: false,
         animation_timer_armed: false,
         height: 0.0,
@@ -1008,6 +1133,7 @@ fn startup_window_state(
         close_after_composition: None,
         pending_surrogate: None,
         diagnostic,
+        phase_trace,
         caret: (LEFT, TOP, 28.0),
         native_caret: NativeCaretState::default(),
         status: String::new(),
@@ -1020,6 +1146,7 @@ fn startup_window_state(
         editor_actions: EditorActions::default(),
         diagnostics: DiagnosticsPane::default(),
         close_target: None,
+        settings_requested: false,
     };
     for path in paths {
         if path.is_dir() {
@@ -1040,9 +1167,10 @@ pub fn run() -> windows::core::Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_IBEAM)?,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: w!("MDLiteRustEditor"),
             ..Default::default()
         };
@@ -1137,6 +1265,7 @@ pub fn run() -> windows::core::Result<()> {
             drain_native_notifications(&app, &mut app.app.borrow_mut());
             if key_down {
                 let mut owner = app.app.borrow_mut();
+                owner.features_reset_calendar_click();
                 owner.invalidate_stale_reconversion();
                 if let Some(cancel) =
                     owner.prepare_reconversion_cancel(ingress, input, message.hwnd)
@@ -1149,6 +1278,7 @@ pub fn run() -> windows::core::Result<()> {
             }
             replay_deferred_paints(&app);
             let handled = app.app.borrow_mut().shell_message(&message);
+            settings_dialog::run_requested(&app);
             replay_deferred_paints(&app);
             if handled {
                 continue;
@@ -1185,8 +1315,16 @@ pub fn run() -> windows::core::Result<()> {
             }
         }
         // NCDESTROY has cleared userdata; the last callback has returned.
-        drop(app);
-        CoUninitialize();
+        let phase_trace = app.phase_trace.clone();
+        record_phase(&phase_trace, "message_loop", "ended");
+        {
+            let _phase = PhaseSpan::new(&phase_trace, "app.drop");
+            drop(app);
+        }
+        {
+            let _phase = PhaseSpan::new(&phase_trace, "com.uninitialize");
+            CoUninitialize();
+        }
         Ok(())
     }
 }
@@ -1212,6 +1350,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if msg == WM_NCDESTROY {
             if !pointer.is_null() {
                 let state = &*pointer;
+                if state.main_window.get() == hwnd {
+                    record_phase(&state.phase_trace, "main.destroy", "nc_destroy");
+                    let retired = state.explorer_paint.replace(None);
+                    drop(retired);
+                }
                 state.button_paint.borrow_mut().take();
                 if state.compact_window.get() == hwnd {
                     state.compact_window.set(HWND::default());
@@ -1227,6 +1370,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let state = &*pointer;
+        // Popup tracking pumps messages while App is already mutably borrowed.
+        // These snapshots contain no document/App references.
+        if let Some(result) = menu_style::window_message(state, hwnd, msg, wp, lp) {
+            return result;
+        }
+        if msg == WM_CLOSE {
+            record_phase(&state.phase_trace, "close", "received");
+        }
         state.observe_ime_input_message(hwnd, msg, wp, lp);
         if ((msg == WM_ACTIVATE && matches!(wp.0 & 0xffff, 1 | 2) && (wp.0 >> 16) & 0xffff == 0)
             || (msg == WM_NCACTIVATE && wp.0 != 0 && !IsIconic(hwnd).as_bool()))
@@ -1277,11 +1428,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if state.main_window.get() == hwnd {
+                record_phase(&state.phase_trace, "main.destroy", "post_quit");
                 PostQuitMessage(0);
             }
             return LRESULT(0);
         }
-        let app_borrow = state.app.try_borrow_mut();
+        // A Settings modal no longer owns App across its nested message pump.
+        // Keep its former input/timer semantics, but let native owner painting
+        // use the ordinary App route rather than consume blank child draws.
+        let app_borrow = if state.settings_open.get()
+            && !matches!(
+                msg,
+                WM_PAINT
+                    | WM_ERASEBKGND
+                    | WM_DRAWITEM
+                    | WM_MEASUREITEM
+                    | WM_CTLCOLORSTATIC
+                    | WM_CTLCOLOREDIT
+                    | WM_CTLCOLORLISTBOX
+                    | WM_CTLCOLORBTN
+                    | WM_CTLCOLORDLG
+                    | WM_CTLCOLORSCROLLBAR
+            ) {
+            None
+        } else {
+            state.app.try_borrow_mut().ok()
+        };
         let queue_position = state.notifications.borrow().len();
         let envelope = if (state.editor_window.get() == HWND::default()
             || state.editor_window.get() == hwnd)
@@ -1323,11 +1495,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 .borrow_mut()
                 .insert(queue_position, (envelope.unwrap(), notification));
         }
-        let Ok(mut app) = app_borrow else {
+        let Some(mut app) = app_borrow else {
+            if msg == WM_CLOSE {
+                record_phase(&state.phase_trace, "close", "app_unavailable_consumed");
+            }
             if matches!(
                 msg,
                 WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN
-            ) && hwnd == state.main_window.get()
+            ) && state.owns_paint_surface(hwnd)
                 && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool()
             {
                 let colors = state.control_colors.borrow().clone();
@@ -1336,6 +1511,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if msg == WM_DRAWITEM && lp.0 != 0 {
+                if hwnd == state.main_window.get()
+                    && state.owns_paint_surface(hwnd)
+                    && wp.0 == features::EXPLORER_LIST
+                {
+                    let item = &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+                    if item.CtlID as usize == features::EXPLORER_LIST
+                        && item.CtlType == windows::Win32::UI::Controls::ODT_LISTBOX
+                        && GetDlgCtrlID(item.hwndItem) as usize == features::EXPLORER_LIST
+                        && GetParent(item.hwndItem).ok() == Some(hwnd)
+                    {
+                        let paint = state.explorer_paint.borrow().clone();
+                        if let Some(paint) = paint
+                            && paint.draw(item, control_scroll::horizontal_offset(item.hwndItem))
+                        {
+                            return LRESULT(1);
+                        }
+                    }
+                }
                 if state.owns_paint_surface(hwnd) {
                     let colors = state.control_colors.borrow().clone();
                     if let Some(colors) = colors
@@ -1410,6 +1603,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     | WM_KEYDOWN
                     | WM_CHAR
                     | WM_LBUTTONDOWN
+                    | WM_LBUTTONDBLCLK
                     | WM_DROPFILES
                     | WM_IME_REQUEST
             ) {
@@ -1417,7 +1611,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
-        if state.deferred_persistence.replace(false) {
+        if !state.settings_open.get() && state.deferred_persistence.replace(false) {
             app.rearm_autosave(true);
         }
         state.document_id.set(app.doc().id());
@@ -1452,6 +1646,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         } else if (msg == WM_CLOSE || (msg == WM_COMMAND && wp.0 & 0xffff == CMD_CLOSE))
             && app.composing
         {
+            record_phase(&state.phase_trace, "close", "ime_deferred");
             if app.close_after_composition.is_none() {
                 app.close_after_composition = Some((msg, wp, lp));
                 app.close_target = Some(hwnd);
@@ -1469,6 +1664,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         };
         drain_native_notifications(state, &mut app);
         drop(app);
+        settings_dialog::run_requested(state);
         replay_deferred_paints(state);
         result.unwrap_or_else(|| {
             // Standard default processing can synchronously send WM_SIZE,
@@ -1542,17 +1738,21 @@ unsafe fn perform_reconversion_cancel(
 
 unsafe fn drain_native_notifications(state: &WindowState, app: &mut App) {
     unsafe {
-        // Release the queue borrow before invoking IMM or native callbacks.
-        loop {
-            let next = state.notifications.borrow_mut().pop_front();
-            let Some((owner, notification)) = next else {
-                break;
-            };
-            app.native_packet(owner, notification);
+        // Settings previously queued lifecycle notifications and persistence
+        // while App was borrowed. Painting must not drain those queues early.
+        if !state.settings_open.get() {
+            // Release the queue borrow before invoking IMM or native callbacks.
+            loop {
+                let next = state.notifications.borrow_mut().pop_front();
+                let Some((owner, notification)) = next else {
+                    break;
+                };
+                app.native_packet(owner, notification);
+            }
+            app.invalidate_ime_editor();
+            state.document_id.set(app.doc().id());
+            state.editor_window.set(app.editing_window());
         }
-        app.invalidate_ime_editor();
-        state.document_id.set(app.doc().id());
-        state.editor_window.set(app.editing_window());
         if state.deferred_control_redraw.replace(false) {
             let main = state.main_window.get();
             let main = if main == HWND::default() {
@@ -1585,7 +1785,22 @@ unsafe fn dispatch_window_message(
     app: &mut App,
 ) -> Option<LRESULT> {
     unsafe {
+        if matches!(
+            msg,
+            WM_SIZE
+                | WM_DPICHANGED
+                | WM_KEYDOWN
+                | WM_SYSKEYDOWN
+                | WM_CHAR
+                | WM_COMMAND
+                | WM_KILLFOCUS
+                | WM_CANCELMODE
+                | WM_MOUSEWHEEL
+        ) {
+            app.features_reset_calendar_click();
+        }
         if msg == WM_CLOSE && (app.search_busy() || app.git_job_busy()) {
+            record_phase(&app.phase_trace, "close", "busy_rejected");
             app.status = "処理中です。取消を行い、処理結果を確認してから閉じてください".into();
             app.refresh();
             return Some(LRESULT(0));
@@ -1601,6 +1816,18 @@ unsafe fn dispatch_window_message(
         }
         Some(match msg {
             WM_CREATE => LRESULT(0),
+            WM_SETCURSOR if wp.0 == hwnd.0 as usize && lp.0 as u16 == HTCLIENT as u16 => {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool() {
+                    let cursor =
+                        app.surface_cursor_at(point.x as f32 / app.dpi, point.y as f32 / app.dpi);
+                    if let Ok(cursor) = LoadCursorW(None, cursor) {
+                        SetCursor(Some(cursor));
+                        return Some(LRESULT(1));
+                    }
+                }
+                return None;
+            }
             value if value == WM_APP + 1 && app.diagnostic.is_some() => {
                 app.refresh();
                 LRESULT(1)
@@ -1648,6 +1875,7 @@ unsafe fn dispatch_window_message(
             }
             WM_DPICHANGED => {
                 app.dpi = (wp.0 & 0xffff) as f32 / 96.0;
+                app.update_surface_font(hwnd, (wp.0 & 0xffff) as u32);
                 app.discard_target();
                 let r = &*(lp.0 as *const RECT);
                 let _ = SetWindowPos(
@@ -1674,6 +1902,12 @@ unsafe fn dispatch_window_message(
                 let x = (lp.0 as u16 as i16) as f32 / app.dpi;
                 let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
                 let _ = SetFocus(Some(hwnd));
+                if !app
+                    .feature_panel_rect(mdlite::panel::PanelId::Calendar)
+                    .is_some_and(|r| r.contains(x, y))
+                {
+                    app.features_reset_calendar_click();
+                }
                 if app.shell.enabled {
                     for id in [
                         mdlite::panel::PanelId::Explorer,
@@ -1749,7 +1983,28 @@ unsafe fn dispatch_window_message(
                 app.refresh();
                 LRESULT(0)
             }
+            WM_LBUTTONDBLCLK => {
+                let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                if app.shell.enabled
+                    && app.features_double_click(mdlite::panel::PanelId::Calendar, x, y)
+                {
+                    app.refresh();
+                    return Some(LRESULT(0));
+                }
+                app.features_reset_calendar_click();
+                // Other surfaces retain the ordinary second-click behavior.
+                // Calendar activation above exclusively consumes its double click.
+                dispatch_window_message(hwnd, WM_LBUTTONDOWN, wp, lp, app).unwrap_or(LRESULT(0))
+            }
             WM_MOUSEMOVE => {
+                if GetCapture() == hwnd {
+                    let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                    let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                    if let Ok(cursor) = LoadCursorW(None, app.surface_cursor_at(x, y)) {
+                        SetCursor(Some(cursor));
+                    }
+                }
                 if app.shell.enabled {
                     let x = (lp.0 as u16 as i16) as f32 / app.dpi;
                     let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
@@ -1818,11 +2073,16 @@ unsafe fn dispatch_window_message(
             }
             WM_DRAWITEM => {
                 if lp.0 != 0
-                    && app.explorer_icons.draw(
+                    && app.explorer_icons.draw_offset(
                         &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
                         app.shell.tokens,
+                        control_scroll::horizontal_offset(
+                            (*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT))
+                                .hwndItem,
+                        ),
                     )
                 {
+                    app.features_refresh_explorer_paint(false);
                     LRESULT(1)
                 } else {
                     return None;
@@ -1937,10 +2197,31 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_CLOSE => {
+                record_phase(&app.phase_trace, "close", "dispatch");
+                let confirm_phase = PhaseSpan::new(&app.phase_trace, "close.confirm");
                 if app.confirm_all() {
-                    app.persist_session();
-                    let _ = DestroyWindow(hwnd);
+                    drop(confirm_phase);
+                    record_phase(&app.phase_trace, "close", "confirmed");
+                    {
+                        let _phase = PhaseSpan::new(&app.phase_trace, "close.session");
+                        app.persist_session();
+                    }
+                    {
+                        let _phase = PhaseSpan::new(&app.phase_trace, "close.destroy_window");
+                        let result = DestroyWindow(hwnd);
+                        record_phase(
+                            &app.phase_trace,
+                            "close.destroy_window",
+                            if result.is_ok() {
+                                "returned_ok"
+                            } else {
+                                "returned_error"
+                            },
+                        );
+                    }
                 } else {
+                    drop(confirm_phase);
+                    record_phase(&app.phase_trace, "close", "confirmation_rejected");
                     app.refresh();
                 }
                 LRESULT(0)
@@ -2226,7 +2507,7 @@ impl App {
                     }
                     if self.shell.enabled {
                         document = RECT {
-                            left: (self.editor_left() * self.dpi).round() as i32,
+                            left: (self.content_left() * self.dpi).round() as i32,
                             top: (self.editor_top() * self.dpi).round() as i32,
                             right: (self.editor_right() * self.dpi).round() as i32,
                             bottom: (self.editor_bottom() * self.dpi).round() as i32,
@@ -2366,14 +2647,14 @@ impl App {
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
             self.release_caret();
-            let command = TrackPopupMenu(
+            let command = menu_style::track_popup(
+                self.hwnd,
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY,
                 point.x,
                 point.y,
-                None,
-                self.hwnd,
-                None,
+                self.shell.tokens,
+                self.dpi,
             )
             .0 as usize;
             let _ = DestroyMenu(menu);
@@ -3158,8 +3439,8 @@ impl App {
             }
             match key {
                 0x21 | 0x22 => {
-                    let page =
-                        (self.animation_viewport() - self.editor_top()).max(self.font_size() * 1.6);
+                    let page = (self.animation_viewport() - self.editor_top())
+                        .max(presentation::line_height(self.font_size()));
                     let (x, y, _) = self.caret_location();
                     let x = *self.preferred_x.get_or_insert(x);
                     let delta = if key == 0x21 { -page } else { page };
@@ -3339,8 +3620,17 @@ impl App {
             self.preferred_x = None;
         }
         let (mut target, mut affinity) = match key {
-            0x25 => (self.visible_step(p, true), BoundaryAffinity::After),
-            0x27 => (self.visible_step(p, false), BoundaryAffinity::After),
+            0x25 | 0x27 => {
+                let target = self.visible_step(p, key == 0x25);
+                (
+                    target,
+                    if target == p {
+                        self.doc().selection_affinity()
+                    } else {
+                        BoundaryAffinity::After
+                    },
+                )
+            }
             0x26 | 0x28 => {
                 let (x, _, _) = self.caret_location();
                 let x = *self.preferred_x.get_or_insert(x);
@@ -3392,7 +3682,7 @@ impl App {
         // DirectWrite visual line metrics account for wrapping and heading
         // heights; a guessed multiple of the current glyph height does not.
         let mut rows = Vec::new();
-        for view in &self.views {
+        for (view_index, view) in self.views.iter().enumerate() {
             let mut count = 0;
             unsafe {
                 let _ = view.layout.GetLineMetrics(None, &mut count);
@@ -3404,7 +3694,7 @@ impl App {
                 {
                     let mut top = view.y - scroll;
                     for line in lines {
-                        rows.push((top, top + line.height));
+                        rows.push((top, top + line.height, view_index));
                         top += line.height;
                     }
                 }
@@ -3412,28 +3702,72 @@ impl App {
         }
         let current_top = rows
             .iter()
-            .filter(|&&(top, bottom)| top <= y + 0.5 && y < bottom)
-            .map(|&(top, _)| top)
+            .filter(|&&(top, bottom, _)| top <= y + 0.5 && y < bottom)
+            .map(|&(top, _, _)| top)
             .max_by(f32::total_cmp)
             .unwrap_or(y);
-        let destination = rows
-            .into_iter()
-            .filter(|&(top, _)| {
-                if back {
-                    top < current_top - 0.5
-                } else {
-                    top > current_top + 0.5
+        rows.retain(|&(top, _, _)| {
+            if back {
+                top < current_top - 0.5
+            } else {
+                top > current_top + 0.5
+            }
+        });
+        let at_edge = rows.is_empty();
+        rows.sort_by(|a, b| {
+            (a.0 - current_top)
+                .abs()
+                .total_cmp(&(b.0 - current_top).abs())
+        });
+        let mut destination: Option<(f32, f32, usize, BoundaryAffinity)> = None;
+        for (top, bottom, view_index) in rows {
+            let vertical_distance = (top - current_top).abs();
+            if destination.is_some_and(|(distance, _, _, _)| vertical_distance > distance) {
+                break;
+            }
+            let view = &self.views[view_index];
+            for (byte, affinity) in self.view_hit_candidates(view, x, (top + bottom) * 0.5 + scroll)
+            {
+                let (target_x, target_y, _) = self.caret_location_at(byte, affinity);
+                // A projected trailing newline can share its After boundary
+                // with the next block. Use the side that maps back to this
+                // visual row; an unaddressable layout-only row is not a stop.
+                if target_y >= top - 0.5
+                    && target_y < bottom
+                    && if back {
+                        target_y < current_top - 0.5
+                    } else {
+                        target_y > current_top + 0.5
+                    }
+                {
+                    let horizontal_distance = (target_x - x).abs();
+                    // Several table cells can own the same destination row.
+                    // Keep the caret nearest preferred X, rather than the
+                    // first cell created left-to-right. Preserve affinity ties.
+                    if destination.is_none_or(|(_, distance, _, _)| horizontal_distance < distance)
+                    {
+                        destination =
+                            Some((vertical_distance, horizontal_distance, byte, affinity));
+                    }
                 }
-            })
-            .min_by(|a, b| {
-                (a.0 - current_top)
-                    .abs()
-                    .total_cmp(&(b.0 - current_top).abs())
-            });
-        destination.map_or(
-            (self.doc().selection().head, self.doc().selection_affinity()),
-            |(top, bottom)| self.hit_with_affinity(x, (top + bottom) * 0.5),
-        )
+            }
+        }
+        if let Some((_, _, byte, affinity)) = destination {
+            return (byte, affinity);
+        }
+        let edge = if back { 0 } else { self.doc().byte_len() };
+        if at_edge && edge != self.doc().selection().head {
+            (
+                edge,
+                if back {
+                    BoundaryAffinity::Before
+                } else {
+                    BoundaryAffinity::After
+                },
+            )
+        } else {
+            (self.doc().selection().head, self.doc().selection_affinity())
+        }
     }
     unsafe fn after_input(&mut self) {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -3452,13 +3786,9 @@ impl App {
                     .table_scroll
                     .get(&key)
                     .unwrap_or(&0.0);
-                let caret_x = self.composition_caret().0 - self.editor_left() + current;
-                let next = visible_table_offset(
-                    current,
-                    caret_x,
-                    (self.editor_width() - 12.0).max(1.0),
-                    content_width,
-                );
+                let caret_x = self.composition_caret().0 - self.content_left() + current;
+                let next =
+                    visible_table_offset(current, caret_x, self.content_width(), content_width);
                 if next != current {
                     self.tabs[self.active].table_scroll.insert(key, next);
                     self.layout_key = None;
@@ -3574,6 +3904,7 @@ impl App {
                 self.return_from_compact();
             }
         }
+        self.record_navigation();
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(Tab {
@@ -3611,6 +3942,7 @@ impl App {
         }
         match FileSnapshot::open(&path) {
             Ok(loaded) => {
+                self.record_navigation();
                 let id = self.next_id;
                 self.next_id += 1;
                 self.tabs.push(Tab {
@@ -3644,7 +3976,7 @@ impl App {
             return tab_strip_layout(self.width, self.tabs.len(), self.tab_scroll);
         }
         let left = self.editor_left() - 20.;
-        let right = self.editor_right() + 20. - 148.;
+        let right = self.editor_right() - 28.;
         let mut strip = tab_strip_layout(
             (right - left).max(1.) + LEFT * 2.,
             self.tabs.len(),
@@ -3737,6 +4069,10 @@ impl App {
         if self.composing {
             return;
         }
+        if index >= self.tabs.len() || index == self.active {
+            return;
+        }
+        self.record_navigation();
         if self.shell.compact_window != HWND::default() {
             unsafe {
                 self.return_from_compact();
@@ -4014,18 +4350,33 @@ impl App {
         width: f32,
         size: f32,
     ) -> windows::core::Result<IDWriteTextLayout> {
+        let family = if self.shell.enabled {
+            &self.shell.settings.font_face
+        } else {
+            shell::UI_FONT_FAMILY
+        };
+        unsafe { self.text_layout_family(text, width, size, family) }
+    }
+    unsafe fn ui_text_layout(
+        &self,
+        text: &str,
+        width: f32,
+        size: f32,
+    ) -> windows::core::Result<IDWriteTextLayout> {
+        unsafe { self.text_layout_family(text, width, size, shell::UI_FONT_FAMILY) }
+    }
+    unsafe fn text_layout_family(
+        &self,
+        text: &str,
+        width: f32,
+        size: f32,
+        family: &str,
+    ) -> windows::core::Result<IDWriteTextLayout> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
             let format = self.graphics.write.CreateTextFormat(
-                PCWSTR(
-                    wide(if self.shell.enabled {
-                        &self.shell.settings.font_face
-                    } else {
-                        "Yu Gothic UI"
-                    })
-                    .as_ptr(),
-                ),
+                PCWSTR(wide(family).as_ptr()),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -4034,7 +4385,8 @@ impl App {
                 w!("ja-jp"),
             )?;
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-            format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, size * 1.6, size * 1.25)?;
+            let (line_height, baseline) = presentation::line_spacing(size);
+            format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line_height, baseline)?;
             self.graphics.write.CreateTextLayout(
                 &text.encode_utf16().collect::<Vec<_>>(),
                 &format,
@@ -4050,10 +4402,20 @@ impl App {
         height: f32,
     ) -> windows::core::Result<IDWriteTextLayout> {
         unsafe {
-            let layout = self.text_layout(label, width, 14.0)?;
+            let layout = self.ui_text_layout(label, width, 14.0)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             layout.SetMaxHeight(height)?;
             Ok(layout)
+        }
+    }
+    unsafe fn measure_gutter_width(&self, line_count: usize) -> windows::core::Result<f32> {
+        unsafe {
+            let sample = "9".repeat(presentation::line_number_digits(line_count));
+            let layout = self.text_layout(&sample, 1024.0, self.font_size())?;
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics)?;
+            Ok(metrics.widthIncludingTrailingWhitespace + GUTTER_HORIZONTAL_PADDING)
         }
     }
     unsafe fn gutter_presentation(
@@ -4127,8 +4489,11 @@ impl App {
             self.visible_tokens.extend(tokens);
             let layout = self.text_layout(text, width, size)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut metrics)?;
-            let height = metrics.height.max(size * 1.6);
+            {
+                let _phase = PhaseSpan::new(&self.phase_trace, "layout.view_get_metrics");
+                layout.GetMetrics(&mut metrics)?;
+            }
+            let height = metrics.height.max(presentation::line_height(size));
             self.views.push(TextView {
                 layout,
                 text: text.encode_utf16().collect(),
@@ -4203,10 +4568,7 @@ impl App {
                     .filter(|block| {
                         matches!(
                             block.kind,
-                            BlockKind::Paragraph
-                                | BlockKind::Heading { .. }
-                                | BlockKind::ListItem
-                                | BlockKind::ThematicBreak
+                            BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem
                         ) && block.source.start <= head
                             && (head < block.source.end
                                 || (head == self.doc().byte_len() && block.source.end == head))
@@ -4223,6 +4585,7 @@ impl App {
             if self.layout_key == Some(key) && self.revealed_source == reveal {
                 return Ok(());
             }
+            let _phase = PhaseSpan::new(&self.phase_trace, "layout.rebuild");
             self.revealed_source = reveal;
             self.views.clear();
             self.visible_tokens.clear();
@@ -4230,8 +4593,11 @@ impl App {
             self.tables.clear();
             self.images.clear();
             let source = self.doc().source_shared();
+            let line_starts = physical_line_starts(&source);
+            self.gutter_width = self.measure_gutter_width(line_starts.len())?;
             let mut y = self.editor_top();
-            let width = (self.editor_width() - 12.0).max(50.0);
+            let width = self.content_width();
+            self.gutter_rows.clear();
             if self.tabs[self.active].raw {
                 let mut start = 0;
                 for line in source.split_inclusive('\n') {
@@ -4241,7 +4607,7 @@ impl App {
                         text,
                         (map.clone(), map),
                         start..start + line.len(),
-                        (self.editor_left(), y, width),
+                        (self.content_left(), y, width),
                         self.font_size(),
                         None,
                     )?;
@@ -4253,7 +4619,7 @@ impl App {
                         "",
                         (vec![eof], vec![eof]),
                         eof..eof,
-                        (self.editor_left(), y, width),
+                        (self.content_left(), y, width),
                         self.font_size(),
                         None,
                     )?;
@@ -4480,12 +4846,34 @@ impl App {
                         )?;
                         continue;
                     }
-                    let text = String::from_utf16_lossy(&utf16[block.display_utf16.clone()]);
-                    let (map, before) =
-                        projection_mapping(&projection, block.display_utf16.clone());
-                    let size = match block.kind {
+                    // A literal block's terminating EOL belongs to the source
+                    // boundary, not an extra DirectWrite row before the next
+                    // physical line. Internal blank lines remain in the layout.
+                    let mut display_range = block.display_utf16.clone();
+                    if matches!(block.kind, BlockKind::Code { fenced: true, .. })
+                        && display_range.end > display_range.start
+                        && utf16[display_range.end - 1] == b'\n' as u16
+                    {
+                        display_range.end -= 1;
+                    }
+                    let text = String::from_utf16_lossy(&utf16[display_range.clone()]);
+                    let (map, before) = if display_range.is_empty()
+                        && matches!(block.kind, BlockKind::Heading { .. })
+                    {
+                        // Empty headings share a display boundary with the next
+                        // block. That global boundary may already point beyond
+                        // this row; its insertion point belongs before its EOL.
+                        let point = block.source.start
+                            + source[block.source.clone()]
+                                .trim_end_matches(['\r', '\n'])
+                                .len();
+                        (vec![point], vec![point])
+                    } else {
+                        projection_mapping(&projection, display_range.clone())
+                    };
+                    let size = match &block.kind {
                         BlockKind::Heading { level } => {
-                            self.font_size() + (7 - level.min(6) as i32) as f32 * 2.4
+                            self.font_size() * presentation::heading_scale(*level)
                         }
                         _ => self.font_size(),
                     };
@@ -4500,14 +4888,20 @@ impl App {
                     };
                     let indent = (block.depth.saturating_sub(1) as f32 * 12.0)
                         .max(marker.as_ref().map_or(0.0, |(_, width)| width + 8.0));
-                    y += self.push_view(
+                    let height = self.push_view(
                         &text,
                         (map, before),
                         block.source.clone(),
-                        (self.editor_left() + indent, y, width - indent),
+                        (self.content_left() + indent, y, width - indent),
                         size,
                         None,
-                    )? + 10.0;
+                    )?;
+                    y += height
+                        + if matches!(block.kind, BlockKind::Heading { .. }) {
+                            presentation::heading_gap(size)
+                        } else {
+                            0.0
+                        };
                     if let Some(view) = self.views.last_mut() {
                         view.marker = marker;
                         view.quoted = quoted;
@@ -4524,14 +4918,14 @@ impl App {
                             Self::apply_projection_styles(
                                 &view.layout,
                                 &projection,
-                                block.display_utf16.clone(),
+                                display_range,
                             )?;
                         }
                     }
                     if let Some(view) = self.views.last_mut() {
                         let mut metrics = DWRITE_TEXT_METRICS::default();
                         view.layout.GetMetrics(&mut metrics)?;
-                        let height = metrics.height.max(size * 1.6);
+                        let height = metrics.height.max(presentation::line_height(size));
                         y += height - view.height;
                         view.height = height;
                     }
@@ -4555,11 +4949,11 @@ impl App {
                     "",
                     (vec![0], vec![0]),
                     0..0,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6;
+                y += presentation::line_height(self.font_size());
             }
             if !self.tabs[self.active].raw
                 && (self
@@ -4573,17 +4967,19 @@ impl App {
                     "",
                     (vec![eof], vec![eof]),
                     eof..eof,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6;
+                y += presentation::line_height(self.font_size());
             }
             if !self.tabs[self.active].raw {
-                y = self.layout_source_markers(&source, y, width)?;
+                y = self.layout_source_markers(&source, y, width, &line_starts)?;
             }
             self.views
                 .sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+            self.source_line_starts = line_starts;
+            self.rebuild_gutter_rows();
             self.height = y + 40.0;
             self.layout_key = Some(key);
             Ok(())
@@ -4596,17 +4992,31 @@ impl App {
         source: Range<usize>,
     ) -> windows::core::Result<()> {
         unsafe {
+            let rope = self.doc().rope();
+            let source_units = rope.utf16_code_unit_of_byte(source.start);
             for run in &projection.runs {
+                if !run.kinds.iter().any(|kind| {
+                    use mdlite::projection::InlineKind;
+                    matches!(
+                        kind,
+                        InlineKind::Strong
+                            | InlineKind::Emphasis
+                            | InlineKind::Code
+                            | InlineKind::Link { .. }
+                            | InlineKind::Strikethrough
+                    )
+                }) {
+                    continue;
+                }
                 let start = run.source.start.max(source.start);
                 let end = run.source.end.min(source.end);
                 if start >= end {
                     continue;
                 }
                 let range = DWRITE_TEXT_RANGE {
-                    startPosition: self.doc().source()[source.start..start]
-                        .encode_utf16()
-                        .count() as u32,
-                    length: self.doc().source()[start..end].encode_utf16().count() as u32,
+                    startPosition: (rope.utf16_code_unit_of_byte(start) - source_units) as u32,
+                    length: (rope.utf16_code_unit_of_byte(end)
+                        - rope.utf16_code_unit_of_byte(start)) as u32,
                 };
                 for kind in &run.kinds {
                     use mdlite::projection::InlineKind;
@@ -4632,84 +5042,200 @@ impl App {
         source: &str,
         mut bottom: f32,
         width: f32,
+        line_starts: &[usize],
     ) -> windows::core::Result<f32> {
         unsafe {
-            let mut markers: Vec<_> = physical_line_starts(source)
-                .into_iter()
-                .filter(|&p| {
-                    let end = source[p..]
-                        .find(['\r', '\n'])
-                        .map_or(source.len(), |offset| p + offset);
-                    source[p..end].trim().is_empty()
-                        && !self
-                            .tables
-                            .iter()
-                            .any(|table| table.table.range.contains(&p))
-                        && !self
-                            .views
-                            .iter()
-                            .any(|view| view.map.contains(&p) && !view.source.is_empty())
-                })
+            let existing_view_count = self.views.len();
+            let mut mapped_line_starts = Vec::new();
+            let mut empty_anchor_positions = Vec::new();
+            let mut source_y = Vec::with_capacity(existing_view_count);
+            for view in &self.views {
+                source_y.push((view.source.start, view.y));
+                if view.source.is_empty() {
+                    empty_anchor_positions.push(view.source.start);
+                    continue;
+                }
+                let first = line_starts.partition_point(|start| *start < view.source.start);
+                let last = line_starts.partition_point(|start| *start <= view.source.end);
+                mapped_line_starts.extend(
+                    line_starts[first..last]
+                        .iter()
+                        .copied()
+                        .filter(|start| view.map.binary_search(start).is_ok()),
+                );
+            }
+            mapped_line_starts.sort_unstable();
+            mapped_line_starts.dedup();
+            empty_anchor_positions.sort_unstable();
+            empty_anchor_positions.dedup();
+
+            source_y.sort_unstable_by_key(|(source_start, _)| *source_start);
+            let mut suffix_min_y = vec![0.0; source_y.len()];
+            for index in (0..source_y.len()).rev() {
+                suffix_min_y[index] = if index + 1 < source_y.len() {
+                    source_y[index].1.min(suffix_min_y[index + 1])
+                } else {
+                    source_y[index].1
+                };
+            }
+            let next_y = |position: usize| {
+                let index = source_y.partition_point(|(source_start, _)| *source_start < position);
+                suffix_min_y.get(index).copied()
+            };
+
+            let mut table_ranges: Vec<_> = self
+                .tables
+                .iter()
+                .map(|table| table.table.range.clone())
                 .collect();
+            table_ranges.sort_unstable_by_key(|range| range.start);
+            let mut markers = Vec::new();
+            for &position in line_starts {
+                let end = source[position..]
+                    .find(['\r', '\n'])
+                    .map_or(source.len(), |offset| position + offset);
+                if source[position..end].trim().is_empty()
+                    && mapped_line_starts.binary_search(&position).is_err()
+                {
+                    let table_index = table_ranges
+                        .partition_point(|range| range.start <= position)
+                        .saturating_sub(1);
+                    if !table_ranges
+                        .get(table_index)
+                        .is_some_and(|range| range.contains(&position))
+                    {
+                        markers.push((position, true));
+                    }
+                }
+            }
             markers.extend(self.tables.windows(2).filter_map(|tables| {
                 let p = tables[0].table.range.end;
                 let next_start = tables[1].table.range.start;
                 source
                     .get(p..next_start)
                     .filter(|gap| !gap.is_empty() && gap.trim().is_empty())
-                    .map(|_| p)
+                    .map(|_| (p, false))
             }));
-            // A source position after a closing fence is distinct from the last
-            // literal line even if the code block source range encloses both.
             markers.extend(
                 self.literal_blocks
                     .iter()
-                    .flat_map(|range| [range.start, range.end])
-                    .filter(|&p| source.is_char_boundary(p)),
+                    .flat_map(|range| [(range.start, true), (range.end, false)])
+                    .filter(|(p, _)| {
+                        source.is_char_boundary(*p)
+                            && !self
+                                .views
+                                .iter()
+                                .any(|view| view.map.binary_search(p).is_ok())
+                    }),
             );
-            markers.sort_unstable();
-            markers.dedup();
-            for p in markers {
-                if self
-                    .views
-                    .iter()
-                    .any(|view| view.source.is_empty() && view.source.start == p)
+            markers.sort_by_key(|(p, _)| *p);
+            let mut unique_markers: Vec<(usize, bool)> = Vec::with_capacity(markers.len());
+            for (position, takes_row) in markers {
+                if let Some((previous, previous_takes_row)) = unique_markers.last_mut()
+                    && *previous == position
                 {
+                    *previous_takes_row |= takes_row;
+                } else {
+                    unique_markers.push((position, takes_row));
+                }
+            }
+            let mut row_positions = Vec::new();
+            let mut reused_row_anchors = Vec::new();
+            let row_height = presentation::line_height(self.font_size());
+            for (p, takes_row) in unique_markers {
+                if empty_anchor_positions.binary_search(&p).is_ok() {
+                    if takes_row {
+                        row_positions.push(p);
+                        reused_row_anchors.push(p);
+                    }
                     continue;
                 }
-                let next = self
-                    .views
-                    .iter()
-                    .filter(|view| view.source.start >= p)
-                    .map(|view| view.y)
-                    .min_by(f32::total_cmp);
-                let y = next.unwrap_or(bottom);
-                let height = self.font_size() * 1.6;
-                for view in &mut self.views {
-                    if view.y >= y {
-                        view.y += height;
-                    }
-                }
-                for image in &mut self.images {
-                    if image.y >= y {
-                        image.y += height;
-                    }
-                }
-                for table in &mut self.tables {
-                    if table.y >= y {
-                        table.y += height;
-                    }
-                }
+                let next_y = next_y(p);
+                let y = if takes_row {
+                    row_positions.push(p);
+                    next_y.unwrap_or(bottom)
+                } else {
+                    self.source_view_at(p, Some(BoundaryAffinity::After))
+                        .and_then(|view| {
+                            let position = view
+                                .map
+                                .partition_point(|&byte| byte < p)
+                                .min(view.map.len().saturating_sub(1));
+                            layout_caret(&view.layout, position as u32, false)
+                                .map(|(_, row_y, _)| view.y + row_y)
+                        })
+                        .or(next_y)
+                        .unwrap_or(bottom)
+                };
                 self.push_view(
                     "",
                     (vec![p], vec![p]),
                     p..p,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
-                bottom += height;
             }
+            for (index, view) in self.views.iter_mut().enumerate() {
+                let reused_row_anchor = index < existing_view_count
+                    && view.source.is_empty()
+                    && reused_row_anchors.binary_search(&view.source.start).is_ok();
+                let include_equal = index < existing_view_count && !reused_row_anchor;
+                let shifts = presentation::source_row_shift_count(
+                    &row_positions,
+                    view.source.start,
+                    include_equal,
+                );
+                view.y += shifts as f32 * row_height;
+            }
+            for image in &mut self.images {
+                let shifts =
+                    presentation::source_row_shift_count(&row_positions, image.source.start, true);
+                image.y += shifts as f32 * row_height;
+            }
+            for table in &mut self.tables {
+                let shifts = presentation::source_row_shift_count(
+                    &row_positions,
+                    table.table.range.start,
+                    true,
+                );
+                table.y += shifts as f32 * row_height;
+            }
+            let blank_row_y: HashMap<_, _> = self
+                .views
+                .iter()
+                .filter(|view| {
+                    view.source.is_empty()
+                        && row_positions.binary_search(&view.source.start).is_ok()
+                })
+                .map(|view| (view.source.start, view.y))
+                .collect();
+            let table_anchors_before_blank: HashMap<_, _> = self
+                .tables
+                .iter()
+                .filter_map(|table| {
+                    let table_line = line_start(source, table.table.range.start);
+                    let index = line_starts.binary_search(&table_line).ok()?;
+                    let previous_line = *line_starts.get(index.checked_sub(1)?)?;
+                    if source_line_is_blank(source, previous_line)
+                        && row_positions.binary_search(&previous_line).is_ok()
+                    {
+                        blank_row_y
+                            .get(&previous_line)
+                            .map(|&y| (table.table.range.start, y))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for view in &mut self.views {
+                if view.source.is_empty()
+                    && let Some(&y) = table_anchors_before_blank.get(&view.source.start)
+                {
+                    view.y = y;
+                }
+            }
+            bottom += row_positions.len() as f32 * row_height;
             let p = self.doc().selection().head;
             if !self
                 .tables
@@ -4738,7 +5264,7 @@ impl App {
                     text,
                     (map.clone(), map),
                     start..end,
-                    (self.editor_left(), y, width),
+                    (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
@@ -4761,6 +5287,100 @@ impl App {
             }
             Ok(bottom)
         }
+    }
+    fn rebuild_gutter_rows(&mut self) {
+        let _phase = PhaseSpan::new(&self.phase_trace, "layout.gutter_metrics_rows");
+        let mut rows = Vec::new();
+        let source = self.doc().source();
+        for (view_index, view) in self.views.iter().enumerate() {
+            let mut count = 0;
+            unsafe {
+                let _ = view.layout.GetLineMetrics(None, &mut count);
+            }
+            if count == 0 {
+                continue;
+            }
+            let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+            if unsafe { view.layout.GetLineMetrics(Some(&mut lines), &mut count) }.is_err() {
+                continue;
+            }
+            let mut position = 0usize;
+            let mut top = view.y;
+            let bottom = view.y + view.height;
+            for line in lines.into_iter().take(count as usize) {
+                if top >= bottom - 0.5 {
+                    break;
+                }
+                let byte = if view.source.is_empty() {
+                    view.source.start
+                } else {
+                    view.map
+                        .get(position)
+                        .or_else(|| view.before.get(position))
+                        .copied()
+                        .unwrap_or(view.source.end)
+                };
+                let represented_row = if view.source.is_empty() || view.text.is_empty() {
+                    presentation::is_source_line_start(&self.source_line_starts, byte)
+                        && source_line_is_blank(source, byte)
+                } else {
+                    !(line.length == 0 && position >= view.text.len())
+                };
+                if represented_row {
+                    let line_number =
+                        presentation::source_line_number(&self.source_line_starts, byte);
+                    rows.push(GutterRow {
+                        view_index,
+                        y: top,
+                        baseline: line.baseline,
+                        height: line.height,
+                        line_number,
+                    });
+                }
+                position = position.saturating_add(line.length as usize);
+                top += line.height;
+            }
+        }
+        let image_anchors: HashMap<_, _> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(_, view)| view.source.is_empty())
+            .map(|(index, view)| (view.source.start, index))
+            .collect();
+        let (line_height, baseline) = presentation::line_spacing(self.font_size());
+        for image in &self.images {
+            if let Some(&view_index) = image_anchors.get(&image.source.start) {
+                rows.push(GutterRow {
+                    view_index,
+                    y: image.y,
+                    baseline,
+                    height: line_height,
+                    line_number: presentation::source_line_number(
+                        &self.source_line_starts,
+                        image.source.start,
+                    ),
+                });
+            }
+        }
+        rows.sort_by(|a: &GutterRow, b| {
+            a.y.total_cmp(&b.y)
+                .then(a.view_index.cmp(&b.view_index))
+                .then(a.line_number.cmp(&b.line_number))
+        });
+        let mut seen_lines = HashSet::new();
+        let mut seen_baselines = HashSet::new();
+        let mut unique_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let baseline_y = row.y + row.baseline;
+            if !seen_lines.insert(row.line_number)
+                || !seen_baselines.insert((baseline_y * 2.0).round() as i32)
+            {
+                continue;
+            }
+            unique_rows.push(row);
+        }
+        self.gutter_rows = unique_rows;
     }
     unsafe fn layout_list_item_fragments(
         &mut self,
@@ -4889,11 +5509,11 @@ impl App {
                 &text,
                 (map, before),
                 source,
-                (self.editor_left() + indent, y, width - indent),
+                (self.content_left() + indent, y, width - indent),
                 self.font_size(),
                 None,
             )?;
-            let minimum_line_height = self.font_size() * 1.6;
+            let minimum_line_height = presentation::line_height(self.font_size());
             if let Some(view) = self.views.last_mut() {
                 view.marker = marker;
                 view.quoted = quoted;
@@ -4903,7 +5523,7 @@ impl App {
                 height = metrics.height.max(minimum_line_height);
                 view.height = height;
             }
-            Ok(height + 10.0)
+            Ok(height)
         }
     }
     unsafe fn layout_image(
@@ -4926,7 +5546,7 @@ impl App {
                 indent,
             } =
                 self.gutter_presentation(projection, gutter_block, show_marker, self.font_size())?;
-            let x = self.editor_left() + indent;
+            let x = self.content_left() + indent;
             let available = (available - indent).max(1.0);
             let dir = self.tabs[self.active]
                 .file
@@ -4980,7 +5600,7 @@ impl App {
                 path: image_path,
                 source: source.clone(),
                 x,
-                y: y + self.font_size() * 1.6,
+                y,
                 width,
                 height,
                 quoted,
@@ -4993,11 +5613,11 @@ impl App {
                 "",
                 (vec![source.end], vec![source.end]),
                 source.end..source.end,
-                (x, y + self.font_size() * 1.6 + height, available),
+                (x, y + height, available),
                 self.font_size(),
                 None,
             )?;
-            Ok(y + height + self.font_size() * 3.2 + 15.0)
+            Ok(y + height)
         }
     }
     /// Decode/upload only visible images and one viewport of lookahead.
@@ -5178,7 +5798,7 @@ impl App {
     unsafe fn layout_table(
         &mut self,
         table: Arc<Table>,
-        mut y: f32,
+        y: f32,
         available: f32,
     ) -> windows::core::Result<f32> {
         // SAFETY: called on the window owner thread; handles and COM resources
@@ -5209,11 +5829,12 @@ impl App {
                     "",
                     (vec![marker], vec![marker]),
                     marker..marker,
-                    (self.editor_left(), y, available),
+                    (self.content_left(), y, available),
                     self.font_size(),
                     None,
                 )?;
-                y += self.font_size() * 1.6 + 10.0;
+                // The table start marker shares the header-row baseline. Real
+                // blank source rows are inserted once after block layout.
             }
             let mut widths = vec![self.font_size() * 4.75; cols];
             for row in &table.rows {
@@ -5238,8 +5859,8 @@ impl App {
             let mut top = y;
             for row in &table.rows {
                 let first = self.views.len();
-                let mut x = self.editor_left() - offset;
-                let mut h = self.font_size() * 1.8;
+                let mut x = self.content_left() - offset;
+                let mut h = presentation::line_height(self.font_size()) + 6.0;
                 for (c, cell) in row.cells.iter().enumerate() {
                     let content = &source[cell.content_range.clone()];
                     let (text, map) = unescape_cell(content, cell.content_range.start);
@@ -5273,7 +5894,7 @@ impl App {
                 height: top - y,
                 width: total,
             });
-            Ok(top + 20.0)
+            Ok(top)
         }
     }
     fn discard_target(&mut self) {
@@ -5352,10 +5973,93 @@ impl App {
             Ok(target)
         }
     }
+    unsafe fn draw_gutter_numbers(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        scroll: f32,
+        viewport: f32,
+        composition: Option<&CompositionVisual>,
+        foreground: &ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let font_size = self.font_size();
+            let number_width = (self.gutter_width - GUTTER_HORIZONTAL_PADDING).max(1.0);
+            let label_baseline = presentation::line_spacing(font_size).1;
+            let top = self.editor_top();
+            let first = if let Some(visual) = composition {
+                let before_end = self
+                    .gutter_rows
+                    .partition_point(|row| row.view_index <= visual.view_index);
+                let first_before = self.gutter_rows[..before_end]
+                    .partition_point(|row| row.y + row.height < scroll + top);
+                if first_before < before_end {
+                    first_before
+                } else {
+                    let after_start = self
+                        .gutter_rows
+                        .partition_point(|row| row.view_index <= visual.end_view_index);
+                    after_start
+                        + self.gutter_rows[after_start..].partition_point(|row| {
+                            row.y + visual.growth + row.height < scroll + top
+                        })
+                }
+            } else {
+                self.gutter_rows
+                    .partition_point(|row| row.y + row.height < scroll + top)
+            };
+            for row in &self.gutter_rows[first..] {
+                let Some(view) = self.views.get(row.view_index) else {
+                    continue;
+                };
+                if composition.is_some_and(|visual| {
+                    row.view_index > visual.view_index && row.view_index <= visual.end_view_index
+                }) {
+                    continue;
+                }
+                let view_growth = composition.map_or(0.0, |visual| {
+                    if view.y >= visual.row_bottom - 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                let table_growth = composition.map_or(0.0, |visual| {
+                    if view.table.is_some() && (view.y - scroll - visual.y).abs() < 0.1 {
+                        visual.growth
+                    } else {
+                        0.0
+                    }
+                });
+                let row_y = row.y - scroll + view_growth + table_growth;
+                if row_y > viewport {
+                    if composition.is_none_or(|visual| row.view_index > visual.end_view_index) {
+                        break;
+                    }
+                    continue;
+                }
+                if row_y + row.height < top {
+                    continue;
+                }
+                let label =
+                    self.text_layout(&row.line_number.to_string(), number_width, font_size)?;
+                label.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                let label_y = row_y + row.baseline - label_baseline;
+                target.DrawTextLayout(
+                    point(self.editor_left() + GUTTER_LABEL_LEFT, label_y),
+                    &label,
+                    foreground,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
+            Ok(())
+        }
+    }
     unsafe fn paint(&mut self, damage: D2D_RECT_F) -> windows::core::Result<()> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            let _phase = PhaseSpan::new(&self.phase_trace, "paint.total");
             if self.minimized {
                 return Ok(());
             }
@@ -5407,14 +6111,17 @@ impl App {
                 paint_fault(PaintFault::Drawing)?;
                 self.features_draw(&t)?;
                 self.git_draw(&t)?;
-                frame.finish()?;
+                {
+                    let _phase = PhaseSpan::new(&self.phase_trace, "paint.frame_finish");
+                    frame.finish()?;
+                }
                 self.full_paint = false;
                 return Ok(());
             }
             let mut x = self.editor_left();
             if !self.shell.enabled {
                 for (_, label, width) in TOOLBAR {
-                    let layout = self.text_layout(label, width - 8.0, 12.0)?;
+                    let layout = self.ui_text_layout(label, width - 8.0, 12.0)?;
                     t.DrawTextLayout(point(x, 4.0), &layout, &muted, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                     x += width;
                 }
@@ -5425,7 +6132,11 @@ impl App {
                 let tab = &self.tabs[i];
                 let x = strip.left + slot as f32 * strip.tab_width;
                 let (tab_top, tab_height, label_y) = if self.shell.enabled {
-                    (36.0, 36.0, 44.0)
+                    (
+                        shell::TAB_STRIP_TOP,
+                        shell::TAB_STRIP_HEIGHT,
+                        shell::TAB_LABEL_TOP,
+                    )
                 } else {
                     (28.0, 43.0, 34.0)
                 };
@@ -5449,26 +6160,29 @@ impl App {
                 frame.pop_clip();
             }
             if self.shell.enabled {
-                let close = self.text_layout("×", 18., 14.)?;
+                let close = self.ui_text_layout("×", 18., 14.)?;
                 for slot in 0..strip.visible_count {
                     t.DrawTextLayout(
-                        point(strip.left + (slot + 1) as f32 * strip.tab_width - 22., 44.),
+                        point(
+                            strip.left + (slot + 1) as f32 * strip.tab_width - 22.,
+                            shell::TAB_LABEL_TOP,
+                        ),
                         &close,
                         &muted,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     );
                 }
-                let add = self.text_layout("+", 24., 18.)?;
+                let add = self.ui_text_layout("+", 24., 18.)?;
                 t.DrawTextLayout(
-                    point(self.editor_right(), 40.),
+                    point(self.editor_right() - 24., shell::TAB_STRIP_TOP + 2.),
                     &add,
                     &muted,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
             }
             if strip.overflow {
-                let previous = self.text_layout("‹", 18.0, 18.0)?;
-                let next = self.text_layout("›", 18.0, 18.0)?;
+                let previous = self.ui_text_layout("‹", 18.0, 18.0)?;
+                let next = self.ui_text_layout("›", 18.0, 18.0)?;
                 let previous_brush = if strip.first > 0 { &text } else { &muted };
                 let next_brush = if strip.first + strip.visible_count < self.tabs.len() {
                     &text
@@ -5476,21 +6190,40 @@ impl App {
                     &muted
                 };
                 t.DrawTextLayout(
-                    point(self.editor_left() + 5.0, 32.0),
+                    point(
+                        strip.left - TAB_SCROLL_BUTTON + 5.0,
+                        if self.shell.enabled {
+                            shell::TAB_STRIP_TOP
+                        } else {
+                            32.0
+                        },
+                    ),
                     &previous,
                     previous_brush,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
                 t.DrawTextLayout(
-                    point(self.editor_right() - TAB_SCROLL_BUTTON + 5.0, 32.0),
+                    point(
+                        strip.right + 5.0,
+                        if self.shell.enabled {
+                            shell::TAB_STRIP_TOP
+                        } else {
+                            32.0
+                        },
+                    ),
                     &next,
                     next_brush,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 );
             }
+            let divider_y = if self.shell.enabled {
+                shell::TAB_DIVIDER_Y
+            } else {
+                75.0
+            };
             t.DrawLine(
-                point(self.editor_left(), 75.0),
-                point(self.editor_right(), 75.0),
+                point(self.editor_left(), divider_y),
+                point(self.editor_right(), divider_y),
                 &border,
                 1.0,
                 None,
@@ -5525,7 +6258,18 @@ impl App {
                 &rect(
                     self.editor_left() - 8.0,
                     self.editor_top(),
-                    self.editor_width() + 8.0,
+                    self.gutter_width + 8.0,
+                    (viewport - self.editor_top()).max(0.0),
+                ),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+            self.draw_gutter_numbers(&t, scroll, viewport, composition.as_ref(), &muted)?;
+            frame.pop_clip();
+            frame.push_clip(
+                &rect(
+                    self.content_left() - 8.0,
+                    self.editor_top(),
+                    (self.editor_right() - self.content_left() + 8.0).max(0.0),
                     (viewport - self.editor_top()).max(0.0),
                 ),
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -5651,13 +6395,18 @@ impl App {
                 }
                 if view.thematic_break {
                     let line_y = y + view.height * 0.5;
-                    t.DrawLine(
-                        point(view.x, line_y),
-                        point(view.x + view.width, line_y),
-                        &border,
-                        1.5,
-                        None,
-                    );
+                    let mut metrics = DWRITE_TEXT_METRICS::default();
+                    view.layout.GetMetrics(&mut metrics)?;
+                    let line_x = view.x + metrics.widthIncludingTrailingWhitespace + 8.0;
+                    if line_x < view.x + view.width {
+                        t.DrawLine(
+                            point(line_x, line_y),
+                            point(view.x + view.width, line_y),
+                            &border,
+                            1.5,
+                            None,
+                        );
+                    }
                 }
                 if let Some(visual) = composition
                     .as_ref()
@@ -5705,14 +6454,18 @@ impl App {
                             );
                         }
                     }
-                    t.DrawTextLayout(
-                        point(visual.x, visual.y),
-                        &visual.layout,
-                        view_text,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    );
+                    {
+                        let _phase = PhaseSpan::new(&self.phase_trace, "paint.paragraph_draw");
+                        t.DrawTextLayout(
+                            point(visual.x, visual.y),
+                            &visual.layout,
+                            view_text,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                    }
                     frame.pop_clip();
                 } else {
+                    let _phase = PhaseSpan::new(&self.phase_trace, "paint.paragraph_draw");
                     t.DrawTextLayout(
                         point(view.x, y),
                         &view.layout,
@@ -5792,7 +6545,8 @@ impl App {
             } else {
                 16.
             };
-            let layout = self.text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
+            let layout =
+                self.ui_text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             frame.push_clip(
                 &rect(
@@ -5811,10 +6565,21 @@ impl App {
             );
             frame.pop_clip();
             frame.pop_clip();
-            let draw_result = frame.finish();
+            let draw_result = {
+                let _phase = PhaseSpan::new(&self.phase_trace, "paint.frame_finish");
+                frame.finish()
+            };
             drop(hidden_caret);
             draw_result?;
             self.full_paint = false;
+            self.painted_frame = Some(PaintedFrame {
+                hwnd: self.hwnd.0 as usize,
+                document_id: self.doc().id(),
+                revision: self.doc().revision(),
+                sequence: self
+                    .painted_frame
+                    .map_or(1, |frame| frame.sequence.saturating_add(1)),
+            });
             self.sync_animations();
             self.diagnostic();
             Ok(())
@@ -5824,17 +6589,32 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
-            let _ = DestroyCaret();
+            // Focus loss can be queued until a child EDIT has already created
+            // its caret. DestroyCaret has no HWND argument: only destroy a
+            // caret currently owned by one of our editor surfaces.
+            if native_caret_owner().is_some_and(|owner| {
+                owner != HWND::default()
+                    && [self.hwnd, self.shell.main_window, self.shell.compact_window]
+                        .contains(&owner)
+            }) {
+                let _ = DestroyCaret();
+            }
             self.native_caret = NativeCaretState::default();
         }
     }
+    #[cfg(test)]
     fn caret_view(&self) -> Option<&TextView> {
         let byte = self.doc().selection().head;
         self.source_view(byte)
     }
     fn source_view(&self, byte: usize) -> Option<&TextView> {
-        if byte == self.doc().selection().head
-            && self.doc().selection_affinity() == BoundaryAffinity::After
+        self.source_view_at(
+            byte,
+            (byte == self.doc().selection().head).then(|| self.doc().selection_affinity()),
+        )
+    }
+    fn source_view_at(&self, byte: usize, affinity: Option<BoundaryAffinity>) -> Option<&TextView> {
+        if affinity == Some(BoundaryAffinity::After)
             && let Some(view) = self
                 .views
                 .iter()
@@ -5843,14 +6623,31 @@ impl App {
         {
             return Some(view);
         }
-        if byte == self.doc().selection().head
-            && self.doc().selection_affinity() == BoundaryAffinity::Before
+        if affinity == Some(BoundaryAffinity::Before)
             && let Some(view) = self
                 .views
                 .iter()
                 .filter(|view| !view.source.is_empty() && view.before.contains(&byte))
-                .min_by_key(|view| view.source.len())
+                .min_by_key(|view| {
+                    // Adjacent blocks share projection boundaries. A following
+                    // short block may retain this byte in before[] even though
+                    // the preceding block owns its source and caret geometry.
+                    (
+                        !(view.source.start <= byte && byte <= view.source.end),
+                        view.source.len(),
+                    )
+                })
         {
+            // A marker before a literal block owns the Before side of its
+            // start. The following block must not pull that caret downwards.
+            if view.source.start == byte
+                && let Some(marker) = self
+                    .views
+                    .iter()
+                    .find(|v| v.source.is_empty() && v.source.start == byte)
+            {
+                return Some(marker);
+            }
             return Some(view);
         }
         self.views
@@ -5860,7 +6657,12 @@ impl App {
                 self.views
                     .iter()
                     .filter(|view| view.map.contains(&byte) || view.before.contains(&byte))
-                    .min_by_key(|view| view.source.len())
+                    .min_by_key(|view| {
+                        (
+                            !(view.source.start <= byte && byte <= view.source.end),
+                            view.source.len(),
+                        )
+                    })
             })
             .or_else(|| {
                 self.views
@@ -5871,14 +6673,19 @@ impl App {
     }
     fn caret_location(&self) -> (f32, f32, f32) {
         let byte = self.doc().selection().head;
+        self.caret_location_at(byte, self.doc().selection_affinity())
+    }
+    fn caret_location_at(&self, byte: usize, affinity: BoundaryAffinity) -> (f32, f32, f32) {
         let scroll = self.tabs[self.active].scroll;
-        let candidate = self.caret_view().or_else(|| self.views.last());
+        let candidate = self
+            .source_view_at(byte, Some(affinity))
+            .or_else(|| self.views.last());
         if let Some(view) = candidate {
             let u = view
                 .map
                 .partition_point(|&p| p < byte)
                 .min(view.map.len().saturating_sub(1));
-            let trailing = self.doc().selection_affinity() == BoundaryAffinity::Before && u > 0;
+            let trailing = affinity == BoundaryAffinity::Before && u > 0;
             let position = if trailing {
                 view.before
                     .partition_point(|&p| p < byte)
@@ -5892,9 +6699,9 @@ impl App {
             }
         }
         (
-            self.editor_left(),
+            self.content_left(),
             self.editor_top(),
-            self.font_size() * 1.6,
+            presentation::line_height(self.font_size()),
         )
     }
     unsafe fn update_caret(&mut self) {
@@ -5904,6 +6711,9 @@ impl App {
             self.caret = self.caret_location();
             let (x, y, height) = self.composition_caret();
             if GetFocus() == self.hwnd && self.hwnd == self.editing_window() {
+                if native_caret_owner() != Some(self.hwnd) {
+                    self.native_caret = NativeCaretState::default();
+                }
                 let size = caret_pixel_size(height, self.dpi);
                 let position = ((x * self.dpi).round() as i32, (y * self.dpi).round() as i32);
                 let change = required_caret_change(self.native_caret, size, position);
@@ -5925,7 +6735,7 @@ impl App {
                     self.editor_right()
                 };
                 let visible = caret_in_editor((x, y, height), right, self.animation_viewport())
-                    && x >= self.editor_left()
+                    && x >= self.content_left()
                     && y >= self.editor_top();
                 if self.native_caret.size.is_some() && visible != self.native_caret.visible {
                     let result = if visible {
@@ -6130,7 +6940,6 @@ impl App {
             self.paint_retry_pending = false;
             let _ = self.ensure_layout();
             self.restore_pending_view();
-            self.update_caret();
             let mut r = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut r);
             let page = (self.editor_bottom() - self.editor_top()).max(1.0);
@@ -6143,6 +6952,10 @@ impl App {
                 .scroll
                 .clamp(0.0, (height - self.editor_top() - page).max(0.0));
             self.tabs[self.active].scroll = scroll;
+            // Reveal, resize, or restoration can reduce the scroll extent.
+            // Native caret coordinates and visibility must use that final
+            // viewport, rather than retaining a pre-clamp offscreen position.
+            self.update_caret();
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             self.sync_animations();
             self.diagnostic();
@@ -6164,7 +6977,7 @@ impl App {
     fn horizontal_scroll(&mut self, delta: f32) {
         let byte = self.doc().selection().head;
         if let Some(t) = self.tables.iter().find(|t| t.table.range.contains(&byte)) {
-            let available = self.editor_width();
+            let available = self.content_width();
             let offset = self.tabs[self.active]
                 .table_scroll
                 .entry(t.table.range.start)
@@ -6215,6 +7028,14 @@ impl App {
         }) else {
             return (0, BoundaryAffinity::After);
         };
+        self.view_hit_candidates(view, x, y)[0]
+    }
+    fn view_hit_candidates(
+        &self,
+        view: &TextView,
+        x: f32,
+        y: f32,
+    ) -> [(usize, BoundaryAffinity); 2] {
         let mut trailing = windows::core::BOOL::default();
         let mut inside = windows::core::BOOL::default();
         let mut metrics = DWRITE_HIT_TEST_METRICS::default();
@@ -6233,20 +7054,22 @@ impl App {
             } else {
                 0
             };
-        let positions = if trailing.as_bool() {
-            &view.before
-        } else {
-            &view.map
+        let candidate = |before| {
+            let positions = if before { &view.before } else { &view.map };
+            let byte = *positions.get(u).unwrap_or(&view.source.end);
+            (
+                snap(self.doc().rope(), byte, false),
+                if before {
+                    BoundaryAffinity::Before
+                } else {
+                    BoundaryAffinity::After
+                },
+            )
         };
-        let byte = *positions.get(u).unwrap_or(&view.source.end);
-        (
-            snap(self.doc().rope(), byte, false),
-            if trailing.as_bool() {
-                BoundaryAffinity::Before
-            } else {
-                BoundaryAffinity::After
-            },
-        )
+        [
+            candidate(trailing.as_bool()),
+            candidate(!trailing.as_bool()),
+        ]
     }
     fn toggle_task_at(&mut self, x: f32, y: f32) -> bool {
         if self.composing || self.tabs[self.active].raw {
@@ -6309,7 +7132,7 @@ impl App {
         true
     }
     fn select_at(&mut self, x: f32, y: f32, extend: bool) {
-        if self.composing {
+        if self.composing || x < self.content_left() {
             return;
         }
         let (byte, affinity) = self.hit_with_affinity(x, y);
@@ -6329,22 +7152,58 @@ impl App {
         let Some(path) = &self.diagnostic else {
             return;
         };
+        let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.total");
+        let build_phase = PhaseSpan::new(&self.phase_trace, "diagnostic.build");
         let sel = self.doc().selection();
         let views:Vec<_>=self.views.iter().map(|v|serde_json::json!({"source_start":v.source.start,"source_end":v.source.end,"x":v.x,"y":v.y-self.tabs[self.active].scroll,"width":v.width,"height":v.height,"table":v.table,"map":v.map})).collect();
         let tables:Vec<_>=self.tables.iter().map(|t|serde_json::json!({"source_start":t.table.range.start,"source_end":t.table.range.end,"y":t.y,"height":t.height,"width":t.width})).collect();
         // Only the opt-in diagnostic path queries the current owner-thread TIP.
-        let active_input_profile = active_input_profile_diagnostic();
-        let ime_open_status = ime_open_status_diagnostic(self.hwnd);
-        let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
+        let (active_input_profile, ime_open_status) = {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.input_profile");
+            (
+                active_input_profile_diagnostic(),
+                ime_open_status_diagnostic(self.hwnd),
+            )
+        };
+        let painted_frame = self.painted_frame.map(|frame| {
+            serde_json::json!({
+                "hwnd": frame.hwnd, "document_id": frame.document_id,
+                "revision": frame.revision, "sequence": frame.sequence,
+            })
+        });
+        let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"painted_frame":painted_frame,"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
         let mut data = data;
+        data["line_numbers"] = serde_json::json!({
+            "physical_line_count": self.source_line_starts.len(),
+            "gutter_row_count": self.gutter_rows.len(),
+            "gutter_width_dip": self.gutter_width,
+            "first_line": self.gutter_rows.first().map(|row| row.line_number),
+            "last_line": self.gutter_rows.last().map(|row| row.line_number),
+        });
         data["selection_affinity"] =
             serde_json::json!(format!("{:?}", self.doc().selection_affinity()));
         let (x, y, height) = self.composition_caret();
         data["composition_caret"] = serde_json::json!({"x": x, "y": y, "height": height});
-        if let Ok(data) = serde_json::to_vec_pretty(&data) {
+        drop(build_phase);
+        let serialized = {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.serialize");
+            serde_json::to_vec_pretty(&data)
+        };
+        if let Ok(data) = serialized {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.write");
             let _ = std::fs::write(path, data);
         }
     }
+}
+
+fn source_line_is_blank(source: &str, start: usize) -> bool {
+    if start > source.len() || !source.is_char_boundary(start) {
+        return false;
+    }
+    let end = source[start..]
+        .find(['\r', '\n'])
+        .map_or(source.len(), |offset| start + offset);
+    source[start..end].trim().is_empty()
 }
 
 /// Read presentation decisions from the existing parser block tree. Gutter
@@ -7470,6 +8329,48 @@ mod tests {
     }
 
     #[test]
+    fn phase_trace_preserves_prior_evidence_and_counts_reentrant_drops() {
+        let directory = TestDirectory::new("phase-trace");
+        let diagnostic = directory.path().join("fixture.json");
+        let sidecar = diagnostic.with_extension("phases.jsonl");
+        let trace = PhaseTrace::open(&diagnostic).unwrap();
+        assert!(PhaseTrace::open(&diagnostic).is_none());
+        {
+            let _file = trace.file.borrow_mut();
+            trace.record("test", "reentrant");
+        }
+        {
+            let _phase = PhaseSpan::new(&Some(Rc::clone(&trace)), "test.scope");
+        }
+        drop(trace);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["event"], "opened");
+        assert_eq!(records[1]["event"], "begin");
+        assert_eq!(records[2]["event"], "end");
+        assert_eq!(records[2]["dropped_total"], 1);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0]["t_us"].as_u64() <= pair[1]["t_us"].as_u64())
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.as_object().unwrap().len() == 4)
+        );
+        let before = std::fs::read(&sidecar).unwrap();
+        {
+            let _phase = PhaseSpan::new(&None, "disabled");
+        }
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[test]
     fn document_identity_duplicate_open_activates_existing_for_path_aliases() {
         let directory = TestDirectory::new("duplicate-open");
         let original = directory.path().join("note.md");
@@ -7630,6 +8531,31 @@ mod tests {
     }
 
     #[test]
+    fn ui_font_is_independent_of_configurable_editor_font_and_document_state() {
+        let mut app = composing_test_app("日本語 **本文** 👩‍💻\r\n");
+        app.clear_composition();
+        app.shell.enabled = true;
+        app.shell.settings.font_face = "Cascadia Mono".into();
+        let before = document_state(app.doc());
+        unsafe {
+            let editor = app.text_layout("本文", 300., FONT).unwrap();
+            let ui = app.ui_text_layout("アウトライン", 300., 12.).unwrap();
+            let mut editor_family = [0u16; 64];
+            let mut ui_family = [0u16; 64];
+            editor
+                .GetFontFamilyName(0, &mut editor_family, None)
+                .unwrap();
+            ui.GetFontFamilyName(0, &mut ui_family, None).unwrap();
+            let family = |name: &[u16]| {
+                String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap()])
+            };
+            assert_eq!(family(&editor_family), "Cascadia Mono");
+            assert_eq!(family(&ui_family), shell::UI_FONT_FAMILY);
+        }
+        assert_eq!(document_state(app.doc()), before);
+    }
+
+    #[test]
     fn tab_labels_stay_single_line_and_bounded_without_document_changes() {
         let directory = TestDirectory::new("tab-label-layout");
         let file_name = format!("{}{}.md", "日本語".repeat(12), "a".repeat(90));
@@ -7655,7 +8581,11 @@ mod tests {
             app.shell.enabled = shell_enabled;
             let strip = app.tab_strip();
             let width = (strip.tab_width - 32.0).max(1.0);
-            let height = if shell_enabled { 36.0 } else { 43.0 };
+            let height = if shell_enabled {
+                shell::TAB_STRIP_HEIGHT
+            } else {
+                43.0
+            };
             for label in &labels {
                 let wrapped = unsafe { app.text_layout(label, width, 14.0).unwrap() };
                 let mut wrapped_metrics = DWRITE_TEXT_METRICS::default();
@@ -8170,6 +9100,68 @@ mod tests {
             assert_eq!(GetForegroundWindow(), foreground);
         }
     }
+    #[test]
+    fn revealed_source_styles_keep_utf16_ranges_after_unicode_prefix_and_clipping() {
+        let source = "prefix😀\n\n前置 e\u{301} **太字😀** と ***両方😀***、~~取消~~、[リンク](u) と `code` 末尾";
+        let fixture = EditorFixture::new(source, false);
+        let app = fixture.state.app.borrow();
+        let projection = DisplayProjection::parse(source);
+        // A nonzero source origin and a clip inside bold text exercise metric
+        // subtraction independently of display/projection coordinates.
+        for start in [source.find("前置").unwrap(), source.find("字😀").unwrap()] {
+            let layout = unsafe {
+                app.text_layout(&source[start..], 900., app.font_size())
+                    .unwrap()
+            };
+            unsafe {
+                app.apply_source_styles(&layout, &projection, start..source.len())
+                    .unwrap()
+            };
+            for (needle, bold, italic) in [
+                ("字😀", true, false),
+                ("両方😀", true, true),
+                ("末尾", false, false),
+            ] {
+                let byte = source.find(needle).unwrap();
+                let position = source[start..byte].encode_utf16().count() as u32;
+                let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
+                let mut style = DWRITE_FONT_STYLE_NORMAL;
+                unsafe {
+                    layout.GetFontWeight(position, &mut weight, None).unwrap();
+                    layout.GetFontStyle(position, &mut style, None).unwrap();
+                }
+                assert_eq!(
+                    weight == DWRITE_FONT_WEIGHT_BOLD,
+                    bold,
+                    "{needle} at {start}"
+                );
+                assert_eq!(
+                    style == DWRITE_FONT_STYLE_ITALIC,
+                    italic,
+                    "{needle} at {start}"
+                );
+            }
+            for (needle, strike) in [("リンク", false), ("取消", true)] {
+                let position = source[start..source.find(needle).unwrap()]
+                    .encode_utf16()
+                    .count() as u32;
+                let mut applied = windows::core::BOOL::default();
+                unsafe {
+                    if strike {
+                        layout
+                            .GetStrikethrough(position, &mut applied, None)
+                            .unwrap();
+                    } else {
+                        layout.GetUnderline(position, &mut applied, None).unwrap();
+                    }
+                }
+                assert!(applied.as_bool(), "{needle} at {start}");
+            }
+        }
+        assert_eq!(app.doc().source(), source);
+        assert!(!app.doc().is_dirty());
+    }
+
     impl EditorFixture {
         fn new(source: &str, raw: bool) -> Self {
             let mut app = composing_test_app(source);
@@ -8418,7 +9410,12 @@ mod tests {
                         "shifted table start {q} has no exact source-affine marker ({eol:?}, fixture {index})"
                     );
                     assert_eq!(app.caret_view().unwrap().source, q..q);
-                    assert!(app.caret_location().1 < app.tables[if index == 2 { 1 } else { 0 }].y);
+                    let caret_y = app.caret_location().1;
+                    let table_y = app.tables[if index == 2 { 1 } else { 0 }].y;
+                    assert!(
+                        caret_y < table_y,
+                        "inserted blank source row must provide a caret baseline before the table ({eol:?}, fixture {index}, caret y={caret_y}, table y={table_y})"
+                    );
                 }
                 fixture.message(WM_CHAR, '前' as usize);
                 let app = &mut *fixture.state.app.borrow_mut();
@@ -8792,7 +9789,7 @@ mod tests {
         }
     }
     #[test]
-    fn editor_wrapped_source_fallback_reserves_measured_height() {
+    fn editor_wrapped_full_fence_source_reserves_measured_height() {
         let opening = format!("```{}", "long-info ".repeat(24));
         let source = format!("{opening}\nx\n```\n\nafter");
         let mut app = composing_test_app(&source);
@@ -8804,27 +9801,322 @@ mod tests {
         unsafe {
             app.ensure_layout().unwrap();
         }
-        let fallback = app
+        let fence = app
             .views
             .iter()
-            .find(|view| view.source == (0..opening.len()) && view.text.len() == opening.len())
-            .expect("hidden fence interior needs an editable source-line fallback");
-        assert!(fallback.height > app.font_size() * 1.6 * 2.0);
+            .find(|view| {
+                view.source.start == 0
+                    && view
+                        .text
+                        .starts_with(&opening.encode_utf16().collect::<Vec<_>>())
+            })
+            .expect("the full fenced source must remain directly editable");
+        let displayed = String::from_utf16(&fence.text).unwrap();
+        assert_eq!(displayed, format!("{opening}\nx\n```"));
+        assert_eq!(
+            source[fence.source.clone()].trim_end_matches(['\r', '\n']),
+            displayed
+        );
+        assert_eq!(fence.map.first(), Some(&0));
+        // Interior UTF-16 boundaries map to the literal source; the terminal
+        // projection boundary may also own the following blank-line anchor.
+        for (index, byte) in fence.map.iter().take(fence.text.len()).enumerate() {
+            assert_eq!(*byte, index);
+        }
+        assert!(fence.height > app.font_size() * 1.6 * 2.0);
         let following = app
             .views
             .iter()
-            .filter(|view| !view.source.is_empty() && view.source.start > fallback.source.start)
+            .filter(|view| !view.source.is_empty() && view.source.start > fence.source.start)
             .min_by(|a, b| a.y.total_cmp(&b.y))
             .unwrap();
         assert!(
-            following.y >= fallback.y + fallback.height - 0.01,
-            "fallback bottom {} overlaps following view at {}",
-            fallback.y + fallback.height,
+            following.y >= fence.y + fence.height - 0.01,
+            "fence bottom {} overlaps following view at {}",
+            fence.y + fence.height,
             following.y
         );
         assert_eq!(document_state(app.doc()), before);
         unsafe {
             DestroyWindow(app.hwnd).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn explicit_navigation_toolbar_returns_editor_focus_before_first_followup_character() {
+        let source_a = "source A first\n日本語\n";
+        let source_b = "source B 日本語 and ASCII\n";
+        let mut app = composing_test_app(source_a);
+        app.clear_composition();
+        let mut fixture = MessagePumpFixture::new(app);
+        let main = fixture.hwnd;
+        let (id_a, id_b, before_a, before_b) = unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_shell();
+            app.doc_mut().set_selection(0, 0).unwrap();
+            app.record_navigation();
+            app.doc_mut().set_selection(14, 14).unwrap();
+            let id_a = app.doc().id();
+            let before_a = document_state(app.doc());
+            app.new_document();
+            let id_b = app.doc().id();
+            let active = app.active;
+            app.tabs[active].doc = Document::new(id_b, source_b.into());
+            app.doc_mut()
+                .set_selection(source_b.len(), source_b.len())
+                .unwrap();
+            let before_b = document_state(app.doc());
+            app.refresh();
+            let _ = ShowWindow(main, SW_SHOWNOACTIVATE);
+            (id_a, id_b, before_a, before_b)
+        };
+        unsafe {
+            SetFocus(Some(main)).unwrap();
+            let back = GetDlgItem(Some(main), 168).unwrap();
+            let forward = GetDlgItem(Some(main), 169).unwrap();
+            for (button, expected_document, expected_position) in
+                [(back, id_a, 14), (forward, id_b, source_b.len())]
+            {
+                assert!(IsWindowEnabled(button).as_bool());
+                SendMessageW(
+                    button,
+                    WM_LBUTTONDOWN,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(5 | (5 << 16))),
+                );
+                assert_eq!(
+                    GetFocus(),
+                    button,
+                    "native mouse-down must focus the real navigation button"
+                );
+                SendMessageW(
+                    button,
+                    WM_LBUTTONUP,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(5 | (5 << 16))),
+                );
+                let app = fixture.state.app.borrow();
+                assert_eq!(app.doc().id(), expected_document);
+                assert_eq!(app.doc().selection(), Selection::caret(expected_position));
+                println!(
+                    "navigation pid={} button={button:?} enabled={} focus={:?} editor={main:?}",
+                    std::process::id(),
+                    IsWindowEnabled(button).as_bool(),
+                    GetFocus()
+                );
+            }
+            assert!(
+                !IsWindowEnabled(forward).as_bool(),
+                "Forward must disable itself after consuming the last forward entry"
+            );
+            assert_eq!(
+                GetFocus(),
+                main,
+                "successful Forward must retain a keyboard target after its button disables"
+            );
+            {
+                let app = fixture.state.app.borrow();
+                assert_eq!(
+                    document_state(
+                        &app.tabs
+                            .iter()
+                            .find(|tab| tab.doc.id() == id_a)
+                            .unwrap()
+                            .doc
+                    ),
+                    before_a
+                );
+                assert_eq!(document_state(app.doc()), before_b);
+            }
+            SendMessageW(
+                GetFocus(),
+                WM_CHAR,
+                Some(WPARAM('X' as usize)),
+                Some(LPARAM(0)),
+            );
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                assert_eq!(app.doc().source(), format!("{source_b}X"));
+                app.key_with_modifiers(0x5a, true, false);
+                assert_eq!(app.doc().source(), source_b);
+                assert_eq!(app.doc().selection(), before_b.6);
+                assert_eq!(app.doc().is_dirty(), before_b.3);
+                assert_eq!(app.doc().undo_count(), before_b.4);
+                assert_eq!(app.doc().redo_count(), before_b.5 + 1);
+            }
+
+            let other = shell::control(
+                main,
+                w!("BUTTON"),
+                "owned no-op focus",
+                999,
+                WINDOW_STYLE(0),
+            );
+            SetFocus(Some(other)).unwrap();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                let restored = document_state(app.doc());
+                app.command(169); // Empty forward stack is a no-op.
+                assert_eq!(GetFocus(), other);
+                app.tabs.retain(|tab| tab.doc.id() != id_a);
+                app.active = 0;
+                app.command(168); // Only closed-document targets remain.
+                assert_eq!(GetFocus(), other);
+                assert_eq!(document_state(app.doc()), restored);
+                app.doc_mut().set_selection(0, 0).unwrap();
+                app.record_navigation();
+                app.doc_mut()
+                    .set_selection(source_b.len(), source_b.len())
+                    .unwrap();
+            }
+            let compact = fixture.create_compact();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.compact_window = compact;
+                app.select_surface(compact);
+                let _ = ShowWindow(compact, SW_SHOWNOACTIVATE);
+                let child = shell::control(
+                    compact,
+                    w!("BUTTON"),
+                    "owned Compact focus",
+                    999,
+                    WINDOW_STYLE(0),
+                );
+                SetFocus(Some(child)).unwrap();
+                app.command(168);
+                assert_eq!(GetFocus(), compact);
+                assert_eq!(app.editing_window(), compact);
+                assert_eq!(app.doc().selection(), Selection::caret(0));
+                assert_eq!(app.doc().source(), source_b);
+            }
+            let _ = ShowWindow(compact, SW_HIDE);
+            let _ = ShowWindow(main, SW_HIDE);
+        }
+    }
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn native_caret_ownership_preserves_focused_query_through_palette_and_diagnostic() {
+        let fixture = EditorFixture::new("selected body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        let directory = TestDirectory::new("native-caret-ownership");
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.start_shell();
+            let settings = app.shell.settings.clone();
+            app.apply_shell_settings(settings);
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            let query = GetDlgItem(Some(fixture.hwnd), 150).unwrap();
+            app.diagnostic = Some(directory.path().join("diagnostic.json"));
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert!(app.native_caret.size.is_some());
+            let cached_editor_caret = app.native_caret;
+            let before = document_state(app.doc());
+
+            SetFocus(Some(query)).unwrap();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(
+                native_caret_owner(),
+                Some(query),
+                "native EDIT must first create its real caret"
+            );
+            // Click ingress already focuses the toolbar query before opening
+            // candidates. Opening and deferred editor focus loss may not destroy
+            // that native caret or depend on a second focus transition.
+            app.open_palette();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(
+                native_caret_owner(),
+                Some(query),
+                "open_palette destroyed the focused EDIT caret"
+            );
+            app.native_notification(NativeNotification::FocusLost);
+            assert_eq!(native_caret_owner(), Some(query));
+            app.refresh();
+            app.diagnostic();
+            assert_eq!(GetFocus(), query);
+            assert_eq!(native_caret_owner(), Some(query));
+            println!(
+                "native query ownership pid={} editor={:?} query={query:?} focus={:?} caret={:?}",
+                std::process::id(),
+                fixture.hwnd,
+                GetFocus(),
+                native_caret_owner()
+            );
+            assert!(directory.path().join("diagnostic.json").exists());
+            assert_eq!(document_state(app.doc()), before);
+
+            // Simulate stale cached geometry after native child ownership. The
+            // editor must recreate its own caret even at unchanged size/position.
+            app.native_caret = cached_editor_caret;
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert!(app.native_caret.size.is_some());
+            app.release_caret();
+            assert_eq!(native_caret_owner(), Some(HWND::default()));
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert_eq!(document_state(app.doc()), before);
+            app.release_caret();
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
+        }
+    }
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn native_caret_ownership_tracks_main_compact_and_native_edit_children() {
+        let fixture = EditorFixture::new("main and Compact source", false);
+        let compact = EditorFixture::new("unused fixture source", false);
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact.hwnd;
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(compact.hwnd, SW_SHOWNOACTIVATE);
+            app.select_surface(compact.hwnd);
+            SetFocus(Some(compact.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(compact.hwnd));
+            let before = document_state(app.doc());
+            let input = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                4,
+                4,
+                200,
+                24,
+                Some(compact.hwnd),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetFocus(Some(input)).unwrap();
+            assert_eq!(native_caret_owner(), Some(input));
+            app.release_caret();
+            assert_eq!(native_caret_owner(), Some(input));
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(input));
+            SetFocus(Some(compact.hwnd)).unwrap();
+            app.update_caret();
+            assert_eq!(native_caret_owner(), Some(compact.hwnd));
+            app.release_caret();
+            app.shell.compact_window = HWND::default();
+            app.select_surface(fixture.hwnd);
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            app.refresh();
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert_eq!(document_state(app.doc()), before);
+            app.release_caret();
+            let _ = ShowWindow(compact.hwnd, SW_HIDE);
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
         }
     }
     #[test]
@@ -8844,7 +10136,7 @@ mod tests {
             }
             let query = {
                 let children = fixture.state.app.borrow();
-                // The palette owns its query through its common native host.
+                // The toolbar owns the sole query; the host owns candidates.
                 let main = children.shell.main_window;
                 let mut found = HWND::default();
                 unsafe extern "system" fn find_query(
@@ -8900,14 +10192,9 @@ mod tests {
             }
             let hosts = [
                 (
-                    FindWindowExW(
-                        Some(fixture.hwnd),
-                        None,
-                        w!("STATIC"),
-                        w!("コマンドパレット"),
-                    )
-                    .unwrap(),
-                    "コマンドパレット",
+                    FindWindowExW(Some(fixture.hwnd), None, w!("STATIC"), w!("コマンド候補"))
+                        .unwrap(),
+                    "コマンド候補",
                 ),
                 (GetDlgItem(Some(fixture.hwnd), 6508).unwrap(), "Git pane"),
             ];
@@ -8972,8 +10259,8 @@ mod tests {
                 app.open_palette();
             }
             let host =
-                FindWindowExW(Some(compact), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
-            check_host(compact, host, "コマンドパレット");
+                FindWindowExW(Some(compact), None, w!("STATIC"), w!("コマンド候補")).unwrap();
+            check_host(compact, host, "コマンド候補");
             for owner in [fixture.hwnd, compact] {
                 let mut app = fixture.state.app.borrow_mut();
                 app.shell_command(106);
@@ -8981,14 +10268,15 @@ mod tests {
                 app.open_palette();
                 drop(app);
                 let host =
-                    FindWindowExW(Some(owner), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
+                    FindWindowExW(Some(owner), None, w!("STATIC"), w!("コマンド候補")).unwrap();
                 for (id, message) in [(150, WM_CTLCOLOREDIT), (151, WM_CTLCOLORLISTBOX)] {
-                    let child = GetDlgItem(Some(host), id).unwrap();
+                    let recipient = if id == 150 { owner } else { host };
+                    let child = GetDlgItem(Some(recipient), id).unwrap();
                     for borrowed in [false, true] {
                         let _borrow = borrowed.then(|| fixture.state.app.borrow_mut());
                         SetBkColor(dc, COLORREF(0));
                         let brush = SendMessageW(
-                            host,
+                            recipient,
                             message,
                             Some(WPARAM(dc.0 as usize)),
                             Some(LPARAM(child.0 as isize)),
@@ -9172,6 +10460,236 @@ mod tests {
             assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
             // Hidden children do not expose an update region. Root's visible
             // modal scenario verifies the resulting themed pixels separately.
+        }
+    }
+    #[test]
+    fn themed_popup_snapshot_reentry_disabled_and_native_restore() {
+        use windows::Win32::UI::Controls::*;
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            let child = CreatePopupMenu().unwrap();
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 12, w!("保存(&S)\tCtrl+S")).unwrap();
+            AppendMenuW(menu, MF_POPUP, child.0 as usize, w!("表示")).unwrap();
+            AppendMenuW(child, MF_STRING, 13, w!("日本語項目(&J)")).unwrap();
+            AppendMenuW(child, MF_SEPARATOR, 0, PCWSTR::null()).unwrap();
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_DATA,
+                dwItemData: 42,
+                ..Default::default()
+            };
+            SetMenuItemInfoW(menu, 0, true, &info).unwrap();
+            let mut background = MENUINFO {
+                cbSize: std::mem::size_of::<MENUINFO>() as u32,
+                fMask: MIM_BACKGROUND,
+                ..Default::default()
+            };
+            GetMenuInfo(menu, &mut background).unwrap();
+            let old_background = background.hbrBack;
+            let before = document_state(fixture.state.app.borrow().doc());
+            let scope = menu_style::MenuScope::new(
+                &fixture.state,
+                fixture.hwnd,
+                menu,
+                shell::Tokens::default(),
+                1.,
+            )
+            .expect("standard-contrast fixture");
+            info.fMask = MIIM_DATA | MIIM_FTYPE | MIIM_STATE;
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(info.fType.contains(MFT_OWNERDRAW));
+            assert_ne!(info.fState.0 & MFS_DISABLED.0, 0);
+            assert_ne!(info.dwItemData, 42);
+            let mut text = [0u16; 64];
+            let length = GetMenuStringW(menu, 0, Some(&mut text), MF_BYPOSITION);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..length as usize]),
+                "保存(&S)\tCtrl+S"
+            );
+            let dc = CreateCompatibleDC(None);
+            let bitmap = CreateBitmap(320, 40, 1, 32, None);
+            let old = SelectObject(dc, bitmap.into());
+            let mut measure = MEASUREITEMSTRUCT {
+                CtlType: ODT_MENU,
+                itemID: 12,
+                itemData: info.dwItemData,
+                ..Default::default()
+            };
+            let mut item = DRAWITEMSTRUCT {
+                CtlType: ODT_MENU,
+                itemID: 12,
+                itemData: info.dwItemData,
+                itemState: ODS_FLAGS(ODS_SELECTED.0 | ODS_DISABLED.0),
+                hwndItem: HWND(menu.0),
+                hDC: dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 320,
+                    bottom: 40,
+                },
+                ..Default::default()
+            };
+            {
+                let app = fixture.state.app.borrow_mut();
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_INITMENUPOPUP,
+                        WPARAM(child.0 as usize),
+                        LPARAM(0)
+                    ),
+                    LRESULT(0)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MENUCHAR,
+                        WPARAM('s' as usize),
+                        LPARAM(menu.0 as isize)
+                    ),
+                    LRESULT((MNC_IGNORE << 16) as isize)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MENUCHAR,
+                        WPARAM('j' as usize),
+                        LPARAM(child.0 as isize)
+                    ),
+                    LRESULT((MNC_EXECUTE << 16) as isize)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MEASUREITEM,
+                        WPARAM(0),
+                        LPARAM((&mut measure as *mut MEASUREITEMSTRUCT) as isize)
+                    ),
+                    LRESULT(1)
+                );
+                assert!(
+                    measure.itemWidth > 100
+                        && measure.itemHeight == shell::UI_ROW_HEIGHT.round() as u32
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_DRAWITEM,
+                        WPARAM(0),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    ),
+                    LRESULT(1)
+                );
+                // A disabled selected item uses panel, never active hover color.
+                assert_eq!(
+                    GetPixel(dc, 8, 8),
+                    shell::rgb(shell::Tokens::default().panel)
+                );
+                assert_eq!(document_state(app.doc()), before);
+                item.hwndItem = HWND(child.0);
+                assert!(
+                    menu_style::window_message(
+                        &fixture.state,
+                        fixture.hwnd,
+                        WM_DRAWITEM,
+                        WPARAM(0),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    )
+                    .is_none()
+                );
+            }
+            let _ = SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            drop(scope);
+            assert!(fixture.state.menu_paint.borrow().is_empty());
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            assert_eq!(info.dwItemData, 42);
+            assert_ne!(info.fState.0 & MFS_DISABLED.0, 0);
+            GetMenuInfo(menu, &mut background).unwrap();
+            assert_eq!(background.hbrBack, old_background);
+            DestroyMenu(menu).unwrap();
+        }
+    }
+    #[test]
+    fn themed_popup_scope_high_contrast_foreign_items_and_unwind() {
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            AppendMenuW(menu, MF_STRING, 12, w!("項目")).unwrap();
+            let tokens = shell::Tokens {
+                high_contrast: true,
+                ..Default::default()
+            };
+            assert!(
+                menu_style::MenuScope::new(&fixture.state, fixture.hwnd, menu, tokens, 1.)
+                    .is_none()
+            );
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_DATA,
+                ..Default::default()
+            };
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            let outer = menu_style::MenuScope::new(
+                &fixture.state,
+                fixture.hwnd,
+                menu,
+                shell::Tokens::default(),
+                1.,
+            )
+            .unwrap();
+            // Tracking the same handles must not replace the active snapshot.
+            assert!(
+                menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.
+                )
+                .is_none()
+            );
+            assert_eq!(fixture.state.menu_paint.borrow().len(), 1);
+            drop(outer);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.,
+                )
+                .unwrap();
+                panic!("menu unwind fixture");
+            }));
+            assert!(result.is_err());
+            assert!(fixture.state.menu_paint.borrow().is_empty());
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            info.fType |= MFT_OWNERDRAW;
+            info.dwItemData = 99;
+            SetMenuItemInfoW(menu, 0, true, &info).unwrap();
+            assert!(
+                menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.
+                )
+                .is_none()
+            );
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(info.fType.contains(MFT_OWNERDRAW));
+            assert_eq!(info.dwItemData, 99);
+            DestroyMenu(menu).unwrap();
         }
     }
     #[test]
@@ -9650,6 +11168,67 @@ mod tests {
     }
 
     #[test]
+    fn paint_recovery_frame_identity_tracks_only_successful_editor_frames() {
+        let mut seed = composing_test_app("frame body");
+        seed.clear_composition();
+        let mut fixture = MessagePumpFixture::new(seed);
+        let compact = fixture.create_compact();
+        PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.select_surface(fixture.hwnd);
+            assert_eq!(app.painted_frame, None);
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            let first = app.painted_frame.unwrap();
+            assert_eq!(first.hwnd, fixture.hwnd.0 as usize);
+            assert_eq!(first.document_id, app.doc().id());
+            assert_eq!(first.revision, app.doc().revision());
+            app.doc_mut().replace_selection("new ").unwrap();
+            assert_ne!(first.revision, app.doc().revision());
+            let before = document_state(app.doc());
+            app.refresh();
+            assert_eq!(
+                app.painted_frame,
+                Some(first),
+                "refresh is not a rendered frame"
+            );
+            app.minimized = true;
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame, Some(first));
+            app.minimized = false;
+            PAINT_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.fault = Some(PaintFault::EndDraw);
+                state.failures = 1;
+            });
+            assert!(app.paint(rect(0., 0., 450., 480.)).is_err());
+            assert_eq!(
+                app.painted_frame,
+                Some(first),
+                "failed EndDraw cannot certify a frame"
+            );
+            app.discard_target();
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame.unwrap().sequence, first.sequence + 1);
+            assert_eq!(app.painted_frame.unwrap().revision, app.doc().revision());
+            let editor_frame = app.painted_frame;
+            app.shell.enabled = true;
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact;
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(
+                app.painted_frame, editor_frame,
+                "main placeholder is not the editor"
+            );
+            app.select_surface(compact);
+            app.paint(rect(0., 0., 450., 480.)).unwrap();
+            assert_eq!(app.painted_frame.unwrap().hwnd, compact.0 as usize);
+            assert_eq!(app.painted_frame.unwrap().sequence, first.sequence + 2);
+            assert_eq!(document_state(app.doc()), before);
+        }
+    }
+
+    #[test]
     fn paint_recovery_resize_invalidates_frame_and_discards_failed_target() {
         let fixture = EditorFixture::new("resize body", false);
         let before = document_state(fixture.state.app.borrow().doc());
@@ -10080,6 +11659,326 @@ mod tests {
             app.character('続' as u16);
         }
         assert_eq!(app.doc().source(), format!("{expected}続"));
+    }
+    #[test]
+    fn live_heading_end_before_affinity_keeps_owning_view_and_direct_pointer_hit() {
+        let source = "# Heading 日本語\n\n---\n\n```rust\n# literal\n\n---\n```\n\nSetext\n---\n";
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let end = source.find('\n').unwrap();
+        assert_eq!(end, 19);
+        unsafe { app.key_with_modifiers(VK_END.0, false, false) };
+        assert_eq!(app.doc().selection(), Selection::caret(end));
+        assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::Before);
+        let heading = app
+            .views
+            .iter()
+            .find(|view| view.source == (0..20))
+            .unwrap();
+        let rule = app.views.iter().find(|view| view.thematic_break).unwrap();
+        assert!(heading.before.contains(&end));
+        assert!(
+            rule.before.contains(&end),
+            "the global shared boundary is a legitimate Before choice"
+        );
+        assert!(!rule.source.contains(&end));
+        println!(
+            "heading end={end} chosen={:?} rule_before={:?}",
+            app.source_view(end).unwrap().source,
+            rule.before
+        );
+        assert_eq!(app.source_view(end).unwrap().source, heading.source);
+        let (x, y, height) = app.caret_location();
+        assert!(y >= heading.y && y < heading.y + heading.height);
+        // Match the registered harness's rounded native-caret pixel point.
+        let click_x = x.round();
+        let click_y = y.round() + (height.round() / 2.0).floor();
+        let before = document_state(app.doc());
+        app.select_at(click_x, click_y, false);
+        assert_eq!(app.doc().selection(), Selection::caret(end));
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().revision(), before.2);
+        assert_eq!(app.doc().undo_count(), before.4);
+        assert_eq!(app.doc().redo_count(), before.5);
+        assert_eq!(app.doc().is_dirty(), before.3);
+    }
+    #[test]
+    fn live_heading_direct_hit_reveal_and_scroll_refresh_keep_caret_geometry() {
+        for level in 1..=6 {
+            for title in [
+                "",
+                "日本語 👩‍💻 é heading",
+                "wrapped 日本語 ".repeat(18).as_str(),
+            ] {
+                let source = format!("before\n\n{} {title}\n\nafter\n", "#".repeat(level));
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.tabs[0].scroll = 0.0;
+                app.hwnd = hidden_test_window_size(450, 480);
+                unsafe { app.ensure_layout().unwrap() };
+                let heading = app
+                    .cached_projection()
+                    .blocks
+                    .iter()
+                    .find(|block| matches!(block.kind, BlockKind::Heading { .. }))
+                    .unwrap()
+                    .clone();
+                // Probe the actual display hit-test before raw heading reveal,
+                // then follow selection -> layout -> caret -> input. No focus
+                // or activation API is used by this hidden geometry regression.
+                let view = app
+                    .views
+                    .iter()
+                    .find(|view| view.source == heading.source)
+                    .unwrap();
+                let mut points = Vec::new();
+                for u in [0, view.text.len() / 2, view.text.len()] {
+                    if let Some((x, y, h)) = layout_caret(&view.layout, u as u32, false) {
+                        points.push((view.x + x + 0.1, view.y + y + h * 0.5));
+                    }
+                }
+                for (x, y) in points {
+                    app.doc_mut().set_selection(0, 0).unwrap();
+                    unsafe { app.ensure_layout().unwrap() };
+                    app.select_at(x, y, false);
+                    let p = app.doc().selection().head;
+                    assert!(
+                        heading.source.contains(&p) || p == heading.source.end,
+                        "level={level} title={title:?} p={p}"
+                    );
+                    unsafe { app.refresh() };
+                    assert_eq!(app.caret, app.caret_location());
+                    let (cx, cy, h) = app.caret_location();
+                    assert!(cx.is_finite() && cy.is_finite() && h > 0.0);
+                    assert!(app.source_view(p).is_some());
+                    for inserted in ["A", "字"] {
+                        let before = document_state(app.doc());
+                        app.edit(inserted);
+                        let mut expected = source.clone();
+                        expected.insert_str(p, inserted);
+                        assert_eq!(app.doc().source(), expected);
+                        assert!(app.doc_mut().undo());
+                        assert_eq!(app.doc().source(), source);
+                        assert_eq!(app.doc().selection(), Selection::caret(p));
+                        assert_eq!(app.doc().undo_count(), before.4);
+                        unsafe { app.ensure_layout().unwrap() };
+                    }
+                }
+                app.tabs[0].scroll = app.height;
+                unsafe { app.refresh() };
+                assert_eq!(
+                    app.caret,
+                    app.caret_location(),
+                    "refresh must commit caret after scroll clamp: level={level} title={title:?}"
+                );
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+        }
+    }
+    #[test]
+    fn editor_live_front_matter_vertical_sequence_reaches_both_edges_without_cycle() {
+        let source = "---\ntitle: 架空の編集試料\n---\n\n# MDLite 編集基盤\n日本語と **太字**、*強調*、`code`、[リンク](#表)を編集します。\n絵文字 👩‍💻 と結合文字 e\u{301} の境界を保持します\n";
+        assert_vertical_sequence(source);
+        assert_vertical_sequence(&source.replace('\n', "\r\n"));
+    }
+    #[test]
+    fn editor_live_front_matter_delimiters_edit_and_undo_through_native_input() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("---{eol}title: 日本語 👩‍💻{eol}---{eol}{eol}# body{eol}");
+            for p in [0, source.rfind("---").unwrap()] {
+                let fixture = EditorFixture::new(&source, false);
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    app.doc_mut().set_selection(p, p).unwrap();
+                    unsafe {
+                        app.after_input();
+                    }
+                    let rows: Vec<_> = app.gutter_rows.iter().map(|r| r.line_number).collect();
+                    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+                    let (x, y, height) = app.caret_location();
+                    let (hit, _) = app.hit_with_affinity(x + 0.5, y + height * 0.5);
+                    assert_eq!(hit, p, "delimiter hit-test at {p}");
+                }
+                fixture.message(WM_KEYDOWN, VK_DELETE.0 as usize);
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    let mut edited = source.clone();
+                    edited.remove(p);
+                    assert_eq!(app.doc().source(), edited);
+                    assert_eq!(app.doc().undo_count(), 1);
+                    assert!(app.doc().is_dirty());
+                    unsafe {
+                        app.key_with_modifiers(0x5a, true, false);
+                    }
+                    assert_eq!(app.doc().source(), source);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    assert!(!app.doc().is_dirty());
+                    unsafe {
+                        app.key_with_modifiers(0x59, true, false);
+                    }
+                    assert_eq!(app.doc().source(), edited);
+                    unsafe {
+                        app.key_with_modifiers(0x5a, true, false);
+                    }
+                }
+                fixture.message(WM_CHAR, '字' as usize);
+                let app = fixture.state.app.borrow();
+                let mut edited = source.clone();
+                edited.insert(p, '字');
+                assert_eq!(app.doc().source(), edited);
+                assert_eq!(app.doc().selection().head, p + '字'.len_utf8());
+            }
+        }
+    }
+    #[test]
+    fn editor_live_markdown_vertical_sequence_keeps_selection_and_edges() {
+        let source = "# Heading\n\nparagraph **bold** and *italic*, `code` and [link](url)\nnext 👩‍💻 e\u{301}\n\n- item\n- second\n\n> quote\n> next\n\n```rust\nlet n = 1;\n```\n\n| H | J |\n|---|---|\n| one | 日本語 |\n| two | next |\n\n![image](missing.png)\n\nlast\n";
+        assert_vertical_sequence(source);
+        assert_vertical_sequence(&source.replace('\n', "\r\n"));
+    }
+    fn assert_vertical_sequence(source: &str) {
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let before = (
+            app.doc().revision(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().is_dirty(),
+        );
+        app.doc_mut()
+            .set_selection(source.len(), source.len())
+            .unwrap();
+        unsafe {
+            app.after_input();
+        }
+        for (key, edge, extend) in [
+            (VK_UP.0, 0, false),
+            (VK_DOWN.0, source.len(), false),
+            (VK_UP.0, 0, true),
+        ] {
+            let anchor = app.doc().selection().head;
+            let mut visited = std::collections::HashSet::new();
+            let mut trace = Vec::new();
+            while app.doc().selection().head != edge {
+                let p = app.doc().selection().head;
+                let affinity = app.doc().selection_affinity();
+                let y = app.caret_location().1 + app.tabs[app.active].scroll;
+                let layout_before = app.layout_key;
+                let revealed_before = app.revealed_source.clone();
+                trace.push((p, format!("{affinity:?}"), y));
+                assert!(
+                    visited.insert((p, format!("{affinity:?}"))),
+                    "vertical cycle key={key}: {trace:?}"
+                );
+                app.move_caret(key, extend);
+                let target = app.doc().selection().head;
+                let target_affinity = app.doc().selection_affinity();
+                assert_eq!(app.layout_key, layout_before);
+                assert_eq!(app.revealed_source, revealed_before);
+                let chosen_y =
+                    app.caret_location_at(target, target_affinity).1 + app.tabs[app.active].scroll;
+                assert!(
+                    if key == VK_UP.0 {
+                        chosen_y < y || (target == edge && chosen_y <= y)
+                    } else {
+                        chosen_y > y || (target == edge && chosen_y >= y)
+                    },
+                    "same-layout visual direction key={key}: ({p}, {affinity:?}, {y}) -> ({target}, {target_affinity:?}, {chosen_y})"
+                );
+                unsafe {
+                    app.after_input();
+                }
+                if extend {
+                    assert_eq!(app.doc().selection().anchor, anchor);
+                }
+            }
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(
+                (
+                    app.doc().revision(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().is_dirty()
+                ),
+                before
+            );
+        }
+    }
+    #[test]
+    fn editor_live_vertical_marker_edges_keep_horizontal_affinity() {
+        let fixture = EditorFixture::new("---\nvalue: text\n---\n\n# body\n", false);
+        let mut app = fixture.state.app.borrow_mut();
+        app.doc_mut()
+            .set_selection_with_affinity(0, 0, BoundaryAffinity::Before)
+            .unwrap();
+        unsafe {
+            app.after_input();
+        }
+        let before = (app.doc().selection_affinity(), app.caret_location());
+        app.move_caret(VK_LEFT.0, false);
+        unsafe {
+            app.after_input();
+        }
+        assert_eq!(
+            (app.doc().selection_affinity(), app.caret_location()),
+            before
+        );
+    }
+    #[test]
+    fn editor_live_table_vertical_movement_retains_second_column_and_shift_anchor() {
+        let source = "| A | B |\n|---|---|\n| one | two |\n| three | four |\n";
+        let fixture = EditorFixture::new(source, false);
+        let mut app = fixture.state.app.borrow_mut();
+        let two = source.find("two").unwrap();
+        let four = source.find("four").unwrap();
+        let before = (
+            app.doc().revision(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+        );
+        app.doc_mut().set_selection(two, two).unwrap();
+        unsafe {
+            app.after_input();
+        }
+        let preferred_x = app.caret_location().0;
+        for (key, target, extend) in [
+            (VK_DOWN.0, four, false),
+            (VK_UP.0, two, false),
+            (VK_DOWN.0, four, true),
+            (VK_UP.0, two, true),
+        ] {
+            let y = app.caret_location().1 + app.tabs[app.active].scroll;
+            app.move_caret(key, extend);
+            unsafe {
+                app.after_input();
+            }
+            assert_eq!(
+                app.doc().selection().head,
+                target,
+                "key={key}, extend={extend}"
+            );
+            if extend {
+                assert_eq!(app.doc().selection().anchor, two);
+            }
+            assert!((app.caret_location().0 - preferred_x).abs() < 1.0);
+            let target_y = app.caret_location().1 + app.tabs[app.active].scroll;
+            assert!(if key == VK_UP.0 {
+                target_y < y
+            } else {
+                target_y > y
+            });
+        }
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(
+            (
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count()
+            ),
+            before
+        );
     }
     #[test]
     fn editor_visual_rows_keep_preferred_x_across_short_line() {
@@ -10888,6 +12787,9 @@ mod tests {
             tab_scroll: 0,
             next_id: 2,
             views: Vec::new(),
+            source_line_starts: Vec::new(),
+            gutter_rows: Vec::new(),
+            gutter_width: 0.0,
             visible_tokens: Vec::new(),
             literal_blocks: Vec::new(),
             tables: Vec::new(),
@@ -10895,6 +12797,7 @@ mod tests {
             image_cache: HashMap::new(),
             minimized: false,
             full_paint: true,
+            painted_frame: None,
             paint_retry_pending: false,
             animation_timer_armed: false,
             height: 0.0,
@@ -10926,6 +12829,7 @@ mod tests {
             close_after_composition: None,
             pending_surrogate: None,
             diagnostic: None,
+            phase_trace: None,
             caret: (LEFT, TOP, 28.0),
             native_caret: NativeCaretState::default(),
             status: String::new(),
@@ -10938,6 +12842,7 @@ mod tests {
             editor_actions: EditorActions::default(),
             diagnostics: DiagnosticsPane::default(),
             close_target: None,
+            settings_requested: false,
         }
     }
     fn hidden_test_window() -> HWND {
@@ -11695,6 +13600,393 @@ mod tests {
     }
 
     #[test]
+    fn live_blank_rows_measure_against_source_and_literal_dwrite_rows() {
+        fn source_row_y(app: &App, byte: usize) -> f32 {
+            let view = app
+                .source_view_at(byte, Some(BoundaryAffinity::After))
+                .expect("source byte should have a presentation row");
+            let position = view
+                .map
+                .iter()
+                .position(|&mapped| mapped == byte)
+                .or_else(|| view.before.iter().position(|&mapped| mapped == byte))
+                .expect("source byte should map to a DirectWrite position");
+            let (_, row_y, _) = layout_caret(&view.layout, position as u32, false)
+                .expect("DirectWrite should locate the source row");
+            view.y + row_y
+        }
+
+        let mut spacing = Vec::new();
+        for blank_lines in [0usize, 1, 2] {
+            let source = format!("before{}after", "\n".repeat(blank_lines + 1));
+            let mut gaps = Vec::new();
+            for raw in [true, false] {
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.tabs[0].raw = raw;
+                app.hwnd = hidden_test_window_size(720, 520);
+                let before = document_state(app.doc());
+                unsafe {
+                    app.ensure_layout().unwrap();
+                }
+                let before_y = source_row_y(&app, source.find("before").unwrap());
+                let after_y = source_row_y(&app, source.find("after").unwrap());
+                let gap = after_y - before_y;
+                let first_view = app
+                    .source_view_at(
+                        source.find("before").unwrap(),
+                        Some(BoundaryAffinity::After),
+                    )
+                    .unwrap();
+                let mut count = 0;
+                unsafe {
+                    let _ = first_view.layout.GetLineMetrics(None, &mut count);
+                }
+                let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+                unsafe {
+                    first_view
+                        .layout
+                        .GetLineMetrics(Some(&mut lines), &mut count)
+                        .unwrap();
+                }
+                let line_height = lines[0].height;
+                let expected_gap = line_height * (blank_lines + 1) as f32;
+                assert!(
+                    (gap - expected_gap).abs() <= 1.0,
+                    "raw={raw} blank_lines={blank_lines}: expected {expected_gap}px from DirectWrite rows, got {gap}px"
+                );
+                gaps.push(gap);
+                assert_eq!(document_state(app.doc()), before);
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+            assert!(
+                (gaps[0] - gaps[1]).abs() <= 1.0,
+                "blank_lines={blank_lines}: Live and source layout must share physical row spacing"
+            );
+            spacing.push(gaps[0]);
+        }
+        assert!(spacing[0] < spacing[1] && spacing[1] < spacing[2]);
+
+        let literal = "```text\nline\n```\n\nfollowing";
+        let mut app = composing_test_app(literal);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(app.source_line_starts, physical_line_starts(literal));
+        let code = app
+            .views
+            .iter()
+            .find(|view| String::from_utf16_lossy(&view.text).contains("line"))
+            .unwrap();
+        let mut count = 0;
+        unsafe {
+            let _ = code.layout.GetLineMetrics(None, &mut count);
+        }
+        let mut lines = vec![DWRITE_LINE_METRICS::default(); count as usize];
+        unsafe {
+            code.layout
+                .GetLineMetrics(Some(&mut lines), &mut count)
+                .unwrap();
+        }
+        assert_eq!(
+            lines.len(),
+            3,
+            "opening fence, body, and closing fence each occupy one physical row"
+        );
+        let following = app
+            .views
+            .iter()
+            .find(|view| String::from_utf16_lossy(&view.text).contains("following"))
+            .unwrap();
+        assert!(
+            (following.y - code.y - code.height - lines[0].height).abs() <= 1.0,
+            "the literal trailing row and one physical blank row should each occupy one baseline"
+        );
+        assert!(
+            (source_row_y(&app, 13) - source_row_y(&app, 0) - 2.0 * lines[0].height).abs() <= 1.0
+        );
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+
+        let table_source = "before\n\n| A | B |\n|---|---|\n| x | y |\n\nafter";
+        let mut app = composing_test_app(table_source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        let table = app.tables.first().unwrap();
+        let table_start = app
+            .source_view_at(table.table.range.start, Some(BoundaryAffinity::After))
+            .unwrap();
+        assert!(table_start.source.is_empty());
+        let line_height = presentation::line_height(app.font_size());
+        assert!(
+            (table.y - table_start.y - line_height).abs() <= 1.0,
+            "table-start anchor should share the preceding blank-row baseline"
+        );
+        let before_y = app
+            .views
+            .iter()
+            .find(|view| table_source[view.source.clone()].contains("before"))
+            .unwrap()
+            .y;
+        let after_y = app
+            .views
+            .iter()
+            .find(|view| table_source[view.source.clone()].contains("after"))
+            .unwrap()
+            .y;
+        assert!(
+            (table.y - before_y - 2.0 * line_height).abs() <= 1.0,
+            "table_start={} before_row={} line_height={}",
+            table.y,
+            before_y,
+            line_height
+        );
+        assert!((after_y - table.y - table.height - line_height).abs() <= 1.0);
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+
+        let image_source = "before\n\n![image](image.png)\n\nafter";
+        let mut app = composing_test_app(image_source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(720, 520);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        let line_height = presentation::line_height(app.font_size());
+        let image = app.images.first().unwrap();
+        let before_y = app
+            .views
+            .iter()
+            .find(|view| image_source[view.source.clone()].contains("before"))
+            .unwrap()
+            .y;
+        let after_y = app
+            .views
+            .iter()
+            .find(|view| image_source[view.source.clone()].contains("after"))
+            .unwrap()
+            .y;
+        assert!((image.y - before_y - 2.0 * line_height).abs() <= 1.0);
+        let image_start = app
+            .source_view_at(image.source.start, Some(BoundaryAffinity::After))
+            .unwrap();
+        let image_end = app
+            .source_view_at(image.source.end, Some(BoundaryAffinity::After))
+            .unwrap();
+        assert!(image_start.source.is_empty());
+        assert!(image_end.source.is_empty());
+        assert!((image_start.y - image.y).abs() <= 1.0);
+        assert!(
+            (image_end.y - image.y - image.height).abs() <= 1.0,
+            "image_y={} height={} end_anchor_y={} following_y={} font_size={} row_height={}",
+            image.y,
+            image.height,
+            image_end.y,
+            after_y,
+            app.font_size(),
+            line_height
+        );
+        assert!((after_y - image.y - image.height - line_height).abs() <= 1.0);
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+    }
+
+    #[test]
+    fn gutter_width_and_rows_follow_physical_source_lines() {
+        let source = format!(
+            "{}\n\n| A | B | C | D | E |\n|---|---|---|---|---|\n| x | y | z | q | r |\n\n![image](image.png)",
+            "wrapped text ".repeat(80)
+        );
+        let mut app = composing_test_app(&source);
+        app.clear_composition();
+        app.hwnd = hidden_test_window_size(360, 480);
+        let (one_digit, six_digits) = unsafe {
+            (
+                app.measure_gutter_width(9).unwrap(),
+                app.measure_gutter_width(100_000).unwrap(),
+            )
+        };
+        assert!(six_digits > one_digit);
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(app.source_line_starts, physical_line_starts(&source));
+        let labels: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+        assert!(!labels.is_empty());
+        assert!(
+            labels.windows(2).all(|pair| pair[0] < pair[1]),
+            "wraps, table cells, and image boundary markers share one label per physical source line: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|line| *line <= app.source_line_starts.len())
+        );
+
+        let content_left = app.content_left();
+        let table = app.tables.first().unwrap();
+        app.tabs[0]
+            .table_scroll
+            .insert(table.table.range.start, table.width);
+        app.layout_key = None;
+        unsafe {
+            app.ensure_layout().unwrap();
+        }
+        assert_eq!(
+            app.content_left(),
+            content_left,
+            "table scrolling keeps the gutter fixed"
+        );
+
+        let before_selection = app.doc().selection();
+        app.select_at(app.content_left() - 1.0, app.editor_top() + 5.0, false);
+        assert_eq!(
+            app.doc().selection(),
+            before_selection,
+            "the gutter is not interactive"
+        );
+        unsafe { DestroyWindow(app.hwnd).unwrap() };
+    }
+
+    #[test]
+    fn gutter_rows_include_literal_delimiters_and_skip_unrepresented_trailing_metrics() {
+        fn assert_rows(source: &str, expected: &[usize], raw: bool) {
+            let mut app = composing_test_app(source);
+            app.clear_composition();
+            app.tabs[0].raw = raw;
+            app.hwnd = hidden_test_window_size(720, 520);
+            let before = document_state(app.doc());
+            unsafe {
+                app.ensure_layout().unwrap();
+            }
+            let actual: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+            assert_eq!(actual, expected, "source={source:?} raw={raw}");
+            let mut baselines: Vec<_> = app
+                .gutter_rows
+                .iter()
+                .map(|row| row.y + row.baseline)
+                .collect();
+            baselines.sort_by(f32::total_cmp);
+            assert!(
+                baselines.windows(2).all(|pair| {
+                    (pair[0] * 2.0).round() as i32 != (pair[1] * 2.0).round() as i32
+                })
+            );
+            assert_eq!(document_state(app.doc()), before);
+            unsafe { DestroyWindow(app.hwnd).unwrap() };
+        }
+
+        assert_rows(
+            "```text\nline\n```\n\nfollowing\n",
+            &[1, 2, 3, 4, 5, 6],
+            false,
+        );
+        assert_rows(
+            "---\ntitle: note\n---\n\nbody\n",
+            &[1, 2, 3, 4, 5, 6],
+            false,
+        );
+        assert_rows("one\n\nthree\n", &[1, 2, 3, 4], true);
+    }
+
+    #[test]
+    fn live_fenced_source_rows_hit_edit_language_delimiters_and_restore_exact_history() {
+        for eol in ["\n", "\r\n"] {
+            for info in ["", "rust", "unknown-language"] {
+                let source = format!(
+                    "````{info}{eol}# literal **raw** | --- 👩‍💻 é{eol}{eol}{}{eol}```{eol}````{eol}{eol}~~~{eol}{eol}~~~{eol}",
+                    "long raw code ".repeat(35)
+                );
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.hwnd = hidden_test_window_size(450, 480);
+                let before = document_state(app.doc());
+                unsafe { app.ensure_layout().unwrap() };
+                assert_eq!(document_state(app.doc()), before);
+                let rows: Vec<_> = app.gutter_rows.iter().map(|row| row.line_number).collect();
+                assert_eq!(
+                    rows,
+                    (1..=physical_line_starts(&source).len()).collect::<Vec<_>>()
+                );
+                assert!(app.tables.is_empty() && app.images.is_empty());
+                assert_eq!(
+                    app.cached_projection()
+                        .blocks
+                        .iter()
+                        .filter(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+                        .count(),
+                    2
+                );
+                assert!(
+                    app.views
+                        .iter()
+                        .filter(|view| !view.source.is_empty())
+                        .all(|view| !view.thematic_break)
+                );
+                // Fence and info-string positions use the same source map as
+                // text and the gutter; editing is one ordinary source transaction.
+                for p in [
+                    0,
+                    2,
+                    4,
+                    4 + info.len(),
+                    source.find("# literal").unwrap(),
+                    source.find("````").unwrap() + 1,
+                    source.rfind("~~~").unwrap() + 2,
+                ] {
+                    app.doc_mut().set_selection(p, p).unwrap();
+                    unsafe { app.ensure_layout().unwrap() };
+                    let (x, y, h) = app.caret_location();
+                    assert_eq!(
+                        app.hit(x + 0.1, y + h * 0.5),
+                        p,
+                        "{eol:?} info={info:?} p={p}"
+                    );
+                    app.select_at(x + 0.1, y + h * 0.5, false);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    app.edit("字");
+                    let mut expected = source.clone();
+                    expected.insert(p, '字');
+                    assert_eq!(app.doc().source(), expected);
+                    assert!(app.doc_mut().undo());
+                    assert_eq!(app.doc().source(), source);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    assert!(app.doc_mut().redo());
+                    assert_eq!(app.doc().source(), expected);
+                    assert!(app.doc_mut().undo());
+                }
+                let opening_info = 4..4 + info.len();
+                app.edit_range(opening_info.clone(), "python");
+                assert_eq!(&app.doc().source()[4..10], "python");
+                assert!(app.doc_mut().undo());
+                app.edit_range(opening_info, "");
+                assert!(app.doc().source().starts_with(&format!("````{eol}")));
+                if !info.is_empty() {
+                    assert!(app.doc_mut().undo());
+                }
+                assert_eq!(app.doc().source(), source);
+                let closing = source.find(&format!("````{eol}{eol}")).unwrap();
+                app.doc_mut().set_selection(closing, closing + 4).unwrap();
+                app.edit("");
+                assert!(!app.doc().source().contains(&format!("````{eol}{eol}")));
+                unsafe { app.ensure_layout().unwrap() };
+                assert!(app.doc_mut().undo());
+                assert_eq!(app.doc().source(), source);
+                assert_eq!(
+                    app.doc().selection(),
+                    Selection {
+                        anchor: closing,
+                        head: closing + 4
+                    }
+                );
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+        }
+    }
+
+    #[test]
     fn wrapped_code_image_fragments_use_post_style_metrics_for_layout() {
         let before_code = "iiiiiiii ".repeat(5);
         let after_code = "iiiiiiii ".repeat(6);
@@ -11727,7 +14019,12 @@ mod tests {
                 view.layout.GetMetrics(&mut metrics).unwrap();
             }
             assert!(metrics.height > FONT * 1.6, "inline code should wrap");
-            assert_eq!(view.height, metrics.height.max(FONT * 1.6));
+            assert_eq!(
+                view.height,
+                metrics
+                    .height
+                    .max(presentation::line_height(app.font_size()))
+            );
         }
         let mut family = [0u16; 64];
         unsafe {
@@ -11747,17 +14044,22 @@ mod tests {
             .iter()
             .find(|image| source[image.source.clone()].contains("![image]"))
             .unwrap();
-        assert!(image.y >= before_view.y + before_view.height + 10.0 + FONT * 1.6 - 0.01);
-        assert!(
-            after_view.y >= image.y + image.height + FONT * 1.6 + 15.0 - 0.01,
-            "trailing fragment must start below the image"
-        );
+        assert!(image.y >= before_view.y + before_view.height - 1.0);
+        assert!(after_view.y >= image.y + image.height - 1.0);
         let following = app
             .views
             .iter()
             .find(|view| source[view.source.clone()].contains("following paragraph"))
             .unwrap();
-        assert!(following.y >= after_view.y + after_view.height + 10.0 - 0.01);
+        assert!(
+            (following.y
+                - after_view.y
+                - after_view.height
+                - presentation::line_height(app.font_size()))
+            .abs()
+                <= 1.0,
+            "the physical blank row should provide exactly one following baseline"
+        );
         assert_eq!(document_state(app.doc()), before);
         unsafe {
             DestroyWindow(app.hwnd).unwrap();
@@ -11785,20 +14087,17 @@ mod tests {
             assert!(rule_views[0].width > 100.0);
             let rule_start = source.find(syntax).unwrap();
             assert!(source[rule_views[0].source.clone()].starts_with(syntax));
-            let rule = app
-                .visible_tokens
-                .iter()
-                .find(|token| {
-                    token.spans.len() == 1
-                        && token.spans[0] == (rule_start..rule_start + syntax.len())
+            assert_eq!(String::from_utf16_lossy(&rule_views[0].text), syntax);
+            assert!((rule_start..rule_start + syntax.len()).all(|byte| {
+                app.visible_tokens.iter().any(|token| {
+                    !token.atomic
+                        && token.spans.as_slice() == std::slice::from_ref(&(byte..byte + 1))
                 })
-                .unwrap();
-            assert!(rule.atomic);
-            assert_eq!(rule.text.as_deref(), Some("─"));
-            assert_eq!(rule.display_utf16.end - rule.display_utf16.start, 1);
+            }));
+            let geometry = (rule_views[0].y, rule_views[0].height);
             assert_eq!(
                 live_horizontal_step(&source, &app.visible_tokens, &[], &[], rule_start, false,),
-                rule_start + syntax.len()
+                rule_start + 1
             );
             assert_eq!(
                 live_horizontal_step(
@@ -11809,8 +14108,17 @@ mod tests {
                     rule_start + syntax.len(),
                     true,
                 ),
-                rule_start
+                rule_start + syntax.len() - 1
             );
+            for byte in rule_start..=rule_start + syntax.len() {
+                app.doc_mut().set_selection(byte, byte).unwrap();
+                unsafe { app.ensure_layout().unwrap() };
+                let view = app.views.iter().find(|view| view.thematic_break).unwrap();
+                assert_eq!((view.y, view.height), geometry);
+                assert_eq!(String::from_utf16_lossy(&view.text), syntax);
+                let (x, y, h) = app.caret_location();
+                assert_eq!(app.hit(x + 0.1, y + h * 0.5), byte);
+            }
 
             app.doc_mut()
                 .set_selection(rule_start, rule_start + syntax.len())
@@ -13561,7 +15869,7 @@ mod tests {
         ));
     }
     #[test]
-    fn horizontal_arrows_cross_adjacent_eol_without_skipping_text_or_entering_metadata_prefix() {
+    fn horizontal_arrows_cross_adjacent_eol_and_enter_front_matter_delimiters() {
         for eol in ["\n", "\r\n"] {
             let source = format!("hello{eol}");
             let tokens = projected_tokens(&source);
@@ -13595,7 +15903,7 @@ mod tests {
             .collect();
         assert_eq!(
             live_horizontal_step(source, &tokens, &[], &blocks, 4, true),
-            4
+            3
         );
     }
     fn apply_plan(doc: &mut Document, plan: LiveEdit) {
@@ -13693,33 +16001,33 @@ mod tests {
         }
     }
     #[test]
-    fn first_frontmatter_and_fence_text_backspace_keeps_hidden_opening_line_ending() {
-        for source in ["---\ntitle: T\n---\n", "```\nfirst\n```\n"] {
-            let projection = DisplayProjection::parse(source);
-            let tokens = projected_tokens(source);
-            let blocks: Vec<_> = projection
-                .blocks
-                .iter()
-                .filter(|block| {
-                    matches!(
-                        block.kind,
-                        BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
-                    )
-                })
-                .map(|block| block.source.clone())
-                .collect();
-            let first = tokens[0].spans[0].start;
-            assert_eq!(first, 4);
-            let mut doc = Document::new(34, source.into());
-            doc.set_selection(first, first).unwrap();
-            let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
-            assert!(plan.range.is_empty());
-            apply_plan(&mut doc, plan);
-            assert_eq!(doc.source(), source);
-            assert_eq!(doc.selection().head, first);
-            assert_eq!(doc.undo_count(), 0);
-            assert_eq!(doc.revision(), 0);
-        }
+    fn first_fence_text_backspace_edits_visible_opening_line_ending_and_undo_restores_it() {
+        let source = "```\nfirst\n```\n";
+        let projection = DisplayProjection::parse(source);
+        let tokens = projected_tokens(source);
+        let blocks: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.kind,
+                    BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
+                )
+            })
+            .map(|block| block.source.clone())
+            .collect();
+        let first = source.find("first").unwrap();
+        let mut doc = Document::new(34, source.into());
+        doc.set_selection(first, first).unwrap();
+        let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
+        assert_eq!(plan.range, 3..4);
+        apply_plan(&mut doc, plan);
+        assert_eq!(doc.source(), "```first\n```\n");
+        assert_eq!(doc.selection().head, 3);
+        assert_eq!(doc.undo_count(), 1);
+        assert!(doc.undo());
+        assert_eq!(doc.source(), source);
+        assert_eq!(doc.selection().head, first);
     }
     #[test]
     fn real_image_token_and_exact_layout_markers_keep_before_after_insertions_and_undo() {
@@ -13755,10 +16063,10 @@ mod tests {
         );
     }
     #[test]
-    fn initial_live_insertion_preserves_heading_and_frontmatter_prefix_and_undo_caret() {
+    fn initial_live_insertion_respects_visible_frontmatter_and_hidden_heading_prefix() {
         for (source, expected, first) in [
             ("# ab", "# Xab", 2),
-            ("---\ntitle: T\n---\n", "---\nXtitle: T\n---\n", 4),
+            ("---\ntitle: T\n---\n", "X---\ntitle: T\n---\n", 0),
         ] {
             let tokens = projected_tokens(source);
             let point = live_caret_boundary(&tokens, 0, &[]);

@@ -1,5 +1,122 @@
 # Rust Editor受入記録
 
+## Rev2方向修正のcheckpoint（2026年10月19日 JST、未完了）
+
+製品source local commit: `7847b04688b57a9216a9c402d7ef88fac65f6cd5`。
+source aggregate `c2a286a481d677392fc2ad0d6e0c86a534a5a70683d7a3516b4449f8a0d83eec`、
+Release EXE SHA256 `8549142476651093435fa23831520ce480b2db448f1b1de211f7c84bbbd0e14d`。
+登録GUI harness SHA256 `1028285e433d70328b9029ecdd47a8dca30462e91260f48375a77a731af8f416`。
+source／compile-time資材・fixture・toolsの83ファイルをbyte hash付きsnapshotへ保存した。
+Gitの改行正規化後blobとコンパイラ入力bytesを区別する。
+
+| 確認 | 結果・境界 |
+|---|---|
+| Debug通常 | LIB146、BIN278 PASS。LIBは同一SHA ddd42697...の141成功＋失敗5件の成功。BIN ignored5。 |
+| Release通常 | LIB146、BIN278 PASS、BIN ignored5。 |
+| 排他visible fixture | 各構成4件PASS。editor reentry、palette focus、EDIT mutation、Settings exposure。exposure各31段階。実製品受入ではない。 |
+| fmt／strict Clippy／build | fmt、Debug／Release all-targets -D warnings、登録Release build PASS。build JSONのtest等NOT_RUNはbuild単体の範囲で、試験receiptは別。 |
+| 独立correctness | Root／実装者と別Sol High。狭幅drawer復帰のsole P2を修正し、後続の配色所有ガード・機械的修正・harness適合も同reviewerが限定確認。指摘解消済み。 |
+| 最終製品GUI | PID23696、実96 DPI。通常前面化1回が拒否されNO INPUT／NO CAPTURE。本文hash／dirty／revision／Undo／Redo／保存bytes不変、通常close exit0。 |
+| 必須実GUI／150 DPI／物理IME／Human | UNVERIFIED。準備・fixture PASSを受入へ読み替えない。 |
+
+runnerのGit PATH不足と、repo内TEMPによる親repo検出を分離して修正し、製品のGit期待値を変えていない。
+最初のDebug BINは277成功／配色所有1失敗。foreign HWNDへのCompact配色を所有範囲で拒否し、
+既存focused回帰と最終全BINを通した。初期失敗と旧sourceの証拠を最終成功に混ぜない。
+foreground拒否後は再activation、入力、撮影、利用者への追加前面化／DPI操作要求を行っていない。
+
+状態はBLOCKED／INCOMPLETE_CHECKPOINT。develop統合・push・GitBook merge／公開・Inbox cleanupなし。
+W01／W03、E08、高度なpin／unpin全体は既存残件として保持する。
+以降は各固定commit当時の履歴で、この最終EXEの証明ではない。
+
+## Rev1 Live移動・UI・Git候補の履歴（2026年10月19日 JST、未完了）
+
+### 最終修正後の結果（未完了checkpoint）
+
+製品sourceのlocal保存commit: `4702012a7daf1bfe08ea7aed8e874d6778031b0f`。developへは未統合。
+
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`、
+最終Release EXE SHA256 `7dfdaccac11c965e86c20dcdb9103b2bd9058001788fe65ce3e7b42a05645267`。
+Debug／Release BIN各269件（ignored5件）PASS。LIB各141件は再compile後の同一EXE hashを照合して既存結果を再利用。
+排他visibleは各構成4件：editor reentry、palette focus、EDIT mutation、EDIT exposure。Debugの後2件は同一BIN hashの直前結果を再利用。
+exposureは各31段階。fmt、Debug／Release strict all-targets Clippy、登録済みRelease build PASS。
+同じ独立Sol High reviewerの追加修正限定reviewは指摘なし。Ponytail確認とは別。
+
+この最終EXEの製品GUIは96 DPIで起動したが、1回の通常前面化をWindowsが拒否したため入力・撮影なし。
+対象PID24400のsource／履歴／disk不変を読戻し、通常終了exit0を確認した。利用者へ追加操作を依頼していない。
+従って修正後の製品Settings railのpixel確認、Trust→init等のGit GUI代表、150 DPI、全必須GUIは未確認。
+直前の`3ac8b609...`／source `fbacf547...`での上下13steps、四つの設定閉鎖、外側thumb drag、light Apply、Source／Live画像は履歴に限定し、新EXEの成功証拠へ流用しない。
+初期化promptは旧runの所有dialogを通常処理済み。最終runは状態folderを用意して起動し、promptで停止していない。
+
+Task12未達のためdevelop統合・pushは行わず、Inboxと未統合作業branchを保持する。
+GitBookは候補明記のdraft CR6のみを保存し、現行公開revisionは変更していない。
+
+
+### 同日machine確認の継続記録
+
+hidden native確認でLISTBOX V6、Explorer H6、共通settings rail 3件、runtime snapshot 2件がPASS。
+publication order修正後のruntime snapshot 2件と、module order修正後のformatterもPASS。
+全i32／H範囲、既知suffix pixel >65535、native font units 8/7/13、独立V wheel／key／geometry／HC／lifecycleを確認。
+`apply_source_styles`のUTF-16 prefix再走査を既存crop metricに置換し、対象外kindをskipした。
+native DWrite Unicode／clipped styleは1件PASS。
+
+診断Debug source aggregate `97de2d6e094dfc47ce63b5c779afacad50a478523d7d3c20f71e81d2f1bef136`、
+EXE SHA256 `9d570249ca18ba9f5557b49bbb45bd6ea4b86e1caaa10c0e7a053760597fee16`。
+100,000行観測はready 3691ms、gutter 100001、59.4375 DIP、通常close exit 0。
+別の自然paint観測は59.9ms、frame finish 5.6ms、paint total 299.8msでpending phaseなし。
+任意WaitForPaint observerは失敗し、証拠に採用しない。
+
+EDITの共通factory接続10欄とDiagnostics出力1欄を追加し、統合focused 12件PASS。
+native style・入力・selection・Undoを維持し、native nonclient部位への操作委譲と描画領域の除外を行う。
+独立reviewで見つかったnative文字変更／selection／scroll後の同期漏れを修正。
+
+Settings実画面で見つかったExplorerテーマ適用時のnative EDIT rail消失を追加修正した。
+原因はregion除外中のSetWindowThemeがmessage dispatchの外でもnonclient geometryを更新すること。
+既存API呼出し全体で元regionを保持し、完了後にnative geometryを再取得する最小helperへ変更した。
+Debug重点6件（hidden4・visible mutation・exposure31段階）PASS、同じ独立reviewerの限定再確認で追加指摘なし。
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`。
+最終Release実画面はこの修正後に改めて確認するまで未確認として扱う。
+
+専用NOACTIVATE visible試験で実WM_PAINT／native geometry／本文・selection・Undo同値を確認し、指摘は解消済み。
+専用GUI比較ではV69989、移動後取消・capture解除を確認。製品pilot ReleaseのGit DiffではH5174／V71、
+文書・履歴保持、通常closeを確認した。LFのDiffは表示コピーだけCRLFへ変換し、元stdout不変の回帰1件PASS。
+
+これらは診断Debug／pilotの限定結果であり、最終Release、50MB、全GUI／Human受入ではない。
+正式UiParityはmetadataのみPASS、Save As dialogの制限時間内検出でBLOCKED、後続の全件受入は未成立。
+150 DPI、physical HC／IME、UIA visibilityは未証明。最終machine／GUI確認とHANDOFFは進行中。
+
+Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 1の作業branch
+`fix/live-navigation-ui-git-polish-20261018`。全native scrollbarのstyle統一と
+必須GUI条件が未達のため、developへ統合・pushしない。Task Inboxは保持する。
+GUI利用の予約は解除され作業を再開した。以降、利用者への追加手動操作依頼は行わない。
+
+保存済み旧checkpointのReleaseはRust 1.99.1、source集約
+`65cd3cc9b935a01e0de500cef88523a8ec87ce781ec0be534fd92271a32aa312`、EXE SHA256
+`81b30d4669aecca7166b8b378d71e4e0f788800a6040967ce6c7933054f23be6`。
+compile-time入力20件と正式GUI harnessのhashはlocal HANDOFFで対応付ける。
+
+| 検証 | 実結果・境界 |
+|---|---|
+| Debug通常 | lib141＋bin239 PASS。libは同一test EXE hashの既存141件receiptを再利用。binのexit0・hash・件数は記録、child PIDだけ記録漏れとしてUNKNOWN。 |
+| Release通常 | lib141＋bin239 PASS、両test process exit0。 |
+| 排他visible | 既存NOACTIVATE 2件をDebug／Release各一processずつ実行、全PASS。SendInputなし。実製品GUIの代替ではない。 |
+| fmt／Clippy | fmt、Debug／Releaseのstrict all-targets Clippy PASS。 |
+| 独立review | 実装者と別のSol Highがread-onlyで確認。表の列位置とharnessの表示／toggle前提を修正後、追加指摘なし。RootのPonytail確認とは別。 |
+| 最終EXE・96 DPI dark | 問題fixtureの通常上下で先頭→末尾→先頭、13 steps・循環なし。Source／Live行番号、上部bar、1候補paletteを実画面で確認。設定のCancel／Esc／Alt+F4／×閉じ後に次の編集操作を確認。 |
+| 設定scroll | 実resize、capture確認付きthumb drag、top／middle／bottomを観測。EDITへのnative WM_MOUSEWHEEL注入でもdraft18と選択を維持。物理wheel／touchpadの証拠ではない。draft破棄で設定file不変。 |
+| 最終EXE・96 DPI light | 合成LocalAppDataだけへthemeをApplyし、通知を閉じてmainへ復帰。実画面と本文・履歴不変を確認。Calendarの土日・祝日・前後月を代表画面で確認。全custom色matrixではない。 |
+| 100,000行runtime | 100,000内容行＋EOF行の起動観測は60秒以内にsemantic layoutへ到達せず。その後process不在、exit code／原因UNKNOWN。fixture file不変、入力・captureなし。helperの6桁／行数試験をruntime PASSへ読み替えない。 |
+
+検証の隔離AppData内で、fixture compilerの`rustc.exe`がmise shimを経由して
+ツールcacheを展開した。後続の排他試験は既存compilerの実binをchild PATHの先頭へ固定した。
+Cargo／miseの親環境とglobal設定は変更していない。これは試験実行環境の記録であり、製品失敗の断定ではない。
+
+残存標準LISTBOX／EDIT等の全axis style、Calendar次月buttonのicon化、実tooltip／pointer、
+Compact、Git GUI matrix、実150 DPI、physical／ATOK／Microsoft IME・再変換とHuman受入は未完了または未確認。
+OS menu／dialog fontの全条件も未確認。既知W01／W03、E08、pin／unpinを解消済みにしない。
+設定Apply通知の実OK buttonはID2であり、正式harnessの固定ID1前提は後続修正が必要。suite全体は未実行。
+観測手順の早期focus guardやAPI識別失敗はlocal記録に保持し、未観測の入力を成功にしない。
+GUI停止時のPID22580はユーザーが使用し得るため、その後のclean状態や所有を推定して閉じない。
+
 ## 文字重なり修正と実画面受入（Rev3）
 
 Task `20261017-mdlite-ui-surface-recovery` Revision 3は、作業branchの

@@ -5,6 +5,36 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## 2026年10月19日・Rev2候補の下書き
+
+製品source local commit `7847b04688b57a9216a9c402d7ef88fac65f6cd5` の候補契約と検証境界を、
+既存draft CR6 `GEWkXQliAGYt3jQyWpVW` の4ページへ追補した。
+製品概要、日次／Calendar、編集／Markdown、構成／検証が対象で、revisionは
+`lhaBZKkokHRgZnmWH0eS`。左活動bar・領域開閉・上部一体query、1click選択／doubleclick Daily、
+Daily一覧filter、Front Matter全行編集を未統合候補と明記した。
+4ページの候補節と旧C++本文の完全保持を読戻し、公開main revision
+`RMRPLqlyutca5w8bY68z` の不変を確認。merge／公開は行っていない。
+実GUIは最終EXEのforeground拒否によりNOT_RUN、150 DPI・物理IME／Humanも未確認。
+Task完了や公開developへの採用とは区別する。
+
+## Rev1下書きの履歴（2026年10月19日・未統合）
+
+GitBook draft CR #6 `GEWkXQliAGYt3jQyWpVW` に「構成と検証の境界」と
+「検索・置換・Git」の候補節だけを追加した。revision `4OFWYabNwGB6bjwKYQ7w`。
+読戻しで候補節と従来本文の完全保持を確認。CRはdraftで、merge／公開は行っていない。
+Task12未成立のため現行develop仕様へ採用せず、150 DPI・全GUI未確認を明記した。
+
+## 2026年10月18日・Live移動／UI／Git候補（未公開）
+
+今回の候補は全native scrollbar共通化と必須GUI条件が未達であり、developへ統合しない。
+そのためGitBookの現行develop仕様を候補の実装済み仕様で置き換えない。
+後続の限定反映先は「製品概要と画面操作」（上部bar、font、pointer）、
+「編集とMarkdown」（物理行番号、実空行、上下移動）、
+「検索・置換・Git」（Trust明示操作後だけlocal init、親repo／worktree、remoteなし）、
+「設定と保存形式」（modal ownershipと縦scroll）、
+「構成と検証の境界」（最終buildと未確認境界）。旧C++節とstable linkは維持する。
+公開時には候補・統合・実GUI・Human受入の区別と、その時点のHANDOFF根拠を明記する。
+
 ## Rev3の文字重なり修正と確認範囲
 
 主画面のパレット／Git host自身のcaption描画を切り分け、名前と入力・通知を保った

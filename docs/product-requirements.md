@@ -7,7 +7,8 @@ Rust開発への移行で製品要件を削除しない。ここに記載する�
 
 ## Workspaceと画面
 
-Activity Barと既存のアイコン体系を維持する。中央は文書tabと一つの
+上部はメニュー、新規／開く／保存、中央のコマンド検索、各viewと設定のiconを一行に置く。
+既存のコマンドとアイコン体系を維持する。中央は文書tabと一つの
 native Live Markdown編集面。ExplorerとSearchは独立した論理viewとし、
 現在は同じsidebar領域を排他的に使う。Calendar、Outline、Gitを含む既存配置は
 移行まで維持する。補助操作で中央編集面を奪わない。
@@ -22,6 +23,13 @@ light/dark/system、DPI、high contrastを含む受入は実施範囲を明記�
 scrollは通常6 DIP程度、hover/dragで8〜10 DIP程度の灰色thumbを基準にする。
 ヒット領域と標準wheel/keyboard操作は維持し、表の横scrollは表内に限定する。
 native実装を使い、WebViewやJavaScript実行基盤を追加しない。
+
+2026年10月18日の作業候補では、DWrite描画と主要child controlのUI fontを`Yu Gothic UI`へ共通化し、
+本文の設定fontとcodeのmonospaceは分離する。本文／入力欄、操作対象、splitter、
+背景でpointerを分ける。Calendarは土曜を青、日曜・祝休日を赤とし、重複時は赤を優先する。
+settingsの縦scrollは専用の6／10 DIP railを使う。残る標準LISTBOX／EDIT等のscrollbarは
+操作互換を確認できておらず、全領域のstyle統一は未完了。候補の機械試験を実GUI・Human受入や
+develop統合へ読み替えない。対象buildと未確認条件は受入記録に分ける。
 
 ### パネル操作の入口
 

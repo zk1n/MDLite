@@ -194,6 +194,8 @@ impl GitClient {
             "core.fsmonitor=false".into(),
             "-c".into(),
             "core.untrackedCache=false".into(),
+            "-c".into(),
+            "core.quotepath=false".into(),
         ];
         arguments.extend(args);
         Ok(process::run(&ProcessRequest {
@@ -270,7 +272,10 @@ impl GitClient {
         }
         if !root.succeeded() {
             if root.outcome == ProcessOutcome::Exited(128)
-                && String::from_utf8_lossy(&root.stderr).contains("not a git repository")
+                && std::str::from_utf8(&root.stderr).is_ok_and(|text| {
+                    text.trim_end()
+                        == "fatal: not a git repository (or any of the parent directories): .git"
+                })
             {
                 return Ok(GitStatus {
                     state: GitState::NoRepository,
@@ -316,6 +321,37 @@ impl GitClient {
         };
         status.repository_root = root;
         Ok(status)
+    }
+    /// Only an explicit Trust grant or explicit retry may call this method.
+    /// Trust is already durable; initialization failure must never revoke it.
+    pub fn discover_or_init(
+        &self,
+        token: &TrustToken,
+        cancel: &Cancellation,
+        generation: u64,
+    ) -> Result<GitStatus, GitError> {
+        let _lease = self
+            .trust
+            .begin_mutation(token, &self.workspace)
+            .map_err(GitError::Untrusted)?;
+        let status = self.refresh(token, cancel, generation)?;
+        if status.state != GitState::NoRepository {
+            return Ok(status);
+        }
+        // Rediscover immediately before init: a parent repository must win over
+        // creating a nested one. Any discovery error propagates without init.
+        let status = self.refresh(token, cancel, generation)?;
+        if status.state != GitState::NoRepository {
+            return Ok(status);
+        }
+        self.complete(
+            token,
+            &token.identity().canonical,
+            strings(&["init"]),
+            cancel,
+            generation,
+        )?;
+        self.refresh(token, cancel, generation)
     }
     pub fn diff(
         &self,
@@ -1081,5 +1117,187 @@ mod tests {
             client.refresh(&token, &Cancellation::default(), 1),
             Err(GitError::Untrusted(_))
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn explicit_init_parent_discovery_unicode_and_cancellation() {
+        let f = Fixture::new();
+        let workspace = f.root.join("空白 workspace 日本語");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("日本語 note.md"), "本文\r\n").unwrap();
+        let client = GitClient {
+            executable: f.client.executable.clone(),
+            workspace: workspace.clone(),
+            trust: f.client.trust.clone(),
+        };
+        client.trust.set_trusted(&workspace, true).unwrap();
+        let token = client.trust.token(&workspace).unwrap();
+        assert_eq!(
+            client
+                .refresh(&token, &Cancellation::default(), 1)
+                .unwrap()
+                .state,
+            GitState::NoRepository
+        );
+        assert!(!workspace.join(".git").exists());
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        assert!(client.discover_or_init(&token, &cancelled, 1).is_err());
+        assert!(!workspace.join(".git").exists());
+        let status = client
+            .discover_or_init(&token, &Cancellation::default(), 1)
+            .unwrap();
+        assert_eq!(status.state, GitState::NoRemote);
+        assert!(status.unborn);
+        assert!(!status.branch.is_empty());
+        assert_eq!(
+            status.repository_root,
+            fs::canonicalize(&workspace).unwrap()
+        );
+        assert!(
+            status
+                .files
+                .iter()
+                .any(|p| p.path == Path::new("日本語 note.md") && p.untracked)
+        );
+        assert!(status.files.iter().all(|p| !p.staged()));
+        assert_eq!(
+            fs::read(workspace.join("日本語 note.md")).unwrap(),
+            "本文\r\n".as_bytes()
+        );
+
+        let child = workspace.join("child");
+        fs::create_dir(&child).unwrap();
+        client.trust.set_trusted(&child, true).unwrap();
+        let child_client = GitClient {
+            workspace: child.clone(),
+            ..client
+        };
+        let child_token = child_client.trust.token(&child).unwrap();
+        let inherited = child_client
+            .discover_or_init(&child_token, &Cancellation::default(), 2)
+            .unwrap();
+        assert_eq!(inherited.repository_root, status.repository_root);
+        assert!(!child.join(".git").exists());
+        assert!(inherited.remotes.is_empty());
+
+        fixture_git(&f.repo, &["commit", "--allow-empty", "-m", "fixture"]);
+        let worktree = f.root.join("linked-worktree");
+        fixture_git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        f.client.trust.set_trusted(&worktree, true).unwrap();
+        let linked = GitClient {
+            executable: f.client.executable.clone(),
+            workspace: worktree.clone(),
+            trust: f.client.trust.clone(),
+        };
+        let token = linked.trust.token(&worktree).unwrap();
+        let status = linked
+            .discover_or_init(&token, &Cancellation::default(), 3)
+            .unwrap();
+        assert_eq!(status.repository_root, fs::canonicalize(&worktree).unwrap());
+        assert_eq!(status.branch, "linked");
+        assert!(worktree.join(".git").is_file());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn explicit_init_failure_retry_and_discovery_error_command_contract() {
+        let f = Fixture::new();
+        let workspace = f.root.join("no-repo");
+        fs::create_dir(&workspace).unwrap();
+        let source = f.root.join("git_mock.rs");
+        let executable = f.root.join("git_mock.exe");
+        fs::write(&source, r##"
+use std::{fs, io::Write, path::Path};
+fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    writeln!(fs::OpenOptions::new().create(true).append(true).open("commands").unwrap(), "{}", args.join(" ")).unwrap();
+    let mode = fs::read_to_string("mode").unwrap_or_default();
+    if args.iter().any(|a| a == "rev-parse") {
+        if mode == "discovery-error" { eprintln!("fatal: not a git repository: malformed.git"); std::process::exit(128); }
+        if !Path::new("initialized").exists() { eprintln!("fatal: not a git repository (or any of the parent directories): .git"); std::process::exit(128); }
+        println!("{}", std::env::current_dir().unwrap().display());
+    } else if args.iter().any(|a| a == "init") {
+        if mode == "init-error" { eprintln!("fatal: permission denied 日本語"); std::process::exit(128); }
+        fs::write("initialized", "").unwrap();
+    } else if args.iter().any(|a| a == "status") {
+        std::io::stdout().write_all(b"# branch.oid (initial)\0# branch.head fixture-default\0").unwrap();
+    } else { assert!(args.iter().any(|a| a == "remote")); }
+}
+"##).unwrap();
+        let compiled = std::process::Command::new("rustc.exe")
+            .arg(&source)
+            .args(["--edition", "2024", "-o"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let client = GitClient {
+            executable,
+            workspace: workspace.clone(),
+            trust: f.client.trust.clone(),
+        };
+        client.trust.set_trusted(&workspace, true).unwrap();
+        let token = client.trust.token(&workspace).unwrap();
+        fs::write(workspace.join("mode"), "discovery-error").unwrap();
+        assert!(
+            client
+                .discover_or_init(&token, &Cancellation::default(), 1)
+                .is_err()
+        );
+        let log = fs::read_to_string(workspace.join("commands")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert!(!log.lines().any(|line| line.ends_with(" init")));
+        fs::write(workspace.join("commands"), "").unwrap();
+        fs::write(workspace.join("mode"), "init-error").unwrap();
+        assert!(
+            client
+                .discover_or_init(&token, &Cancellation::default(), 1)
+                .is_err()
+        );
+        assert!(client.trust.token(&workspace).is_ok());
+        let log = fs::read_to_string(workspace.join("commands")).unwrap();
+        assert_eq!(log.lines().count(), 3);
+        assert!(log.lines().last().unwrap().ends_with(" init"));
+        assert!(!workspace.join("initialized").exists());
+        fs::write(workspace.join("mode"), "").unwrap();
+        fs::write(workspace.join("commands"), "").unwrap();
+        let status = client
+            .discover_or_init(&token, &Cancellation::default(), 1)
+            .unwrap();
+        assert_eq!(status.state, GitState::NoRemote);
+        assert_eq!(status.branch, "fixture-default");
+        let log = fs::read_to_string(workspace.join("commands")).unwrap();
+        assert_eq!(log.lines().count(), 6);
+        for line in log.lines() {
+            assert!(
+                line.ends_with(" init")
+                    || line.ends_with("rev-parse --show-toplevel")
+                    || line.ends_with("status --porcelain=v2 --branch -z --untracked-files=all")
+                    || line.ends_with(" remote"),
+                "{line}"
+            );
+        }
+        fs::write(workspace.join("commands"), "").unwrap();
+        client.trust.set_trusted(&workspace, false).unwrap();
+        assert!(matches!(
+            client.discover_or_init(&token, &Cancellation::default(), 1),
+            Err(GitError::Untrusted(_))
+        ));
+        assert!(fs::read(workspace.join("commands")).unwrap().is_empty());
     }
 }

@@ -7,7 +7,12 @@ IME合成中は未確定文字を本文や履歴へ入れず、変換キーをIM
 ## 原文行番号とLiveの縦間隔
 
 Source／Liveとも原文の物理行番号を左gutterへ表示する。折返しや表の複数cellには
-同じ番号を重ねず、Liveで隠すfence／Front Matter等の行番号は飛ぶことがある。
+同じ番号を重ねず、Liveで隠すfenceや圧縮した表等の行番号は飛ぶことがある。
+未統合の2026年10月19日Rev2候補では、Front Matterは開始・終端区切りを含む
+全原文行を表示し、Liveのまま編集する。行番号・caret・hit-testは同じ原文位置に対応する。
+区切りを壊した場合は通常Markdownとして再解釈し、自動修復せずUndoで戻せる。
+LF／CRLF、Unicode、空・空行先頭のYAMLを扱い、表の圧縮表示は維持する。
+実GUI／IME／全製品受入の結果は受入記録に限定する。
 gutter幅は行数の桁と実fontの計測から決まり、本文・表を横scrollしても固定する。
 番号へのclickは本文selectionを変えない。
 

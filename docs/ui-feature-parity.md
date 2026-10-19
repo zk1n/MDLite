@@ -1,6 +1,27 @@
 # Rust UI・周辺機能の実装記録
 
-## 2026年10月19日・同一Taskの継続（未統合・未完了）
+## 2026年10月19日・Rev2方向修正（未統合checkpoint）
+
+製品source local commit: `7847b04688b57a9216a9c402d7ef88fac65f6cd5`。
+Front Matter全行のLive編集、左活動bar、左右領域4状態の保存と狭幅復帰、
+上部queryと直下候補、Calendarの選択／OSダブルクリック起動とDaily一覧filter、
+themeメニューと実focus対象の表示を実装した。既存のP0／Git修正を保持する。
+
+Debug／ReleaseともLIB146・BIN278を確認。Debug LIBは同一EXE hashの141成功と、
+runnerのGit PATH／repo外TEMP修正後の失敗5件成功を合わせた記録。通常BINのignored5件中、
+editor reentry／palette focus／EDIT mutation／Settings exposureの4件を各構成で排他実行しPASS。
+Settings比較は各31段階。fmt、両構成strict all-targets Clippy、登録Release build PASS。
+別Sol Highの独立reviewと同reviewerの修正限定再確認は指摘解消済み。Ponytail確認とは別。
+
+source aggregate: `c2a286a481d677392fc2ad0d6e0c86a534a5a70683d7a3516b4449f8a0d83eec`。
+Release EXE SHA256: `8549142476651093435fa23831520ce480b2db448f1b1de211f7c84bbbd0e14d`。
+最終製品PID23696／96 DPIで通常前面化を1回試みたが拒否され、NO INPUT／NO CAPTURE。
+本文・履歴・disk不変を確認し通常終了exit0。Task9.2の実GUI代表、150 DPI、物理IME／Humanは未確認。
+Task12未達のためdevelop統合・push・Inbox cleanupを行わず、未完了checkpointとする。
+GitBookは既存draft CR6への限定追補だけで、公開mainは変更しない。
+以降は各時点の履歴であり、この最終EXEの成功証拠へ流用しない。
+
+## Rev1継続の履歴（2026年10月19日・未統合・未完了）
 
 ### 最終修正後の結果（未完了checkpoint）
 

@@ -1,6 +1,34 @@
 # Rust Editor受入記録
 
-## Live移動・UI・Git候補のcheckpoint（2026年10月19日 JST、未完了）
+## Rev2方向修正のcheckpoint（2026年10月19日 JST、未完了）
+
+製品source local commit: `7847b04688b57a9216a9c402d7ef88fac65f6cd5`。
+source aggregate `c2a286a481d677392fc2ad0d6e0c86a534a5a70683d7a3516b4449f8a0d83eec`、
+Release EXE SHA256 `8549142476651093435fa23831520ce480b2db448f1b1de211f7c84bbbd0e14d`。
+登録GUI harness SHA256 `1028285e433d70328b9029ecdd47a8dca30462e91260f48375a77a731af8f416`。
+source／compile-time資材・fixture・toolsの83ファイルをbyte hash付きsnapshotへ保存した。
+Gitの改行正規化後blobとコンパイラ入力bytesを区別する。
+
+| 確認 | 結果・境界 |
+|---|---|
+| Debug通常 | LIB146、BIN278 PASS。LIBは同一SHA ddd42697...の141成功＋失敗5件の成功。BIN ignored5。 |
+| Release通常 | LIB146、BIN278 PASS、BIN ignored5。 |
+| 排他visible fixture | 各構成4件PASS。editor reentry、palette focus、EDIT mutation、Settings exposure。exposure各31段階。実製品受入ではない。 |
+| fmt／strict Clippy／build | fmt、Debug／Release all-targets -D warnings、登録Release build PASS。build JSONのtest等NOT_RUNはbuild単体の範囲で、試験receiptは別。 |
+| 独立correctness | Root／実装者と別Sol High。狭幅drawer復帰のsole P2を修正し、後続の配色所有ガード・機械的修正・harness適合も同reviewerが限定確認。指摘解消済み。 |
+| 最終製品GUI | PID23696、実96 DPI。通常前面化1回が拒否されNO INPUT／NO CAPTURE。本文hash／dirty／revision／Undo／Redo／保存bytes不変、通常close exit0。 |
+| 必須実GUI／150 DPI／物理IME／Human | UNVERIFIED。準備・fixture PASSを受入へ読み替えない。 |
+
+runnerのGit PATH不足と、repo内TEMPによる親repo検出を分離して修正し、製品のGit期待値を変えていない。
+最初のDebug BINは277成功／配色所有1失敗。foreign HWNDへのCompact配色を所有範囲で拒否し、
+既存focused回帰と最終全BINを通した。初期失敗と旧sourceの証拠を最終成功に混ぜない。
+foreground拒否後は再activation、入力、撮影、利用者への追加前面化／DPI操作要求を行っていない。
+
+状態はBLOCKED／INCOMPLETE_CHECKPOINT。develop統合・push・GitBook merge／公開・Inbox cleanupなし。
+W01／W03、E08、高度なpin／unpin全体は既存残件として保持する。
+以降は各固定commit当時の履歴で、この最終EXEの証明ではない。
+
+## Rev1 Live移動・UI・Git候補の履歴（2026年10月19日 JST、未完了）
 
 ### 最終修正後の結果（未完了checkpoint）
 

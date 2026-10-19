@@ -3,6 +3,9 @@
 Rust版の操作入口を記録する。最終buildで実施した操作と未確認条件は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を参照する。
 
+2026年10月19日Rev2の変更は未統合候補。以下の追加契約を公開developや
+実GUI／Human受入済みと扱わない。
+
 ## 画面とNavigation
 
 中央の文書tabとEditorを、Explorer/Search、Calendar、Outline、Gitの4パネルが囲む。
@@ -11,11 +14,18 @@ Rust版の操作入口を記録する。最終buildで実施した操作と未�
 配置resetは表示メニューにある。Compactは同じ文書・選択・履歴の別windowで、
 ×は主windowへ戻す。主windowの終了は全tabの未保存確認を行う。
 
+Rev2候補では機能入口を左の縦活動barに置く。上部はハンバーガー・新規・保存、
+中央のコマンドquery、左右領域の表示切替。領域全体を独立して隠す4状態でeditor幅を戻す。
+領域状態は個別panelのhidden／collapsed／slot／幅と別に保存し、復帰時に配置を保持する。
+旧panel-layout schema1は追加keyなしでも両側表示として読む。配置resetは領域表示も戻す。
+活動iconは対象側を表示してfocusし、領域を隠す操作とは区別する。
+
 statusはWorkspace、明示取得したbranch、保存/外部変更、行列、encoding/EOL、文書種類を示す。
 Ln/Colは1起算で、Colは行頭からのUnicode scalar数に1を加える。UTF-8 byte、UTF-16 unit、
 graphemeや表示上の横位置とは別。外部変更は検出済みと未確認を区別し、Gitを自動起動しない。
 
-Ctrl+Kとタイトルの入口でコマンド検索を開く。無効な操作も理由付きで表示し、
+Ctrl+Kまたは上部のqueryへ直接入力し、直下に候補だけを表示する（Rev2候補）。
+Main／Compactともqueryを別popupへ複製しない。無効な操作も理由付きで表示し、
 実効keybindingをヒントに使う。設定は共通/Workspaceの層を選び、空欄は継承する。
 Applyは開始時snapshotと照合し、外部変更・不明schema・書込み失敗ではフォームを保持する。
 詳細編集では未知の行を保持する。変更可能bindingと固定Editor/表/パネル操作の衝突を拒否する。
@@ -35,7 +45,13 @@ stale revision・自己内部・IME中を拒否する。リンクはCtrl+click�
 ## ノートとCalendar
 
 Calendarは日曜始まり42セル。月移動・今日の選択と、日付のDaily起動を区別する。
+Rev2候補では1クリックは日付選択・一覧更新だけ。同じcellのOSダブルクリック、
+日付focusのEnter、明示Daily操作だけが起動する。一覧行のEnter／ダブルクリックは対象fileを開く。
 日別一覧はWindows作成日時のローカル日付であり、更新日時やfilenameの日付ではない。
+既定Dairyと解決済みdaily profileの保存先に一致するDailyを一覧・件数から除外し、
+実file、tab、Explorer、Daily markerは保持する。過去日のDailyを今日作った場合も除外する。
+入力値／titleに依存してDailyと確定できない保存先は一般fileの誤除外を避けて表示を残す。
+日付形式filenameやMeetingという理由だけでは除外しない。
 祝日は同梱データと明示local CSV取込みを使い、起動や月移動でHTTPを行わない。
 高さが小さいpaneでは「操作…」から同じCalendarコマンドを開く。profile管理中は専用一覧・formを
 同じpaneに表示する。日別一覧から開く直前に、Workspace・作成日・file種類を再確認する。
@@ -50,7 +66,7 @@ profile管理から追加・編集・複製・上書き定義の削除・templat
 同IDは定義全体でoverlayする。組込みprofileの上書きを削除すると下位定義へ戻る。
 必須入力の空defaultは定義保存とpreviewでは許し、実作成時に検査する。
 unknown token、複数cursor、衝突、危険pathは本文作成前に拒否する。
-日付click/選択日のDailyはその日の0時。「今日のDairy」と通常profile作成は現在local日時を使う。
+選択日のDaily起動はその日の0時。「今日のDairy」と通常profile作成は現在local日時を使う。
 入力formが必要な場合も、作成開始時の日時をpreviewから送信まで保持する。
 
 ## 検索・置換

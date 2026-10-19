@@ -4627,7 +4627,7 @@ function Add-UiParityCase(
 }
 
 function Invoke-UiParityCase([string]$Id, [scriptblock]$Action) {
-    $selectedCase=if ($Rev3Case -ceq 'S02_CANCEL_ONLY') { 'S01_S02_FORM_CLOSE' } else { $Rev3Case }
+    $selectedCase=if ($Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF')) { 'S01_S02_FORM_CLOSE' } else { $Rev3Case }
     if ($Rev3 -and -not [string]::IsNullOrWhiteSpace($selectedCase) -and $selectedCase -cne $Id) {
         Add-UiParityCase $Id 'NOT_RUN' 'NOT_SELECTED' $null
         return $false
@@ -4702,7 +4702,7 @@ function Get-UiTextSha256([string]$Text) {
     }
 }
 
-function Get-OwnedCaptureStamp {
+function Get-OwnedCaptureStamp([switch]$IncludeState) {
     Assert-OwnedWindow $script:WindowHandle
     try {
         # Read only: WM_APP+1 would invalidate the surface again after the paint fence.
@@ -4711,19 +4711,210 @@ function Get-OwnedCaptureStamp {
         try { $hash=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$state.source)))).Replace('-','').ToLowerInvariant() }
         finally { $sha.Dispose() }
         $painted=$state.PSObject.Properties['painted_frame']
-        return [ordered]@{
+        $stamp=[ordered]@{
             available=$true; document_id=$state.document_id; revision=$state.revision; source_sha256=$hash
             painted_frame=if ($null -ne $painted) { $painted.Value } else { $null }
             file_write_utc=[IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath).ToString('o')
             observed_utc=[DateTime]::UtcNow.ToString('o')
         }
+        if($IncludeState){
+            $stamp['selection']=$state.selection;$stamp['dirty']=$state.dirty
+            $stamp['undo_count']=$state.undo_count;$stamp['redo_count']=$state.redo_count;$stamp['scroll']=$state.scroll
+        }
+        return $stamp
     } catch {
         return [ordered]@{ available=$false; reason=$_.Exception.Message }
     }
 }
 
-function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$CaretScreen, [int[]]$Crop) {
-    $directory=Join-Path $script:UiRunDirectory ('s02-passive-'+$Close)
+function Test-S02CaretRectangle([int[]]$Actual,[int[]]$Expected) {
+    if ($null -eq $Actual -or $null -eq $Expected -or $Actual.Count -ne 4 -or $Expected.Count -ne 4 -or
+        $Expected[2] -le $Expected[0] -or $Expected[3] -le $Expected[1]) { return $false }
+    for($i=0;$i -lt 4;$i++){if($Actual[$i] -ne $Expected[$i]){return $false}}
+    return $true
+}
+
+function Get-S02TypedExpectation($Before,[int]$Target,[string]$Character) {
+    if($Character.Length -ne 1 -or [char]::IsSurrogate($Character[0])){throw 'SETUP_FAILURE: S02 requires one BMP Unicode character.'}
+    $utf8=[Text.UTF8Encoding]::new($false,$true);$bytes=$utf8.GetBytes([string]$Before.source)
+    if($Target -lt 1 -or $Target -ge $bytes.Length -or [int]$Before.selection.anchor -ne ($Target-1) -or
+        [int]$Before.selection.head -ne ($Target-1) -or $bytes[$Target-1] -gt 127){throw 'SETUP_FAILURE: S02 target must be a distinct ASCII boundary after baseline B.'}
+    $left=$utf8.GetString($bytes,0,$Target);$right=$utf8.GetString($bytes,$Target,$bytes.Length-$Target)
+    $expected=$Before|ConvertTo-Json -Depth 30|ConvertFrom-Json
+    $expected.source=$left+$Character+$right;$expected.revision=[long]$Before.revision+1
+    $expected.selection.anchor=$Target+$utf8.GetByteCount($Character);$expected.selection.head=$expected.selection.anchor
+    $expected.undo_count=[int]$Before.undo_count+1;$expected.redo_count=0;$expected.dirty=$true
+    return $expected
+}
+
+function Get-S02StampPhase($Stamp,$Before,$Typed) {
+    if($null -eq $Stamp -or -not $Stamp.available){return 'UNBOUND'}
+    if([long]$Stamp.document_id -ne [long]$Before.document_id){return 'UNEXPECTED'}
+    if([long]$Stamp.revision -eq [long]$Before.revision -and $Stamp.source_sha256 -ceq (Get-UiTextSha256 $Before.source) -and
+        $Stamp.undo_count -eq $Before.undo_count -and $Stamp.redo_count -eq $Before.redo_count -and $Stamp.dirty -eq $Before.dirty -and $Stamp.scroll -eq $Before.scroll){
+        if($Stamp.selection.anchor -eq $Before.selection.anchor -and $Stamp.selection.head -eq $Before.selection.head){return 'BASELINE'}
+        if($null -ne $Typed -and $Stamp.selection.anchor -eq ([int]$Before.selection.anchor+1) -and $Stamp.selection.head -eq $Stamp.selection.anchor){return 'CLICK_TARGET'}
+    }
+    if($null -ne $Typed -and [long]$Stamp.revision -eq [long]$Typed.revision -and
+        $Stamp.source_sha256 -ceq (Get-UiTextSha256 $Typed.source) -and
+        $Stamp.selection.anchor -eq $Typed.selection.anchor -and $Stamp.selection.head -eq $Typed.selection.head -and
+        $Stamp.undo_count -eq $Typed.undo_count -and $Stamp.redo_count -eq 0 -and $Stamp.dirty -and $Stamp.scroll -eq $Typed.scroll){return 'TYPED'}
+    return 'UNEXPECTED'
+}
+
+function Get-S02DiskState {
+    $result=[ordered]@{}
+    foreach($path in (@($script:UiInitialDocPaths)+@((Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'),(Join-Path $script:UiLocalAppData 'MDLite/settings.toml')))){
+        $result[$path]=Get-UiSafeFileHash $path
+    }
+    return $result
+}
+
+function Assert-S02DiskState($Before,[string]$Stage) {
+    foreach($path in $Before.Keys){if((Get-UiSafeFileHash $path) -cne $Before[$path]){throw ('PRODUCT_ASSERTION: S02 disk change at '+$Stage+': '+$path)}}
+}
+
+function Invoke-S02ExactSuccessNotice([IntPtr]$Settings) {
+    # Reuse S01's exact body/title/owner/thread and unique direct-owned OK proof.
+    Invoke-S01Notice $Settings '設定' '保存しました。Workspace/Commonの編集対象は変更していません。'
+}
+
+function Set-S02ThemePreset([string]$Theme) {
+    $before=Wait-Diagnostic {$true} 'S02 theme setup source baseline'
+    Invoke-UiControlById $script:WindowHandle 115
+    $settings=Wait-UiThreadWindow 'MDLiteSettings' -SettingsReady -WaitMs $TimeoutMs
+    [void](Select-S01Combo $settings 200 0 'ユーザー共通')
+    $index=if($Theme -ceq 'dark'){3}else{2};$label=if($Theme -ceq 'dark'){'ダーク'}else{'ライト'}
+    [void](Select-S01Combo $settings 403 $index $label)
+    Invoke-S01Button $settings 210;Invoke-S02ExactSuccessNotice $settings
+    [void](Select-S01Combo $settings 200 1 'Workspace')
+    [void](Select-S01Combo $settings 403 0 '継承')
+    Invoke-S01Button $settings 210;Invoke-S02ExactSuccessNotice $settings
+    Close-S01Cancel $settings
+    $common=Join-Path $script:UiLocalAppData 'MDLite/settings.toml';$workspace=Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'
+    $cv=Read-S01Assignments ([IO.File]::ReadAllText($common));$wv=Read-S01Assignments ([IO.File]::ReadAllText($workspace))
+    if($cv['theme'] -cne $Theme -or $wv.ContainsKey('theme') -or $cv['auto_save'] -cne 'false' -or $wv['auto_save'] -cne 'false'){
+        throw 'SETUP_FAILURE: S02 theme/layer/autosave preset readback mismatch.'
+    }
+    $after=Wait-Diagnostic {$true} 'S02 theme preset complete'
+    Assert-UiDiagnosticDragInvariants $after $before 'S02 intentional theme setup'
+    return @{theme=$Theme;workspace_theme='INHERIT';disk_after_setup=Get-S02DiskState;visual_palette='REQUIRES_ACTUAL_PASSIVE_FRAME_REVIEW'}
+}
+
+function New-S02StatefulBaseline([string]$Mode) {
+    $saved=[string]$script:UiDocumentSources['doc-00.md'];$length=[Text.Encoding]::UTF8.GetByteCount($saved)
+    $clean=Wait-Diagnostic {param($s) $s.source -ceq $saved -and -not $s.dirty -and $s.undo_count -eq 0} 'S02 clean long fixture'
+    Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
+    [void](Wait-Diagnostic {param($s) $s.selection.anchor -eq $length -and $s.selection.head -eq $length} 'S02 setup EOF')
+    Send-UnicodeText 'X' $script:WindowHandle
+    [void](Wait-Diagnostic {param($s) $s.source -ceq ($saved+'X') -and $s.undo_count -eq 1 -and $s.redo_count -eq 0 -and $s.dirty} 'S02 setup edit X')
+    Send-Key $script:WindowHandle 0x25;Send-Key $script:WindowHandle 0x27
+    [void](Wait-Diagnostic {param($s) $s.selection.anchor -eq ($length+1) -and $s.selection.head -eq ($length+1)} 'S02 separated typing group')
+    Send-UnicodeText 'Y' $script:WindowHandle
+    [void](Wait-Diagnostic {param($s) $s.source -ceq ($saved+'XY') -and $s.undo_count -eq 2 -and $s.redo_count -eq 0} 'S02 setup edit Y')
+    Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))
+    [void](Wait-Diagnostic {param($s) $s.source -ceq ($saved+'X') -and $s.undo_count -eq 1 -and $s.redo_count -eq 1 -and $s.dirty} 'S02 dirty Undo and Redo baseline')
+    if($Mode -ceq 'CloseState'){
+        Send-Key $script:WindowHandle 0x25 ([uint16[]]@(0x10))
+        $before=Wait-Diagnostic {param($s) $s.selection.anchor -eq ($length+1) -and $s.selection.head -eq $length -and $s.scroll -gt 0} 'S02 noncollapsed scrolled state'
+        return @{before=$before;saved_source=$saved;target=$null;typed=$null}
+    }
+    Send-Key $script:WindowHandle 0x25
+    $atTarget=Wait-Diagnostic {param($s) $s.selection.anchor -eq $length -and $s.selection.head -eq $length -and $s.scroll -gt 0} 'S02 visible target T'
+    $point=Get-EditorRecoveryCaretDipPoint $atTarget 'S02 target T actual native caret'
+    $native=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+    if(-not $native.foreground_is_expected -or -not $native.active_is_expected -or -not $native.focus_is_expected -or -not $native.caret_is_expected){throw 'OWNERSHIP_GATE: S02 target T caret is not owned.'}
+    [int]$x=0;[int]$y=0
+    if(-not [MdliteRustAcceptanceNative]::OwnedClientPointToScreen($script:WindowHandle,$script:ProcessId,[int][Math]::Round($point.x*$point.dpi),[int][Math]::Round($point.y*$point.dpi),[ref]$x,[ref]$y)){throw 'OWNERSHIP_GATE: S02 T coordinate conversion failed.'}
+    Send-Key $script:WindowHandle 0x25
+    $before=Wait-Diagnostic {param($s) $s.selection.anchor -eq ($length-1) -and $s.selection.head -eq ($length-1) -and $s.scroll -eq $atTarget.scroll} 'S02 baseline B=T-1'
+    $atB=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+    if(-not $atB.caret_is_expected -or (Test-S02CaretRectangle $atB.caret_rect $native.caret_rect)){throw 'SETUP_FAILURE: S02 B must have a distinct owned caret rectangle from T.'}
+    $typed=Get-S02TypedExpectation $before $length 'Ω'
+    return @{before=$before;saved_source=$saved;typed=$typed;target=@{byte=$length;baseline_byte=$length-1;screen=@($x,$y);native_rect=[int[]]$native.caret_rect;baseline_native_rect=[int[]]$atB.caret_rect;character='Ω';before=$before;typed=$typed}}
+}
+
+function Restore-S02KnownFixture($Baseline,$Observed,[bool]$Typed) {
+    # Only called after the complete exact source/history oracle succeeded.
+    $before=$Baseline.before;$length=[Text.Encoding]::UTF8.GetByteCount($Baseline.saved_source)
+    $expectedCount=if($Typed){2}else{1}
+    if($Observed.undo_count -ne $expectedCount -or $Observed.document_id -ne $before.document_id){throw 'CLEANUP_GUARD: S02 unexpected document/history; no Undo sent.'}
+    if($Typed){
+        Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))
+        [void](Wait-Diagnostic {param($s) $s.document_id -eq $before.document_id -and $s.source -ceq $before.source -and $s.undo_count -eq 1 -and $s.redo_count -eq 1 -and $s.selection.anchor -eq $Baseline.target.byte -and $s.selection.head -eq $Baseline.target.byte -and $s.dirty} 'S02 intentional character Undo')
+    }
+    Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))
+    $clean=Wait-Diagnostic {param($s) $s.document_id -eq $before.document_id -and $s.source -ceq $Baseline.saved_source -and -not $s.dirty -and $s.undo_count -eq 0 -and $s.redo_count -eq 2 -and $s.selection.anchor -eq $length -and $s.selection.head -eq $length} 'S02 intentional setup-X Undo restores clean fixture'
+    return @{intentional_cleanup=$true;undo_actions=$expectedCount;source_restored=$true;dirty=$clean.dirty;undo_count=$clean.undo_count;redo_count=$clean.redo_count;revision=$clean.revision;original_redo_branch_preserved=(-not $Typed);note='Typing intentionally clears old Y redo; cleanup is not neutral history restoration. Next setup starts a known new branch.'}
+}
+
+function Invoke-S02ReturnProof {
+    # Bounded representatives, not the Cartesian product. Stop on any failed row.
+    $rows=@(
+        @{close='Cancel';mode='ClickChar';theme='light';layer=0;scrolled=$true},
+        @{close='Cancel';mode='CloseState';theme='dark';layer=1;scrolled=$true},
+        @{close='Escape';mode='CloseState';theme='light';layer=0;scrolled=$false},
+        @{close='Escape';mode='ClickChar';theme='dark';layer=1;scrolled=$false},
+        @{close='TitlebarClose';mode='CloseState';theme='dark';layer=0;scrolled=$true},
+        @{close='TitlebarClose';mode='ClickChar';theme='light';layer=1;scrolled=$true},
+        @{close='ApplyThenCancel';mode='CloseState';theme='dark';layer=1;scrolled=$true;apply_theme='light'},
+        @{close='ApplyThenCancel';mode='ClickChar';theme='light';layer=0;scrolled=$true;apply_theme='dark'}
+    )
+    $proof=[ordered]@{rows=[Collections.Generic.List[object]]::new();scope='S02_EIGHT_REPRESENTATIVES_ONLY';g01='NOT_ASSERTED_GEOMETRY_ONLY_STARTUP';physical_ime='NOT_ASSERTED';visual_acceptance='PENDING_ACTUAL_FRAME_REVIEW';dpi_matrix='NOT_RUN'}
+    $script:Report['s02_return_proof']=$proof
+    foreach($spec in $rows){
+        $row=[ordered]@{close=$spec.close;mode=$spec.mode;theme=$spec.theme;layer=$spec.layer;settings_scrolled=$spec.scrolled;status='PREPARING';phase='theme_setup';failure=$null}
+        $proof.rows.Add($row)
+        try {
+            $row['theme_setup']=Set-S02ThemePreset $spec.theme
+            $baseline=New-S02StatefulBaseline $spec.mode;$before=$baseline.before
+            $row['before']=@{document_id=$before.document_id;revision=$before.revision;source_sha256=Get-UiTextSha256 $before.source;selection=$before.selection;scroll=$before.scroll;dirty=$before.dirty;undo_count=$before.undo_count;redo_count=$before.redo_count}
+            $row.phase='settings_setup'
+            Invoke-UiControlById $script:WindowHandle 115
+            $settings=Wait-UiThreadWindow 'MDLiteSettings' -SettingsReady -WaitMs $TimeoutMs
+            [void](Select-S01Combo $settings 200 $spec.layer $(if($spec.layer -eq 0){'ユーザー共通'}else{'Workspace'}))
+            if($spec.close -ceq 'ApplyThenCancel'){
+                $preApply=Get-S02DiskState;$theme=$spec.apply_theme
+                [void](Select-S01Combo $settings 403 $(if($theme -ceq 'dark'){3}else{2}) $(if($theme -ceq 'dark'){'ダーク'}else{'ライト'}))
+                Invoke-S01Button $settings 210;Invoke-S02ExactSuccessNotice $settings
+                $path=if($spec.layer -eq 0){Join-Path $script:UiLocalAppData 'MDLite/settings.toml'}else{Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'}
+                $values=Read-S01Assignments ([IO.File]::ReadAllText($path))
+                if($values['theme'] -cne $theme){throw 'PRODUCT_ASSERTION: S02 intentional theme Apply readback failed.'}
+                foreach($doc in $script:UiInitialDocPaths){if((Get-UiSafeFileHash $doc) -cne $preApply[$doc]){throw 'PRODUCT_ASSERTION: S02 Apply changed document bytes.'}}
+                $row['intentional_theme_apply']=@{before=$preApply;after=Get-S02DiskState;effective_theme_after_close=$theme;visual_palette='REQUIRES_ACTUAL_FRAME_REVIEW'}
+            }
+            if($spec.scrolled){Expand-S01Category $settings 302;Expand-S01Category $settings 303;[void](Move-S01ToControl $settings 211)}
+            $disk=Get-S02DiskState;$row['disk_before_close']=$disk
+            $row.phase='passive_close_actor'
+            $screen=if($spec.mode -ceq 'ClickChar'){[int[]]$baseline.target.screen}else{[int[]]@(0,0)}
+            $receipt=Invoke-S02PassiveClose $spec.close $settings $screen $script:S02FixedMainBounds $spec.mode $baseline.target $before
+            $row['passive']=$receipt
+            $row.phase='post_interval_semantics'
+            $after=Wait-Diagnostic {$true} 'S02 post-interval semantic proof'
+            $expected=if($spec.mode -ceq 'ClickChar'){$baseline.typed}else{$before}
+            Assert-UiDiagnosticDragInvariants $after $expected 'S02 close/intentional character expectation'
+            if($after.selection.anchor -ne $expected.selection.anchor -or $after.selection.head -ne $expected.selection.head -or $after.scroll -ne $expected.scroll){throw 'PRODUCT_ASSERTION: S02 selection/scroll expectation mismatch.'}
+            Assert-S02DiskState $disk 'after close/input'
+            $row['after']=@{document_id=$after.document_id;revision=$after.revision;source_sha256=Get-UiTextSha256 $after.source;selection=$after.selection;scroll=$after.scroll;dirty=$after.dirty;undo_count=$after.undo_count;redo_count=$after.redo_count}
+            $row.phase='intentional_cleanup'
+            $row['cleanup']=Restore-S02KnownFixture $baseline $after ($spec.mode -ceq 'ClickChar')
+            Assert-S02DiskState $disk 'after intentional Undo cleanup'
+            $row.phase='COMPLETE';$row.status='OBSERVED_FUNCTIONAL_PROOF_VISUAL_PENDING'
+        } catch {
+            $row.status='FAILED_PROCESS_RETAINED';$row.failure=@{message=$_.Exception.Message;stack=$_.ScriptStackTrace}
+            throw
+        }
+    }
+    return $proof
+}
+
+function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$CaretScreen, [int[]]$Crop,
+    [ValidateSet('Legacy','CloseState','ClickChar')][string]$Mode='Legacy',$TargetInfo=$null,$ObservationBefore=$null) {
+    $advanced=$Mode -cne 'Legacy'
+    if($advanced -and $null -eq $ObservationBefore){throw 'SETUP_FAILURE: S02 semantic baseline missing.'}
+    if($Mode -ceq 'ClickChar' -and ($null -eq $TargetInfo -or -not (Test-S02CaretRectangle $TargetInfo.native_rect $TargetInfo.native_rect))){throw 'SETUP_FAILURE: S02 distinct target caret missing.'}
+    $suffix=if($advanced){'-'+$Mode}else{''}
+    $directory=Join-Path $script:UiRunDirectory ('s02-passive-'+$Close+$suffix)
     [void][IO.Directory]::CreateDirectory($directory)
     $cancel=Get-UiControlById $Settings 211 'BUTTON' -RequireVisible -RequireEnabled
     $cancelPoint=[int[]]@(
@@ -4740,7 +4931,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         shared=$shared; main=$script:WindowHandle; modal=$Settings; process=$script:Process; pid=$script:ProcessId
         creation_ticks=$script:Process.StartTime.ToUniversalTime().Ticks; crop=$Crop; directory=$directory
         diagnostic=$script:DiagnosticPath; assert_definition=${function:Assert-OwnedWindow}.ToString()
-        stamp_definition=${function:Get-OwnedCaptureStamp}.ToString()
+        stamp_definition=${function:Get-OwnedCaptureStamp}.ToString(); advanced=$advanced
     }
     $worker=[PowerShell]::Create()
     [void]$worker.AddScript({
@@ -4760,9 +4951,9 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             while ($shared.clock.ElapsedMilliseconds -lt 2000 -and $shared.frames.Count -lt 128 -and -not $shared.stop.WaitOne(0)) {
                 $remaining=$next-$shared.clock.ElapsedMilliseconds
                 if ($remaining -gt 0 -and $shared.stop.WaitOne([int]$remaining)) { break }
-                $sample=[ordered]@{ index=$shared.frames.Count; scheduled_ms=$next; copy_started_ms=$null; copy_completed_ms=$null; start_gap_ms=$null; file=$null; stamp=$null; before=$null; after=$null; copied=$false }
+                $sample=[ordered]@{ index=$shared.frames.Count; scheduled_ms=$next; copy_started_ms=$null; copy_completed_ms=$null; start_gap_ms=$null; file=$null; stamp=$null; stamp_after=$null; before=$null; after=$null; copied=$false }
                 Assert-OwnedWindow $context.main
-                $sample.stamp=Get-OwnedCaptureStamp
+                $sample.stamp=Get-OwnedCaptureStamp -IncludeState:$context.advanced
                 $sample.before=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($context.main,$context.modal,$context.pid,$context.crop)
                 if (-not $sample.before.safe) {
                     $shared.frames.Add($sample)
@@ -4781,6 +4972,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
                     $shared.frames.Add($sample)
                     throw ('S02_PASSIVE_POSTCOPY_GATE_DISCARDED: '+$sample.after.classification)
                 }
+                if($context.advanced){$sample['stamp_after']=Get-OwnedCaptureStamp -IncludeState}
                 if ($shared.stop.WaitOne(0)) { break }
                 $sample.file='frame-{0:D3}.png' -f $sample.index
                 $bitmap.Save((Join-Path $context.directory $sample.file),[Drawing.Imaging.ImageFormat]::Png)
@@ -4799,7 +4991,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     $async=$worker.BeginInvoke()
     $actions=[Collections.Generic.List[object]]::new(); $actorError=$null; $clickCompleted=$null
     $firstClickFocus=$null; $focusObservedMs=$null; $focusObservations=[Collections.Generic.List[object]]::new()
-    $focusReady=$false; $focusFirstReadyMs=$null; $modalDisappearanceMs=$null
+    $focusReady=$false; $focusFirstReadyMs=$null; $modalDisappearanceMs=$null; $characterCompleted=$null
     $click={ param([IntPtr]$window,[int[]]$point,[string]$action)
         $entry=[ordered]@{action=$action;start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0;point=$point;guard=$null}
         $actions.Add($entry)
@@ -4821,9 +5013,17 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             if (-not [MdliteRustAcceptanceNative]::VerifyS02ClosePoint($Settings,$script:ProcessId,$closePoint[0],$closePoint[1])) { throw 'S02_HTCLOSE_CHANGED' }
             & $click $Settings $closePoint 'titlebar HTCLOSE=20'
         } else { & $click $Settings $cancelPoint 'Cancel' }
-        Wait-UiWindowGone $Settings 1200
+        $closeWait=1200
+        if($advanced){$closeWait=[int][Math]::Min(1200,[Math]::Floor(2000-$shared.clock.Elapsed.TotalMilliseconds));if($closeWait -le 0){throw 'S02_CLOSE_DEADLINE_EXHAUSTED'}}
+        Wait-UiWindowGone $Settings $closeWait
         $modalDisappearanceMs=$shared.clock.Elapsed.TotalMilliseconds
         $actions.Add(@{action='modal disappearance observed';time_ms=$modalDisappearanceMs})
+        if($Mode -ceq 'CloseState'){
+            if($modalDisappearanceMs -ge 2000){throw 'S02_CLOSE_DEADLINE_EXHAUSTED'}
+            # State-only mode deliberately sends no Main input. Native focus is not asserted.
+            $focusReady=$true
+        } else {
+        if($advanced -and $shared.clock.Elapsed.TotalMilliseconds -ge 2000){throw 'S02_CLICK_DEADLINE_EXHAUSTED'}
         & $click $script:WindowHandle $CaretScreen 'first editor click without activation'
         $clickCompleted=$shared.clock.Elapsed.TotalMilliseconds
         $immediateObservation=[ordered]@{kind='immediate';status='PENDING';query_start_ms=$null;query_end_ms=$null;snapshot=$null;native_state_matches=$false;ready_within_deadline=$false;ready=$false}
@@ -4849,6 +5049,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         $immediateReady=$firstClickFocus.registered_editor_window -and $firstClickFocus.gui_thread_info_available -and
             $firstClickFocus.foreground_is_expected -and $firstClickFocus.active_is_expected -and
             $firstClickFocus.focus_is_expected -and $firstClickFocus.caret_is_expected
+        if($Mode -ceq 'ClickChar'){$immediateReady=$immediateReady -and (Test-S02CaretRectangle $firstClickFocus.caret_rect $TargetInfo.native_rect)}
         $immediateObservation.native_state_matches=$immediateReady
         $immediateObservation.ready_within_deadline=$immediateReady -and $focusObservedMs -lt 2000.0
         $immediateObservation.ready=$immediateObservation.ready_within_deadline
@@ -4881,6 +5082,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             $queryReady=$snapshot.registered_editor_window -and $snapshot.gui_thread_info_available -and
                 $snapshot.foreground_is_expected -and $snapshot.active_is_expected -and
                 $snapshot.focus_is_expected -and $snapshot.caret_is_expected
+            if($Mode -ceq 'ClickChar'){$queryReady=$queryReady -and (Test-S02CaretRectangle $snapshot.caret_rect $TargetInfo.native_rect)}
             $observation.native_state_matches=$queryReady
             $observation.ready_within_deadline=$queryReady -and $queryEnd -lt 2000.0
             $observation.ready=$observation.ready_within_deadline
@@ -4889,6 +5091,16 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         }
         if (-not $focusReady) {
             throw 'S02 native readiness was NOT observed within the original 2000ms observation interval.'
+        }
+        if($Mode -ceq 'ClickChar'){
+            # No diagnostic refresh, activation, second click or sampler wait between readiness and this input.
+            $entry=[ordered]@{action='first Unicode character at distinct T';start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0;character=$TargetInfo.character;target_byte=$TargetInfo.byte}
+            $actions.Add($entry)
+            if($entry.start_ms -ge 2000){throw 'S02_CHARACTER_DEADLINE_EXHAUSTED'}
+            $entry.sent=[MdliteRustAcceptanceNative]::SendUnicodeText($script:WindowHandle,$script:ProcessId,$TargetInfo.character)
+            $entry.end_ms=$shared.clock.Elapsed.TotalMilliseconds;$characterCompleted=$entry.end_ms
+            if($entry.sent -ne 2 -or $characterCompleted -ge 2000){throw 'S02_DIRECT_UNICODE_NOT_ONCE_WITHIN_DEADLINE'}
+        }
         }
     } catch { $actorError=@{message=$_.Exception.Message;stack=$_.ScriptStackTrace} }
     finally {
@@ -4908,19 +5120,34 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     [object[]]$frameRecords=@()
     if ($workerCompleted) { $frameRecords=$shared.frames.ToArray() }
     $copied=@($frameRecords | Where-Object { $null -ne $_.file })
+    $coverageAnchor=if($Mode -ceq 'CloseState'){$modalDisappearanceMs}elseif($Mode -ceq 'ClickChar'){$characterCompleted}else{$clickCompleted}
+    $phaseError=$null;$typedSamples=0
+    if($advanced){
+        foreach($frame in $frameRecords){
+            $typed=if($Mode -ceq 'ClickChar'){$TargetInfo.typed}else{$null}
+            $pre=Get-S02StampPhase $frame.stamp $ObservationBefore $typed
+            $post=Get-S02StampPhase $frame.stamp_after $ObservationBefore $typed
+            $ranks=@{BASELINE=0;CLICK_TARGET=1;TYPED=2}
+            $phase=if($pre -ceq $post){$pre}elseif($ranks.ContainsKey($pre) -and $ranks.ContainsKey($post) -and $ranks[$pre] -lt $ranks[$post]){'TRANSITION'}else{'UNEXPECTED'}
+            $frame['semantic_phase']=$phase
+            if($phase -ceq 'TYPED' -and $frame.copied -and $frame.copy_completed_ms -lt 2000){$typedSamples++}
+            if($phase -cin @('UNBOUND','UNEXPECTED')){$phaseError='S02 unbound or unexpected semantic sampling phase'}
+        }
+        if($Mode -ceq 'ClickChar' -and $typedSamples -eq 0){$phaseError='S02 typed source/history was not naturally observed within the original 2s interval'}
+    }
     $coverageInputs=[ordered]@{
-        copied_frame_count=$copied.Count; click_completed_ms=$clickCompleted
+        copied_frame_count=$copied.Count; click_completed_ms=$clickCompleted; coverage_anchor_ms=$coverageAnchor
         final_copy_started_ms=if ($copied.Count -gt 0) { $copied[-1]['copy_started_ms'] } else { $null }
         required_frame_count=2
     }
     $rawEvidencePath=Join-Path $directory 'raw-evidence-before-metrics.json'
     $rawEvidence=[ordered]@{
-        path=$Close; crop=$Crop; frame_records=$frameRecords; actions=$actions.ToArray()
+        path=$Close; mode=$Mode; target=$TargetInfo; character_completed_ms=$characterCompleted; typed_samples_within_2s=$typedSamples; semantic_phase_error=$phaseError; crop=$Crop; frame_records=$frameRecords; actions=$actions.ToArray()
         sampler_error=$shared.error; actor_error=$actorError; worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
         native_focus_immediate=if ($focusObservations.Count -gt 0) { $focusObservations[0].snapshot } else { $null }; native_focus_observations=$focusObservations.ToArray()
         native_focus_ready=$focusReady; native_focus_first_ready_ms=$focusFirstReadyMs
-        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$clickCompleted } else { $null }
+        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs -and $null -ne $clickCompleted) { $focusFirstReadyMs-$clickCompleted } else { $null }
         native_focus_latency_from_modal_disappearance_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$modalDisappearanceMs } else { $null }
         native_focus_observation_deadline_ms=2000; native_focus_deadline_kind='2s observation ceiling, not latency acceptance'
         native_focus_observation_kind='PASSIVE_NATIVE_READINESS_OBSERVATION'; native_focus_limitation='Does not establish mouse dispatch acknowledgement, immediate responsiveness, caret source position, or first-character behavior.'
@@ -4940,29 +5167,32 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             })
             if ($gapValues.Count -gt 0) { ($gapValues | Measure-Object -Maximum).Maximum } else { $null }
         } else { $null }
-        $coverage=$copied.Count -ge 2 -and $null -ne $clickCompleted -and $copied[-1]['copy_started_ms'] -ge $clickCompleted
+        $coverage=$copied.Count -ge 2 -and $null -ne $coverageAnchor -and $copied[-1]['copy_started_ms'] -ge $coverageAnchor
     } catch {
         $metricError=[ordered]@{message=$_.Exception.Message;stack=$_.ScriptStackTrace}
     }
     $rawEvidenceSha256=(Get-FileHash -LiteralPath $rawEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $receipt=[ordered]@{
-        path=$Close; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
+        path=$Close; mode=$Mode; target=$TargetInfo; character_completed_ms=$characterCompleted; typed_samples_within_2s=$typedSamples; semantic_phase_error=$phaseError; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
         raw_evidence_path=$rawEvidencePath; raw_evidence_sha256=$rawEvidenceSha256; coverage_inputs=$coverageInputs; metric_error=$metricError
         worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
         native_focus_immediate=if ($focusObservations.Count -gt 0) { $focusObservations[0].snapshot } else { $null }; native_focus_observations=$focusObservations.ToArray()
         native_focus_ready=$focusReady; native_focus_first_ready_ms=$focusFirstReadyMs
-        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$clickCompleted } else { $null }
+        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs -and $null -ne $clickCompleted) { $focusFirstReadyMs-$clickCompleted } else { $null }
         native_focus_latency_from_modal_disappearance_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$modalDisappearanceMs } else { $null }
         native_focus_observation_deadline_ms=2000; native_focus_deadline_kind='2s observation ceiling, not latency acceptance'
         native_focus_observation_kind='PASSIVE_NATIVE_READINESS_OBSERVATION'; native_focus_limitation='Does not establish mouse dispatch acknowledgement, immediate responsiveness, caret source position, or first-character behavior.'
         native_focus_observation_order='IMMEDIATE QUERY THEN PASSIVE NATIVE OBSERVATIONS; BEFORE_ANY_DIAGNOSTIC_REFRESH'
         sampling_target_ms=16; bounded_duration_ms=2000; dropped_slots=$shared.dropped_slots; max_actual_start_gap_ms=$maxGap
-        covers_first_editor_click=$coverage; paint_forced=$false; activation_during_interval=$false
-        apply=if ($Close -ceq 'ApplyThenCancel') { 'CLOSE AFTER NO-OP APPLY ONLY; Apply-phase pixels NOT_OBSERVED; changed-value Apply NOT_RUN' } else { 'NOT_RUN' }
+        covers_first_editor_click=($Mode -cne 'CloseState' -and $coverage); covers_close_and_input=$coverage; native_focus_asserted=($Mode -cne 'CloseState'); paint_forced=$false; activation_during_interval=$false
+        input_proof=if($Mode -ceq 'ClickChar'){'ONE guarded click at pre-recorded distinct native caret T, then ONE Unicode character immediately after passive native readiness; source/history oracle required'}elseif($Mode -ceq 'CloseState'){'NO MAIN INPUT; close-state invariants only'}else{'LEGACY_NO_CHARACTER'}
+        semantic_pixel_binding='COPY stamps classify source transitions; EndDraw/pixel identity and actual visual acceptance require separate frame review. TRANSITION frames are not settled-pixel claims.'
+        apply=if($advanced -and $Close -ceq 'ApplyThenCancel'){'CHANGED THEME APPLIED BEFORE CLOSE BASELINE; Apply-phase pixels NOT_OBSERVED'}elseif ($Close -ceq 'ApplyThenCancel') { 'CLOSE AFTER NO-OP APPLY ONLY; Apply-phase pixels NOT_OBSERVED; changed-value Apply NOT_RUN' } else { 'NOT_RUN' }
         visual_acceptance='PENDING: inspect passive frames; flashes shorter than measured gaps are not ruled out.'
     }
     [IO.File]::WriteAllText((Join-Path $directory 'receipt.json'),($receipt | ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
+    if($null -ne $phaseError){throw ('S02_PASSIVE_SEMANTIC_PHASE_FAILED: '+$directory+': '+$phaseError)}
     if ($null -ne $metricError) { throw ('S02_PASSIVE_METRIC_FAILED: '+$directory+': '+$metricError.message) }
     if ($null -ne $shared.error -or $null -ne $actorError -or -not $coverage -or -not $focusReady) { throw ('S02_PASSIVE_OBSERVATION_FAILED: '+$directory) }
     return $receipt
@@ -4983,6 +5213,58 @@ function Test-Rev3MainAfterFrameBinding($SourceBefore, $RenderedAfter, [long]$Ma
             $frame.hwnd -eq $MainHwnd -and $frame.document_id -eq $RenderedAfter.document_id -and
             $frame.revision -eq $RenderedAfter.revision -and $frame.sequence -gt 0
     } catch { return $false }
+}
+
+function Test-Rev3MainOnlyPaintRemainder($Fence,[long]$MainHwnd) {
+    try {
+        if ($MainHwnd -le 0 -or $null -eq $Fence -or $Fence.reconciliation_blocked -isnot [bool] -or
+            -not $Fence.reconciliation_blocked -or $Fence.reconciliation_classification -cne 'BLOCKED') { return $false }
+        foreach ($pending in @(@{handles=$Fence.pending_after_normal},@{handles=$Fence.pending_after})) {
+            $values=@($pending.handles)
+            if ($values.Count -ne 1 -or [long]$values[0] -ne $MainHwnd) { return $false }
+        }
+        foreach ($pass in @(@{rows=$Fence.after_normal_pass},@{rows=$Fence.final_surface_observations})) {
+            $mainCount=0
+            foreach ($row in @($pass.rows)) {
+                if ($null -eq $row -or [long]$row.hwnd -le 0 -or [string]::IsNullOrWhiteSpace([string]$row.class) -or
+                    $row.visible -isnot [bool] -or $row.pending -isnot [bool]) { return $false }
+                if ([long]$row.hwnd -eq $MainHwnd) {
+                    $mainCount++
+                    if ($row.class -cne 'MDLiteRustEditor' -or -not $row.visible -or -not $row.pending) { return $false }
+                } elseif ($row.pending) { return $false }
+            }
+            if ($mainCount -ne 1) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Get-Rev3MainFrameState($SourceBefore,$Observed,[long]$MainHwnd) {
+    try {
+        if ($MainHwnd -le 0) { return 'OWNER_INVALID' }
+        foreach ($stamp in @($SourceBefore,$Observed)) {
+            if ($null -eq $stamp -or $stamp.available -isnot [bool] -or -not $stamp.available -or
+                ($stamp.document_id -isnot [long] -and $stamp.document_id -isnot [int]) -or
+                ($stamp.revision -isnot [long] -and $stamp.revision -isnot [int]) -or
+                $null -eq $stamp.document_id -or [long]$stamp.document_id -le 0 -or $null -eq $stamp.revision -or [long]$stamp.revision -lt 0 -or
+                [string]$stamp.source_sha256 -cnotmatch '^[0-9a-f]{64}$') { return 'SOURCE_INVALID' }
+        }
+        if ($SourceBefore.document_id -ne $Observed.document_id -or $SourceBefore.revision -ne $Observed.revision -or
+            $SourceBefore.source_sha256 -cne $Observed.source_sha256) { return 'SOURCE_CHANGED' }
+        $frame=$Observed.painted_frame
+        if ($null -eq $frame) { return 'FRAME_PENDING' }
+        foreach ($value in @($frame.hwnd,$frame.document_id,$frame.revision,$frame.sequence)) {
+            if ($value -isnot [long] -and $value -isnot [int]) { return 'FRAME_INVALID' }
+        }
+        if ($null -eq $frame.hwnd -or [long]$frame.hwnd -le 0 -or $null -eq $frame.document_id -or [long]$frame.document_id -le 0 -or
+            $null -eq $frame.revision -or [long]$frame.revision -lt 0 -or $null -eq $frame.sequence -or [long]$frame.sequence -le 0) { return 'FRAME_INVALID' }
+        if ([long]$frame.hwnd -ne $MainHwnd) { return 'FRAME_FOREIGN' }
+        if ($frame.document_id -eq $Observed.document_id -and $frame.revision -gt $Observed.revision) { return 'FRAME_INVALID' }
+        # A prior successful frame can name an earlier source. It never admits
+        # COPY; only the existing exact EndDraw binding predicate can do that.
+        if (Test-Rev3MainAfterFrameBinding $SourceBefore $Observed $MainHwnd) { return 'READY' }
+        return 'FRAME_PENDING'
+    } catch { return 'SOURCE_OR_FRAME_INVALID' }
 }
 
 function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
@@ -5019,6 +5301,7 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $readiness=[ordered]@{
         before=(Get-OwnedCaptureStamp); after=$null; after_copy=$null; fence=$null; unfenced_capture=$null
+        post_fence_initial=$null; frame_observation_state=$null; fence_admission='UNCHANGED_POLICY'; capture_elapsed_ms=$null; late_image_invalidated=$false
         copy_started_utc=$null; copy_completed_utc=$null; image_persisted=$false
         source_revision_binding='UNAVAILABLE'
         visual_acceptance=if ($rev3MainObservation) { 'PENDING: inspect actual pixels together with semantic evidence.' } else { 'NOT_ASSERTED: inspect the actual captured pixels.' }
@@ -5029,21 +5312,42 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
         pre_fence_frame_contract=if ($rev3MainObservation) { 'OBSERVED_UNASSERTED: may be missing/stale before the paint fence.' } else { 'LEGACY_BEHAVIOR' }
         copied_frame_contract=if ($rev3MainObservation) { 'AVAILABLE_UNCHANGED_SOURCE_ALL_THREE_STAMPS; MATCHING_MAIN_ENDDRAW_POST_FENCE_AND_POST_COPY' } else { 'LEGACY_BEHAVIOR' }
     }
+    $captureClock=$null
     try {
         Assert-UiOwnedWindow $Window
         if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
             throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground before client capture.'
         }
+        if ($rev3MainObservation) { $captureClock=[Diagnostics.Stopwatch]::StartNew() }
         $readiness.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($Window,$script:ProcessId,7000,$true)
-        if ($readiness.fence.reconciliation_blocked -or
+        # Preserve the first post-fence stamp even when admission/deadline fails.
+        $readiness.after=Get-OwnedCaptureStamp
+        $readiness.post_fence_initial=$readiness.after
+        $mainOnlyAdmission=$rev3MainObservation -and (Test-Rev3MainOnlyPaintRemainder $readiness.fence $Window.ToInt64())
+        if ($mainOnlyAdmission) { $readiness.fence_admission='EXACT_MAIN_ONLY_NATURAL_OBSERVATION' }
+        if (($readiness.fence.reconciliation_blocked -and -not $mainOnlyAdmission) -or
             (-not $rev3MainObservation -and @($readiness.fence.pending_after).Count -ne 0)) {
             throw 'OBSERVER_FAILURE: owned pending paint did not drain within the bounded render fence.'
         }
         if ($rev3MainObservation) {
             $readiness.natural_pending_regions=@($readiness.fence.final_surface_observations | Where-Object { $_.visible -and $_.pending })
         }
-        $readiness.after=Get-OwnedCaptureStamp
         if ($rev3MainObservation) {
+            # Reuse the original total budget; do not restart a frame timeout.
+            $readiness.frame_observation_state=Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64()
+            while ($mainOnlyAdmission -and $readiness.frame_observation_state -ceq 'FRAME_PENDING') {
+                Assert-OwnedWindow $Window
+                if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) { throw 'OWNERSHIP_GATE: Rev3 Main foreground changed during read-only frame observation.' }
+                if ($captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired awaiting Main EndDraw.' }
+                [void][Threading.Thread]::Yield()
+                $readiness.after=Get-OwnedCaptureStamp
+                $readiness.frame_observation_state=Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64()
+            }
+            if ($readiness.frame_observation_state -cne 'READY' -and $readiness.frame_observation_state -cne 'FRAME_PENDING') {
+                throw ('OBSERVER_FAILURE: terminal Rev3 Main post-fence binding state: '+$readiness.frame_observation_state)
+            }
+            if ($captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired after paint fence/frame observation.' }
+            if ($readiness.frame_observation_state -cne 'READY') { throw ('OBSERVER_FAILURE: Rev3 Main post-fence binding state: '+$readiness.frame_observation_state) }
             if (-not (Test-Rev3MainAfterFrameBinding $readiness.before $readiness.after $Window.ToInt64())) {
                 throw 'OBSERVER_FAILURE: Rev3 Main source and successful Main EndDraw binding unavailable or mismatched.'
             }
@@ -5069,6 +5373,7 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                 throw 'OWNERSHIP_GATE: Rev3 Main crop is not currently owned, opaque, fixed and unoccluded before COPY.'
             }
         }
+        if ($rev3MainObservation -and $captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired before COPY.' }
         $readiness.copy_started_utc=[DateTime]::UtcNow.ToString('o')
         $graphics.CopyFromScreen(
             $bounds[0], $bounds[1], 0, 0,
@@ -5111,9 +5416,16 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
             }
             $readiness.source_revision_binding='MATCH: unchanged source across all three stamps; matching Main EndDraw POST-FENCE and POST-COPY. Pre-fence frame observed only; layout/children/quiescence unasserted.'
         }
+        if ($rev3MainObservation -and $captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired before image persistence.' }
         $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
         $readiness.image_persisted=$true
+        if ($rev3MainObservation -and $captureClock.Elapsed.TotalMilliseconds -ge 7000) {
+            $readiness.late_image_invalidated=$true
+            $readiness.visual_acceptance='NOT_ACCEPTED: original budget expired during persistence; retained diagnostic pixels only'
+            throw 'OBSERVER_FAILURE: image persistence exceeded the original capture budget; diagnostic image retained.'
+        }
     } finally {
+        if ($null -ne $captureClock) { $readiness.capture_elapsed_ms=$captureClock.Elapsed.TotalMilliseconds }
         [IO.File]::WriteAllText(($Path+'.readiness.json'),($readiness | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
         $graphics.Dispose()
         $bitmap.Dispose()
@@ -5154,6 +5466,10 @@ function New-UiParityFixture {
         $rev3SettingsPath=Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'
         [IO.File]::WriteAllText($rev3SettingsPath,"schema_version = 1`nauto_save = false`n",[Text.UTF8Encoding]::new($false))
         $script:Report['rev3_workspace_settings']=@{ path=$rev3SettingsPath; configured_auto_save=$false; sha256=Get-UiSafeFileHash $rev3SettingsPath }
+        if($Rev3Case -ceq 'S02_RETURN_PROOF'){
+            $commonDir=Join-Path $script:UiLocalAppData 'MDLite';[void][IO.Directory]::CreateDirectory($commonDir)
+            [IO.File]::WriteAllText((Join-Path $commonDir 'settings.toml'),"schema_version = 1`nauto_save = false`ntheme = `"dark`"`n",[Text.UTF8Encoding]::new($false))
+        }
     }
     [IO.File]::WriteAllText(
         (Join-Path $script:UiFixtureRoot '.gitignore'),
@@ -5167,7 +5483,10 @@ function New-UiParityFixture {
     $script:UiDocumentSources = @{}
     for ($index = 0; $index -lt 9; $index++) {
         $name = 'doc-{0:D2}.md' -f $index
-        if ($index -eq 0) {
+        if ($Rev3 -and $Rev3Case -ceq 'S02_RETURN_PROOF' -and $index -eq 0) {
+            # Plain LF/ASCII lines keep byte T and native caret geometry unambiguous.
+            $source=((0..119 | ForEach-Object { 'S02 plain line {0:D3} abcdefghijklmnopqrstuvwxyz' -f $_ }) -join "`n")+"`nS02 visible tail abcdef"
+        } elseif ($index -eq 0) {
             $source = '# UI heading A' + [Environment]::NewLine +
                 'alpha body' + [Environment]::NewLine + [Environment]::NewLine +
                 '# UI heading B' + [Environment]::NewLine + 'beta body' + [Environment]::NewLine
@@ -6388,7 +6707,8 @@ function Invoke-Rev3FocusedCases($StartupState) {
     if ($Rev3Case -ceq 'S01_FORM_FIELDS') {
         [void](Invoke-UiParityCase 'S01_FORM_FIELDS' { Invoke-S01FormFields })
     }
-    [void](Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
+    $s02CasePassed=Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
+        if($Rev3Case -ceq 'S02_RETURN_PROOF'){return (Invoke-S02ReturnProof)}
         $paths=@(); $finalFrames=@()
         $closeNames=@('Cancel')
         if ($Rev3Case -cne 'S02_CANCEL_ONLY') { $closeNames+=@('Escape','TitlebarClose','ApplyThenCancel') }
@@ -6430,7 +6750,13 @@ function Invoke-Rev3FocusedCases($StartupState) {
                     [MdliteRustAcceptanceNative]::WindowTitle($notice) -cne '設定') {
                     throw 'OWNERSHIP_GATE: S02 no-op Apply success notice does not belong to the exact Settings modal.'
                 }
-                $ok=Get-UiControlById $notice 1 'BUTTON' -RequireVisible -RequireEnabled
+                $children=@(Get-UiOwnedChildren $notice)
+                $body=@($children | Where-Object {$_.Class -ieq 'STATIC' -and $_.Text -ceq '保存しました。Workspace/Commonの編集対象は変更していません。'})
+                if($body.Count -ne 1){throw 'PRODUCT_ASSERTION: S02 exact Apply success notice body mismatch.'}
+                $buttons=@($children | Where-Object {$_.Class -ieq 'BUTTON' -and $_.Text -ceq 'OK' -and $_.Visible -and $_.Enabled -and [MdliteRustAcceptanceNative]::GetParent($_.Handle) -eq $notice})
+                if($buttons.Count -ne 1){throw [NotSupportedException]::new('CONTROL_UNAVAILABLE')}
+                $ok=$buttons[0];[uint32]$okPid=0;$okThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($ok.Handle,[ref]$okPid)
+                if($okPid -ne $script:ProcessId -or $okThread -ne $noticeMetadata.ThreadId){throw 'OWNERSHIP_GATE: S02 notice OK thread changed.'}
                 $setup.notice=@{hwnd=$notice.ToInt64();owner=$noticeMetadata.OwnerHwnd;pid=$noticeMetadata.ProcessId;thread_id=$noticeMetadata.ThreadId;ok_control_id=$ok.Id}
                 $setup.notice_ready_ms=$setupClock.ElapsedMilliseconds
                 Invoke-UiOwnedDialogOk $notice
@@ -6463,7 +6789,8 @@ function Invoke-Rev3FocusedCases($StartupState) {
             $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE OWNED SNAPSHOT; NOT SETTLED OR FLICKER PROOF' }
         }
         @{ settings_layout='COMPACT_INITIAL_FORM_REPRESENTATIVE'; settings_scroll='NOT_RUN'; close_paths=$paths; close_path_scope=if ($Rev3Case -ceq 'S02_CANCEL_ONLY') { 'CANCEL_ONLY; Escape/TitlebarClose/ApplyThenCancel NOT_RUN' } else { 'FOUR_COMPACT_INITIAL_FORM_PATHS; layers/theme/scroll remain separate' }; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
-    })
+    }
+    if($Rev3Case -ceq 'S02_RETURN_PROOF' -and -not $s02CasePassed){throw 'S02_RETURN_PROOF_STOPPED_PROCESS_RETAINED'}
     [void](Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
         $frames=@()
         foreach ($activity in @(112,114)) {
@@ -6674,7 +7001,7 @@ function Invoke-UiParitySuite {
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S01_FORM_FIELDS')) {
+        if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S01_FORM_FIELDS')) {
             Assert-OwnedWindow $script:WindowHandle
             if ([MdliteRustAcceptanceNative]::WindowClass($script:WindowHandle) -cne 'MDLiteRustEditor') {
                 throw 'OWNERSHIP_GATE: S02 geometry-only startup requires the exact owned Main instance.'
@@ -6698,9 +7025,9 @@ function Invoke-UiParitySuite {
             if (-not [MdliteRustAcceptanceNative]::TestS02PassiveBounds($script:S02FixedMainBounds,$script:S02FixedMainBounds,$desktop)) {
                 throw 'S02_GEOMETRY_ONLY_MAIN_BOUNDS_INVALID_OR_OFFSCREEN'
             }
-            $script:Report.initial_window_capture_kind='SKIPPED_GEOMETRY_ONLY_S02_CANCEL_ONLY'
+            $script:Report.initial_window_capture_kind='SKIPPED_GEOMETRY_ONLY_'+$Rev3Case
             $script:Report.initial_window_capture='NOT_RUN: no initial Main COPY'
-            $script:Report.g01_startup_capture='NOT_RUN: initial startup capture/fence omitted for selected S02_CANCEL_ONLY case'
+            $script:Report.g01_startup_capture='NOT_ASSERTED: initial startup capture/fence omitted for selected '+$Rev3Case
             $script:Report.pre_open_main_source_enddraw_pixel_comparison='NOT_RUN: no pre-open initial Main COPY/fence'
             $script:Report.s02_geometry_only_crop=[ordered]@{
                 hwnd=('0x{0:X}' -f $script:WindowHandle.ToInt64());class='MDLiteRustEditor';

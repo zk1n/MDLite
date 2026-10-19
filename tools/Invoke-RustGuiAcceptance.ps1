@@ -608,6 +608,41 @@ public static class MdliteRustAcceptanceNative
         return enumerationComplete ? "SAFE" : "ZORDER_UNRESOLVED";
     }
 
+    public static Dictionary<string, object> ObserveS02SettingsStatusAuxiliary(
+        IntPtr surface, IntPtr main, IntPtr modal, uint pid, int[] crop)
+    {
+        // This status surface was verified directly owned by the declared Settings
+        // instance. It is not an allowance for other IME classes or Main-owned UI.
+        if (modal == IntPtr.Zero || !IsWindow(main) || !IsWindow(modal) || !IsWindow(surface)) return null;
+        uint mainPid, modalPid, surfacePid;
+        uint mainThread = GetWindowThreadProcessId(main, out mainPid);
+        uint modalThread = GetWindowThreadProcessId(modal, out modalPid);
+        uint surfaceThread = GetWindowThreadProcessId(surface, out surfacePid);
+        IntPtr modalOwner = GetWindow(modal, 4), surfaceOwner = GetWindow(surface, 4);
+        RECT rectangle;
+        if (mainPid != pid || modalPid != pid || surfacePid != pid || mainThread == 0 ||
+            modalThread != mainThread || surfaceThread != mainThread ||
+            WindowClass(main) != "MDLiteRustEditor" || WindowClass(modal) != "MDLiteSettings" ||
+            WindowClass(surface) != "ATOK36NvPaletteTemplate" || modalOwner != main || surfaceOwner != modal ||
+            !IsWindowVisible(modal) || !IsWindowVisible(surface) || IsWindowEnabled(surface) ||
+            crop == null || crop.Length != 4 || crop[2] <= crop[0] || crop[3] <= crop[1] ||
+            !GetWindowRect(surface, out rectangle) || rectangle.Right <= rectangle.Left || rectangle.Bottom <= rectangle.Top ||
+            rectangle.Left < crop[0] || rectangle.Top < crop[1] || rectangle.Right > crop[2] || rectangle.Bottom > crop[3])
+            return null;
+        return new Dictionary<string, object> {
+            { "classification", "OWNED_SETTINGS_STATUS_AUXILIARY" }, { "hwnd", surface.ToInt64() },
+            { "class", "ATOK36NvPaletteTemplate" }, { "pid", surfacePid }, { "thread_id", surfaceThread },
+            { "owner_hwnd", surfaceOwner.ToInt64() }, { "parent_hwnd", GetParent(surface).ToInt64() },
+            { "owner_chain", new long[] { surface.ToInt64(), modal.ToInt64(), main.ToInt64() } },
+            { "settings_hwnd", modal.ToInt64() }, { "settings_class", "MDLiteSettings" },
+            { "settings_pid", modalPid }, { "settings_thread_id", modalThread }, { "settings_owner_hwnd", modalOwner.ToInt64() },
+            { "main_hwnd", main.ToInt64() }, { "main_thread_id", mainThread },
+            { "visible", true }, { "disabled", true }, { "bounds_known", true },
+            { "rect", new int[] { rectangle.Left, rectangle.Top, rectangle.Right, rectangle.Bottom } },
+            { "underlying_main_pixels", "NOT_OBSERVED" }, { "ime_semantics", "NOT_ASSESSED" }
+        };
+    }
+
     public static Dictionary<string, object> ObserveS02PassiveCrop(IntPtr main, IntPtr modal, uint pid, int[] crop)
     {
         bool modalAlive = IsWindow(modal);
@@ -631,6 +666,7 @@ public static class MdliteRustAcceptanceNative
         IntPtr foreground = GetForegroundWindow();
         bool foregroundAllowed = foreground == main || (modalOwned && foreground == modal);
         bool overlap = false, foundMain = false;
+        var allowedStatus = new List<object>();
         object blocker = null;
         if (identity && opaque && bounds && foregroundAllowed) {
             IntPtr surface = GetTopWindow(IntPtr.Zero);
@@ -643,6 +679,15 @@ public static class MdliteRustAcceptanceNative
                 RECT rectangle;
                 bool known = GetWindowRect(surface, out rectangle);
                 if (TestS02PassiveRectOverlap(crop, known ? new int[] { rectangle.Left, rectangle.Top, rectangle.Right, rectangle.Bottom } : null, known)) {
+                    var status = known && rectangle.Left >= crop[0] && rectangle.Top >= crop[1] &&
+                        rectangle.Right <= crop[2] && rectangle.Bottom <= crop[3]
+                        ? ObserveS02SettingsStatusAuxiliary(surface, main, modal, pid, crop) : null;
+                    if (status != null) {
+                        allowedStatus.Add(status);
+                        // Keep walking: this owned status cannot conceal an
+                        // unknown/foreign lower surface from the overlap check.
+                        continue;
+                    }
                     uint process; GetWindowThreadProcessId(surface, out process);
                     overlap = true;
                     blocker = new Dictionary<string, object> {
@@ -654,10 +699,15 @@ public static class MdliteRustAcceptanceNative
             }
         }
         string classification = ClassifyS02PassiveOwnership(identity, opaque, bounds, foregroundAllowed, overlap, foundMain);
+        bool safe = classification == "SAFE";
+        if (safe && allowedStatus.Count != 0) classification = "SAFE_OWNED_SETTINGS_STATUS_UI";
         return new Dictionary<string, object> {
-            { "safe", classification == "SAFE" }, { "classification", classification },
+            { "safe", safe }, { "classification", classification },
             { "main", main.ToInt64() }, { "modal", modal.ToInt64() }, { "modal_alive", modalAlive },
-            { "foreground", foreground.ToInt64() }, { "current_client_bounds", current }, { "crop", crop }, { "blocker", blocker }
+            { "foreground", foreground.ToInt64() }, { "current_client_bounds", current }, { "crop", crop }, { "blocker", blocker },
+            { "allowed_settings_status_auxiliaries", allowedStatus.ToArray() },
+            { "main_crop_coverage", allowedStatus.Count == 0 ? "EXISTING_MAIN_SETTINGS_SCOPE" : "OWNED_COMPOSITE_STATUS_REGIONS_NOT_OBSERVED_AS_MAIN" },
+            { "coverage_limit", "Allowed status rectangles are owned UI; underlying Main pixels are NOT_OBSERVED. This is not IME semantic or visual acceptance." }
         };
     }
 
@@ -1003,6 +1053,78 @@ public static class MdliteRustAcceptanceNative
             });
         }
         return new Dictionary<string, object> {{"controls_ready", ready}, {"client_screen_bounds", clientBounds}, {"controls", controls.ToArray()}};
+    }
+
+    public static Dictionary<string, object> ObserveSettingsNativePendingRegions(IntPtr settings, IntPtr main, uint pid)
+    {
+        uint settingsPid, mainPid;
+        uint settingsThread = GetWindowThreadProcessId(settings, out settingsPid);
+        uint mainThread = GetWindowThreadProcessId(main, out mainPid);
+        IntPtr settingsOwner = GetWindow(settings, 4);
+        bool identityVerified = IsWindow(settings) && IsWindow(main) && IsOwnedWindow(settings, pid) &&
+            IsOwnedWindow(main, pid) && WindowClass(settings) == "MDLiteSettings" && settingsOwner == main &&
+            settingsPid == pid && mainPid == pid && settingsThread != 0 && settingsThread == mainThread;
+        if (!identityVerified) throw new InvalidOperationException("SETTINGS_PAINT_OWNERSHIP_UNVERIFIED");
+
+        var surfaces = new List<IntPtr> { settings };
+        bool childrenVerified = true;
+        bool enumerationComplete = EnumChildWindows(settings, delegate(IntPtr child, IntPtr state)
+        {
+            if (!IsWindow(child)) { childrenVerified = false; return false; }
+            uint childPid;
+            uint childThread = GetWindowThreadProcessId(child, out childPid);
+            if (childPid == pid)
+            {
+                if (childThread != settingsThread || !IsChild(settings, child))
+                {
+                    childrenVerified = false;
+                    return false;
+                }
+                surfaces.Add(child);
+            }
+            return true;
+        }, IntPtr.Zero);
+        enumerationComplete = enumerationComplete && childrenVerified;
+        if (!enumerationComplete) throw new InvalidOperationException("SETTINGS_PAINT_CHILD_ENUMERATION_UNVERIFIED");
+
+        int visibleCount = 0, pendingCount = 0;
+        var pendingRegions = new List<object>();
+        foreach (IntPtr surface in surfaces)
+        {
+            uint surfacePid;
+            uint surfaceThread = GetWindowThreadProcessId(surface, out surfacePid);
+            if (!IsWindow(surface) || surfacePid != pid || surfaceThread != settingsThread)
+                throw new InvalidOperationException("SETTINGS_PAINT_SURFACE_OWNERSHIP_CHANGED");
+            bool visible = IsWindowVisible(surface);
+            if (visible)
+            {
+                visibleCount++;
+                RECT rect;
+                bool pending = GetUpdateRect(surface, out rect, false);
+                if (pending)
+                {
+                    pendingCount++;
+                    int[] updateRect = new int[] { rect.Left, rect.Top, rect.Right, rect.Bottom };
+                    pendingRegions.Add(new Dictionary<string, object> {
+                        {"hwnd", surface.ToInt64()}, {"class", WindowClass(surface)}, {"control_id", GetDlgCtrlID(surface)},
+                        {"visible", visible}, {"pending", pending}, {"update_rect", updateRect},
+                        {"pid", surfacePid}, {"thread_id", surfaceThread},
+                        {"owner_hwnd", GetWindow(surface, 4).ToInt64()}, {"parent_hwnd", GetParent(surface).ToInt64()},
+                        {"settings_modal", surface == settings}
+                    });
+                }
+            }
+        }
+        return new Dictionary<string, object> {
+            {"observed_utc", DateTime.UtcNow.ToString("o")}, {"identity_verified", identityVerified},
+            {"enumeration_complete", enumerationComplete}, {"settings_hwnd", settings.ToInt64()},
+            {"main_hwnd", main.ToInt64()}, {"settings_owner_hwnd", settingsOwner.ToInt64()},
+            {"pid", pid}, {"settings_thread_id", settingsThread}, {"main_thread_id", mainThread},
+            {"owned_surface_count", surfaces.Count}, {"visible_owned_surface_count", visibleCount},
+            {"pending_region_count", pendingCount}, {"pending_regions", pendingRegions.ToArray()},
+            {"native_regions_clear", identityVerified && enumerationComplete && pendingCount == 0},
+            {"limitation", "No pending native update regions do not prove that pixels were presented or painted."}
+        };
     }
 
     [DllImport("user32.dll")]
@@ -3466,20 +3588,59 @@ function Set-UiEditText(
     if ($Value.Length -gt 0) { Send-UnicodeText $Value $ForegroundWindow }
 }
 
-function Get-UiThreadWindows([switch]$IncludeHidden) {
+function Get-UiThreadWindows([switch]$IncludeHidden, [string]$MetadataClass = '') {
     Assert-UiOwnedWindow $script:WindowHandle
     foreach ($handleValue in [MdliteRustAcceptanceNative]::OwnedThreadWindows(
         $script:WindowHandle, $script:ProcessId)) {
         $handle = [IntPtr]([long]$handleValue)
         if ($IncludeHidden -or [MdliteRustAcceptanceNative]::IsWindowVisible($handle)) {
+            $windowClass=[MdliteRustAcceptanceNative]::WindowClass($handle)
+            $metadataSelected=[string]::IsNullOrEmpty($MetadataClass) -or $windowClass -ceq $MetadataClass
             $entry=[ordered]@{
                 Handle = $handle
-                Class = [MdliteRustAcceptanceNative]::WindowClass($handle)
-                Title = [MdliteRustAcceptanceNative]::WindowTitle($handle)
+                Class = $windowClass
+                Title = if ([string]::IsNullOrEmpty($MetadataClass)) { [MdliteRustAcceptanceNative]::WindowTitle($handle) } else { '' }
             }
-            if ($IncludeHidden) {
-                $metadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($handle,$script:WindowHandle,$script:ProcessId)
+            if ($IncludeHidden -and $metadataSelected) {
+                try {
+                    $metadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($handle,$script:WindowHandle,$script:ProcessId)
+                    if (-not [string]::IsNullOrEmpty($MetadataClass) -and
+                        [MdliteRustAcceptanceNative]::WindowClass($handle) -cne $MetadataClass) {
+                        throw 'OWNERSHIP_GATE: selected window class changed during metadata observation.'
+                    }
+                } catch {
+                    $metadataFailure=$_
+                    $candidateIsWindow=$null; $candidateIsOwned=$null; [uint32]$candidatePid=0; $candidateThread=$null
+                    $rootIsWindow=$null; $rootIsOwned=$null
+                    try { $candidateIsWindow=[MdliteRustAcceptanceNative]::IsWindow($handle) } catch { }
+                    try { $candidateIsOwned=[MdliteRustAcceptanceNative]::IsOwnedWindow($handle,$script:ProcessId) } catch { }
+                    try { $candidateThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($handle,[ref]$candidatePid) } catch { }
+                    try { $rootIsWindow=[MdliteRustAcceptanceNative]::IsWindow($script:WindowHandle) } catch { }
+                    try { $rootIsOwned=[MdliteRustAcceptanceNative]::IsOwnedWindow($script:WindowHandle,$script:ProcessId) } catch { }
+                    $failureContext=[pscustomobject]@{
+                        name='OwnedWindowMetadata failure during hidden-window inventory'
+                        observed_utc=[DateTime]::UtcNow.ToString('o')
+                        candidate_hwnd=('0x{0:X}' -f $handle.ToInt64())
+                        candidate_pre_read_class=[string]$entry.Class
+                        candidate_is_window=$candidateIsWindow
+                        candidate_is_owned=$candidateIsOwned
+                        candidate_pid=$candidatePid
+                        candidate_thread_id=$candidateThread
+                        root_hwnd=('0x{0:X}' -f $script:WindowHandle.ToInt64())
+                        root_is_window=$rootIsWindow
+                        root_is_owned=$rootIsOwned
+                        expected_pid=$script:ProcessId
+                        exception_type=$metadataFailure.Exception.GetType().FullName
+                        exception_message=$metadataFailure.Exception.Message
+                        exception_stack=$metadataFailure.ScriptStackTrace
+                    }
+                    try { $script:Report.operations += $failureContext } catch { }
+                    throw
+                }
                 foreach ($field in $metadata.GetEnumerator()) { $entry[$field.Key]=$field.Value }
+                if (-not [string]::IsNullOrEmpty($MetadataClass)) {
+                    $entry.Title=[MdliteRustAcceptanceNative]::WindowTitle($handle)
+                }
             }
             [pscustomobject]$entry
         }
@@ -3510,27 +3671,45 @@ function Wait-UiThreadWindow(
         exception_message = $null
         exception_stack = $null
     }
+    if ($SettingsReady) {
+        $receipt['first_structure_ready_ms']=$null
+        $receipt['first_native_pending_clear_ms']=$null
+        $receipt['native_pending_region_limit']='No pending native update regions do not prove that pixels were presented or painted.'
+    }
     $finalStatus = $null
     try {
         do {
-            $windows = @(Get-UiThreadWindows -IncludeHidden:$SettingsReady)
+            $metadataClass=if ($SettingsReady) { $Class } else { '' }
+            $windows = @(Get-UiThreadWindows -IncludeHidden:$SettingsReady -MetadataClass $metadataClass)
             $matches = @(
                 $windows | Where-Object {
                     $_.Class -ceq $Class -and
                     ([string]::IsNullOrEmpty($Title) -or $_.Title -ceq $Title)
                 }
             )
-            $settingsState=$null; $ready=$matches.Count -eq 1
+            $settingsState=$null; $settingsPaintState=$null
+            $settingsStructureReady=$matches.Count -eq 1; $settingsPaintClear=$false
+            $ready=$matches.Count -eq 1
             if ($SettingsReady -and $matches.Count -eq 1) {
                 $match=$matches[0]
                 if ($null -eq $receipt.first_seen_ms) { $receipt.first_seen_ms=$clock.ElapsedMilliseconds }
                 if ($match.Visible -and $null -eq $receipt.first_visible_ms) { $receipt.first_visible_ms=$clock.ElapsedMilliseconds }
                 $settingsState=[MdliteRustAcceptanceNative]::OwnedSettingsControls($match.Handle,$script:WindowHandle,$script:ProcessId)
-                $ready=$match.Visible -and $match.Enabled -and $match.OwnerHwnd -eq $script:WindowHandle.ToInt64() -and
+                $settingsStructureReady=$match.Visible -and $match.Enabled -and $match.OwnerHwnd -eq $script:WindowHandle.ToInt64() -and
                     $match.ProcessId -eq $script:ProcessId -and $match.ThreadId -eq $match.MainThreadId -and $settingsState.controls_ready
+                if ($settingsStructureReady) {
+                    if ($null -eq $receipt.first_structure_ready_ms) { $receipt.first_structure_ready_ms=$clock.ElapsedMilliseconds }
+                    $settingsPaintState=[MdliteRustAcceptanceNative]::ObserveSettingsNativePendingRegions(
+                        $match.Handle,$script:WindowHandle,$script:ProcessId)
+                    $settingsPaintClear=[bool]$settingsPaintState.native_regions_clear
+                    if ($settingsPaintClear -and $null -eq $receipt.first_native_pending_clear_ms) {
+                        $receipt.first_native_pending_clear_ms=$clock.ElapsedMilliseconds
+                    }
+                }
+                $ready=$settingsStructureReady -and $settingsPaintClear
                 if ($ready -and $null -eq $receipt.first_ready_ms) { $receipt.first_ready_ms=$clock.ElapsedMilliseconds }
             }
-            $receipt.samples += [pscustomobject]@{
+            $sample=[ordered]@{
                 elapsed_ms = [long]$clock.ElapsedMilliseconds
                 matching_count = $matches.Count
                 settings_controls = $settingsState
@@ -3543,6 +3722,12 @@ function Wait-UiThreadWindow(
                     }
                 })
             }
+            if ($SettingsReady) {
+                $sample['settings_structure_ready']=[bool]$settingsStructureReady
+                $sample['settings_native_pending'] = $settingsPaintState
+                $sample['settings_native_pending_clear']=[bool]$settingsPaintClear
+            }
+            $receipt.samples += [pscustomobject]$sample
             if ($ready) {
                 $finalStatus = 'MATCHED'
                 return $matches[0].Handle
@@ -4399,7 +4584,8 @@ function Add-UiParityCase(
 }
 
 function Invoke-UiParityCase([string]$Id, [scriptblock]$Action) {
-    if ($Rev3 -and -not [string]::IsNullOrWhiteSpace($Rev3Case) -and $Rev3Case -cne $Id) {
+    $selectedCase=if ($Rev3Case -ceq 'S02_CANCEL_ONLY') { 'S01_S02_FORM_CLOSE' } else { $Rev3Case }
+    if ($Rev3 -and -not [string]::IsNullOrWhiteSpace($selectedCase) -and $selectedCase -cne $Id) {
         Add-UiParityCase $Id 'NOT_RUN' 'NOT_SELECTED' $null
         return $false
     }
@@ -4569,7 +4755,8 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     }).AddArgument($context)
     $async=$worker.BeginInvoke()
     $actions=[Collections.Generic.List[object]]::new(); $actorError=$null; $clickCompleted=$null
-    $firstClickFocus=$null; $focusObservedMs=$null
+    $firstClickFocus=$null; $focusObservedMs=$null; $focusObservations=[Collections.Generic.List[object]]::new()
+    $focusReady=$false; $focusFirstReadyMs=$null; $modalDisappearanceMs=$null
     $click={ param([IntPtr]$window,[int[]]$point,[string]$action)
         $entry=[ordered]@{action=$action;start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0;point=$point;guard=$null}
         $actions.Add($entry)
@@ -4592,14 +4779,73 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             & $click $Settings $closePoint 'titlebar HTCLOSE=20'
         } else { & $click $Settings $cancelPoint 'Cancel' }
         Wait-UiWindowGone $Settings 1200
-        $actions.Add(@{action='modal disappearance observed';time_ms=$shared.clock.Elapsed.TotalMilliseconds})
+        $modalDisappearanceMs=$shared.clock.Elapsed.TotalMilliseconds
+        $actions.Add(@{action='modal disappearance observed';time_ms=$modalDisappearanceMs})
         & $click $script:WindowHandle $CaretScreen 'first editor click without activation'
         $clickCompleted=$shared.clock.Elapsed.TotalMilliseconds
-        $firstClickFocus=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
-        $focusObservedMs=$shared.clock.Elapsed.TotalMilliseconds
-        if (-not $firstClickFocus.foreground_is_expected -or -not $firstClickFocus.active_is_expected -or
-            -not $firstClickFocus.focus_is_expected -or -not $firstClickFocus.caret_is_expected) {
-            throw 'PRODUCT_ASSERTION: S02 first editor click did not immediately restore native focus/caret before diagnostic refresh.'
+        $immediateObservation=[ordered]@{kind='immediate';status='PENDING';query_start_ms=$null;query_end_ms=$null;snapshot=$null;native_state_matches=$false;ready_within_deadline=$false;ready=$false}
+        $focusObservations.Add($immediateObservation)
+        $immediateQueried=$false
+        try {
+            Assert-OwnedWindow $script:WindowHandle
+            if ($shared.clock.Elapsed.TotalMilliseconds -ge 2000) {
+                $immediateObservation.status='NOT_QUERIED_DEADLINE_EXHAUSTED'
+                throw 'S02 native readiness was NOT observed within the original 2000ms observation interval.'
+            }
+            $immediateObservation.query_start_ms=$shared.clock.Elapsed.TotalMilliseconds
+            $immediateQueried=$true
+            $firstClickFocus=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+            $immediateObservation.snapshot=$firstClickFocus
+            $immediateObservation.status='QUERIED'
+        } catch {
+            if ($immediateQueried) { $immediateObservation.status='QUERY_FAILED' }
+            throw
+        } finally {
+            if ($immediateQueried) { $focusObservedMs=$shared.clock.Elapsed.TotalMilliseconds; $immediateObservation.query_end_ms=$focusObservedMs }
+        }
+        $immediateReady=$firstClickFocus.registered_editor_window -and $firstClickFocus.gui_thread_info_available -and
+            $firstClickFocus.foreground_is_expected -and $firstClickFocus.active_is_expected -and
+            $firstClickFocus.focus_is_expected -and $firstClickFocus.caret_is_expected
+        $immediateObservation.native_state_matches=$immediateReady
+        $immediateObservation.ready_within_deadline=$immediateReady -and $focusObservedMs -lt 2000.0
+        $immediateObservation.ready=$immediateObservation.ready_within_deadline
+        $focusReady=$immediateObservation.ready_within_deadline
+        if ($focusReady) { $focusFirstReadyMs=$focusObservedMs }
+        while (-not $focusReady -and $shared.clock.ElapsedMilliseconds -lt 2000) {
+            $remaining=2000-$shared.clock.ElapsedMilliseconds
+            if ($remaining -le 0) { break }
+            [void]$shared.stop.WaitOne([int][Math]::Min(15,$remaining))
+            if ($shared.clock.ElapsedMilliseconds -ge 2000) { break }
+            $queryStart=$shared.clock.Elapsed.TotalMilliseconds
+            $observation=[ordered]@{kind='passive_native_observation';status='PENDING';query_start_ms=$null;query_end_ms=$null;snapshot=$null;native_state_matches=$false;ready_within_deadline=$false;ready=$false}
+            $focusObservations.Add($observation)
+            $queryAttempted=$false
+            try {
+                Assert-OwnedWindow $script:WindowHandle
+                if ($shared.clock.Elapsed.TotalMilliseconds -ge 2000) {
+                    $observation.status='NOT_QUERIED_DEADLINE_EXHAUSTED'
+                    throw 'S02 native readiness was NOT observed within the original 2000ms observation interval.'
+                }
+                $observation.query_start_ms=$shared.clock.Elapsed.TotalMilliseconds
+                $queryAttempted=$true
+                $snapshot=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+                $observation.snapshot=$snapshot
+                $observation.status='QUERIED'
+            } catch {
+                if ($queryAttempted) { $observation.status='QUERY_FAILED' }
+                throw
+            } finally { if ($queryAttempted) { $queryEnd=$shared.clock.Elapsed.TotalMilliseconds; $observation.query_end_ms=$queryEnd } }
+            $queryReady=$snapshot.registered_editor_window -and $snapshot.gui_thread_info_available -and
+                $snapshot.foreground_is_expected -and $snapshot.active_is_expected -and
+                $snapshot.focus_is_expected -and $snapshot.caret_is_expected
+            $observation.native_state_matches=$queryReady
+            $observation.ready_within_deadline=$queryReady -and $queryEnd -lt 2000.0
+            $observation.ready=$observation.ready_within_deadline
+            $firstClickFocus=$snapshot; $focusObservedMs=$queryEnd
+            if ($observation.ready_within_deadline) { $focusReady=$true; $focusFirstReadyMs=$queryEnd }
+        }
+        if (-not $focusReady) {
+            throw 'S02 native readiness was NOT observed within the original 2000ms observation interval.'
         }
     } catch { $actorError=@{message=$_.Exception.Message;stack=$_.ScriptStackTrace} }
     finally {
@@ -4629,6 +4875,12 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         path=$Close; crop=$Crop; frame_records=$frameRecords; actions=$actions.ToArray()
         sampler_error=$shared.error; actor_error=$actorError; worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
+        native_focus_immediate=if ($focusObservations.Count -gt 0) { $focusObservations[0].snapshot } else { $null }; native_focus_observations=$focusObservations.ToArray()
+        native_focus_ready=$focusReady; native_focus_first_ready_ms=$focusFirstReadyMs
+        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$clickCompleted } else { $null }
+        native_focus_latency_from_modal_disappearance_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$modalDisappearanceMs } else { $null }
+        native_focus_observation_deadline_ms=2000; native_focus_deadline_kind='2s observation ceiling, not latency acceptance'
+        native_focus_observation_kind='PASSIVE_NATIVE_READINESS_OBSERVATION'; native_focus_limitation='Does not establish mouse dispatch acknowledgement, immediate responsiveness, caret source position, or first-character behavior.'
         dropped_slots=$shared.dropped_slots; coverage_inputs=$coverageInputs
     }
     try {
@@ -4655,7 +4907,13 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         raw_evidence_path=$rawEvidencePath; raw_evidence_sha256=$rawEvidenceSha256; coverage_inputs=$coverageInputs; metric_error=$metricError
         worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
-        native_focus_observation_order='BEFORE_ANY_DIAGNOSTIC_REFRESH'
+        native_focus_immediate=if ($focusObservations.Count -gt 0) { $focusObservations[0].snapshot } else { $null }; native_focus_observations=$focusObservations.ToArray()
+        native_focus_ready=$focusReady; native_focus_first_ready_ms=$focusFirstReadyMs
+        native_focus_latency_from_click_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$clickCompleted } else { $null }
+        native_focus_latency_from_modal_disappearance_ms=if ($null -ne $focusFirstReadyMs) { $focusFirstReadyMs-$modalDisappearanceMs } else { $null }
+        native_focus_observation_deadline_ms=2000; native_focus_deadline_kind='2s observation ceiling, not latency acceptance'
+        native_focus_observation_kind='PASSIVE_NATIVE_READINESS_OBSERVATION'; native_focus_limitation='Does not establish mouse dispatch acknowledgement, immediate responsiveness, caret source position, or first-character behavior.'
+        native_focus_observation_order='IMMEDIATE QUERY THEN PASSIVE NATIVE OBSERVATIONS; BEFORE_ANY_DIAGNOSTIC_REFRESH'
         sampling_target_ms=16; bounded_duration_ms=2000; dropped_slots=$shared.dropped_slots; max_actual_start_gap_ms=$maxGap
         covers_first_editor_click=$coverage; paint_forced=$false; activation_during_interval=$false
         apply=if ($Close -ceq 'ApplyThenCancel') { 'CLOSE AFTER NO-OP APPLY ONLY; Apply-phase pixels NOT_OBSERVED; changed-value Apply NOT_RUN' } else { 'NOT_RUN' }
@@ -4663,7 +4921,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     }
     [IO.File]::WriteAllText((Join-Path $directory 'receipt.json'),($receipt | ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
     if ($null -ne $metricError) { throw ('S02_PASSIVE_METRIC_FAILED: '+$directory+': '+$metricError.message) }
-    if ($null -ne $shared.error -or $null -ne $actorError -or -not $coverage) { throw ('S02_PASSIVE_OBSERVATION_FAILED: '+$directory) }
+    if ($null -ne $shared.error -or $null -ne $actorError -or -not $coverage -or -not $focusReady) { throw ('S02_PASSIVE_OBSERVATION_FAILED: '+$directory) }
     return $receipt
 }
 
@@ -5216,7 +5474,78 @@ function Invoke-Rev3FocusedCases($StartupState) {
     $script:Report['native_editor_focus_checks']=@()
     $script:Report['rev3_acceptance']='PARTIAL: case PASS means observed assertions only; visual review, actual DPI matrix and physical IME remain separate.'
     $script:Report['rev3_selected_case']=if ([string]::IsNullOrWhiteSpace($Rev3Case)) { 'ALL' } else { $Rev3Case }
-    if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
+    if ($Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') {
+        $script:Report['rev3_acceptance']='NOT_ASSERTED: diagnostic-only Settings enumeration and native pending-region readiness observation.'
+        $script:CurrentUiCaseId='SETTINGS_ENUMERATION_PROBE'
+        $source=[string]$StartupState.source
+        $diskBefore=[ordered]@{}
+        foreach ($path in (@($script:UiInitialDocPaths)+@((Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'),(Join-Path $script:UiLocalAppData 'MDLite/settings.toml')))) {
+            $diskBefore[$path]=Get-UiSafeFileHash $path
+        }
+        $probePath=Join-Path $script:UiRunDirectory 'settings-enumeration-probe.json'
+        $operationStart=$script:Report.operations.Count
+        $probe=[ordered]@{
+            diagnostic_only=$true; acceptance='NOT_ASSERTED'; screenshot='NO COPY / NO CAPTURE'
+            source_before=@{document_id=$StartupState.document_id;revision=$StartupState.revision;source_sha256=(Get-UiTextSha256 $source);dirty=$StartupState.dirty;selection=$StartupState.selection}
+            disk_before=$diskBefore; settings_open_action=$null
+            settings_metadata=$null; settings_close=$null; settings_gone=$false
+            disk_after_settings_close=$null; disk_unchanged=$null
+            error=$null; receipt_write_error=$null; started_utc=[DateTime]::UtcNow.ToString('o');completed_utc=$null
+            wait_timeout_ms=$TimeoutMs; readiness_operation_start_index=$operationStart
+            evidence_limit='Native pending-region clearance is not pixel-presentation or visual acceptance proof.'
+        }
+        $script:Report['settings_enumeration_probe']=$probe
+        $probeFailure=$null
+        try {
+            Assert-UiExecutableIdentity
+            Assert-UiOwnedWindow $script:WindowHandle
+            $probe.settings_open_action=[ordered]@{control_id=115;method='existing Invoke-UiControlById';started_utc=[DateTime]::UtcNow.ToString('o');completed_utc=$null}
+            Invoke-UiControlById $script:WindowHandle 115
+            $probe.settings_open_action.completed_utc=[DateTime]::UtcNow.ToString('o')
+            $settings=Wait-UiThreadWindow -Class 'MDLiteSettings' -SettingsReady -WaitMs $TimeoutMs
+            Assert-UiOwnedWindow $settings
+            $settingsMetadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($settings,$script:WindowHandle,$script:ProcessId)
+            if ([MdliteRustAcceptanceNative]::WindowClass($settings) -cne 'MDLiteSettings' -or $settingsMetadata.OwnerHwnd -ne $script:WindowHandle.ToInt64() -or
+                $settingsMetadata.ProcessId -ne $script:ProcessId -or $settingsMetadata.ThreadId -ne $settingsMetadata.MainThreadId -or
+                -not $settingsMetadata.Visible -or -not $settingsMetadata.Enabled) {
+                throw 'SETTINGS_ENUMERATION_PROBE_MODAL_IDENTITY_MISMATCH'
+            }
+            $probe.settings_metadata=$settingsMetadata
+            $settingsCloseResult=[IntPtr]::Zero;$settingsCloseTimer=[Diagnostics.Stopwatch]::StartNew()
+            $settingsCloseSent=[MdliteRustAcceptanceNative]::SendMessageTimeoutW(
+                $settings,[uint32]$WM_CLOSE,[IntPtr]::Zero,[IntPtr]::Zero,
+                [uint32]$SMTO_ABORTIFHUNG,[uint32]1500,[ref]$settingsCloseResult)
+            $settingsCloseError=if($settingsCloseSent){0}else{[System.Runtime.InteropServices.Marshal]::GetLastWin32Error()}
+            $settingsCloseTimer.Stop()
+            $probe.settings_close=[ordered]@{
+                api='user32!SendMessageTimeoutW';message='WM_CLOSE';value='0x0010';call_count=1
+                send_succeeded=$settingsCloseSent;send_result=$settingsCloseResult.ToInt64();send_win32_error=$settingsCloseError
+                send_timeout_ms=1500;send_elapsed_ms=$settingsCloseTimer.ElapsedMilliseconds
+                settings_hwnd=$settings.ToInt64();owner_hwnd=$settingsMetadata.OwnerHwnd;process_id=$settingsMetadata.ProcessId;thread_id=$settingsMetadata.ThreadId
+            }
+            Wait-UiWindowGone $settings 1200
+            $probe.settings_gone=$true
+            $diskAfterSettings=[ordered]@{}
+            foreach ($path in $diskBefore.Keys) { $diskAfterSettings[$path]=Get-UiSafeFileHash $path }
+            $probe.disk_after_settings_close=$diskAfterSettings
+            $probe.disk_unchanged=(@($diskBefore.Keys | Where-Object { $diskAfterSettings[$_] -cne $diskBefore[$_] }).Count -eq 0)
+            $probe.status='DIAGNOSTIC_ONLY_MODAL_CLOSED'
+        } catch {
+            $probeFailure=$_
+            $probe.error=[ordered]@{message=$_.Exception.Message;stack=$_.ScriptStackTrace}
+            $probe.status='DIAGNOSTIC_ERROR_PROCESS_RETAINED'
+        } finally {
+            $probe.completed_utc=[DateTime]::UtcNow.ToString('o')
+            try { [IO.File]::WriteAllText($probePath,($probe | ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false)) }
+            catch { $probe.receipt_write_error=$_.Exception.Message }
+        }
+        Add-UiParityCase 'SETTINGS_ENUMERATION_PROBE' 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $probe
+        foreach ($id in @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS')) {
+            Add-UiParityCase $id 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $null
+        }
+        if ($null -ne $probeFailure) { throw $probeFailure }
+        $script:CurrentUiCaseId=$null
+    } elseif ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
         $script:Report['rev3_acceptance']='NOT_ASSERTED: diagnostic-only paint dependency probe; no capture or acceptance cases.'
         Invoke-Rev3PaintDependencyProbe $StartupState
         foreach ($id in @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS')) {
@@ -5461,7 +5790,9 @@ function Invoke-Rev3FocusedCases($StartupState) {
     })
     [void](Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
         $paths=@(); $finalFrames=@()
-        foreach ($close in @('Cancel','Escape','TitlebarClose','ApplyThenCancel')) {
+        $closeNames=@('Cancel')
+        if ($Rev3Case -cne 'S02_CANCEL_ONLY') { $closeNames+=@('Escape','TitlebarClose','ApplyThenCancel') }
+        foreach ($close in $closeNames) {
             $before=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
             if ($before.selection.anchor -ne $before.selection.head) { throw 'SETUP_FAILURE: S02 needs a collapsed native caret baseline.' }
             $point=Get-EditorRecoveryCaretDipPoint $before 'S02 pre-recorded native caret'
@@ -5510,7 +5841,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
                 }
                 $setup.status='PASS: exact owned success notice acknowledged before sampling; fixture disk bytes unchanged'
             }
-            $receipt=Invoke-S02PassiveClose $close $settings ([int[]]@($caretX,$caretY)) $script:S02FencedMainBounds
+            $receipt=Invoke-S02PassiveClose $close $settings ([int[]]@($caretX,$caretY)) $script:S02FixedMainBounds
             $after=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
             Assert-UiDiagnosticDragInvariants $after $before 'settings close'
             if ($after.selection.anchor -ne $before.selection.anchor -or $after.selection.head -ne $before.selection.head -or $after.scroll -ne $before.scroll) {
@@ -5531,7 +5862,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
             $finalPath=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'-final-owned-snapshot.png')
             $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE OWNED SNAPSHOT; NOT SETTLED OR FLICKER PROOF' }
         }
-        @{ settings_layout='COMPACT_INITIAL_FORM_REPRESENTATIVE'; settings_scroll='NOT_RUN'; close_paths=$paths; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
+        @{ settings_layout='COMPACT_INITIAL_FORM_REPRESENTATIVE'; settings_scroll='NOT_RUN'; close_paths=$paths; close_path_scope=if ($Rev3Case -ceq 'S02_CANCEL_ONLY') { 'CANCEL_ONLY; Escape/TitlebarClose/ApplyThenCancel NOT_RUN' } else { 'FOUR_COMPACT_INITIAL_FORM_PATHS; layers/theme/scroll remain separate' }; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
     })
     [void](Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
         $frames=@()
@@ -5718,6 +6049,7 @@ function Invoke-UiParitySuite {
         'DIRTY_CLOSE_CANCEL_RESTART_RECOVERY_NORMAL_CLOSE'
     )
     if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds }; if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') { $caseIds = @('PAINT_DEPENDENCY_PROBE') + $caseIds } }
+    if ($Rev3 -and $Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') { $caseIds = @('SETTINGS_ENUMERATION_PROBE') + $caseIds }
     if ($StartupSmoke) {
         $caseIds = @('STARTUP_VISIBLE_LAYOUT')
     }
@@ -5741,11 +6073,45 @@ function Invoke-UiParitySuite {
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        if ($Rev3 -and $Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
+        if ($Rev3 -and $Rev3Case -ceq 'S02_CANCEL_ONLY') {
+            Assert-OwnedWindow $script:WindowHandle
+            if ([MdliteRustAcceptanceNative]::WindowClass($script:WindowHandle) -cne 'MDLiteRustEditor') {
+                throw 'OWNERSHIP_GATE: S02 geometry-only startup requires the exact owned Main instance.'
+            }
+            $clientRect=[int[]][MdliteRustAcceptanceNative]::ClientRect($script:WindowHandle)
+            if ($clientRect.Count -ne 4) { throw 'S02_GEOMETRY_ONLY_CLIENT_RECT_INVALID' }
+            [int]$screenLeft=0; [int]$screenTop=0; [int]$screenRight=0; [int]$screenBottom=0
+            $topLeftConverted=[MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
+                $script:WindowHandle,$script:ProcessId,$clientRect[0],$clientRect[1],[ref]$screenLeft,[ref]$screenTop)
+            $bottomRightConverted=[MdliteRustAcceptanceNative]::OwnedClientPointToScreen(
+                $script:WindowHandle,$script:ProcessId,$clientRect[2],$clientRect[3],[ref]$screenRight,[ref]$screenBottom)
+            if (-not $topLeftConverted -or -not $bottomRightConverted) { throw 'S02_GEOMETRY_ONLY_SCREEN_CONVERSION_FAILED' }
+            $script:S02FixedMainBounds=[int[]]@($screenLeft,$screenTop,$screenRight,$screenBottom)
+            $virtualScreen=[int[]][MdliteRustAcceptanceNative]::GetVirtualScreenMetrics()
+            if ($virtualScreen.Count -ne 4 -or $virtualScreen[2] -le 0 -or $virtualScreen[3] -le 0) {
+                throw 'S02_GEOMETRY_ONLY_VIRTUAL_SCREEN_INVALID'
+            }
+            $desktopRight=$virtualScreen[0]+$virtualScreen[2]
+            $desktopBottom=$virtualScreen[1]+$virtualScreen[3]
+            $desktop=[int[]]@($virtualScreen[0],$virtualScreen[1],$desktopRight,$desktopBottom)
+            if (-not [MdliteRustAcceptanceNative]::TestS02PassiveBounds($script:S02FixedMainBounds,$script:S02FixedMainBounds,$desktop)) {
+                throw 'S02_GEOMETRY_ONLY_MAIN_BOUNDS_INVALID_OR_OFFSCREEN'
+            }
+            $script:Report.initial_window_capture_kind='SKIPPED_GEOMETRY_ONLY_S02_CANCEL_ONLY'
+            $script:Report.initial_window_capture='NOT_RUN: no initial Main COPY'
+            $script:Report.g01_startup_capture='NOT_RUN: initial startup capture/fence omitted for selected S02_CANCEL_ONLY case'
+            $script:Report.pre_open_main_source_enddraw_pixel_comparison='NOT_RUN: no pre-open initial Main COPY/fence'
+            $script:Report.s02_geometry_only_crop=[ordered]@{
+                hwnd=('0x{0:X}' -f $script:WindowHandle.ToInt64());class='MDLiteRustEditor';
+                client_rect=$clientRect;screen_crop=$script:S02FixedMainBounds;virtual_screen=$virtualScreen
+                proof='GEOMETRY_ONLY';initial_copy='NOT_RUN';initial_fence='NOT_RUN'
+                limitation='No G01 startup capture/fence or pre-open Main source/EndDraw/pixel comparison. Final Task G01 remains applicable.'
+            }
+        } elseif ($Rev3 -and $Rev3Case -cin @('PAINT_DEPENDENCY_PROBE','SETTINGS_ENUMERATION_PROBE')) {
             $script:Report.initial_window_capture_kind='SKIPPED_DIAGNOSTIC_NO_COPY_NO_CAPTURE'
         } else {
             $initialCapture = Capture-UiOwnedWindow $script:WindowHandle $script:UiCapturePath
-            $script:S02FencedMainBounds=[int[]]$initialCapture.bounds
+            $script:S02FixedMainBounds=[int[]]$initialCapture.bounds
             $script:Report.initial_window_capture = '.codex-runtime/editor-acceptance/' + $runId + '/initial-window.png'
             $script:Report.initial_window_capture_kind = [string]$initialCapture.capture_kind
         }

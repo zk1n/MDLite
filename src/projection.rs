@@ -129,7 +129,30 @@ impl PendingText<'_> {
 impl DisplayProjection {
     pub fn parse(source: &str) -> Self {
         let mut builder = ProjectionBuilder::new(source);
-        let parser = Parser::new_ext(source, parser_options()).into_offset_iter();
+        // pulldown-cmark excludes empty or blank-leading metadata bodies. Keep
+        // those YAML cases editable; whitespace masking retains subsequent byte offsets
+        // and the parser's document context without synthesizing source content.
+        let masked;
+        let parser_source = if let Some(range) = blank_leading_front_matter_range(source) {
+            builder.start_tag(
+                &Tag::MetadataBlock(pulldown_cmark::MetadataBlockKind::YamlStyle),
+                range.clone(),
+            );
+            builder.close_block(&EndTag::FrontMatter, &range);
+            let prefix: String = source[..range.end]
+                .bytes()
+                .map(|byte| match byte {
+                    b'\r' => '\r',
+                    b'\n' => '\n',
+                    _ => ' ',
+                })
+                .collect();
+            masked = format!("{prefix}{}", &source[range.end..]);
+            &masked
+        } else {
+            source
+        };
+        let parser = Parser::new_ext(parser_source, parser_options()).into_offset_iter();
         let mut pending_text: Option<PendingText<'_>> = None;
         for (event, range) in parser {
             match event {
@@ -200,7 +223,20 @@ impl DisplayProjection {
         }
         let mut nearest = None;
         let mut nearest_distance = usize::MAX;
-        for (display, boundary) in self.boundaries.iter().enumerate() {
+        // Reverse mapping may only return complete display scalar boundaries.
+        // The interior of a surrogate pair brackets both source scalar ends,
+        // but is not a valid caret position for either affinity.
+        let display_positions = self
+            .text
+            .chars()
+            .scan(0usize, |position, character| {
+                let start = *position;
+                *position += character.len_utf16();
+                Some(start)
+            })
+            .chain(std::iter::once(self.boundaries.len() - 1));
+        for display in display_positions {
+            let boundary = &self.boundaries[display];
             let selected = match affinity {
                 BoundaryAffinity::Before => boundary.before,
                 BoundaryAffinity::After => boundary.after,
@@ -227,6 +263,26 @@ impl DisplayProjection {
             .get(source_byte / 64)
             .is_some_and(|word| word & (1 << (source_byte % 64)) != 0)
     }
+}
+
+fn blank_leading_front_matter_range(source: &str) -> Option<Range<usize>> {
+    let mut lines = source.split_inclusive('\n');
+    let opening = lines.next()?;
+    if opening.trim_end() != "---" {
+        return None;
+    }
+    let first = lines.next()?;
+    if !first.trim().is_empty() && !matches!(first.trim_end(), "---" | "...") {
+        return None;
+    }
+    let mut end = opening.len();
+    for line in std::iter::once(first).chain(lines) {
+        end += line.len();
+        if matches!(line.trim_end(), "---" | "...") {
+            return Some(0..end - (line.len() - line.trim_end_matches(['\r', '\n']).len()));
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +352,16 @@ impl<'a> ProjectionBuilder<'a> {
             Event::Start(tag) => self.start_tag(&tag, range),
             Event::End(tag) => self.end_tag(&tag, range),
             Event::Text(value) => {
+                // Metadata was projected from its complete source range at
+                // Start, including both delimiters. Parser Text events contain
+                // only its body and would duplicate those editable positions.
+                if self
+                    .open_blocks
+                    .iter()
+                    .any(|block| block.end_tag == EndTag::FrontMatter)
+                {
+                    return;
+                }
                 let kinds = self.current_kinds();
                 if self.in_literal_context() {
                     self.append_literal(&value, range, kinds, '\n');
@@ -376,7 +442,10 @@ impl<'a> ProjectionBuilder<'a> {
                 self.inline_stack.push(InlineKind::Code);
             }
             Tag::MetadataBlock(_) => {
-                self.open_block(BlockKind::FrontMatter, EndTag::FrontMatter, &range)
+                self.open_block(BlockKind::FrontMatter, EndTag::FrontMatter, &range);
+                let raw = self.source.get(range.clone()).unwrap_or_default();
+                let visible = raw.replace("\r\n", "\n").replace('\r', "\n");
+                self.append_literal(&visible, range, vec![InlineKind::Text], '\n');
             }
             Tag::Table(_) => {
                 self.in_table = true;
@@ -1886,6 +1955,122 @@ mod tests {
     }
 
     #[test]
+    fn front_matter_exposes_every_raw_line_and_scalar_boundary() {
+        for eol in ["\n", "\r\n"] {
+            for body in [
+                "",
+                "title: 日本語 👩‍💻 é",
+                "title: `raw` &amp;\n\nkey: \\*",
+                "\ntitle: 日本語 👩‍💻\n\nkey: `raw` &amp;",
+                " \t\n\nkey: value",
+            ] {
+                for closing in ["---", "..."] {
+                    let raw = if body.is_empty() {
+                        format!("---{eol}{closing}{eol}")
+                    } else {
+                        format!("---{eol}{}{eol}{closing}{eol}", body.replace('\n', eol))
+                    };
+                    let source = format!("{raw}{eol}# body");
+                    let projection = DisplayProjection::parse(&source);
+                    let block = projection
+                        .blocks
+                        .iter()
+                        .find(|block| block.kind == BlockKind::FrontMatter)
+                        .unwrap_or_else(|| panic!("closed YAML front matter: {source:?}"));
+                    assert_eq!(
+                        block.source,
+                        0..raw.trim_end_matches(['\r', '\n']).len(),
+                        "{source:?}"
+                    );
+                    let display: Vec<_> = projection.text.encode_utf16().collect();
+                    assert_eq!(
+                        String::from_utf16(&display[block.display_utf16.clone()]).unwrap(),
+                        source[block.source.clone()].replace("\r\n", "\n")
+                    );
+                    for (byte, _) in raw.char_indices() {
+                        if byte >= block.source.end {
+                            break;
+                        }
+                        // CRLF is one display break and one editor movement.
+                        if byte > 0
+                            && raw.as_bytes()[byte] == b'\n'
+                            && raw.as_bytes()[byte - 1] == b'\r'
+                        {
+                            continue;
+                        }
+                        let expected = raw[..byte].replace("\r\n", "\n").encode_utf16().count();
+                        for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After] {
+                            assert_eq!(
+                                projection.utf16_at_source_byte(byte, affinity),
+                                Some(expected),
+                                "{source:?} at {byte}"
+                            );
+                            assert_eq!(
+                                projection.source_byte_at_utf16(expected, affinity),
+                                Some(byte),
+                                "{source:?} at {byte}"
+                            );
+                        }
+                    }
+                    // Every physical front matter line has its own mapped
+                    // display start, which the native gutter and hit-test use.
+                    let mut start = 0;
+                    for line in raw.split_inclusive('\n') {
+                        assert!(projection.editable_source_positions.contains(&start));
+                        start += line.len();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn front_matter_delimiter_edits_reparse_without_repair_and_restore_history() {
+        use crate::document::{Document, Selection};
+
+        for eol in ["\n", "\r\n"] {
+            let source = format!("---{eol}title: 日本語 👩‍💻{eol}---{eol}{eol}# surviving body");
+            let closing = source.rfind("---").unwrap();
+            for range in [0..1, closing..closing + 1] {
+                let mut doc = Document::new(41, source.clone());
+                let selection = Selection {
+                    anchor: range.end,
+                    head: range.start,
+                };
+                doc.set_selection(selection.anchor, selection.head).unwrap();
+                let revision = doc.revision();
+                let before = DisplayProjection::parse(doc.source());
+                assert_eq!(doc.source(), source);
+                assert_eq!(doc.revision(), revision);
+                assert!(!doc.is_dirty());
+                assert_eq!(doc.undo_count(), 0);
+                doc.replace_selection("").unwrap();
+                let edited = doc.source().to_owned();
+                let after_selection = doc.selection();
+                let after = DisplayProjection::parse(doc.source());
+                assert!(
+                    !after
+                        .blocks
+                        .iter()
+                        .any(|block| block.kind == BlockKind::FrontMatter)
+                );
+                assert!(doc.source().ends_with("# surviving body"));
+                assert!(after.text.contains("surviving body"));
+                assert_eq!(doc.undo_count(), 1);
+                assert!(doc.undo());
+                assert_eq!(doc.source(), source);
+                assert_eq!(doc.selection(), selection);
+                assert!(!doc.is_dirty());
+                assert_eq!(DisplayProjection::parse(doc.source()), before);
+                assert!(doc.redo());
+                assert_eq!(doc.source(), edited);
+                assert_eq!(doc.selection(), after_selection);
+                assert_eq!(DisplayProjection::parse(doc.source()), after);
+            }
+        }
+    }
+
+    #[test]
     fn front_matter_needs_a_complete_boundary_and_uses_literal_source_text() {
         for (closing, closing_text) in [("---", "---"), ("...", "...")] {
             let source = format!("---\r\ntitle: `raw` &amp;\r\n{closing}\r\n# body");
@@ -1910,6 +2095,8 @@ mod tests {
 
         for source in [
             "---\ntitle: not closed\n# body\n",
+            "---\n\ntitle: not closed\n# body\n",
+            "```yaml\n---\n\ntitle: fenced\n---\n```\n",
             "---\ntitle: ambiguous\n--- trailing text\n# body\n",
             "body\n---\ntitle: not at document start\n---\n",
         ] {
@@ -2030,6 +2217,7 @@ mod tests {
             .filter(|block| block.kind == BlockKind::Table)
             .collect::<Vec<_>>();
         assert_eq!(table_blocks.len(), 1);
+        assert!(projection.text.contains("Header\tValue\nbody\ttable"));
         assert!(table_blocks[0].source.start >= front_matter.source.end);
         assert!(
             source

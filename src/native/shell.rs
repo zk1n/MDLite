@@ -26,6 +26,8 @@ pub(super) const EDITOR_HISTORY_UNDO: usize = 0x7ef0;
 const EDITOR_HISTORY_REDO: usize = 0x7ef1;
 const ACTIVITY: usize = 110;
 const ACTIVITY_COUNT: usize = 6;
+const REGION_LEFT: usize = 108;
+const REGION_RIGHT: usize = 109;
 const HEADER: usize = 130;
 const QUERY: usize = 150;
 const RESULTS: usize = 151;
@@ -126,10 +128,14 @@ const ACTIVITY_ICONS: [&str; ACTIVITY_COUNT] = [
     include_str!("../../assets/ui/icons/git-branch.svg"),
     include_str!("../../assets/ui/icons/settings.svg"),
 ];
-const TOP_ACTION_ICONS: [&str; 3] = [
+const TOP_ACTION_ICONS: [&str; 2] = [
     include_str!("../../assets/ui/icons/file.svg"),
-    include_str!("../../assets/ui/icons/folder.svg"),
     include_str!("../../assets/ui/icons/save.svg"),
+];
+const HAMBURGER_ICON: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h16M4 12h16M4 18h16"/></svg>"#;
+const REGION_ICONS: [&str; 2] = [
+    r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M9 4v16"/></svg>"#,
+    r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M15 4v16"/></svg>"#,
 ];
 const MENU_ICON: &str = include_str!("../../assets/ui/icons/more.svg");
 
@@ -151,6 +157,7 @@ enum Command {
     Compact,
     Return,
     Reset,
+    Region(bool),
     PanelMove(u8),
     PanelResize(bool),
     Feature(usize),
@@ -179,6 +186,8 @@ impl Command {
             Self::Compact => COMPACT,
             Self::Return => RETURN,
             Self::Reset => RESET,
+            Self::Region(true) => REGION_LEFT,
+            Self::Region(false) => REGION_RIGHT,
             Self::PanelMove(slot) => 160 + slot as usize,
             Self::PanelResize(grow) => {
                 if grow {
@@ -209,7 +218,9 @@ impl Command {
             Self::Settings => "設定…",
             Self::Compact => "Compactへ移す",
             Self::Return => "主windowへ戻す",
-            Self::Reset => "パネル配置をリセット",
+            Self::Reset => "パネル配置と左右領域の表示をリセット",
+            Self::Region(true) => "左領域を表示 / 非表示",
+            Self::Region(false) => "右領域を表示 / 非表示",
             Self::PanelMove(slot) => match slot {
                 0 => "対象パネルを左上へ",
                 1 => "対象パネルを左下へ",
@@ -266,7 +277,7 @@ impl Command {
         }
     }
 }
-const COMMANDS: [Command; 24] = [
+const COMMANDS: [Command; 26] = [
     Command::New,
     Command::Open,
     Command::Save,
@@ -283,6 +294,8 @@ const COMMANDS: [Command; 24] = [
     Command::Compact,
     Command::Return,
     Command::Reset,
+    Command::Region(true),
+    Command::Region(false),
     Command::PanelMove(0),
     Command::PanelMove(1),
     Command::PanelMove(2),
@@ -329,6 +342,7 @@ fn command_menu_group(command: Command) -> usize {
         | Command::Compact
         | Command::Return
         | Command::Reset
+        | Command::Region(_)
         | Command::Source
         | Command::PanelMove(_)
         | Command::PanelResize(_) => 1,
@@ -429,7 +443,6 @@ enum Splitter {
 struct PaletteState {
     host: HWND,
     font: Option<control_style::UiFont>,
-    label: HWND,
     query: HWND,
     list: HWND,
     commands: Vec<Command>,
@@ -443,6 +456,8 @@ struct PaletteState {
 impl Drop for PaletteState {
     fn drop(&mut self) {
         unsafe {
+            // The toolbar query outlives this candidate list and its IME state.
+            let _ = RemoveWindowSubclass(self.query, Some(control_ime_proc), 71);
             if IsWindow(Some(self.host)).as_bool() {
                 let _ = DestroyWindow(self.host);
             }
@@ -469,6 +484,9 @@ pub(super) struct NativeShell {
     activity: Vec<HWND>,
     headers: Vec<HWND>,
     command_button: HWND,
+    compact_query: HWND,
+    region_buttons: [HWND; 2],
+    region_focus: [HWND; 2],
     tooltip: HWND,
     search: bool,
     drawer: Option<PanelId>,
@@ -509,6 +527,9 @@ impl Default for NativeShell {
             activity: Vec::new(),
             headers: Vec::new(),
             command_button: HWND::default(),
+            compact_query: HWND::default(),
+            region_buttons: [HWND::default(); 2],
+            region_focus: [HWND::default(); 2],
             tooltip: HWND::default(),
             search: false,
             drawer: None,
@@ -793,6 +814,28 @@ unsafe fn child_control_state(hwnd: HWND) -> Option<([i32; 4], bool)> {
     }
 }
 
+const QUERY_PREVIOUS_FOCUS: PCWSTR = w!("MDLite.Query.PreviousFocus");
+unsafe extern "system" fn toolbar_query_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        if msg == WM_SETFOCUS {
+            if wp.0 != 0 {
+                let _ = SetPropW(hwnd, QUERY_PREVIOUS_FOCUS, Some(HANDLE(wp.0 as *mut _)));
+            }
+        } else if msg == WM_NCDESTROY {
+            let _ = RemovePropW(hwnd, QUERY_PREVIOUS_FOCUS);
+            let _ = RemoveWindowSubclass(hwnd, Some(toolbar_query_proc), id);
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
 unsafe extern "system" fn palette_host_proc(
     hwnd: HWND,
     msg: u32,
@@ -819,10 +862,12 @@ unsafe extern "system" fn palette_host_proc(
                 }
             }
         }
-        if matches!(
-            msg,
-            WM_COMMAND | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
-        ) {
+        if msg == WM_COMMAND
+            || (matches!(
+                msg,
+                WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
+            ) && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool())
+        {
             return SendMessageW(HWND(owner as *mut _), msg, Some(wp), Some(lp));
         }
         DefSubclassProc(hwnd, msg, wp, lp)
@@ -883,7 +928,7 @@ fn shell_geometry(
         }
         (id, r)
     });
-    if narrow && let Some(id) = drawer {
+    if narrow && let Some(id) = drawer.filter(|id| layout.region_visible(*id)) {
         panels[id as usize].1 = Rect {
             x: 48.,
             y: TOP_BAR_HEIGHT,
@@ -901,6 +946,32 @@ fn shell_geometry(
         },
         panels,
     )
+}
+
+fn toggle_region_visibility(layout: &mut PanelLayout, left: bool) {
+    if left {
+        layout.left_visible = !layout.left_visible;
+    } else {
+        layout.right_visible = !layout.right_visible;
+    }
+}
+fn toolbar_query_rect(width: f32, compact: bool) -> Rect {
+    let left = if compact {
+        8.
+    } else if width >= 480. {
+        108.
+    } else {
+        40.
+    };
+    let right = if compact { width - 8. } else { width - 80. };
+    let available = (right - left).max(1.);
+    let width = available.min(500.);
+    Rect {
+        x: left + (available - width) / 2.,
+        y: 4.,
+        width,
+        height: 28.,
+    }
 }
 impl App {
     fn activity_button_active(&self, index: usize) -> bool {
@@ -921,7 +992,7 @@ impl App {
             self.shell.drawer == Some(id)
         } else {
             let panel = self.shell.layout.get(id);
-            !panel.hidden && !panel.collapsed
+            self.shell.layout.region_visible(id) && !panel.hidden && !panel.collapsed
         }
     }
     pub(super) fn parent_root_diagnostic(&self) -> serde_json::Value {
@@ -952,7 +1023,7 @@ impl App {
                 |r: Rect| serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height});
             serde_json::json!({"schema":1,"hwnd":main.0 as usize,"editor_hwnd":self.editing_window().0 as usize,"compact_hwnd":self.shell.compact_window.0 as usize,"dpi":dpi,"dpi_raw":raw_dpi,
             "client_rect":{"left":client.left,"top":client.top,"right":client.right,"bottom":client.bottom},"window_rect":{"left":window.left,"top":window.top,"right":window.right,"bottom":window.bottom},
-            "editor_rect":rectangle(editor),"active_editor_rect":rectangle(self.shell.editor),"search_active":self.search_pane_active(),
+            "left_region_visible":self.shell.layout.left_visible,"right_region_visible":self.shell.layout.right_visible,"editor_rect":rectangle(editor),"active_editor_rect":rectangle(self.shell.editor),"search_active":self.search_pane_active(),
             "panel_rects":panels.iter().map(|(id,r)|{let state=self.shell.layout.get(*id);serde_json::json!({"id":(["explorer","calendar","outline","git"][*id as usize]),"rect":rectangle(*r),"body":rectangle(Rect{x:r.x,y:r.y+30.,width:r.width,height:(r.height-30.).max(0.)}),"hidden":state.hidden,"collapsed":state.collapsed,"slot":format!("{:?}",state.slot)})}).collect::<Vec<_>>(),
             "features":self.feature_test_geometry(&panels),"search_busy":self.search_busy(),"git_job_busy":self.git_job_busy(),"mutation_busy":self.background_mutation_busy()})
         }
@@ -1089,6 +1160,47 @@ impl App {
             && let Some(font) = &mut palette.font
         {
             let _ = font.replace_on(palette.host, dpi, 14.);
+            unsafe {
+                send(
+                    palette.list,
+                    LB_SETITEMHEIGHT,
+                    WPARAM(0),
+                    LPARAM((22. * dpi as f32 / 96.).round() as isize),
+                );
+            }
+        }
+    }
+    unsafe fn ensure_toolbar_query(&mut self, owner: HWND) -> HWND {
+        unsafe {
+            let compact = owner == self.shell.compact_window && owner != HWND::default();
+            let existing = if compact {
+                self.shell.compact_query
+            } else {
+                self.shell.command_button
+            };
+            if IsWindow(Some(existing)).as_bool() {
+                return existing;
+            }
+            let query = control(
+                owner,
+                w!("EDIT"),
+                "",
+                QUERY,
+                WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            );
+            let _ = SetWindowSubclass(query, Some(toolbar_query_proc), 72, 0);
+            send(
+                query,
+                EM_SETCUEBANNER,
+                WPARAM(1),
+                LPARAM(wide("コマンドを検索… Ctrl+K").as_ptr() as isize),
+            );
+            if compact {
+                self.shell.compact_query = query;
+            } else {
+                self.shell.command_button = query;
+            }
+            query
         }
     }
     pub(super) unsafe fn start_shell(&mut self) {
@@ -1103,11 +1215,7 @@ impl App {
                 SHELL_MENU,
                 WINDOW_STYLE(BS_OWNERDRAW as u32),
             );
-            for (id, label) in [
-                (CMD_NEW, "新しい文書"),
-                (CMD_OPEN, "文書を開く"),
-                (CMD_SAVE, "保存"),
-            ] {
+            for (id, label) in [(CMD_NEW, "新しい文書"), (CMD_SAVE, "保存")] {
                 self.shell.top_actions.push(control(
                     self.hwnd,
                     w!("BUTTON"),
@@ -1116,13 +1224,23 @@ impl App {
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
                 ));
             }
-            self.shell.command_button = control(
-                self.hwnd,
-                w!("BUTTON"),
-                "コマンドを検索… Ctrl+K",
-                PALETTE,
-                WINDOW_STYLE(BS_OWNERDRAW as u32),
-            );
+            self.ensure_toolbar_query(self.hwnd);
+            for (index, label) in ["左領域を表示 / 非表示", "右領域を表示 / 非表示"]
+                .into_iter()
+                .enumerate()
+            {
+                self.shell.region_buttons[index] = control(
+                    self.hwnd,
+                    w!("BUTTON"),
+                    label,
+                    if index == 0 {
+                        REGION_LEFT
+                    } else {
+                        REGION_RIGHT
+                    },
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                );
+            }
             for (i, label) in [
                 "エクスプローラー",
                 "検索",
@@ -1174,6 +1292,7 @@ impl App {
                 .iter()
                 .chain(std::iter::once(&self.shell.menu_button))
                 .chain(self.shell.activity.iter())
+                .chain(self.shell.region_buttons.iter())
                 .chain(self.shell.headers.iter())
                 .chain(std::iter::once(&self.shell.command_button))
             {
@@ -1287,14 +1406,14 @@ impl App {
             let mut button = RECT::default();
             let _ = GetWindowRect(self.shell.menu_button, &mut button);
             let focus = GetFocus();
-            let selected = TrackPopupMenu(
+            let selected = menu_style::track_popup(
+                self.hwnd,
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY,
                 button.left,
                 button.bottom,
-                None,
-                self.hwnd,
-                None,
+                self.shell.tokens,
+                self.dpi,
             )
             .0 as usize;
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
@@ -1438,6 +1557,18 @@ impl App {
         self.shell.editor = editor;
         self.shell.panels = panels;
         if compact {
+            unsafe {
+                let query = self.ensure_toolbar_query(self.hwnd);
+                let rect = toolbar_query_rect(self.width, true);
+                let _ = position_child_control(
+                    query,
+                    (rect.x * self.dpi) as i32,
+                    (rect.y * self.dpi) as i32,
+                    (rect.width * self.dpi) as i32,
+                    (rect.height * self.dpi) as i32,
+                );
+                self.position_palette();
+            }
             return;
         }
         let size = (self.width.to_bits(), height.to_bits());
@@ -1480,41 +1611,38 @@ impl App {
                     },
                 );
             }
-            let left_end = if actions_visible { 132. } else { 36. };
-            let activity_count = if self.width >= 480. {
-                ACTIVITY_COUNT
-            } else if self.width < 320. {
-                3
-            } else {
-                ACTIVITY_COUNT - 1
-            };
-            let activity_width = activity_count as f32 * 32. - 4.;
-            let right_start = (self.width - 8. - activity_width).max(left_end + 1.);
             for (i, h) in self.shell.activity.iter().enumerate() {
-                let visible = i < activity_count;
-                let _ = show_child_control(*h, visible);
+                let y = if i == ACTIVITY_COUNT - 1 {
+                    (height - 24. - 36.).max(TOP_BAR_HEIGHT + 5. * 36.)
+                } else {
+                    TOP_BAR_HEIGHT + i as f32 * 36.
+                };
+                let _ = show_child_control(*h, y + 32. <= height - 24.);
                 position(
                     *h,
                     Rect {
-                        x: right_start + i as f32 * 32.,
+                        x: 8.,
+                        y,
+                        width: 32.,
+                        height: 32.,
+                    },
+                );
+            }
+            for (i, h) in self.shell.region_buttons.iter().enumerate() {
+                let _ = show_child_control(*h, true);
+                position(
+                    *h,
+                    Rect {
+                        x: self.width - 72. + i as f32 * 32.,
                         y: 4.,
                         width: 28.,
                         height: 28.,
                     },
                 );
             }
-            let center_left = left_end + 8.;
-            let available = (right_start - center_left - 8.).max(80.);
-            let w = available.min(500.);
-            let x = center_left + ((right_start - center_left - w) / 2.).max(0.);
             position(
                 self.shell.command_button,
-                Rect {
-                    x,
-                    y: 4.,
-                    width: w,
-                    height: 28.,
-                },
+                toolbar_query_rect(self.width, false),
             );
             for (i, h) in self.shell.headers.iter().enumerate() {
                 let r = panels[i].1;
@@ -1754,11 +1882,12 @@ impl App {
                 .filter(|index| *index < ACTIVITY_COUNT);
             let action = match id {
                 CMD_NEW => Some(0),
-                CMD_OPEN => Some(1),
-                CMD_SAVE => Some(2),
+                CMD_SAVE => Some(1),
                 _ => None,
             };
-            let active = activity.is_some_and(|index| self.activity_button_active(index));
+            let active = activity.is_some_and(|index| self.activity_button_active(index))
+                || (id == REGION_LEFT && self.shell.layout.left_visible)
+                || (id == REGION_RIGHT && self.shell.layout.right_visible);
             let bg = if item.itemState.0 & ODS_SELECTED.0 != 0 || active {
                 self.shell.tokens.selected
             } else {
@@ -1778,7 +1907,11 @@ impl App {
                 FillRect(item.hDC, &stripe, brush);
                 let _ = DeleteObject(brush.into());
             }
-            let icon = if id == SHELL_MENU || (HEADER..HEADER + 4).contains(&id) {
+            let icon = if id == SHELL_MENU {
+                Some(HAMBURGER_ICON)
+            } else if id == REGION_LEFT || id == REGION_RIGHT {
+                Some(REGION_ICONS[usize::from(id == REGION_RIGHT)])
+            } else if (HEADER..HEADER + 4).contains(&id) {
                 Some(MENU_ICON)
             } else if let Some(index) = action {
                 Some(TOP_ACTION_ICONS[index])
@@ -1817,7 +1950,7 @@ impl App {
                 }
             }
             if item.itemState.0 & ODS_FOCUS.0 != 0 {
-                let _ = DrawFocusRect(item.hDC, &item.rcItem);
+                control_style::draw_focus(self.shell.tokens, item, &item.rcItem, true);
             }
         }
     }
@@ -1910,7 +2043,7 @@ pub(super) unsafe fn draw_owner_button(
                 right: item.rcItem.right - inset,
                 bottom: item.rcItem.bottom - inset,
             };
-            let _ = DrawFocusRect(item.hDC, &focus);
+            control_style::draw_focus(tokens, item, &focus, true);
         }
     }
 }
@@ -1975,6 +2108,8 @@ impl App {
                     }
                     if id != PALETTE
                         && id != SHELL_MENU
+                        && id != REGION_LEFT
+                        && id != REGION_RIGHT
                         && ![CMD_NEW, CMD_OPEN, CMD_SAVE].contains(&id)
                         && !(ACTIVITY..ACTIVITY + ACTIVITY_COUNT).contains(&id)
                         && !(HEADER..HEADER + 4).contains(&id)
@@ -1985,7 +2120,8 @@ impl App {
                     Some(LRESULT(1))
                 }
                 WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
-                    if hwnd == self.shell.main_window =>
+                    if (hwnd == self.shell.main_window || hwnd == self.shell.compact_window)
+                        && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool() =>
                 {
                     Some(self.shell.colors.paint(wp))
                 }
@@ -2020,6 +2156,10 @@ impl App {
                 {
                     self.select_surface(self.shell.compact_window);
                     None
+                }
+                WM_COMMAND if wp.0 & 0xffff == QUERY && wp.0 >> 16 == EN_SETFOCUS as usize => {
+                    self.open_palette();
+                    Some(LRESULT(0))
                 }
                 WM_COMMAND if wp.0 & 0xffff == QUERY && wp.0 >> 16 == EN_CHANGE as usize => {
                     self.filter_palette();
@@ -2075,13 +2215,26 @@ impl App {
                     self.shell.active_activity = index;
                 }
                 match index {
-                    0 => self.toggle_toolbar_panel(PanelId::Explorer),
+                    0 => {
+                        self.shell.search = false;
+                        self.show_panel(PanelId::Explorer);
+                        self.focus_feature_body(PanelId::Explorer);
+                    }
                     1 => {
                         self.command(5001);
                     }
-                    2 => self.toggle_toolbar_panel(PanelId::Calendar),
-                    3 => self.toggle_toolbar_panel(PanelId::Outline),
-                    4 => self.toggle_toolbar_panel(PanelId::Git),
+                    2 => {
+                        self.show_panel(PanelId::Calendar);
+                        self.focus_feature_body(PanelId::Calendar);
+                    }
+                    3 => {
+                        self.show_panel(PanelId::Outline);
+                        self.focus_feature_body(PanelId::Outline);
+                    }
+                    4 => {
+                        self.show_panel(PanelId::Git);
+                        self.focus_feature_body(PanelId::Git);
+                    }
                     _ => self.show_settings(),
                 };
                 return true;
@@ -2172,6 +2325,7 @@ impl App {
                         self.presentation_changed();
                         self.save_panel_layout();
                     }
+                    Command::Region(left) => self.toggle_region(left),
                     Command::Reset => {
                         self.shell.layout = PanelLayout::default();
                         self.shell.drawer = None;
@@ -2195,34 +2349,55 @@ impl App {
     }
     pub(super) fn show_panel(&mut self, id: PanelId) {
         self.focus_feature_panel(id);
+        self.shell.layout.show_region_for(id);
         self.shell.layout.get_mut(id).hidden = false;
         self.shell.layout.get_mut(id).collapsed = false;
         self.shell.drawer = if self.width < 760. { Some(id) } else { None };
         self.presentation_changed();
         self.save_panel_layout();
     }
-    fn toggle_toolbar_panel(&mut self, id: PanelId) {
-        if id == PanelId::Explorer && self.search_pane_active() {
-            self.set_search_pane_active(false);
-            return;
-        }
-        let visible = if self.width < 760. {
-            self.shell.drawer == Some(id)
+    fn toggle_region(&mut self, left: bool) {
+        let visible = if left {
+            self.shell.layout.left_visible
         } else {
-            let state = self.shell.layout.get(id);
-            !state.hidden && !state.collapsed
+            self.shell.layout.right_visible
         };
-        if visible {
-            if self.width < 760. {
-                self.shell.drawer = None;
-                self.presentation_changed();
-            } else {
-                self.shell.layout.get_mut(id).hidden = true;
-                self.presentation_changed();
-                self.save_panel_layout();
+        let index = usize::from(!left);
+        unsafe {
+            let focus = GetFocus();
+            let mut bounds = RECT::default();
+            if visible && GetWindowRect(focus, &mut bounds).is_ok() {
+                let mut point = POINT {
+                    x: bounds.left,
+                    y: bounds.top,
+                };
+                let _ = ScreenToClient(self.shell.main_window, &mut point);
+                if self.shell.panels.iter().any(|(id, rect)| {
+                    matches!(
+                        self.shell.layout.get(*id).slot,
+                        Slot::LeftTop | Slot::LeftBottom
+                    ) == left
+                        && rect.contains(point.x as f32 / self.dpi, point.y as f32 / self.dpi)
+                }) {
+                    self.shell.region_focus[index] = focus;
+                    let _ = SetFocus(Some(self.editing_window()));
+                }
             }
-        } else {
-            self.show_panel(id);
+        }
+        toggle_region_visibility(&mut self.shell.layout, left);
+        self.presentation_changed();
+        self.save_panel_layout();
+        if !visible {
+            unsafe {
+                let focus = self.shell.region_focus[index];
+                if IsWindow(Some(focus)).as_bool()
+                    && IsWindowVisible(focus).as_bool()
+                    && IsWindowEnabled(focus).as_bool()
+                    && IsChild(self.shell.main_window, focus).as_bool()
+                {
+                    let _ = SetFocus(Some(focus));
+                }
+            }
         }
     }
     unsafe fn panel_menu(&mut self, id: PanelId) {
@@ -2286,14 +2461,14 @@ impl App {
             }
             let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
-            let command = TrackPopupMenu(
+            let command = menu_style::track_popup(
+                self.hwnd,
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY,
                 p.x,
                 p.y,
-                None,
-                self.hwnd,
-                None,
+                self.shell.tokens,
+                self.dpi,
             )
             .0;
             let _ = DestroyMenu(menu);
@@ -2551,36 +2726,36 @@ impl App {
                 return;
             }
             let focus = GetFocus();
+            let query = self.ensure_toolbar_query(self.hwnd);
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut client);
+            let rect = toolbar_query_rect(
+                client.right as f32 / self.dpi,
+                self.hwnd == self.shell.compact_window,
+            );
+            let _ = position_child_control(
+                query,
+                (rect.x * self.dpi) as i32,
+                (rect.y * self.dpi) as i32,
+                (rect.width * self.dpi) as i32,
+                (rect.height * self.dpi) as i32,
+            );
             self.release_caret();
             let host = control(
                 self.hwnd,
                 w!("STATIC"),
-                "コマンドパレット",
+                "コマンド候補",
                 0,
                 WS_BORDER | WS_CLIPCHILDREN | CONTAINER_STYLE | WINDOW_STYLE(0x0100), // SS_NOTIFY
             );
             let _ = SetWindowLongPtrW(host, GWL_EXSTYLE, WS_EX_CONTROLPARENT.0 as isize);
             let _ = SetWindowSubclass(host, Some(palette_host_proc), 1, self.hwnd.0 as usize);
-            let label = control(
-                host,
-                w!("STATIC"),
-                "コマンド検索 · Escで閉じる",
-                0,
-                WINDOW_STYLE(0),
-            );
-            let query = control(
-                host,
-                w!("EDIT"),
-                "",
-                QUERY,
-                WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            );
             let list = control(
                 host,
                 w!("LISTBOX"),
                 "コマンド候補",
                 RESULTS,
-                WS_BORDER | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
+                WS_VSCROLL | WINDOW_STYLE((LBS_NOTIFY | LBS_USETABSTOPS) as u32),
             );
             let font = control_style::UiFont::new(GetDpiForWindow(host), 14.)
                 .ok()
@@ -2591,15 +2766,25 @@ impl App {
                 WPARAM(0),
                 LPARAM((22. * self.dpi) as isize),
             );
+            let tab = 200_i32;
+            send(
+                list,
+                LB_SETTABSTOPS,
+                WPARAM(1),
+                LPARAM((&tab as *const i32) as isize),
+            );
             let composing = track_control_ime(query);
             self.shell.palette = Some(PaletteState {
                 host,
                 font,
-                label,
                 query,
                 list,
                 commands: Vec::new(),
-                focus,
+                focus: if focus == query {
+                    HWND(GetPropW(query, QUERY_PREVIOUS_FOCUS).0)
+                } else {
+                    focus
+                },
                 document: self.doc().id(),
                 revision: self.doc().revision(),
                 selection: self.doc().selection(),
@@ -2616,70 +2801,54 @@ impl App {
             let Some(p) = &self.shell.palette else {
                 return;
             };
+            let owner = GetParent(p.host).unwrap_or(self.shell.main_window);
             let mut client = RECT::default();
-            if GetClientRect(
-                GetParent(p.host).unwrap_or(self.shell.main_window),
-                &mut client,
-            )
-            .is_err()
+            let mut query = RECT::default();
+            if GetClientRect(owner, &mut client).is_err()
+                || GetWindowRect(p.query, &mut query).is_err()
             {
                 return;
             }
-            let dpi = self.dpi.max(0.1);
-            let margin = (8. * dpi) as i32;
-            let width = (client.right - 2 * margin).max(1).min((600. * dpi) as i32);
-            let top = (((TOP_BAR_HEIGHT + 4.) * dpi) as i32).min((client.bottom - 1).max(0));
-            let max_height = (client.bottom - top - margin)
-                .max(1)
-                .min((300. * dpi) as i32);
-            let pad = (6. * dpi) as i32;
-            let label_h = (18. * dpi) as i32;
-            let query_h = (28. * dpi) as i32;
-            let gap = (4. * dpi) as i32;
-            let row_h = (22. * dpi) as i32;
-            let rows = p.commands.len().clamp(1, 8) as i32;
+            let mut origin = POINT {
+                x: query.left,
+                y: query.bottom,
+            };
+            let _ = ScreenToClient(owner, &mut origin);
+            let width = (query.right - query.left).max(1).min(client.right.max(1));
+            let top = origin.y.min((client.bottom - 1).max(0));
+            let row_h = send(p.list, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0))
+                .0
+                .max(1) as i32;
             let mut host_info = WINDOWINFO {
                 cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
                 ..Default::default()
             };
-            let mut list_info = host_info;
-            if GetWindowInfo(p.host, &mut host_info).is_err()
-                || GetWindowInfo(p.list, &mut list_info).is_err()
-            {
+            if GetWindowInfo(p.host, &mut host_info).is_err() {
                 return;
             }
-            let host_border_y = (host_info.rcWindow.bottom - host_info.rcWindow.top)
-                - (host_info.rcClient.bottom - host_info.rcClient.top);
-            let host_border_x = (host_info.rcWindow.right - host_info.rcWindow.left)
+            let border_x = host_info.rcWindow.right
+                - host_info.rcWindow.left
                 - (host_info.rcClient.right - host_info.rcClient.left);
-            let list_border_y = (list_info.rcWindow.bottom - list_info.rcWindow.top)
-                - (list_info.rcClient.bottom - list_info.rcClient.top);
-            // Integral-height LISTBOX sizing needs a complete client row plus
-            // its own native border, in addition to the host's native border.
-            let desired_height =
-                2 * pad + label_h + query_h + gap + rows * row_h + host_border_y + list_border_y;
-            let height = desired_height.min(max_height).max(1);
+            let border_y = host_info.rcWindow.bottom
+                - host_info.rcWindow.top
+                - (host_info.rcClient.bottom - host_info.rcClient.top);
+            let height = (p.commands.len().clamp(1, 8) as i32 * row_h + border_y)
+                .min((client.bottom - top).max(1));
             let _ = SetWindowPos(
                 p.host,
                 Some(HWND_TOP),
-                (client.right - width) / 2,
+                origin.x.clamp(0, (client.right - width).max(0)),
                 top,
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            let inner = (width - 2 * pad - host_border_x).max(0);
-            let label_h = label_h.min((height - host_border_y - 2 * pad).max(0));
-            let query_h = query_h.min((height - host_border_y - 2 * pad - label_h).max(0));
-            let _ = position_child_control(p.label, pad, pad, inner, label_h);
-            let _ = position_child_control(p.query, pad, pad + label_h, inner, query_h);
-            let list_y = pad + label_h + query_h + gap;
             let _ = position_child_control(
                 p.list,
-                pad,
-                list_y,
-                inner,
-                (height - host_border_y - list_y - pad).max(0),
+                0,
+                0,
+                (width - border_x).max(0),
+                (height - border_y).max(0),
             );
         }
     }
@@ -2688,10 +2857,10 @@ impl App {
             let Some(p) = &self.shell.palette else {
                 return false;
             };
-            if owner != self.shell.main_window
+            if (owner != self.shell.main_window && owner != self.shell.compact_window)
                 || GetFocus() != owner
                 || GetParent(p.host).ok() != Some(owner)
-                || GetParent(p.query).ok() != Some(p.host)
+                || GetParent(p.query).ok() != Some(owner)
                 || !IsWindowVisible(p.host).as_bool()
                 || !IsWindowVisible(p.query).as_bool()
                 || !IsWindowEnabled(p.query).as_bool()
@@ -2726,7 +2895,17 @@ impl App {
                     LPARAM(wide(&label).as_ptr() as isize),
                 );
             }
-            send(list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+            if commands.is_empty() {
+                send(
+                    list,
+                    LB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(wide("候補なし").as_ptr() as isize),
+                );
+                send(list, LB_SETCURSEL, WPARAM(usize::MAX), LPARAM(0));
+            } else {
+                send(list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+            }
             self.shell.palette.as_mut().unwrap().commands = commands;
             self.position_palette();
         }
@@ -2738,6 +2917,7 @@ impl App {
             };
             let _ = SetFocus(Some(self.editing_window()));
             let _ = ShowWindow(p.host, SW_HIDE);
+            let _ = SetWindowTextW(p.query, w!(""));
             if cancel && p.document == self.doc().id() && p.revision == self.doc().revision() {
                 let _ = self.doc_mut().set_selection_with_affinity(
                     p.selection.anchor,
@@ -2748,8 +2928,11 @@ impl App {
             let focus = if IsWindow(Some(p.focus)).as_bool()
                 && IsWindowVisible(p.focus).as_bool()
                 && IsWindowEnabled(p.focus).as_bool()
+                && p.focus != p.query
                 && (p.focus == self.shell.main_window
-                    || IsChild(self.shell.main_window, p.focus).as_bool())
+                    || p.focus == self.shell.compact_window
+                    || IsChild(self.shell.main_window, p.focus).as_bool()
+                    || IsChild(self.shell.compact_window, p.focus).as_bool())
             {
                 p.focus
             } else {
@@ -2805,7 +2988,9 @@ impl App {
                 root
             };
             if let Some(p) = &self.shell.palette {
-                let inside = msg.hwnd == p.host || IsChild(p.host, msg.hwnd).as_bool();
+                let inside = msg.hwnd == p.query
+                    || msg.hwnd == p.host
+                    || IsChild(p.host, msg.hwnd).as_bool();
                 let pointer_down = matches!(
                     msg.message,
                     WM_LBUTTONDOWN
@@ -3101,6 +3286,7 @@ impl App {
                 (*pointer).editor_window.set(main);
             }
             let _ = DestroyWindow(compact);
+            self.shell.compact_query = HWND::default();
             self.shell.compact_font = None;
             self.dpi = GetDpiForWindow(main) as f32 / 96.;
             self.shell.controls_dirty = true;
@@ -3300,6 +3486,85 @@ pub(super) unsafe fn track_control_ime(hwnd: HWND) -> Box<Cell<bool>> {
 mod tests {
     use super::*;
     #[test]
+    fn shell_region_visibility_and_toolbar_bounds_share_available_geometry() {
+        let mut layout = PanelLayout::default();
+        let panels = layout.panels.clone();
+        for width in [360., 480., 760., 1440.] {
+            for left in [false, true] {
+                for right in [false, true] {
+                    layout.left_visible = left;
+                    layout.right_visible = right;
+                    let (editor, rects) = shell_geometry(&layout, width, 800., None);
+                    assert!(editor.width > 0.);
+                    for (id, rect) in rects {
+                        if !layout.region_visible(id) {
+                            assert_eq!(rect, Rect::default());
+                        }
+                    }
+                    for compact in [false, true] {
+                        let query = toolbar_query_rect(width, compact);
+                        assert!(query.x >= 0. && query.x + query.width <= width);
+                        assert!(query.y + query.height <= TOP_BAR_HEIGHT);
+                    }
+                }
+            }
+        }
+        assert_eq!(layout.panels, panels);
+        layout.left_visible = false;
+        let (_, rects) = shell_geometry(&layout, 600., 800., Some(PanelId::Explorer));
+        assert_eq!(rects[PanelId::Explorer as usize].1, Rect::default());
+    }
+
+    #[test]
+    fn shell_toolbar_query_is_persistent_and_dropdown_contains_candidates_only() {
+        unsafe {
+            let window = super::super::tests::hidden_test_window_size(1100, 700);
+            let mut app = super::super::tests::composing_test_app("A😀日Z");
+            app.clear_composition();
+            app.hwnd = window;
+            app.shell.enabled = true;
+            app.shell.main_window = window;
+            app.update_surface_font(window, 96);
+            let document_state = |doc: &Document| {
+                (
+                    doc.source().to_owned(),
+                    doc.revision(),
+                    doc.is_dirty(),
+                    doc.undo_count(),
+                    doc.redo_count(),
+                    doc.selection(),
+                )
+            };
+            let before = document_state(app.doc());
+            let query = app.ensure_toolbar_query(window);
+            for dpi in [1., 150. / 96.] {
+                app.dpi = dpi;
+                app.open_palette();
+                let p = app.shell.palette.as_ref().unwrap();
+                assert_eq!(p.query, query);
+                assert_eq!(GetParent(query).unwrap(), window);
+                assert_eq!(GetParent(p.list).unwrap(), p.host);
+                // Candidate list may own sibling scrollbar rails through the
+                // existing adapter; it must never own another query or heading.
+                assert!(FindWindowExW(Some(p.host), None, w!("EDIT"), None).is_err());
+                assert!(FindWindowExW(Some(p.host), None, w!("STATIC"), None).is_err());
+                let mut query_bounds = RECT::default();
+                let mut host_bounds = RECT::default();
+                GetWindowRect(query, &mut query_bounds).unwrap();
+                GetWindowRect(p.host, &mut host_bounds).unwrap();
+                assert_eq!(host_bounds.left, query_bounds.left);
+                assert_eq!(host_bounds.top, query_bounds.bottom);
+                assert_eq!(host_bounds.right, query_bounds.right);
+                app.close_palette(true);
+                assert!(IsWindow(Some(query)).as_bool());
+                assert_eq!(app.ensure_toolbar_query(window), query);
+                assert_eq!(text_of(query), "");
+            }
+            assert_eq!(document_state(app.doc()), before);
+            DestroyWindow(window).unwrap();
+        }
+    }
+    #[test]
     fn shell_native_edit_factory_eligibility_tokens_and_shared_rail_lifecycle() {
         unsafe {
             let owner = super::super::tests::hidden_test_window_size(800, 600);
@@ -3434,12 +3699,14 @@ mod tests {
             let palette = app.shell.palette.as_ref().unwrap();
             let own = palette.font.as_ref().unwrap().handle();
             assert_ne!(main, own);
-            for child in [palette.label, palette.query, palette.list] {
-                assert_eq!(
-                    send(child, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
-                    own.0 as isize
-                );
-            }
+            assert_eq!(
+                send(palette.query, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                main.0 as isize
+            );
+            assert_eq!(
+                send(palette.list, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                own.0 as isize
+            );
             let mut data = LOGFONTW::default();
             assert_ne!(
                 GetObjectW(
@@ -3486,6 +3753,38 @@ mod tests {
         let (_, panels) = shell_geometry(&layout, 1440., 900., None);
         assert!(panels[PanelId::Calendar as usize].1.x > 700.);
         assert!(panels[PanelId::Outline as usize].1.x < 400.);
+    }
+
+    #[test]
+    fn narrow_drawer_selection_survives_hiding_and_restoring_each_region() {
+        let mut app = super::super::tests::composing_test_app("# keep source\nbody");
+        app.width = 600.;
+        app.shell.search = true;
+        let source = app.doc().source().to_owned();
+        let revision = app.doc().revision();
+        let selection = app.doc().selection();
+        let slots = app.shell.layout.panels.clone();
+
+        for (left, id) in [(true, PanelId::Explorer), (false, PanelId::Git)] {
+            app.shell.active_panel = id;
+            app.shell.drawer = Some(id);
+            toggle_region_visibility(&mut app.shell.layout, left);
+            assert!(!app.shell.layout.region_visible(id));
+            let (_, hidden) = shell_geometry(&app.shell.layout, 600., 800., app.shell.drawer);
+            assert_eq!(hidden[id as usize].1, Rect::default());
+
+            toggle_region_visibility(&mut app.shell.layout, left);
+            assert!(app.shell.layout.region_visible(id));
+            let (_, restored) = shell_geometry(&app.shell.layout, 600., 800., app.shell.drawer);
+            assert!(restored[id as usize].1.width >= 200.);
+            assert_eq!(app.shell.drawer, Some(id));
+            assert_eq!(app.shell.active_panel, id);
+            assert!(app.shell.search_mode());
+            assert_eq!(app.shell.layout.panels, slots);
+            assert_eq!(app.doc().source(), source);
+            assert_eq!(app.doc().revision(), revision);
+            assert_eq!(app.doc().selection(), selection);
+        }
     }
 
     #[test]
@@ -3718,7 +4017,7 @@ mod tests {
                 );
                 app.open_palette();
                 let p = app.shell.palette.as_ref().unwrap();
-                assert_eq!(GetParent(p.query).unwrap(), p.host);
+                assert_eq!(GetParent(p.query).unwrap(), window);
                 assert_eq!(GetParent(p.list).unwrap(), p.host);
                 assert_ne!(
                     GetWindowLongPtrW(p.host, GWL_STYLE) as u32 & WS_CLIPCHILDREN.0,
@@ -3743,7 +4042,8 @@ mod tests {
                 };
                 assert!(app.shell_message(&escape));
                 assert!(app.shell.palette.is_none());
-                for child in [host, query, list] {
+                assert!(IsWindow(Some(query)).as_bool());
+                for child in [host, list] {
                     assert!(!IsWindow(Some(child)).as_bool());
                 }
                 app.open_palette();
@@ -3814,7 +4114,7 @@ mod tests {
             app.doc_mut().set_selection(0, 0).unwrap();
             app.close_palette(true);
             assert_eq!(app.doc().selection(), Selection { anchor: 8, head: 1 });
-            assert!(!IsWindow(Some(query)).as_bool());
+            assert!(IsWindow(Some(query)).as_bool());
             app.open_palette();
             let query = app.shell.palette.as_ref().unwrap().query;
             let _ = SetWindowTextW(query, w!("ソース"));

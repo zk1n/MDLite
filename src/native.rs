@@ -11,6 +11,7 @@ mod editor_actions;
 mod explorer_icons;
 mod features;
 mod git_ui;
+mod menu_style;
 mod persistence;
 mod presentation;
 mod scrollbar_style;
@@ -491,6 +492,7 @@ struct WindowState {
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
+    menu_paint: RefCell<Vec<Rc<menu_style::MenuPaint>>>,
     explorer_paint: features::ExplorerPaintSlot,
     deferred_paints: Cell<[Option<(HWND, RECT)>; 2]>,
     ime_input: Cell<Option<ImeInputContext>>,
@@ -516,6 +518,7 @@ impl WindowState {
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
+            menu_paint: RefCell::new(Vec::new()),
             explorer_paint,
             deferred_paints: Cell::new([None, None]),
             ime_input: Cell::new(None),
@@ -1135,6 +1138,7 @@ pub fn run() -> windows::core::Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -1232,6 +1236,7 @@ pub fn run() -> windows::core::Result<()> {
             drain_native_notifications(&app, &mut app.app.borrow_mut());
             if key_down {
                 let mut owner = app.app.borrow_mut();
+                owner.features_reset_calendar_click();
                 owner.invalidate_stale_reconversion();
                 if let Some(cancel) =
                     owner.prepare_reconversion_cancel(ingress, input, message.hwnd)
@@ -1335,6 +1340,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let state = &*pointer;
+        // Popup tracking pumps messages while App is already mutably borrowed.
+        // These snapshots contain no document/App references.
+        if let Some(result) = menu_style::window_message(state, hwnd, msg, wp, lp) {
+            return result;
+        }
         if msg == WM_CLOSE {
             record_phase(&state.phase_trace, "close", "received");
         }
@@ -1442,7 +1452,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             if matches!(
                 msg,
                 WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN
-            ) && hwnd == state.main_window.get()
+            ) && state.owns_paint_surface(hwnd)
                 && IsChild(hwnd, HWND(lp.0 as *mut _)).as_bool()
             {
                 let colors = state.control_colors.borrow().clone();
@@ -1543,6 +1553,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     | WM_KEYDOWN
                     | WM_CHAR
                     | WM_LBUTTONDOWN
+                    | WM_LBUTTONDBLCLK
                     | WM_DROPFILES
                     | WM_IME_REQUEST
             ) {
@@ -1719,6 +1730,20 @@ unsafe fn dispatch_window_message(
     app: &mut App,
 ) -> Option<LRESULT> {
     unsafe {
+        if matches!(
+            msg,
+            WM_SIZE
+                | WM_DPICHANGED
+                | WM_KEYDOWN
+                | WM_SYSKEYDOWN
+                | WM_CHAR
+                | WM_COMMAND
+                | WM_KILLFOCUS
+                | WM_CANCELMODE
+                | WM_MOUSEWHEEL
+        ) {
+            app.features_reset_calendar_click();
+        }
         if msg == WM_CLOSE && (app.search_busy() || app.git_job_busy()) {
             record_phase(&app.phase_trace, "close", "busy_rejected");
             app.status = "処理中です。取消を行い、処理結果を確認してから閉じてください".into();
@@ -1822,6 +1847,12 @@ unsafe fn dispatch_window_message(
                 let x = (lp.0 as u16 as i16) as f32 / app.dpi;
                 let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
                 let _ = SetFocus(Some(hwnd));
+                if !app
+                    .feature_panel_rect(mdlite::panel::PanelId::Calendar)
+                    .is_some_and(|r| r.contains(x, y))
+                {
+                    app.features_reset_calendar_click();
+                }
                 if app.shell.enabled {
                     for id in [
                         mdlite::panel::PanelId::Explorer,
@@ -1896,6 +1927,20 @@ unsafe fn dispatch_window_message(
                 }
                 app.refresh();
                 LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                if app.shell.enabled
+                    && app.features_double_click(mdlite::panel::PanelId::Calendar, x, y)
+                {
+                    app.refresh();
+                    return Some(LRESULT(0));
+                }
+                app.features_reset_calendar_click();
+                // Other surfaces retain the ordinary second-click behavior.
+                // Calendar activation above exclusively consumes its double click.
+                dispatch_window_message(hwnd, WM_LBUTTONDOWN, wp, lp, app).unwrap_or(LRESULT(0))
             }
             WM_MOUSEMOVE => {
                 if GetCapture() == hwnd {
@@ -2547,14 +2592,14 @@ impl App {
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
             self.release_caret();
-            let command = TrackPopupMenu(
+            let command = menu_style::track_popup(
+                self.hwnd,
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY,
                 point.x,
                 point.y,
-                None,
-                self.hwnd,
-                None,
+                self.shell.tokens,
+                self.dpi,
             )
             .0 as usize;
             let _ = DestroyMenu(menu);
@@ -9668,7 +9713,7 @@ mod tests {
             }
             let query = {
                 let children = fixture.state.app.borrow();
-                // The palette owns its query through its common native host.
+                // The toolbar owns the sole query; the host owns candidates.
                 let main = children.shell.main_window;
                 let mut found = HWND::default();
                 unsafe extern "system" fn find_query(
@@ -9724,14 +9769,9 @@ mod tests {
             }
             let hosts = [
                 (
-                    FindWindowExW(
-                        Some(fixture.hwnd),
-                        None,
-                        w!("STATIC"),
-                        w!("コマンドパレット"),
-                    )
-                    .unwrap(),
-                    "コマンドパレット",
+                    FindWindowExW(Some(fixture.hwnd), None, w!("STATIC"), w!("コマンド候補"))
+                        .unwrap(),
+                    "コマンド候補",
                 ),
                 (GetDlgItem(Some(fixture.hwnd), 6508).unwrap(), "Git pane"),
             ];
@@ -9796,8 +9836,8 @@ mod tests {
                 app.open_palette();
             }
             let host =
-                FindWindowExW(Some(compact), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
-            check_host(compact, host, "コマンドパレット");
+                FindWindowExW(Some(compact), None, w!("STATIC"), w!("コマンド候補")).unwrap();
+            check_host(compact, host, "コマンド候補");
             for owner in [fixture.hwnd, compact] {
                 let mut app = fixture.state.app.borrow_mut();
                 app.shell_command(106);
@@ -9805,14 +9845,15 @@ mod tests {
                 app.open_palette();
                 drop(app);
                 let host =
-                    FindWindowExW(Some(owner), None, w!("STATIC"), w!("コマンドパレット")).unwrap();
+                    FindWindowExW(Some(owner), None, w!("STATIC"), w!("コマンド候補")).unwrap();
                 for (id, message) in [(150, WM_CTLCOLOREDIT), (151, WM_CTLCOLORLISTBOX)] {
-                    let child = GetDlgItem(Some(host), id).unwrap();
+                    let recipient = if id == 150 { owner } else { host };
+                    let child = GetDlgItem(Some(recipient), id).unwrap();
                     for borrowed in [false, true] {
                         let _borrow = borrowed.then(|| fixture.state.app.borrow_mut());
                         SetBkColor(dc, COLORREF(0));
                         let brush = SendMessageW(
-                            host,
+                            recipient,
                             message,
                             Some(WPARAM(dc.0 as usize)),
                             Some(LPARAM(child.0 as isize)),
@@ -9996,6 +10037,233 @@ mod tests {
             assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
             // Hidden children do not expose an update region. Root's visible
             // modal scenario verifies the resulting themed pixels separately.
+        }
+    }
+    #[test]
+    fn themed_popup_snapshot_reentry_disabled_and_native_restore() {
+        use windows::Win32::UI::Controls::*;
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            let child = CreatePopupMenu().unwrap();
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 12, w!("保存(&S)\tCtrl+S")).unwrap();
+            AppendMenuW(menu, MF_POPUP, child.0 as usize, w!("表示")).unwrap();
+            AppendMenuW(child, MF_STRING, 13, w!("日本語項目(&J)")).unwrap();
+            AppendMenuW(child, MF_SEPARATOR, 0, PCWSTR::null()).unwrap();
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_DATA,
+                dwItemData: 42,
+                ..Default::default()
+            };
+            SetMenuItemInfoW(menu, 0, true, &info).unwrap();
+            let mut background = MENUINFO {
+                cbSize: std::mem::size_of::<MENUINFO>() as u32,
+                fMask: MIM_BACKGROUND,
+                ..Default::default()
+            };
+            GetMenuInfo(menu, &mut background).unwrap();
+            let old_background = background.hbrBack;
+            let before = document_state(fixture.state.app.borrow().doc());
+            let scope = menu_style::MenuScope::new(
+                &fixture.state,
+                fixture.hwnd,
+                menu,
+                shell::Tokens::default(),
+                1.,
+            )
+            .expect("standard-contrast fixture");
+            info.fMask = MIIM_DATA | MIIM_FTYPE | MIIM_STATE;
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(info.fType.contains(MFT_OWNERDRAW));
+            assert_ne!(info.fState.0 & MFS_DISABLED.0, 0);
+            assert_ne!(info.dwItemData, 42);
+            let mut text = [0u16; 64];
+            let length = GetMenuStringW(menu, 0, Some(&mut text), MF_BYPOSITION);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..length as usize]),
+                "保存(&S)\tCtrl+S"
+            );
+            let dc = CreateCompatibleDC(None);
+            let bitmap = CreateBitmap(320, 40, 1, 32, None);
+            let old = SelectObject(dc, bitmap.into());
+            let mut measure = MEASUREITEMSTRUCT {
+                CtlType: ODT_MENU,
+                itemID: 12,
+                itemData: info.dwItemData,
+                ..Default::default()
+            };
+            let mut item = DRAWITEMSTRUCT {
+                CtlType: ODT_MENU,
+                itemID: 12,
+                itemData: info.dwItemData,
+                itemState: ODS_FLAGS(ODS_SELECTED.0 | ODS_DISABLED.0),
+                hwndItem: HWND(menu.0),
+                hDC: dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 320,
+                    bottom: 40,
+                },
+                ..Default::default()
+            };
+            {
+                let app = fixture.state.app.borrow_mut();
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_INITMENUPOPUP,
+                        WPARAM(child.0 as usize),
+                        LPARAM(0)
+                    ),
+                    LRESULT(0)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MENUCHAR,
+                        WPARAM('s' as usize),
+                        LPARAM(menu.0 as isize)
+                    ),
+                    LRESULT((MNC_IGNORE << 16) as isize)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MENUCHAR,
+                        WPARAM('j' as usize),
+                        LPARAM(child.0 as isize)
+                    ),
+                    LRESULT((MNC_EXECUTE << 16) as isize)
+                );
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_MEASUREITEM,
+                        WPARAM(0),
+                        LPARAM((&mut measure as *mut MEASUREITEMSTRUCT) as isize)
+                    ),
+                    LRESULT(1)
+                );
+                assert!(measure.itemWidth > 100 && measure.itemHeight == 28);
+                assert_eq!(
+                    window_proc(
+                        fixture.hwnd,
+                        WM_DRAWITEM,
+                        WPARAM(0),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    ),
+                    LRESULT(1)
+                );
+                // A disabled selected item uses panel, never active hover color.
+                assert_eq!(
+                    GetPixel(dc, 8, 8),
+                    shell::rgb(shell::Tokens::default().panel)
+                );
+                assert_eq!(document_state(app.doc()), before);
+                item.hwndItem = HWND(child.0);
+                assert!(
+                    menu_style::window_message(
+                        &fixture.state,
+                        fixture.hwnd,
+                        WM_DRAWITEM,
+                        WPARAM(0),
+                        LPARAM((&item as *const DRAWITEMSTRUCT) as isize)
+                    )
+                    .is_none()
+                );
+            }
+            let _ = SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            drop(scope);
+            assert!(fixture.state.menu_paint.borrow().is_empty());
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            assert_eq!(info.dwItemData, 42);
+            assert_ne!(info.fState.0 & MFS_DISABLED.0, 0);
+            GetMenuInfo(menu, &mut background).unwrap();
+            assert_eq!(background.hbrBack, old_background);
+            DestroyMenu(menu).unwrap();
+        }
+    }
+    #[test]
+    fn themed_popup_scope_high_contrast_foreign_items_and_unwind() {
+        let fixture = EditorFixture::new("body", false);
+        fixture.state.main_window.set(fixture.hwnd);
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            AppendMenuW(menu, MF_STRING, 12, w!("項目")).unwrap();
+            let tokens = shell::Tokens {
+                high_contrast: true,
+                ..Default::default()
+            };
+            assert!(
+                menu_style::MenuScope::new(&fixture.state, fixture.hwnd, menu, tokens, 1.)
+                    .is_none()
+            );
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_DATA,
+                ..Default::default()
+            };
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            let outer = menu_style::MenuScope::new(
+                &fixture.state,
+                fixture.hwnd,
+                menu,
+                shell::Tokens::default(),
+                1.,
+            )
+            .unwrap();
+            // Tracking the same handles must not replace the active snapshot.
+            assert!(
+                menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.
+                )
+                .is_none()
+            );
+            assert_eq!(fixture.state.menu_paint.borrow().len(), 1);
+            drop(outer);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.,
+                )
+                .unwrap();
+                panic!("menu unwind fixture");
+            }));
+            assert!(result.is_err());
+            assert!(fixture.state.menu_paint.borrow().is_empty());
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(!info.fType.contains(MFT_OWNERDRAW));
+            info.fType |= MFT_OWNERDRAW;
+            info.dwItemData = 99;
+            SetMenuItemInfoW(menu, 0, true, &info).unwrap();
+            assert!(
+                menu_style::MenuScope::new(
+                    &fixture.state,
+                    fixture.hwnd,
+                    menu,
+                    shell::Tokens::default(),
+                    1.
+                )
+                .is_none()
+            );
+            GetMenuItemInfoW(menu, 0, true, &mut info).unwrap();
+            assert!(info.fType.contains(MFT_OWNERDRAW));
+            assert_eq!(info.dwItemData, 99);
+            DestroyMenu(menu).unwrap();
         }
     }
     #[test]
@@ -10910,6 +11178,55 @@ mod tests {
         let source = "---\ntitle: 架空の編集試料\n---\n\n# MDLite 編集基盤\n日本語と **太字**、*強調*、`code`、[リンク](#表)を編集します。\n絵文字 👩‍💻 と結合文字 e\u{301} の境界を保持します\n";
         assert_vertical_sequence(source);
         assert_vertical_sequence(&source.replace('\n', "\r\n"));
+    }
+    #[test]
+    fn editor_live_front_matter_delimiters_edit_and_undo_through_native_input() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("---{eol}title: 日本語 👩‍💻{eol}---{eol}{eol}# body{eol}");
+            for p in [0, source.rfind("---").unwrap()] {
+                let fixture = EditorFixture::new(&source, false);
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    app.doc_mut().set_selection(p, p).unwrap();
+                    unsafe {
+                        app.after_input();
+                    }
+                    let rows: Vec<_> = app.gutter_rows.iter().map(|r| r.line_number).collect();
+                    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+                    let (x, y, height) = app.caret_location();
+                    let (hit, _) = app.hit_with_affinity(x + 0.5, y + height * 0.5);
+                    assert_eq!(hit, p, "delimiter hit-test at {p}");
+                }
+                fixture.message(WM_KEYDOWN, VK_DELETE.0 as usize);
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    let mut edited = source.clone();
+                    edited.remove(p);
+                    assert_eq!(app.doc().source(), edited);
+                    assert_eq!(app.doc().undo_count(), 1);
+                    assert!(app.doc().is_dirty());
+                    unsafe {
+                        app.key_with_modifiers(0x5a, true, false);
+                    }
+                    assert_eq!(app.doc().source(), source);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    assert!(!app.doc().is_dirty());
+                    unsafe {
+                        app.key_with_modifiers(0x59, true, false);
+                    }
+                    assert_eq!(app.doc().source(), edited);
+                    unsafe {
+                        app.key_with_modifiers(0x5a, true, false);
+                    }
+                }
+                fixture.message(WM_CHAR, '字' as usize);
+                let app = fixture.state.app.borrow();
+                let mut edited = source.clone();
+                edited.insert(p, '字');
+                assert_eq!(app.doc().source(), edited);
+                assert_eq!(app.doc().selection().head, p + '字'.len_utf8());
+            }
+        }
     }
     #[test]
     fn editor_live_markdown_vertical_sequence_keeps_selection_and_edges() {
@@ -12962,7 +13279,11 @@ mod tests {
         }
 
         assert_rows("```text\nline\n```\n\nfollowing\n", &[2, 4, 5, 6], false);
-        assert_rows("---\ntitle: note\n---\n\nbody\n", &[2, 4, 5, 6], false);
+        assert_rows(
+            "---\ntitle: note\n---\n\nbody\n",
+            &[1, 2, 3, 4, 5, 6],
+            false,
+        );
         assert_rows("one\n\nthree\n", &[1, 2, 3, 4], true);
     }
 
@@ -14843,7 +15164,7 @@ mod tests {
         ));
     }
     #[test]
-    fn horizontal_arrows_cross_adjacent_eol_without_skipping_text_or_entering_metadata_prefix() {
+    fn horizontal_arrows_cross_adjacent_eol_and_enter_front_matter_delimiters() {
         for eol in ["\n", "\r\n"] {
             let source = format!("hello{eol}");
             let tokens = projected_tokens(&source);
@@ -14877,7 +15198,7 @@ mod tests {
             .collect();
         assert_eq!(
             live_horizontal_step(source, &tokens, &[], &blocks, 4, true),
-            4
+            3
         );
     }
     fn apply_plan(doc: &mut Document, plan: LiveEdit) {
@@ -14975,33 +15296,32 @@ mod tests {
         }
     }
     #[test]
-    fn first_frontmatter_and_fence_text_backspace_keeps_hidden_opening_line_ending() {
-        for source in ["---\ntitle: T\n---\n", "```\nfirst\n```\n"] {
-            let projection = DisplayProjection::parse(source);
-            let tokens = projected_tokens(source);
-            let blocks: Vec<_> = projection
-                .blocks
-                .iter()
-                .filter(|block| {
-                    matches!(
-                        block.kind,
-                        BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
-                    )
-                })
-                .map(|block| block.source.clone())
-                .collect();
-            let first = tokens[0].spans[0].start;
-            assert_eq!(first, 4);
-            let mut doc = Document::new(34, source.into());
-            doc.set_selection(first, first).unwrap();
-            let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
-            assert!(plan.range.is_empty());
-            apply_plan(&mut doc, plan);
-            assert_eq!(doc.source(), source);
-            assert_eq!(doc.selection().head, first);
-            assert_eq!(doc.undo_count(), 0);
-            assert_eq!(doc.revision(), 0);
-        }
+    fn first_fence_text_backspace_keeps_hidden_opening_line_ending() {
+        let source = "```\nfirst\n```\n";
+        let projection = DisplayProjection::parse(source);
+        let tokens = projected_tokens(source);
+        let blocks: Vec<_> = projection
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.kind,
+                    BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
+                )
+            })
+            .map(|block| block.source.clone())
+            .collect();
+        let first = tokens[0].spans[0].start;
+        assert_eq!(first, 4);
+        let mut doc = Document::new(34, source.into());
+        doc.set_selection(first, first).unwrap();
+        let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
+        assert!(plan.range.is_empty());
+        apply_plan(&mut doc, plan);
+        assert_eq!(doc.source(), source);
+        assert_eq!(doc.selection().head, first);
+        assert_eq!(doc.undo_count(), 0);
+        assert_eq!(doc.revision(), 0);
     }
     #[test]
     fn real_image_token_and_exact_layout_markers_keep_before_after_insertions_and_undo() {
@@ -15037,10 +15357,10 @@ mod tests {
         );
     }
     #[test]
-    fn initial_live_insertion_preserves_heading_and_frontmatter_prefix_and_undo_caret() {
+    fn initial_live_insertion_respects_visible_frontmatter_and_hidden_heading_prefix() {
         for (source, expected, first) in [
             ("# ab", "# Xab", 2),
-            ("---\ntitle: T\n---\n", "---\nXtitle: T\n---\n", 4),
+            ("---\ntitle: T\n---\n", "X---\ntitle: T\n---\n", 0),
         ] {
             let tokens = projected_tokens(source);
             let point = live_caret_boundary(&tokens, 0, &[]);

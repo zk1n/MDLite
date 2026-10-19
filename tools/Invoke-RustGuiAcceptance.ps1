@@ -2588,7 +2588,7 @@ function Wait-UiListCount(
 }
 
 function Invoke-UiPaletteCommand([string]$Label) {
-    Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 100
+    Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 150 -Class 'EDIT'
     $query = $null
     $results = $null
     $deadline = [DateTime]::UtcNow.AddMilliseconds(2500)
@@ -2668,7 +2668,7 @@ function Invoke-UiPaletteCommand([string]$Label) {
     do {
         $stillOpen = @(
             Get-UiOwnedChildren $script:WindowHandle | Where-Object {
-                $_.Id -eq 150 -and $_.Class -ceq 'EDIT' -and $_.Visible
+                $_.Id -eq 151 -and $_.Class -ceq 'LISTBOX' -and $_.Visible
             }
         ).Count -gt 0
         if (-not $stillOpen) { return }
@@ -2679,7 +2679,7 @@ function Invoke-UiPaletteCommand([string]$Label) {
 
 function Invoke-UiPaletteCancel([string]$Query) {
     $before = Read-Diagnostic
-    Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 100
+    Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 150 -Class 'EDIT'
     $query = Get-UiControlById -Root $script:WindowHandle -ControlId 150 `
         -Class 'EDIT' -RequireVisible -RequireEnabled
     Invoke-UiControlClick $script:WindowHandle $query

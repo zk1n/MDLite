@@ -39,7 +39,6 @@ impl UiFont {
         Ok(Self { handle, root: None })
     }
 
-    #[cfg(test)]
     pub(super) fn handle(&self) -> HFONT {
         self.handle
     }
@@ -254,6 +253,21 @@ unsafe extern "system" fn cursor_proc(
             drop(Box::from_raw(data as *mut CursorState));
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
+        if !scrollbar_style::high_contrast() {
+            let action = match msg {
+                WM_LBUTTONDOWN => Some(UIS_SET),
+                WM_KEYDOWN | WM_SYSKEYDOWN => Some(UIS_CLEAR),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_CHANGEUISTATE,
+                    Some(WPARAM(action as usize | ((UISF_HIDEFOCUS as usize) << 16))),
+                    None,
+                );
+            }
+        }
         // Forwarded descendant and all native nonclient requests must pass on.
         if msg == WM_SETCURSOR && wp.0 == hwnd.0 as usize && lp.0 as u16 == HTCLIENT as u16 {
             let role = (*(data as *const CursorState)).role;
@@ -274,6 +288,36 @@ unsafe extern "system" fn cursor_proc(
             }
         }
         DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
+/// Owner drawing uses the native keyboard-cue state and the actual focused
+/// control. Empty/stale list rows must not manufacture a focus target.
+pub(super) unsafe fn draw_focus(
+    tokens: shell::Tokens,
+    item: &DRAWITEMSTRUCT,
+    area: &RECT,
+    valid_target: bool,
+) {
+    unsafe {
+        if !valid_target
+            || item.itemState.0 & ODS_FOCUS.0 == 0
+            || item.itemState.0 & ODS_NOFOCUSRECT.0 != 0
+            || GetFocus() != item.hwndItem
+            || !IsWindowEnabled(item.hwndItem).as_bool()
+            || !IsWindowVisible(item.hwndItem).as_bool()
+            || SendMessageW(item.hwndItem, WM_QUERYUISTATE, None, None).0 & UISF_HIDEFOCUS as isize
+                != 0
+        {
+            return;
+        }
+        if tokens.high_contrast {
+            let _ = DrawFocusRect(item.hDC, area);
+        } else {
+            let brush = CreateSolidBrush(shell::rgb(tokens.accent));
+            FrameRect(item.hDC, area, brush);
+            let _ = DeleteObject(brush.into());
+        }
     }
 }
 

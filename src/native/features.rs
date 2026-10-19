@@ -248,8 +248,16 @@ struct CalendarPane {
     holiday_loaded: bool,
     daily_markers: BTreeSet<CalendarDate>,
     selected_file: usize,
+    file_focused: bool,
+    click_target: Option<CalendarClickTarget>,
     scroll: usize,
     current_month: Option<CalendarMonthGrid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CalendarClickTarget {
+    Date(CalendarDate),
+    File(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -485,6 +493,8 @@ impl Default for CalendarPane {
             holiday_loaded: false,
             daily_markers: BTreeSet::new(),
             selected_file: 0,
+            file_focused: false,
+            click_target: None,
             scroll: 0,
             current_month: None,
         }
@@ -1368,6 +1378,9 @@ impl FeaturePanes {
                 self.profiles.effective = default_profiles();
             }
         }
+        self.calendar.list_generation = self.calendar.list_generation.wrapping_add(1);
+        self.calendar.listing = None;
+        self.calendar.click_target = None;
         self.profiles.selected = self
             .profiles
             .selected
@@ -1406,6 +1419,7 @@ impl FeaturePanes {
     }
 
     fn start_calendar_list(&mut self, date: CalendarDate) {
+        self.calendar.file_focused = false;
         self.calendar.scroll = 0;
         self.calendar.selected_file = 0;
         self.calendar.listing = None;
@@ -1418,7 +1432,7 @@ impl FeaturePanes {
             self.calendar.retired.push(worker.handle);
         }
         self.calendar.list_generation = self.calendar.list_generation.wrapping_add(1);
-        let request =
+        let mut request =
             match CalendarListRequest::new(&workspace, self.calendar.list_generation, date) {
                 Ok(request) => request,
                 Err(error) => {
@@ -1426,6 +1440,12 @@ impl FeaturePanes {
                     return;
                 }
             };
+        request.daily_profile = self
+            .profiles
+            .effective
+            .iter()
+            .find(|profile| profile.id == "daily")
+            .cloned();
         self.calendar.request = Some(request.clone());
         self.calendar.listing = Some(request.loading_result());
         let worker_request = request.clone();
@@ -1534,7 +1554,18 @@ impl FeaturePanes {
                         workspace,
                         self.calendar.list_generation,
                         worker.request.date,
-                    ) && self.calendar.interaction.selected() == Some(worker.request.date)
+                    ) && worker.request.daily_profile.as_ref()
+                        == self
+                            .profiles
+                            .effective
+                            .iter()
+                            .find(|profile| profile.id == "daily")
+                        && result.matches(
+                            workspace,
+                            self.calendar.list_generation,
+                            worker.request.date,
+                        )
+                        && self.calendar.interaction.selected() == Some(worker.request.date)
                         && self.workspace_identity.as_ref().is_some_and(|identity| {
                             identity.same_workspace(&result.workspace_identity)
                         })
@@ -2081,6 +2112,43 @@ impl FeaturePanes {
         Ok(())
     }
 
+    fn calendar_file_action(&self) -> Option<FeatureAction> {
+        let workspace = self.workspace.as_ref()?;
+        let request = self.calendar.request.as_ref()?;
+        let listing = self.calendar.listing.as_ref()?;
+        if !request.matches(workspace, self.calendar.list_generation, request.date)
+            || self.calendar.interaction.selected() != Some(request.date)
+            || !listing.matches(workspace, request.generation, request.date)
+        {
+            return None;
+        }
+        let file = listing.files.get(self.calendar.selected_file)?;
+        Some(FeatureAction::OpenCalendarFile {
+            request: Box::new(request.clone()),
+            relative_path: file.relative_path.clone(),
+        })
+    }
+
+    fn double_click(
+        &mut self,
+        panel: PanelId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Option<FeatureAction> {
+        let previous = self.calendar.click_target.take();
+        self.click(panel, x, y, width, height);
+        let current = self.calendar.click_target.take();
+        if previous.is_none() || previous != current {
+            return Some(FeatureAction::Refresh);
+        }
+        match current? {
+            CalendarClickTarget::Date(date) => Some(FeatureAction::OpenDaily(date)),
+            CalendarClickTarget::File(_) => self.calendar_file_action(),
+        }
+    }
+
     fn click(
         &mut self,
         panel: PanelId,
@@ -2089,6 +2157,7 @@ impl FeaturePanes {
         panel_width: f32,
         panel_height: f32,
     ) -> Option<FeatureAction> {
+        self.calendar.click_target = None;
         if panel == PanelId::Outline {
             let row_top = y - 8.;
             if row_top < 0. {
@@ -2147,18 +2216,11 @@ impl FeaturePanes {
                     .current_month
                     .and_then(|grid| grid.cells[index])
                 {
-                    if self.profiles.manager_open {
-                        let _ = self.calendar.interaction.set_selection(Some(date));
-                    } else {
-                        let _ = self.calendar.interaction.click_date(date);
-                    }
-                    self.calendar.selected_file = 0;
+                    self.calendar.interaction.click_date(date);
+                    self.calendar.file_focused = false;
                     self.start_calendar_list(date);
-                    return Some(if self.profiles.manager_open {
-                        FeatureAction::Refresh
-                    } else {
-                        FeatureAction::OpenDaily(date)
-                    });
+                    self.calendar.click_target = Some(CalendarClickTarget::Date(date));
+                    return Some(FeatureAction::Refresh);
                 }
                 return None;
             }
@@ -2178,10 +2240,11 @@ impl FeaturePanes {
                     return None;
                 }
                 let file = listing.files.get(index)?;
-                return Some(FeatureAction::OpenCalendarFile {
-                    request: request.clone(),
-                    relative_path: file.relative_path.clone(),
-                });
+                self.calendar.selected_file = index;
+                self.calendar.file_focused = true;
+                self.calendar.click_target =
+                    Some(CalendarClickTarget::File(file.relative_path.clone()));
+                return Some(FeatureAction::Refresh);
             }
         }
         None
@@ -2310,39 +2373,46 @@ impl FeaturePanes {
             return None;
         }
         match active {
-            PanelId::Calendar => match key {
-                KEY_LEFT => {
-                    self.calendar.interaction.move_focus_days(-1);
-                    Some(FeatureAction::Refresh)
+            PanelId::Calendar => {
+                self.calendar.click_target = None;
+                if key != KEY_RETURN {
+                    self.calendar.file_focused = false;
                 }
-                KEY_RIGHT => {
-                    self.calendar.interaction.move_focus_days(1);
-                    Some(FeatureAction::Refresh)
+                match key {
+                    KEY_LEFT => {
+                        self.calendar.interaction.move_focus_days(-1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_RIGHT => {
+                        self.calendar.interaction.move_focus_days(1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_UP => {
+                        self.calendar.interaction.move_focus_days(-7);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_DOWN => {
+                        self.calendar.interaction.move_focus_days(7);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_PAGE_UP => {
+                        self.calendar.interaction.navigate_months(-1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_PAGE_DOWN => {
+                        self.calendar.interaction.navigate_months(1);
+                        Some(FeatureAction::Refresh)
+                    }
+                    KEY_RETURN if self.calendar.file_focused => self.calendar_file_action(),
+                    KEY_RETURN => Some(FeatureAction::OpenDaily(
+                        self.calendar
+                            .interaction
+                            .focused()
+                            .unwrap_or(self.calendar.interaction.today()),
+                    )),
+                    _ => None,
                 }
-                KEY_UP => {
-                    self.calendar.interaction.move_focus_days(-7);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_DOWN => {
-                    self.calendar.interaction.move_focus_days(7);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_PAGE_UP => {
-                    self.calendar.interaction.navigate_months(-1);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_PAGE_DOWN => {
-                    self.calendar.interaction.navigate_months(1);
-                    Some(FeatureAction::Refresh)
-                }
-                KEY_RETURN => Some(FeatureAction::OpenDaily(
-                    self.calendar
-                        .interaction
-                        .focused()
-                        .unwrap_or(self.calendar.interaction.today()),
-                )),
-                _ => None,
-            },
+            }
             PanelId::Explorer => match key {
                 KEY_UP => {
                     self.explorer.selected = self
@@ -2731,7 +2801,7 @@ enum FeatureAction {
     Command(usize),
     OpenFile(PathBuf),
     OpenCalendarFile {
-        request: CalendarListRequest,
+        request: Box<CalendarListRequest>,
         relative_path: PathBuf,
     },
     OpenDaily(CalendarDate),
@@ -2928,6 +2998,37 @@ impl App {
         target: &ID2D1HwndRenderTarget,
     ) -> windows::core::Result<()> {
         self.features.draw(self, target)
+    }
+
+    pub(super) fn features_reset_calendar_click(&mut self) {
+        self.features.calendar.click_target = None;
+    }
+
+    pub(super) unsafe fn features_double_click(&mut self, panel: PanelId, x: f32, y: f32) -> bool {
+        if panel != PanelId::Calendar {
+            return false;
+        }
+        if self.feature_ime_active() || self.background_mutation_busy() {
+            return true;
+        }
+        let Some(body) = self.feature_panel_rect(panel) else {
+            return false;
+        };
+        if x < body.x || y < body.y || x >= body.x + body.width || y >= body.y + body.height {
+            return false;
+        }
+        self.focus_feature_body(panel);
+        if let Some(action) =
+            self.features
+                .double_click(panel, x - body.x, y - body.y, body.width, body.height)
+        {
+            self.run_feature_action(action);
+            self.features_sync();
+            unsafe {
+                self.refresh();
+            }
+        }
+        true
     }
 
     pub(super) unsafe fn features_click(&mut self, panel: PanelId, x: f32, y: f32) -> bool {
@@ -3592,14 +3693,14 @@ impl App {
             }
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_ok() {
-                let selected = TrackPopupMenu(
+                let selected = super::menu_style::track_popup(
+                    self.hwnd,
                     menu,
                     TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
                     point.x,
                     point.y,
-                    None,
-                    self.hwnd,
-                    None,
+                    self.shell.tokens,
+                    self.dpi,
                 )
                 .0;
                 let _ = DestroyMenu(menu);
@@ -4008,7 +4109,14 @@ impl App {
                 workspace,
                 self.features.calendar.list_generation,
                 request.date,
-            ) && request_is_current
+            ) && request.daily_profile.as_ref()
+                == self
+                    .features
+                    .profiles
+                    .effective
+                    .iter()
+                    .find(|profile| profile.id == "daily")
+                && request_is_current
                 && self.features.calendar.interaction.selected() == Some(request.date)
                 && self
                     .features
@@ -4150,12 +4258,14 @@ impl App {
     }
 
     fn navigate_month(&mut self, amount: i32) -> bool {
+        self.features_reset_calendar_click();
         self.features.calendar.interaction.navigate_months(amount);
         self.features_sync();
         true
     }
 
     fn select_today(&mut self) -> bool {
+        self.features_reset_calendar_click();
         self.features.calendar.interaction.select_today();
         self.features_sync();
         true
@@ -5263,7 +5373,7 @@ impl App {
                 request,
                 relative_path,
             } => {
-                self.open_calendar_file(request, relative_path);
+                self.open_calendar_file(*request, relative_path);
                 return;
             }
             FeatureAction::OpenDaily(date) => {
@@ -6575,6 +6685,81 @@ mod tests {
     }
 
     #[test]
+    fn calendar_discards_async_result_after_profile_change() {
+        let root = std::env::temp_dir().join(format!(
+            "mdlite-calendar-profile-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let date = local_now().date;
+        let mut features = FeaturePanes::default();
+        features.workspace = Some(workspace.clone());
+        features.workspace_identity = Some(workspace.identity().clone());
+        features.profiles.effective = default_profiles();
+        let mut request = CalendarListRequest::new(&workspace, 1, date).unwrap();
+        request.daily_profile = Some(features.profiles.effective[0].clone());
+        features.calendar.list_generation = 1;
+        features.calendar.interaction.set_selection(Some(date));
+        let (sender, receiver) = mpsc::channel();
+        sender.send(request.loading_result()).unwrap();
+        features.calendar.worker = Some(CalendarWorker {
+            request,
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+            handle: thread::spawn(|| {}),
+        });
+        features.profiles.effective[0].directory = "Changed".into();
+        assert!(features.poll_workers().is_empty());
+        assert!(features.calendar.listing.is_none());
+        drop(features);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn calendar_click_requires_os_doubleclick_same_target_and_reset() {
+        let mut features = FeaturePanes::default();
+        let date = CalendarDate::new(2026, 10, 19).unwrap();
+        let grid = month_grid(date).unwrap();
+        features.calendar.current_month = Some(grid);
+        let index = grid
+            .cells
+            .iter()
+            .position(|cell| *cell == Some(date))
+            .unwrap();
+        let width = 260.0;
+        let cell_width = (width - 10.0) / 7.0;
+        let layout = calendar_layout(320.0);
+        let x = 5.0 + (index % 7) as f32 * cell_width + 2.0;
+        let y = layout.grid_top + (index / 7) as f32 * layout.week_step + 1.0;
+        for _ in 0..2 {
+            assert!(matches!(
+                features.click(PanelId::Calendar, x, y, width, 320.0),
+                Some(FeatureAction::Refresh)
+            ));
+        }
+        assert!(matches!(
+            features.double_click(PanelId::Calendar, x + cell_width, y, width, 320.0),
+            Some(FeatureAction::Refresh)
+        ));
+        features.click(PanelId::Calendar, x, y, width, 320.0);
+        features.calendar.click_target = None;
+        assert!(matches!(
+            features.double_click(PanelId::Calendar, x, y, width, 320.0),
+            Some(FeatureAction::Refresh)
+        ));
+        features.click(PanelId::Calendar, x, y, width, 320.0);
+        assert!(
+            matches!(features.double_click(PanelId::Calendar, x, y, width, 320.0), Some(FeatureAction::OpenDaily(day)) if day == date)
+        );
+        assert!(features.calendar.click_target.is_none());
+    }
+
+    #[test]
     fn calendar_daily_click_uses_midnight_while_today_and_generic_routes_capture_local_now() {
         let nonce = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6606,6 +6791,12 @@ mod tests {
         let action = click_app
             .features
             .click(PanelId::Calendar, x, y, 260.0, 320.0)
+            .unwrap();
+        assert!(matches!(&action, FeatureAction::Refresh));
+        assert_eq!(click_app.features.pending_daily, None);
+        let action = click_app
+            .features
+            .double_click(PanelId::Calendar, x, y, 260.0, 320.0)
             .unwrap();
         assert!(matches!(&action, FeatureAction::OpenDaily(date) if *date == past));
         click_app.run_feature_action(action);
@@ -6698,6 +6889,8 @@ mod tests {
                 .features
                 .click(PanelId::Calendar, 0.0, layout.rows_top + 1.0, 260.0, 320.0)
                 .unwrap();
+            assert!(matches!(action, FeatureAction::Refresh));
+            let action = app.features.calendar_file_action().unwrap();
             assert!(matches!(action, FeatureAction::OpenCalendarFile { .. }));
 
             match scenario {

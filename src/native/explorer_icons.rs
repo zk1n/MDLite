@@ -7,13 +7,13 @@ use windows::{
         Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM},
         Graphics::Gdi::{
             CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT, DT_NOPREFIX, DT_SINGLELINE,
-            DT_VCENTER, DeleteObject, DrawFocusRect, FillRect, GetDC, GetObjectW, GetStockObject,
+            DT_VCENTER, DeleteObject, FillRect, GetDC, GetObjectW, GetStockObject,
             GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ, IntersectClipRect, LOGFONTW, ReleaseDC,
             RestoreDC, SaveDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
         },
         Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
         UI::{
-            Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, ODT_LISTBOX},
+            Controls::{DRAWITEMSTRUCT, ODS_SELECTED, ODT_LISTBOX},
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Shell::{
                 SHFILEINFOW, SHGFI_ICON, SHGFI_OPENICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
@@ -405,7 +405,7 @@ unsafe fn draw_row(
             viewport.right,
             viewport.bottom,
         );
-        let background = if item.itemState.0 & ODS_SELECTED.0 != 0 {
+        let background = if row.is_some() && item.itemState.0 & ODS_SELECTED.0 != 0 {
             tokens.selected
         } else {
             tokens.panel
@@ -465,9 +465,7 @@ unsafe fn draw_row(
                 );
             }
         }
-        if item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_NOFOCUSRECT.0 == 0 {
-            let _ = DrawFocusRect(item.hDC, &viewport);
-        }
+        super::control_style::draw_focus(tokens, item, &viewport, row.is_some());
         true
     }
 }
@@ -690,7 +688,7 @@ mod tests {
             );
             assert!(icons.measure_extent(list.hwnd).unwrap() > 1024);
             item.itemID = u32::MAX;
-            item.itemState.0 = ODS_FOCUS.0 | ODS_SELECTED.0;
+            item.itemState.0 = windows::Win32::UI::Controls::ODS_FOCUS.0 | ODS_SELECTED.0;
             item.hDC = full.0;
             assert!(icons.draw_offset(&item, shell::Tokens::default(), 0));
             item.hDC = clipped.0;
@@ -699,6 +697,12 @@ mod tests {
                 (0..32)
                     .all(|y| (0..160).all(|x| GetPixel(clipped.0, x, y) == GetPixel(full.0, x, y))),
                 "focus and background must stay in viewport coordinates"
+            );
+            assert!(
+                (0..32).all(|y| (0..160).all(|x| {
+                    GetPixel(clipped.0, x, y) == shell::rgb(shell::Tokens::default().panel)
+                })),
+                "an empty list has no selected row or focus rectangle"
             );
         }
     }

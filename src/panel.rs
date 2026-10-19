@@ -41,6 +41,8 @@ pub struct PanelState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelLayout {
     pub panels: [PanelState; 4],
+    pub left_visible: bool,
+    pub right_visible: bool,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -61,6 +63,8 @@ pub struct Geometry {
 impl Default for PanelLayout {
     fn default() -> Self {
         Self {
+            left_visible: true,
+            right_visible: true,
             panels: std::array::from_fn(|i| PanelState {
                 id: IDS[i],
                 slot: SLOTS[i],
@@ -73,6 +77,20 @@ impl Default for PanelLayout {
     }
 }
 impl PanelLayout {
+    pub fn region_visible(&self, id: PanelId) -> bool {
+        if is_left(self.get(id).slot) {
+            self.left_visible
+        } else {
+            self.right_visible
+        }
+    }
+    pub fn show_region_for(&mut self, id: PanelId) {
+        if is_left(self.get(id).slot) {
+            self.left_visible = true;
+        } else {
+            self.right_visible = true;
+        }
+    }
     pub fn get(&self, id: PanelId) -> &PanelState {
         &self.panels[id as usize]
     }
@@ -108,7 +126,7 @@ impl PanelLayout {
         let side_width = |left: bool| {
             self.panels
                 .iter()
-                .filter(|p| !p.hidden && is_left(p.slot) == left)
+                .filter(|p| !p.hidden && self.region_visible(p.id) && is_left(p.slot) == left)
                 .map(|p| p.width)
                 .fold(0.0, f32::max)
         };
@@ -140,7 +158,7 @@ impl PanelLayout {
                 _ => 0.0,
             };
             let w = if is_left(p.slot) { left } else { right };
-            let rect = if p.hidden {
+            let rect = if p.hidden || !self.region_visible(p.id) {
                 Rect::default()
             } else {
                 Rect {
@@ -176,6 +194,7 @@ impl PanelLayout {
     /// Legacy schema 1 is retained: all four complete records, unique id and slot.
     pub fn parse(text: &str) -> Result<Self, &'static str> {
         let mut version = false;
+        let mut regions = std::collections::BTreeMap::new();
         let mut records: Vec<std::collections::BTreeMap<&str, &str>> = Vec::new();
         for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
@@ -189,10 +208,16 @@ impl PanelLayout {
             let (key, value) = line.split_once('=').ok_or("invalid panel line")?;
             let (key, value) = (key.trim(), value.trim());
             if records.is_empty() {
-                if key != "schema_version" || value != "1" || version {
-                    return Err("unsupported panel schema");
+                match key {
+                    "schema_version" if value == "1" && !version => version = true,
+                    "left_visible" | "right_visible" => {
+                        let value: bool = value.parse().map_err(|_| "invalid region visibility")?;
+                        if regions.insert(key, value).is_some() {
+                            return Err("duplicate region visibility");
+                        }
+                    }
+                    _ => return Err("unsupported panel schema"),
                 }
-                version = true;
             } else if records.last_mut().unwrap().insert(key, value).is_some() {
                 return Err("duplicate panel field");
             }
@@ -200,7 +225,11 @@ impl PanelLayout {
         if !version || records.len() != 4 {
             return Err("all four panel records required");
         }
-        let mut result = Self::default();
+        let mut result = Self {
+            left_visible: regions.get("left_visible").copied().unwrap_or(true),
+            right_visible: regions.get("right_visible").copied().unwrap_or(true),
+            ..Self::default()
+        };
         let mut ids = [false; 4];
         let mut slots = [false; 4];
         for record in records {
@@ -232,7 +261,10 @@ impl PanelLayout {
         Ok(result)
     }
     pub fn serialize(&self) -> String {
-        let mut text = String::from("schema_version = 1\n");
+        let mut text = format!(
+            "schema_version = 1\nleft_visible = {}\nright_visible = {}\n",
+            self.left_visible, self.right_visible
+        );
         for p in &self.panels {
             text.push_str(&format!("\n[[panel]]\nid = \"{}\"\nslot = \"{}\"\nwidth = {}\nheight = {}\ncollapsed = {}\nhidden = {}\n", NAMES[p.id as usize], SLOT_NAMES[p.slot as usize], p.width, p.height, p.collapsed, p.hidden));
         }
@@ -255,6 +287,51 @@ fn finite_nonnegative(n: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regions_release_width_and_preserve_individual_panel_state() {
+        let mut layout = PanelLayout::default();
+        layout.move_to(PanelId::Calendar, Slot::RightTop);
+        layout.get_mut(PanelId::Explorer).collapsed = true;
+        layout.get_mut(PanelId::Git).hidden = true;
+        let panels = layout.panels.clone();
+        let full = layout.geometry(1440., 900., 36., 24.);
+        for (left, right) in [(true, true), (false, true), (true, false), (false, false)] {
+            layout.left_visible = left;
+            layout.right_visible = right;
+            let geometry = layout.geometry(1440., 900., 36., 24.);
+            assert_eq!(layout.panels, panels);
+            for (id, rect) in geometry.panels {
+                if !layout.region_visible(id) {
+                    assert_eq!(rect, Rect::default());
+                }
+            }
+            assert!(geometry.editor.width >= full.editor.width);
+            if !left && !right {
+                assert_eq!(geometry.editor.width, 1396.);
+            }
+            assert_eq!(PanelLayout::parse(&layout.serialize()).unwrap(), layout);
+        }
+        let legacy = layout
+            .serialize()
+            .lines()
+            .filter(|line| !line.starts_with("left_visible") && !line.starts_with("right_visible"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loaded = PanelLayout::parse(&legacy).unwrap();
+        assert!(loaded.left_visible && loaded.right_visible);
+        assert_eq!(loaded.panels, panels);
+        assert!(
+            PanelLayout::parse(&layout.serialize().replacen(
+                "left_visible = false",
+                "left_visible = invalid",
+                1
+            ))
+            .is_err()
+        );
+        assert!(
+            PanelLayout::parse(&format!("left_visible = true\n{}", layout.serialize())).is_err()
+        );
+    }
     #[test]
     fn legacy_roundtrip_rejects_duplicates_unknown_schema_and_nan() {
         let layout = PanelLayout::default();

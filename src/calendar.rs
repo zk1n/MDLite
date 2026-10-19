@@ -198,7 +198,7 @@ pub fn decorate_month(
 pub struct CalendarChange {
     pub month_changed: bool,
     pub selection_changed: bool,
-    /// Set only for click or Enter activation. Month and Today navigation never open a note.
+    /// Set only for explicit double-click or Enter activation. Month and Today navigation never open a note.
     pub activate_date: Option<CalendarDate>,
 }
 
@@ -358,7 +358,7 @@ impl CalendarInteraction {
         CalendarChange {
             month_changed,
             selection_changed,
-            activate_date: Some(date),
+            activate_date: None,
         }
     }
 
@@ -443,6 +443,7 @@ pub struct CalendarListRequest {
     pub workspace_identity: WorkspaceIdentity,
     pub workspace_root: PathBuf,
     pub date: CalendarDate,
+    pub daily_profile: Option<ProfileDefinition>,
 }
 
 #[derive(Clone, Debug)]
@@ -470,6 +471,7 @@ impl CalendarListRequest {
             workspace_identity: workspace.identity().clone(),
             workspace_root: workspace.root().to_path_buf(),
             date,
+            daily_profile: None,
         })
     }
 
@@ -579,9 +581,19 @@ impl CalendarListRequest {
         all_files.sort_by(|left, right| {
             path_sort_key(&left.relative_path).cmp(&path_sort_key(&right.relative_path))
         });
+        let default_daily = crate::profiles::default_profiles().remove(0);
         let files: Vec<_> = all_files
             .iter()
-            .filter(|entry| entry.creation_date_local == Some(self.date))
+            .filter(|entry| {
+                entry.creation_date_local == Some(self.date)
+                    && !self.daily_profile.as_ref().is_some_and(|profile| {
+                        crate::profiles::is_daily_profile_destination(profile, &entry.relative_path)
+                    })
+                    && !crate::profiles::is_daily_profile_destination(
+                        &default_daily,
+                        &entry.relative_path,
+                    )
+            })
             .cloned()
             .collect();
         let state = if errors.is_empty() {
@@ -1409,7 +1421,7 @@ mod tests {
         assert_eq!(today_change.activate_date, None);
         assert_eq!(state.selected(), Some(today));
         let clicked = state.click_date(CalendarDate::new(2024, 2, 14).unwrap());
-        assert_eq!(clicked.activate_date, CalendarDate::new(2024, 2, 14));
+        assert_eq!(clicked.activate_date, None);
         assert_eq!(state.selected(), CalendarDate::new(2024, 2, 14));
         state.set_hover(Some(CalendarDate::new(2024, 2, 15).unwrap()));
         assert_eq!(state.hovered(), CalendarDate::new(2024, 2, 15));
@@ -1479,6 +1491,46 @@ mod tests {
             Err(CalendarError::Io(_))
         ));
         assert_eq!(request.execute(|| true).state, CalendarListState::Cancelled);
+    }
+
+    #[test]
+    fn calendar_filters_all_daily_destinations_without_changing_inventory() {
+        let fixture = Fixture::new();
+        let workspace = Workspace::open(&fixture.0).unwrap();
+        for name in [
+            "Dairy/2001/200102/20010203.md",
+            "Custom/2000-01-02.md",
+            "Meeting/2001/200102/20010203.md",
+            "20260101.md",
+            "Memo.md",
+        ] {
+            let path = fixture.0.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "test").unwrap();
+        }
+        let mut profile = crate::profiles::default_profiles().remove(0);
+        profile.directory = PathBuf::from("Custom");
+        profile.filename = PathBuf::from("{{date:yyyy-MM-dd}}.md");
+        let date = local_creation_date(&fs::metadata(fixture.0.join("Memo.md")).unwrap()).unwrap();
+        let mut request = CalendarListRequest::new(&workspace, 7, date).unwrap();
+        request.daily_profile = Some(profile);
+        let result = request.execute(|| false);
+        assert_eq!(result.file_count(), 3);
+        assert_eq!(result.workspace_files.len(), 5);
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|entry| entry.relative_path.starts_with("Meeting"))
+        );
+        assert!(fixture.0.join("Dairy/2001/200102/20010203.md").is_file());
+        for path in ["Meeting/2001/200102/20010203.md", "20260101.md", "Memo.md"] {
+            fs::remove_file(fixture.0.join(path)).unwrap();
+        }
+        let empty = request.execute(|| false);
+        assert_eq!(empty.state, CalendarListState::Zero);
+        assert_eq!(empty.file_count(), 0);
+        assert_eq!(empty.workspace_files.len(), 2);
     }
 
     #[test]

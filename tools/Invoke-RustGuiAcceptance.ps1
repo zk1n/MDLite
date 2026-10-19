@@ -575,6 +575,18 @@ public static class MdliteRustAcceptanceNative
     [DllImport("user32.dll")]
     private static extern IntPtr GetTopWindow(IntPtr window);
 
+    public static bool TestS02PassiveRectOverlap(int[] crop, int[] rectangle, bool boundsKnown)
+    {
+        if (!boundsKnown) return true;
+        if (crop == null || rectangle == null || crop.Length != 4 || rectangle.Length != 4) return true;
+        long cropWidth = (long)crop[2] - crop[0], cropHeight = (long)crop[3] - crop[1];
+        long width = (long)rectangle[2] - rectangle[0], height = (long)rectangle[3] - rectangle[1];
+        if (cropWidth <= 0 || cropHeight <= 0 || width < 0 || height < 0) return true;
+        if (width == 0 || height == 0) return false;
+        return rectangle[0] < crop[2] && rectangle[2] > crop[0] &&
+            rectangle[1] < crop[3] && rectangle[3] > crop[1];
+    }
+
     public static bool TestS02PassiveBounds(int[] crop, int[] current, int[] desktop)
     {
         if (crop == null || current == null || desktop == null || crop.Length != 4 || current.Length != 4 || desktop.Length != 4)
@@ -630,7 +642,7 @@ public static class MdliteRustAcceptanceNative
                 if (DwmGetWindowAttribute(surface, 14, out hidden, sizeof(int)) == 0 && hidden != 0) continue;
                 RECT rectangle;
                 bool known = GetWindowRect(surface, out rectangle);
-                if (!known || (rectangle.Left < crop[2] && rectangle.Right > crop[0] && rectangle.Top < crop[3] && rectangle.Bottom > crop[1])) {
+                if (TestS02PassiveRectOverlap(crop, known ? new int[] { rectangle.Left, rectangle.Top, rectangle.Right, rectangle.Bottom } : null, known)) {
                     uint process; GetWindowThreadProcessId(surface, out process);
                     overlap = true;
                     blocker = new Dictionary<string, object> {
@@ -4521,6 +4533,23 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     return $receipt
 }
 
+function Test-Rev3MainAfterFrameBinding($SourceBefore, $RenderedAfter, [long]$MainHwnd) {
+    # The earlier stamp contributes SOURCE identity only. Its observed frame may
+    # be absent/stale before the fence; only RenderedAfter proves matching EndDraw.
+    try {
+        if ($MainHwnd -eq 0 -or $null -eq $SourceBefore -or $null -eq $RenderedAfter -or -not $SourceBefore.available -or -not $RenderedAfter.available) { return $false }
+        if ($null -eq $SourceBefore.document_id -or $null -eq $SourceBefore.revision -or
+            [string]::IsNullOrWhiteSpace([string]$SourceBefore.source_sha256) -or
+            $null -eq $RenderedAfter.document_id -or $null -eq $RenderedAfter.revision -or
+            [string]::IsNullOrWhiteSpace([string]$RenderedAfter.source_sha256)) { return $false }
+        $frame=$RenderedAfter.painted_frame
+        return $SourceBefore.document_id -eq $RenderedAfter.document_id -and $SourceBefore.revision -eq $RenderedAfter.revision -and
+            $SourceBefore.source_sha256 -ceq $RenderedAfter.source_sha256 -and $null -ne $frame -and
+            $frame.hwnd -eq $MainHwnd -and $frame.document_id -eq $RenderedAfter.document_id -and
+            $frame.revision -eq $RenderedAfter.revision -and $frame.sequence -gt 0
+    } catch { return $false }
+}
+
 function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     Assert-UiOwnedWindow $Window
     Set-OwnedForeground -Window $Window
@@ -4548,21 +4577,43 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     if ($width -lt 1 -or $height -lt 1 -or $width -gt 7680 -or $height -gt 4320) {
         throw [System.InvalidOperationException]::new('OWNED_WINDOW_CAPTURE_BOUNDS_INVALID')
     }
+    $rev3MainObservation=$Rev3 -and $Window -eq $script:WindowHandle -and
+        [MdliteRustAcceptanceNative]::WindowClass($Window) -ceq 'MDLiteRustEditor'
     Add-Type -AssemblyName System.Drawing
     $bitmap = [System.Drawing.Bitmap]::new($width, $height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    $readiness=[ordered]@{ before=(Get-OwnedCaptureStamp); after=$null; fence=$null; unfenced_capture=$null; copy_started_utc=$null; copy_completed_utc=$null; source_revision_binding='UNAVAILABLE'; visual_acceptance='NOT_ASSERTED: inspect the actual captured pixels.' }
+    $readiness=[ordered]@{
+        before=(Get-OwnedCaptureStamp); after=$null; after_copy=$null; fence=$null; unfenced_capture=$null
+        copy_started_utc=$null; copy_completed_utc=$null; image_persisted=$false
+        source_revision_binding='UNAVAILABLE'
+        visual_acceptance=if ($rev3MainObservation) { 'PENDING: inspect actual pixels together with semantic evidence.' } else { 'NOT_ASSERTED: inspect the actual captured pixels.' }
+        observation_kind=if ($rev3MainObservation) { 'OWNED_NATURAL_PIXEL_OBSERVATION' } else { 'LEGACY_STRICT_PENDING_REGION_GATE' }
+        quiescence=if ($rev3MainObservation) { 'UNCONFIRMED' } else { 'LEGACY_GATE' }
+        natural_pending_regions=@(); ownership_before_copy=$null; ownership_after_copy=$null
+        binding_limitations='Main EndDraw/source identity does not prove layout or child-surface freshness.'
+        pre_fence_frame_contract=if ($rev3MainObservation) { 'OBSERVED_UNASSERTED: may be missing/stale before the paint fence.' } else { 'LEGACY_BEHAVIOR' }
+        copied_frame_contract=if ($rev3MainObservation) { 'AVAILABLE_UNCHANGED_SOURCE_ALL_THREE_STAMPS; MATCHING_MAIN_ENDDRAW_POST_FENCE_AND_POST_COPY' } else { 'LEGACY_BEHAVIOR' }
+    }
     try {
         Assert-UiOwnedWindow $Window
         if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
             throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground before client capture.'
         }
         $readiness.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($Window,$script:ProcessId,7000,$true)
-        if ($readiness.fence.reconciliation_blocked -or @($readiness.fence.pending_after).Count -ne 0) {
+        if ($readiness.fence.reconciliation_blocked -or
+            (-not $rev3MainObservation -and @($readiness.fence.pending_after).Count -ne 0)) {
             throw 'OBSERVER_FAILURE: owned pending paint did not drain within the bounded render fence.'
         }
+        if ($rev3MainObservation) {
+            $readiness.natural_pending_regions=@($readiness.fence.final_surface_observations | Where-Object { $_.visible -and $_.pending })
+        }
         $readiness.after=Get-OwnedCaptureStamp
-        if ($readiness.before.available -and $readiness.after.available) {
+        if ($rev3MainObservation) {
+            if (-not (Test-Rev3MainAfterFrameBinding $readiness.before $readiness.after $Window.ToInt64())) {
+                throw 'OBSERVER_FAILURE: Rev3 Main source and successful Main EndDraw binding unavailable or mismatched.'
+            }
+            $readiness.source_revision_binding='MATCH: unchanged source and successful POST-FENCE Main EndDraw; pre-fence frame unasserted.'
+        } elseif ($readiness.before.available -and $readiness.after.available) {
             if ($readiness.before.document_id -ne $readiness.after.document_id -or
                 $readiness.before.revision -ne $readiness.after.revision -or
                 $readiness.before.source_sha256 -cne $readiness.after.source_sha256) {
@@ -4574,6 +4625,13 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                     throw 'OBSERVER_FAILURE: last successful painted frame does not match the source revision.'
                 }
                 $readiness.source_revision_binding='MATCH: last successful EndDraw identity; visual pixels still require inspection.'
+            }
+        }
+        if ($rev3MainObservation) {
+            Assert-OwnedWindow $Window
+            $readiness.ownership_before_copy=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($Window,[IntPtr]::Zero,$script:ProcessId,$bounds)
+            if (-not $readiness.ownership_before_copy.safe) {
+                throw 'OWNERSHIP_GATE: Rev3 Main crop is not currently owned, opaque, fixed and unoccluded before COPY.'
             }
         }
         $readiness.copy_started_utc=[DateTime]::UtcNow.ToString('o')
@@ -4606,13 +4664,26 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                 throw 'ENVIRONMENT_BLOCKED: owned client bounds changed during capture.'
             }
         }
+        if ($rev3MainObservation) {
+            $readiness.after_copy=Get-OwnedCaptureStamp
+            if (-not (Test-Rev3MainAfterFrameBinding $readiness.after $readiness.after_copy $Window.ToInt64())) {
+                throw 'OBSERVER_FAILURE: Rev3 Main source/render binding changed during COPY; image discarded.'
+            }
+            Assert-OwnedWindow $Window
+            $readiness.ownership_after_copy=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($Window,[IntPtr]::Zero,$script:ProcessId,$bounds)
+            if (-not $readiness.ownership_after_copy.safe) {
+                throw 'OWNERSHIP_GATE: Rev3 Main crop ownership/opacity/occlusion changed during COPY; image discarded.'
+            }
+            $readiness.source_revision_binding='MATCH: unchanged source across all three stamps; matching Main EndDraw POST-FENCE and POST-COPY. Pre-fence frame observed only; layout/children/quiescence unasserted.'
+        }
         $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        $readiness.image_persisted=$true
     } finally {
         [IO.File]::WriteAllText(($Path+'.readiness.json'),($readiness | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
         $graphics.Dispose()
         $bitmap.Dispose()
     }
-    return [pscustomobject]@{ capture_kind='client'; bounds=$bounds; width=$width; height=$height; readiness_path=($Path+'.readiness.json'); source_revision_binding=$readiness.source_revision_binding }
+    return [pscustomobject]@{ capture_kind='client'; bounds=$bounds; width=$width; height=$height; readiness_path=($Path+'.readiness.json'); source_revision_binding=$readiness.source_revision_binding; observation_kind=$readiness.observation_kind; quiescence=$readiness.quiescence; visual_acceptance=$readiness.visual_acceptance }
 }
 
 function Wait-UiFileState(
@@ -5290,10 +5361,10 @@ function Invoke-Rev3FocusedCases($StartupState) {
                 before=@{document_id=$before.document_id;revision=$before.revision;source_sha256=(Get-UiTextSha256 $before.source);selection=$before.selection;scroll=$before.scroll;dirty=$before.dirty;undo_count=$before.undo_count;redo_count=$before.redo_count}
                 after=@{document_id=$after.document_id;revision=$after.revision;source_sha256=(Get-UiTextSha256 $after.source);selection=$after.selection;scroll=$after.scroll;dirty=$after.dirty;undo_count=$after.undo_count;redo_count=$after.redo_count}
             }
-            $finalPath=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'-final-fenced.png')
-            $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE FINAL FENCED SNAPSHOT' }
+            $finalPath=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'-final-owned-snapshot.png')
+            $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE OWNED SNAPSHOT; NOT SETTLED OR FLICKER PROOF' }
         }
-        @{ close_paths=$paths; final_fenced_frames=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
+        @{ close_paths=$paths; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
     })
     [void](Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
         $frames=@()

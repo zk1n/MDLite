@@ -1540,38 +1540,67 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
     }
 }
+struct PreparedSettings {
+    state: Box<Window>,
+    hwnd: HWND,
+    owner: HWND,
+}
+
+struct SettingsOutcome {
+    detail: Option<PathBuf>,
+    quit: Option<WPARAM>,
+}
+
 impl App {
-    pub(super) unsafe fn show_settings(&mut self) {
+    pub(super) fn show_settings(&mut self) {
+        if !self.composing {
+            self.settings_requested = true;
+        }
+    }
+
+    unsafe fn prepare_settings(&mut self) -> Option<PreparedSettings> {
         unsafe {
             if self.composing {
-                return;
+                return None;
             }
             let Some(common) = std::env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .map(|p| p.join("MDLite/settings.toml"))
             else {
                 self.status = "共通設定の保存先を取得できません".into();
-                return;
+                return None;
             };
+            let paths: Vec<_> = std::iter::once(common)
+                .chain(
+                    self.persistence
+                        .workspace_root()
+                        .map(|p| p.join(".mdlite/settings.toml")),
+                )
+                .collect();
+            self.prepare_settings_files(paths)
+        }
+    }
+
+    unsafe fn prepare_settings_files(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<PreparedSettings> {
+        unsafe {
             let fields = field_specs();
             let mut forms = Vec::new();
-            for path in std::iter::once(common).chain(
-                self.persistence
-                    .workspace_root()
-                    .map(|p| p.join(".mdlite/settings.toml")),
-            ) {
+            for path in paths {
                 let file = match CapturedSettings::capture(path) {
                     Ok(f) => f,
                     Err(e) => {
                         self.notice("設定を開けません", &e.to_string());
-                        return;
+                        return None;
                     }
                 };
                 let expected = match raw(file.target()) {
                     Ok(v) => v,
                     Err(e) => {
                         self.notice("設定を開けません", &e.to_string());
-                        return;
+                        return None;
                     }
                 };
                 let baseline = values(&file, &fields);
@@ -1638,7 +1667,7 @@ impl App {
             let Ok(hwnd) = hwnd else {
                 let _ = DeleteObject(brush.into());
                 self.status = "設定windowを作成できません".into();
-                return;
+                return None;
             };
             state.form.borrow_mut().hwnd = hwnd;
             state.form.borrow_mut().create_controls();
@@ -1651,7 +1680,36 @@ impl App {
             scroll_window(&state, 0);
             self.monitor_safe_position(hwnd);
             self.release_caret();
-            let owner = self.hwnd;
+            Some(PreparedSettings {
+                state,
+                hwnd,
+                owner: self.hwnd,
+            })
+        }
+    }
+
+    unsafe fn complete_settings(&mut self, outcome: SettingsOutcome) {
+        unsafe {
+            let previous_settings = self.shell.settings.clone();
+            self.load_persistence_settings();
+            if self.shell.settings != previous_settings {
+                self.install_shell_menu();
+            }
+            if let Some(path) = outcome.detail {
+                self.open_path(path);
+            }
+            self.refresh();
+            if let Some(code) = outcome.quit {
+                PostQuitMessage(code.0 as i32);
+            }
+        }
+    }
+}
+
+impl PreparedSettings {
+    unsafe fn pump(self) -> SettingsOutcome {
+        unsafe {
+            let Self { state, hwnd, owner } = self;
             let _ = EnableWindow(owner, false);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let mut msg = MSG::default();
@@ -1662,6 +1720,14 @@ impl App {
                 if result.0 <= 0 {
                     quit = Some(msg.wParam);
                     break;
+                }
+                // Disabled owners do not receive new physical input, but keys
+                // already queued for an editor/child must not run in this pump.
+                if (msg.hwnd == owner || IsChild(owner, msg.hwnd).as_bool())
+                    && ((WM_KEYFIRST..=WM_KEYLAST).contains(&msg.message)
+                        || (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&msg.message))
+                {
+                    continue;
                 }
                 let composing = state
                     .form
@@ -1684,20 +1750,49 @@ impl App {
             }
             let _ = SetFocus(Some(owner));
             let detail = state.form.borrow_mut().detail.take();
-            let _ = DeleteObject(brush.into());
-            let previous_settings = self.shell.settings.clone();
-            self.load_persistence_settings();
-            if self.shell.settings != previous_settings {
-                self.install_shell_menu();
-            }
-            if let Some(path) = detail {
-                self.open_path(path);
-            }
-            self.refresh();
-            if let Some(code) = quit {
-                PostQuitMessage(code.0 as i32);
-            }
+            let _ = DeleteObject(state.form.borrow().brush.into());
+            SettingsOutcome { detail, quit }
         }
+    }
+}
+
+// Called only at a native command/pretranslation boundary, after its RefMut
+// has been dropped. Form state owns all data used by the nested modal pump.
+pub(super) unsafe fn run_requested(state: &WindowState) {
+    unsafe {
+        if state.settings_open.get() {
+            return;
+        }
+        let prepared = {
+            let mut app = state.app.borrow_mut();
+            if !std::mem::take(&mut app.settings_requested) {
+                return;
+            }
+            state.settings_open.set(true);
+            app.prepare_settings()
+        };
+        if let Some(prepared) = prepared {
+            run_prepared(state, prepared);
+        } else {
+            state.settings_open.set(false);
+            let mut app = state.app.borrow_mut();
+            drain_native_notifications(state, &mut app);
+        }
+    }
+}
+
+unsafe fn run_prepared(state: &WindowState, prepared: PreparedSettings) {
+    unsafe {
+        let outcome = prepared.pump();
+        let mut app = state.app.borrow_mut();
+        app.complete_settings(outcome);
+        state.settings_open.set(false);
+        if state.deferred_persistence.replace(false) {
+            app.rearm_autosave(true);
+        }
+        drain_native_notifications(state, &mut app);
+        drop(app);
+        replay_deferred_paints(state);
     }
 }
 #[cfg(test)]
@@ -1826,6 +1921,231 @@ mod tests {
                 }
                 let _ = DeleteObject(self.state.form.borrow().brush.into());
             }
+        }
+    }
+
+    #[test]
+    fn settings_modal_boundary_paints_main_without_editing_and_restores_owner() {
+        const PROBE: u32 = WM_APP + 61;
+        const WATCHDOG: usize = 793;
+        struct Probe {
+            state: *const WindowState,
+            button: HWND,
+            dc: HDC,
+            called: Cell<bool>,
+            app_available: Cell<bool>,
+            owner_disabled: Cell<bool>,
+            timer_deferred: Cell<bool>,
+            draw_return: Cell<isize>,
+            watchdog: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                let probe = &*(data as *const Probe);
+                if msg == PROBE {
+                    let state = &*probe.state;
+                    probe.called.set(true);
+                    probe.app_available.set(state.app.try_borrow_mut().is_ok());
+                    probe
+                        .owner_disabled
+                        .set(!IsWindowEnabled(state.main_window.get()).as_bool());
+                    probe.timer_deferred.set(state.deferred_persistence.get());
+                    let item = DRAWITEMSTRUCT {
+                        CtlType: ODT_BUTTON,
+                        CtlID: CMD_SAVE as u32,
+                        hwndItem: probe.button,
+                        hDC: probe.dc,
+                        rcItem: RECT {
+                            left: 0,
+                            top: 0,
+                            right: 160,
+                            bottom: 32,
+                        },
+                        ..Default::default()
+                    };
+                    probe.draw_return.set(
+                        window_proc(
+                            state.main_window.get(),
+                            WM_DRAWITEM,
+                            WPARAM(CMD_SAVE),
+                            LPARAM((&item as *const DRAWITEMSTRUCT) as isize),
+                        )
+                        .0,
+                    );
+                    let _ = KillTimer(Some(hwnd), WATCHDOG);
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    return LRESULT(0);
+                }
+                if msg == WM_TIMER && wp.0 == WATCHDOG {
+                    probe.watchdog.set(true);
+                    let _ = KillTimer(Some(hwnd), WATCHDOG);
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    return LRESULT(0);
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let temp = SettingsTempDir::new();
+        let path = temp.0.join("settings.toml");
+        let settings_bytes = b"schema_version = 1\n";
+        fs::write(&path, settings_bytes).unwrap();
+        let mut app = super::super::tests::composing_test_app("# fixture\nbody 日本語\n");
+        app.clear_composition();
+        app.doc_mut().set_selection(2, 5).unwrap();
+        app.doc_mut().replace_selection("selected").unwrap();
+        let fixture = super::super::tests::MessagePumpFixture::new(app);
+        let snapshot = |app: &App| {
+            (
+                app.doc().id(),
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().selection(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+                app.tabs.len(),
+            )
+        };
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.start_shell();
+                app.features_init();
+                app.ensure_layout().unwrap();
+                // All routes keep the same Settings request method and IME gate.
+                app.show_settings();
+                assert!(std::mem::take(&mut app.settings_requested));
+            }
+            SetFocus(Some(fixture.hwnd)).unwrap();
+            let before = snapshot(&fixture.state.app.borrow());
+            let button = GetDlgItem(Some(fixture.hwnd), CMD_SAVE as i32).unwrap();
+            let query = GetDlgItem(Some(fixture.hwnd), 150).unwrap();
+            let query_before = shell::text_of(query);
+            fixture.state.settings_open.set(true);
+            let prepared = fixture
+                .state
+                .app
+                .borrow_mut()
+                .prepare_settings_files([path.clone()])
+                .unwrap();
+            let modal = prepared.hwnd;
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 160,
+                    biHeight: -32,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap =
+                CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let previous = SelectObject(dc, bitmap.into());
+            let sentinel = COLORREF(0x005a2bc3);
+            let brush = CreateSolidBrush(sentinel);
+            FillRect(
+                dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 160,
+                    bottom: 32,
+                },
+                brush,
+            );
+            let _ = DeleteObject(brush.into());
+            let probe = Probe {
+                state: &*fixture.state,
+                button,
+                dc,
+                called: Cell::new(false),
+                app_available: Cell::new(false),
+                owner_disabled: Cell::new(false),
+                timer_deferred: Cell::new(false),
+                draw_return: Cell::new(0),
+                watchdog: Cell::new(false),
+            };
+            assert!(
+                SetWindowSubclass(modal, Some(observe), 793, (&probe as *const Probe) as usize)
+                    .as_bool()
+            );
+            SetTimer(Some(modal), WATCHDOG, 5_000, None);
+            for (hwnd, message, value) in [
+                (fixture.hwnd, WM_CHAR, b'x' as usize),
+                (query, WM_CHAR, b'y' as usize),
+                (fixture.hwnd, WM_COMMAND, CMD_NEW),
+                (fixture.hwnd, WM_COMMAND, 101), // Settings reentry is blocked.
+                (fixture.hwnd, WM_TIMER, PERSISTENCE_TIMER),
+                (fixture.hwnd, WM_CLOSE, 0),
+                (modal, PROBE, 0),
+            ] {
+                PostMessageW(Some(hwnd), message, WPARAM(value), LPARAM(0)).unwrap();
+            }
+            // The production boundary pumps the owned form without a RefMut,
+            // then reacquires App for the ordinary completion path.
+            run_prepared(&fixture.state, prepared);
+            let changed = (0..32)
+                .flat_map(|y| (0..160).map(move |x| (x, y)))
+                .filter(|(x, y)| GetPixel(dc, *x, *y) != sentinel)
+                .count();
+            println!(
+                "settings-boundary called={} app_available={} owner_disabled={} timer_deferred={} draw_return={} dib_changed={} owner_enabled={} focus={:?} owner={:?} watchdog={}",
+                probe.called.get(),
+                probe.app_available.get(),
+                probe.owner_disabled.get(),
+                probe.timer_deferred.get(),
+                probe.draw_return.get(),
+                changed,
+                IsWindowEnabled(fixture.hwnd).as_bool(),
+                GetFocus(),
+                fixture.hwnd,
+                probe.watchdog.get()
+            );
+            assert!(probe.called.get() && !probe.watchdog.get());
+            assert!(probe.app_available.get() && probe.owner_disabled.get());
+            assert!(probe.timer_deferred.get());
+            assert_eq!(probe.draw_return.get(), 1);
+            assert_eq!(changed, 160 * 32);
+            assert!(!IsWindow(Some(modal)).as_bool());
+            assert!(IsWindowEnabled(fixture.hwnd).as_bool());
+            assert_eq!(GetFocus(), fixture.hwnd);
+            assert_eq!(native_caret_owner(), Some(fixture.hwnd));
+            assert!(!fixture.state.settings_open.get());
+            assert!(!fixture.state.deferred_persistence.get());
+            assert!(!fixture.state.app.borrow().settings_requested);
+            assert_eq!(snapshot(&fixture.state.app.borrow()), before);
+            assert_eq!(shell::text_of(query), query_before);
+            assert_eq!(fs::read(path).unwrap(), settings_bytes);
+            let (mut expected, position) = {
+                let app = fixture.state.app.borrow();
+                (app.doc().source().to_owned(), app.doc().selection().head)
+            };
+            expected.insert(position, 'z');
+            SendMessageW(
+                fixture.hwnd,
+                WM_CHAR,
+                Some(WPARAM(b'z' as usize)),
+                Some(LPARAM(0)),
+            );
+            let app = fixture.state.app.borrow();
+            assert_eq!(app.doc().source(), expected);
+            assert_eq!(app.doc().selection(), Selection::caret(position + 1));
+            drop(app);
+            SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
         }
     }
 

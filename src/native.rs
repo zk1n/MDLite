@@ -482,6 +482,7 @@ struct App {
     editor_actions: EditorActions,
     diagnostics: DiagnosticsPane,
     close_target: Option<HWND>,
+    settings_requested: bool,
 }
 
 // App is never mutably aliased. Only owned, synchronous notification snapshots
@@ -497,6 +498,7 @@ struct WindowState {
     compact_window: Cell<HWND>,
     workspace_message: Cell<u32>,
     deferred_persistence: Cell<bool>,
+    settings_open: Cell<bool>,
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
@@ -523,6 +525,7 @@ impl WindowState {
             compact_window: Cell::new(HWND::default()),
             workspace_message: Cell::new(0),
             deferred_persistence: Cell::new(false),
+            settings_open: Cell::new(false),
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
@@ -1143,6 +1146,7 @@ fn startup_window_state(
         editor_actions: EditorActions::default(),
         diagnostics: DiagnosticsPane::default(),
         close_target: None,
+        settings_requested: false,
     };
     for path in paths {
         if path.is_dir() {
@@ -1274,6 +1278,7 @@ pub fn run() -> windows::core::Result<()> {
             }
             replay_deferred_paints(&app);
             let handled = app.app.borrow_mut().shell_message(&message);
+            settings_dialog::run_requested(&app);
             replay_deferred_paints(&app);
             if handled {
                 continue;
@@ -1428,7 +1433,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             return LRESULT(0);
         }
-        let app_borrow = state.app.try_borrow_mut();
+        // A Settings modal no longer owns App across its nested message pump.
+        // Keep its former input/timer semantics, but let native owner painting
+        // use the ordinary App route rather than consume blank child draws.
+        let app_borrow = if state.settings_open.get()
+            && !matches!(
+                msg,
+                WM_PAINT
+                    | WM_ERASEBKGND
+                    | WM_DRAWITEM
+                    | WM_MEASUREITEM
+                    | WM_CTLCOLORSTATIC
+                    | WM_CTLCOLOREDIT
+                    | WM_CTLCOLORLISTBOX
+                    | WM_CTLCOLORBTN
+                    | WM_CTLCOLORDLG
+                    | WM_CTLCOLORSCROLLBAR
+            ) {
+            None
+        } else {
+            state.app.try_borrow_mut().ok()
+        };
         let queue_position = state.notifications.borrow().len();
         let envelope = if (state.editor_window.get() == HWND::default()
             || state.editor_window.get() == hwnd)
@@ -1470,7 +1495,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 .borrow_mut()
                 .insert(queue_position, (envelope.unwrap(), notification));
         }
-        let Ok(mut app) = app_borrow else {
+        let Some(mut app) = app_borrow else {
             if msg == WM_CLOSE {
                 record_phase(&state.phase_trace, "close", "app_unavailable_consumed");
             }
@@ -1586,7 +1611,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
-        if state.deferred_persistence.replace(false) {
+        if !state.settings_open.get() && state.deferred_persistence.replace(false) {
             app.rearm_autosave(true);
         }
         state.document_id.set(app.doc().id());
@@ -1639,6 +1664,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         };
         drain_native_notifications(state, &mut app);
         drop(app);
+        settings_dialog::run_requested(state);
         replay_deferred_paints(state);
         result.unwrap_or_else(|| {
             // Standard default processing can synchronously send WM_SIZE,
@@ -1712,17 +1738,21 @@ unsafe fn perform_reconversion_cancel(
 
 unsafe fn drain_native_notifications(state: &WindowState, app: &mut App) {
     unsafe {
-        // Release the queue borrow before invoking IMM or native callbacks.
-        loop {
-            let next = state.notifications.borrow_mut().pop_front();
-            let Some((owner, notification)) = next else {
-                break;
-            };
-            app.native_packet(owner, notification);
+        // Settings previously queued lifecycle notifications and persistence
+        // while App was borrowed. Painting must not drain those queues early.
+        if !state.settings_open.get() {
+            // Release the queue borrow before invoking IMM or native callbacks.
+            loop {
+                let next = state.notifications.borrow_mut().pop_front();
+                let Some((owner, notification)) = next else {
+                    break;
+                };
+                app.native_packet(owner, notification);
+            }
+            app.invalidate_ime_editor();
+            state.document_id.set(app.doc().id());
+            state.editor_window.set(app.editing_window());
         }
-        app.invalidate_ime_editor();
-        state.document_id.set(app.doc().id());
-        state.editor_window.set(app.editing_window());
         if state.deferred_control_redraw.replace(false) {
             let main = state.main_window.get();
             let main = if main == HWND::default() {
@@ -12812,6 +12842,7 @@ mod tests {
             editor_actions: EditorActions::default(),
             diagnostics: DiagnosticsPane::default(),
             close_target: None,
+            settings_requested: false,
         }
     }
     fn hidden_test_window() -> HWND {

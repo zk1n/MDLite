@@ -569,15 +569,167 @@ public static class MdliteRustAcceptanceNative
     [DllImport("dwmapi.dll", PreserveSig = true)]
     private static extern int DwmFlush();
 
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out int value, int size);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetTopWindow(IntPtr window);
+
+    public static bool TestS02PassiveBounds(int[] crop, int[] current, int[] desktop)
+    {
+        if (crop == null || current == null || desktop == null || crop.Length != 4 || current.Length != 4 || desktop.Length != 4)
+            return false;
+        long width = (long)crop[2] - crop[0], height = (long)crop[3] - crop[1];
+        return width > 0 && height > 0 && width <= 7680 && height <= 4320 &&
+            crop[0] == current[0] && crop[1] == current[1] && crop[2] == current[2] && crop[3] == current[3] &&
+            crop[0] >= desktop[0] && crop[1] >= desktop[1] && crop[2] <= desktop[2] && crop[3] <= desktop[3];
+    }
+
+    public static string ClassifyS02PassiveOwnership(bool identity, bool opaqueVisible, bool bounds,
+        bool foreground, bool occlusion, bool enumerationComplete)
+    {
+        if (!identity) return "IDENTITY_CHANGED";
+        if (!opaqueVisible) return "MAIN_NOT_VISIBLE_OPAQUE";
+        if (!bounds) return "MAIN_BOUNDS_CHANGED_OR_OFFSCREEN";
+        if (!foreground) return "UNEXPECTED_FOREGROUND";
+        if (occlusion) return "UNEXPECTED_OVERLAP";
+        return enumerationComplete ? "SAFE" : "ZORDER_UNRESOLVED";
+    }
+
+    public static Dictionary<string, object> ObserveS02PassiveCrop(IntPtr main, IntPtr modal, uint pid, int[] crop)
+    {
+        bool modalAlive = IsWindow(modal);
+        bool modalOwned = modalAlive && IsOwnedWindow(modal, pid) && WindowClass(modal) == "MDLiteSettings" && GetWindow(modal, 4) == main;
+        bool identity = IsOwnedWindow(main, pid) && WindowClass(main) == "MDLiteRustEditor" && (!modalAlive || modalOwned);
+        int cloaked = 0;
+        bool opaque = identity && IsWindowVisible(main) && !IsIconic(main) &&
+            (GetWindowLongW(main, -20) & (0x00080000 | 0x00000020)) == 0 &&
+            DwmGetWindowAttribute(main, 14, out cloaked, sizeof(int)) == 0 && cloaked == 0;
+        RECT client = new RECT();
+        POINT origin = new POINT(), end = new POINT();
+        bool measured = identity && GetClientRect(main, out client);
+        if (measured) {
+            origin.X = client.Left; origin.Y = client.Top; end.X = client.Right; end.Y = client.Bottom;
+            measured = ClientToScreen(main, ref origin) && ClientToScreen(main, ref end);
+        }
+        int[] current = new int[] { origin.X, origin.Y, end.X, end.Y };
+        int[] screen = GetVirtualScreenMetrics();
+        bool bounds = measured && TestS02PassiveBounds(crop, current,
+            new int[] { screen[0], screen[1], screen[0] + screen[2], screen[1] + screen[3] });
+        IntPtr foreground = GetForegroundWindow();
+        bool foregroundAllowed = foreground == main || (modalOwned && foreground == modal);
+        bool overlap = false, foundMain = false;
+        object blocker = null;
+        if (identity && opaque && bounds && foregroundAllowed) {
+            IntPtr surface = GetTopWindow(IntPtr.Zero);
+            for (int count = 0; surface != IntPtr.Zero && count < 4096; count++, surface = GetWindow(surface, 2)) {
+                if (surface == main) { foundMain = true; break; }
+                if (surface == modal && modalOwned) continue;
+                if (!IsWindowVisible(surface) || IsIconic(surface)) continue;
+                int hidden;
+                if (DwmGetWindowAttribute(surface, 14, out hidden, sizeof(int)) == 0 && hidden != 0) continue;
+                RECT rectangle;
+                bool known = GetWindowRect(surface, out rectangle);
+                if (!known || (rectangle.Left < crop[2] && rectangle.Right > crop[0] && rectangle.Top < crop[3] && rectangle.Bottom > crop[1])) {
+                    uint process; GetWindowThreadProcessId(surface, out process);
+                    overlap = true;
+                    blocker = new Dictionary<string, object> {
+                        { "hwnd", surface.ToInt64() }, { "pid", process }, { "class", WindowClass(surface) },
+                        { "bounds_known", known }, { "rect", known ? new int[] { rectangle.Left, rectangle.Top, rectangle.Right, rectangle.Bottom } : null }
+                    };
+                    break;
+                }
+            }
+        }
+        string classification = ClassifyS02PassiveOwnership(identity, opaque, bounds, foregroundAllowed, overlap, foundMain);
+        return new Dictionary<string, object> {
+            { "safe", classification == "SAFE" }, { "classification", classification },
+            { "main", main.ToInt64() }, { "modal", modal.ToInt64() }, { "modal_alive", modalAlive },
+            { "foreground", foreground.ToInt64() }, { "current_client_bounds", current }, { "crop", crop }, { "blocker", blocker }
+        };
+    }
+
+    public static bool VerifyS02ClosePoint(IntPtr modal, uint pid, int x, int y)
+    {
+        if (!IsOwnedWindow(modal, pid) || WindowClass(modal) != "MDLiteSettings" || GetForegroundWindow() != modal)
+            return false;
+        POINT point = new POINT { X = x, Y = y };
+        if (WindowFromPoint(point) != modal) return false;
+        IntPtr hit;
+        IntPtr packed = new IntPtr(unchecked((int)(((uint)(ushort)y << 16) | (ushort)x)));
+        return SendMessageTimeoutW(modal, 0x0084, IntPtr.Zero, packed, 2, 100, out hit) && hit.ToInt64() == 20;
+    }
+
+    public static int[] S02ClosePoint(IntPtr modal, uint pid)
+    {
+        RECT bounds;
+        if (!IsOwnedWindow(modal, pid) || !GetWindowRect(modal, out bounds)) throw new InvalidOperationException("S02_CLOSE_IDENTITY");
+        double scale = GetDpiForWindow(modal) / 96.0;
+        foreach (int y in new int[] { 12, 20, 28 }) foreach (int x in new int[] { 12, 24, 36 }) {
+            int px = bounds.Right - (int)Math.Round(x * scale), py = bounds.Top + (int)Math.Round(y * scale);
+            if (VerifyS02ClosePoint(modal, pid, px, py)) return new int[] { px, py };
+        }
+        throw new InvalidOperationException("S02_HTCLOSE_NOT_OBSERVED");
+    }
+
     public static Dictionary<string, object> FlushOwnedPendingPaint(IntPtr window, uint expectedPid, int timeoutMs)
+    {
+        return FlushOwnedPendingPaint(window, expectedPid, timeoutMs, false);
+    }
+
+    public static string ClassifyOwnedPaintRemainder(int pendingCount, bool soleVisibleRail, bool alreadyVisited)
+    {
+        if (pendingCount < 0) throw new ArgumentOutOfRangeException("pendingCount");
+        if (pendingCount == 0) return "CLEAN";
+        return pendingCount == 1 && soleVisibleRail && alreadyVisited ? "ONE_VISITED_VISIBLE_RAIL" : "BLOCKED";
+    }
+
+    public static Dictionary<string, object> FlushOwnedPendingPaint(IntPtr window, uint expectedPid, int timeoutMs, bool reconcileVisitedRail)
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
         var paints = new List<object>();
+        var observations = new List<object>();
+        var visitedRails = new List<long>();
+        var railObservations = new List<object>();
+        var presentationFences = new List<object>();
+        Func<int> presentOnce = () => {
+            int remaining = timeoutMs - (int)clock.ElapsedMilliseconds;
+            if (remaining <= 0) throw new TimeoutException("OWNED_PRESENT_FENCE_TIMEOUT");
+            long started = clock.ElapsedMilliseconds;
+            // DwmFlush has no native timeout; its background task cannot hold up harness exit.
+            var task = System.Threading.Tasks.Task.Run(() => DwmFlush());
+            if (!task.Wait(remaining)) throw new TimeoutException("OWNED_DWM_FLUSH_TIMEOUT");
+            if (task.Result < 0) Marshal.ThrowExceptionForHR(task.Result);
+            presentationFences.Add(new Dictionary<string, object> {
+                { "ordinal", presentationFences.Count + 1 }, { "started_ms", started },
+                { "completed_ms", clock.ElapsedMilliseconds }, { "remaining_budget_ms", remaining },
+                { "hresult", task.Result }
+            });
+            return task.Result;
+        };
+        Func<IntPtr, Dictionary<string, object>> observe = surface => {
+            if (!IsOwnedWindow(surface, expectedPid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+            RECT region;
+            bool pendingRegion = GetUpdateRect(surface, out region, false);
+            return new Dictionary<string, object> {
+                { "hwnd", surface.ToInt64() }, { "class", WindowClass(surface) },
+                { "control_id", ControlId(surface) }, { "parent", GetParent(surface).ToInt64() },
+                { "visible", IsWindowVisible(surface) }, { "pending", pendingRegion },
+                { "damage", pendingRegion ? new int[] { region.Left, region.Top, region.Right, region.Bottom } : null },
+                { "elapsed_ms", clock.ElapsedMilliseconds }
+            };
+        };
         var windows = new List<long>(); windows.Add(window.ToInt64());
         windows.AddRange(OwnedChildren(window, expectedPid));
+        int ordinal = 0;
         foreach (long value in windows) {
             IntPtr surface = new IntPtr(value);
             if (!IsOwnedWindow(surface, expectedPid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+            var before = observe(surface);
+            var observation = new Dictionary<string, object> {
+                { "ordinal", ordinal++ }, { "before", before }, { "paint_sent", false }, { "after", null }
+            };
+            observations.Add(observation);
             if (!IsWindowVisible(surface)) continue;
             RECT damage;
             if (!GetUpdateRect(surface, out damage, false)) continue;
@@ -588,29 +740,115 @@ public static class MdliteRustAcceptanceNative
             if (!SendMessageTimeoutW(surface, 0x000F, IntPtr.Zero, IntPtr.Zero, 2, (uint)remaining, out result))
                 throw new TimeoutException("OWNED_PAINT_MESSAGE_TIMEOUT");
             if (!IsOwnedWindow(surface, expectedPid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+            observation["paint_sent"] = true;
+            observation["after"] = observe(surface);
             paints.Add(new Dictionary<string, object> {
                 { "hwnd", value }, { "class", WindowClass(surface) },
-                { "damage", new int[] { damage.Left, damage.Top, damage.Right, damage.Bottom } }
+                { "control_id", ControlId(surface) }, { "parent", GetParent(surface).ToInt64() },
+                { "damage", new int[] { damage.Left, damage.Top, damage.Right, damage.Bottom } },
+                { "elapsed_ms", clock.ElapsedMilliseconds }
             });
+            if (WindowClass(surface) == "MDLiteVerticalRail") visitedRails.Add(value);
+            if (reconcileVisitedRail) {
+                foreach (long rail in visitedRails) {
+                    railObservations.Add(new Dictionary<string, object> {
+                        { "after_surface_hwnd", value }, { "after_surface_ordinal", observation["ordinal"] },
+                        { "rail", observe(new IntPtr(rail)) }
+                    });
+                }
+            }
         }
-        int presentRemaining = timeoutMs - (int)clock.ElapsedMilliseconds;
-        if (presentRemaining <= 0) throw new TimeoutException("OWNED_PRESENT_FENCE_TIMEOUT");
-        // DwmFlush has no native timeout; its background task cannot hold up harness exit.
-        var present = System.Threading.Tasks.Task.Run(() => DwmFlush());
-        if (!present.Wait(presentRemaining)) throw new TimeoutException("OWNED_DWM_FLUSH_TIMEOUT");
-        if (present.Result < 0) Marshal.ThrowExceptionForHR(present.Result);
+        int firstPresent = presentOnce();
         if (!IsOwnedWindow(window, expectedPid) || GetForegroundWindow() != window)
             throw new InvalidOperationException("OWNED_CAPTURE_FOREGROUND_CHANGED");
         var pending = new List<long>();
-        foreach (long value in windows) {
+        var afterPass = new List<object>();
+        var surfacesAfterPass = new List<long>(); surfacesAfterPass.Add(window.ToInt64());
+        surfacesAfterPass.AddRange(OwnedChildren(window, expectedPid));
+        foreach (long value in surfacesAfterPass) {
             IntPtr surface = new IntPtr(value);
             RECT damage;
             if (!IsOwnedWindow(surface, expectedPid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+            afterPass.Add(observe(surface));
             if (IsWindowVisible(surface) && GetUpdateRect(surface, out damage, false)) pending.Add(value);
         }
+        object targeted = null;
+        var afterTarget = new List<long>();
+        bool reconciliationBlocked = false;
+        bool needsFinalPresentation = false;
+        string classification = ClassifyOwnedPaintRemainder(pending.Count,
+            pending.Count == 1 && IsWindowVisible(new IntPtr(pending[0])) && WindowClass(new IntPtr(pending[0])) == "MDLiteVerticalRail",
+            pending.Count == 1 && visitedRails.Contains(pending[0]));
+        if (reconcileVisitedRail) {
+            string outcome = pending.Count == 0 ? "NO_PENDING_AFTER_NORMAL_PASS" : "UNRESOLVED_PENDING_SET";
+            reconciliationBlocked = classification == "BLOCKED";
+            if (classification == "ONE_VISITED_VISIBLE_RAIL") {
+                IntPtr rail = new IntPtr(pending[0]);
+                if (!IsOwnedWindow(window, expectedPid) || GetForegroundWindow() != window)
+                    throw new InvalidOperationException("OWNED_CAPTURE_FOREGROUND_CHANGED");
+                var beforeTarget = observe(rail);
+                if (!(bool)beforeTarget["visible"] || (string)beforeTarget["class"] != "MDLiteVerticalRail") {
+                    reconciliationBlocked = true;
+                    targeted = new Dictionary<string, object> {
+                        { "paint_sent", false }, { "before", beforeTarget },
+                        { "outcome", "UNRESOLVED_RAIL_IDENTITY_OR_VISIBILITY_CHANGED" }
+                    };
+                } else if (!(bool)beforeTarget["pending"]) {
+                    needsFinalPresentation = true;
+                    targeted = new Dictionary<string, object> {
+                        { "paint_sent", false }, { "before", beforeTarget },
+                        { "outcome", "CLEARED_NATURALLY_BEFORE_TARGET" }
+                    };
+                } else {
+                    int remaining = timeoutMs - (int)clock.ElapsedMilliseconds;
+                    if (remaining <= 0) throw new TimeoutException("OWNED_PAINT_FENCE_TIMEOUT");
+                    IntPtr result;
+                    if (!SendMessageTimeoutW(rail, 0x000F, IntPtr.Zero, IntPtr.Zero, 2, (uint)remaining, out result))
+                        throw new TimeoutException("OWNED_PAINT_MESSAGE_TIMEOUT");
+                    needsFinalPresentation = true;
+                    var afterTargetRegion = observe(rail);
+                    var surfacesAfterTarget = new List<long>(); surfacesAfterTarget.Add(window.ToInt64());
+                    surfacesAfterTarget.AddRange(OwnedChildren(window, expectedPid));
+                    foreach (long value in surfacesAfterTarget) {
+                        IntPtr surface = new IntPtr(value);
+                        if (!IsOwnedWindow(surface, expectedPid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+                        RECT damage;
+                        if (IsWindowVisible(surface) && GetUpdateRect(surface, out damage, false)) afterTarget.Add(value);
+                    }
+                    reconciliationBlocked = afterTarget.Count != 0;
+                    outcome = afterTarget.Count == 0 ? "ONE_TARGET_CLEARED_IMMEDIATE_READBACK" : "UNRESOLVED_RECURRENCE_OR_OTHER_PENDING";
+                    targeted = new Dictionary<string, object> {
+                        { "paint_sent", true },
+                        { "before", beforeTarget }, { "after", afterTargetRegion },
+                        { "remaining_budget_ms", remaining }, { "elapsed_ms", clock.ElapsedMilliseconds },
+                        { "pending_after_target", afterTarget.ToArray() }, { "outcome", outcome }
+                    };
+                }
+            }
+            if (targeted == null) targeted = new Dictionary<string, object> { { "paint_sent", false }, { "outcome", outcome } };
+        }
+        if (needsFinalPresentation) presentOnce();
+        if (!IsOwnedWindow(window, expectedPid) || GetForegroundWindow() != window)
+            throw new InvalidOperationException("OWNED_CAPTURE_FOREGROUND_CHANGED");
+        var finalPending = new List<long>();
+        var finalObservations = new List<object>();
+        var finalSurfaces = new List<long>(); finalSurfaces.Add(window.ToInt64());
+        finalSurfaces.AddRange(OwnedChildren(window, expectedPid));
+        foreach (long value in finalSurfaces) {
+            var state = observe(new IntPtr(value));
+            finalObservations.Add(state);
+            if ((bool)state["visible"] && (bool)state["pending"]) finalPending.Add(value);
+        }
+        if (clock.ElapsedMilliseconds >= timeoutMs) throw new TimeoutException("OWNED_PAINT_FENCE_TIMEOUT");
         return new Dictionary<string, object> {
-            { "pending_paints_consumed", paints.ToArray() }, { "pending_after", pending.ToArray() },
-            { "dwm_flush_hresult", present.Result }, { "elapsed_ms", clock.ElapsedMilliseconds },
+            { "pending_paints_consumed", paints.ToArray() }, { "pending_after_normal", pending.ToArray() },
+            { "pending_after", finalPending.ToArray() }, { "final_surface_observations", finalObservations.ToArray() },
+            { "reconciliation_enabled", reconcileVisitedRail }, { "reconciliation_classification", classification },
+            { "reconciliation_blocked", reconciliationBlocked },
+            { "surface_observations", observations.ToArray() }, { "after_normal_pass", afterPass.ToArray() },
+            { "visited_rail_observations", railObservations.ToArray() }, { "targeted_rail_paint", targeted },
+            { "dwm_flush_hresult", firstPresent }, { "presentation_fences", presentationFences.ToArray() },
+            { "elapsed_ms", clock.ElapsedMilliseconds },
             { "timeout_ms", timeoutMs }, { "invalidated_by_harness", false }
         };
     }
@@ -4130,10 +4368,157 @@ function Get-OwnedCaptureStamp {
         return [ordered]@{
             available=$true; document_id=$state.document_id; revision=$state.revision; source_sha256=$hash
             painted_frame=if ($null -ne $painted) { $painted.Value } else { $null }
+            file_write_utc=[IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath).ToString('o')
+            observed_utc=[DateTime]::UtcNow.ToString('o')
         }
     } catch {
         return [ordered]@{ available=$false; reason=$_.Exception.Message }
     }
+}
+
+function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$CaretScreen, [int[]]$Crop) {
+    $directory=Join-Path $script:UiRunDirectory ('s02-passive-'+$Close)
+    [void][IO.Directory]::CreateDirectory($directory)
+    $cancel=Get-UiControlById $Settings 211 'BUTTON' -RequireVisible -RequireEnabled
+    $cancelPoint=[int[]]@(($cancel.Rect[0]+$cancel.Rect[2])/2,($cancel.Rect[1]+$cancel.Rect[3])/2)
+    $applyPoint=$null; $closePoint=$null
+    if ($Close -ceq 'ApplyThenCancel') {
+        $apply=Get-UiControlById $Settings 210 'BUTTON' -RequireVisible -RequireEnabled
+        $applyPoint=[int[]]@(($apply.Rect[0]+$apply.Rect[2])/2,($apply.Rect[1]+$apply.Rect[3])/2)
+    }
+    if ($Close -ceq 'TitlebarClose') { $closePoint=[MdliteRustAcceptanceNative]::S02ClosePoint($Settings,$script:ProcessId) }
+    $shared=[hashtable]::Synchronized(@{
+        ready=[Threading.ManualResetEvent]::new($false); stop=[Threading.ManualResetEvent]::new($false)
+        clock=$null; frames=[Collections.Generic.List[object]]::new(); error=$null; dropped_slots=0
+    })
+    $context=@{
+        shared=$shared; main=$script:WindowHandle; modal=$Settings; process=$script:Process; pid=$script:ProcessId
+        creation_ticks=$script:Process.StartTime.ToUniversalTime().Ticks; crop=$Crop; directory=$directory
+        diagnostic=$script:DiagnosticPath; assert_definition=${function:Assert-OwnedWindow}.ToString()
+        stamp_definition=${function:Get-OwnedCaptureStamp}.ToString()
+    }
+    $worker=[PowerShell]::Create()
+    [void]$worker.AddScript({
+        param($context)
+        $ErrorActionPreference='Stop'
+        $script:Process=$context.process; $script:ProcessId=$context.pid; $script:WindowHandle=$context.main
+        $script:DiagnosticPath=$context.diagnostic; $script:OwnedCreationTicks=@{ $context.pid=$context.creation_ticks }
+        Set-Item Function:Assert-OwnedWindow ([scriptblock]::Create($context.assert_definition))
+        Set-Item Function:Get-OwnedCaptureStamp ([scriptblock]::Create($context.stamp_definition))
+        $shared=$context.shared; $bitmap=$null; $graphics=$null
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $width=$context.crop[2]-$context.crop[0]; $height=$context.crop[3]-$context.crop[1]
+            $bitmap=[Drawing.Bitmap]::new($width,$height); $graphics=[Drawing.Graphics]::FromImage($bitmap)
+            $shared.clock=[Diagnostics.Stopwatch]::StartNew()
+            $next=0L; $previous=$null
+            while ($shared.clock.ElapsedMilliseconds -lt 2000 -and $shared.frames.Count -lt 128 -and -not $shared.stop.WaitOne(0)) {
+                $remaining=$next-$shared.clock.ElapsedMilliseconds
+                if ($remaining -gt 0 -and $shared.stop.WaitOne([int]$remaining)) { break }
+                $sample=[ordered]@{ index=$shared.frames.Count; scheduled_ms=$next; copy_started_ms=$null; copy_completed_ms=$null; start_gap_ms=$null; file=$null; stamp=$null; before=$null; after=$null; copied=$false }
+                Assert-OwnedWindow $context.main
+                $sample.stamp=Get-OwnedCaptureStamp
+                $sample.before=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($context.main,$context.modal,$context.pid,$context.crop)
+                if (-not $sample.before.safe) {
+                    $shared.frames.Add($sample)
+                    throw ('S02_PASSIVE_PRECOPY_GATE: '+$sample.before.classification)
+                }
+                Assert-OwnedWindow $context.main
+                $sample.copy_started_ms=$shared.clock.Elapsed.TotalMilliseconds
+                if ($null -ne $previous) { $sample.start_gap_ms=$sample.copy_started_ms-$previous }
+                $previous=$sample.copy_started_ms
+                $graphics.CopyFromScreen($context.crop[0],$context.crop[1],0,0,[Drawing.Size]::new($width,$height),[Drawing.CopyPixelOperation]::SourceCopy)
+                $sample.copy_completed_ms=$shared.clock.Elapsed.TotalMilliseconds
+                $sample.copied=$true
+                Assert-OwnedWindow $context.main
+                $sample.after=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($context.main,$context.modal,$context.pid,$context.crop)
+                if (-not $sample.after.safe) {
+                    $shared.frames.Add($sample)
+                    throw ('S02_PASSIVE_POSTCOPY_GATE_DISCARDED: '+$sample.after.classification)
+                }
+                if ($shared.stop.WaitOne(0)) { break }
+                $sample.file='frame-{0:D3}.png' -f $sample.index
+                $bitmap.Save((Join-Path $context.directory $sample.file),[Drawing.Imaging.ImageFormat]::Png)
+                $shared.frames.Add($sample)
+                if ($shared.frames.Count -eq 1) { [void]$shared.ready.Set() }
+                $late=[Math]::Max(0,[Math]::Floor(($shared.clock.ElapsedMilliseconds-$next)/16))
+                $shared.dropped_slots+=[int]$late
+                $next+=([long]$late+1)*16
+            }
+        } catch { $shared.error=@{message=$_.Exception.Message;stack=$_.ScriptStackTrace} }
+        finally {
+            if ($null -ne $graphics) { $graphics.Dispose() }; if ($null -ne $bitmap) { $bitmap.Dispose() }
+            [void]$shared.ready.Set()
+        }
+    }).AddArgument($context)
+    $async=$worker.BeginInvoke()
+    $actions=[Collections.Generic.List[object]]::new(); $actorError=$null; $clickCompleted=$null
+    $firstClickFocus=$null; $focusObservedMs=$null
+    $click={ param([IntPtr]$window,[int[]]$point,[string]$action)
+        $entry=[ordered]@{action=$action;start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0;point=$point;guard=$null}
+        $actions.Add($entry)
+        $entry.sent=[MdliteRustAcceptanceNative]::ClickOwnedAt($window,$script:ProcessId,$point[0],$point[1])
+        $entry.end_ms=$shared.clock.Elapsed.TotalMilliseconds
+        $entry.guard=[MdliteRustAcceptanceNative]::LastOwnedPointerCheck
+        if ($entry.sent -ne 2) { throw ('S02_DIRECT_OWNED_CLICK_FAILED: '+$action) }
+    }
+    try {
+        if (-not $shared.ready.WaitOne(2000) -or $null -ne $shared.error -or $shared.frames.Count -eq 0) { throw 'S02_PASSIVE_FIRST_FRAME_UNAVAILABLE' }
+        if ($Close -ceq 'ApplyThenCancel') { & $click $Settings $applyPoint 'no-op Apply' }
+        if ($Close -ceq 'Escape') {
+            $entry=[ordered]@{action='Escape';start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0}
+            $actions.Add($entry)
+            if (-not [MdliteRustAcceptanceNative]::TestOwnedActivationReady($Settings,$script:ProcessId,$false)) { throw 'S02_ESCAPE_OWNED_KEYBOARD_GATE' }
+            $entry.sent=[MdliteRustAcceptanceNative]::SendVirtualKey($Settings,$script:ProcessId,0x1B,[uint16[]]@())
+            $entry.end_ms=$shared.clock.Elapsed.TotalMilliseconds
+            if ($entry.sent -ne 2) { throw 'S02_DIRECT_ESCAPE_FAILED' }
+        } elseif ($Close -ceq 'TitlebarClose') {
+            if (-not [MdliteRustAcceptanceNative]::VerifyS02ClosePoint($Settings,$script:ProcessId,$closePoint[0],$closePoint[1])) { throw 'S02_HTCLOSE_CHANGED' }
+            & $click $Settings $closePoint 'titlebar HTCLOSE=20'
+        } else { & $click $Settings $cancelPoint 'Cancel' }
+        Wait-UiWindowGone $Settings 1200
+        $actions.Add(@{action='modal disappearance observed';time_ms=$shared.clock.Elapsed.TotalMilliseconds})
+        & $click $script:WindowHandle $CaretScreen 'first editor click without activation'
+        $clickCompleted=$shared.clock.Elapsed.TotalMilliseconds
+        $firstClickFocus=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+        $focusObservedMs=$shared.clock.Elapsed.TotalMilliseconds
+        if (-not $firstClickFocus.foreground_is_expected -or -not $firstClickFocus.active_is_expected -or
+            -not $firstClickFocus.focus_is_expected -or -not $firstClickFocus.caret_is_expected) {
+            throw 'PRODUCT_ASSERTION: S02 first editor click did not immediately restore native focus/caret before diagnostic refresh.'
+        }
+    } catch { $actorError=@{message=$_.Exception.Message;stack=$_.ScriptStackTrace} }
+    finally {
+        $workerCompleted=$async.AsyncWaitHandle.WaitOne(2500)
+        if (-not $workerCompleted) {
+            [void]$shared.stop.Set()
+            $stopAsync=$worker.BeginStop($null,$null)
+            if ($stopAsync.AsyncWaitHandle.WaitOne(500)) { $worker.EndStop($stopAsync) }
+            $workerCompleted=$async.IsCompleted
+            $actorError=@{message='S02_PASSIVE_WORKER_DEADLINE';stop_confirmed=$workerCompleted}
+        }
+        if ($workerCompleted) {
+            try { [void]$worker.EndInvoke($async) } catch { if ($null -eq $actorError) { $actorError=@{message=$_.Exception.Message} } }
+            $worker.Dispose(); $shared.ready.Dispose(); $shared.stop.Dispose()
+        }
+    }
+    [object[]]$frameRecords=@()
+    if ($workerCompleted) { $frameRecords=$shared.frames.ToArray() }
+    $copied=@($frameRecords | Where-Object { $null -ne $_.file })
+    $maxGap=if ($copied.Count -gt 1) { ($copied | Measure-Object start_gap_ms -Maximum).Maximum } else { $null }
+    $coverage=$copied.Count -ge 2 -and $null -ne $clickCompleted -and $copied[-1].copy_started_ms -ge $clickCompleted
+    $receipt=[ordered]@{
+        path=$Close; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
+        worker_completion_confirmed=$workerCompleted
+        native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
+        native_focus_observation_order='BEFORE_ANY_DIAGNOSTIC_REFRESH'
+        sampling_target_ms=16; bounded_duration_ms=2000; dropped_slots=$shared.dropped_slots; max_actual_start_gap_ms=$maxGap
+        covers_first_editor_click=$coverage; paint_forced=$false; activation_during_interval=$false
+        apply=if ($Close -ceq 'ApplyThenCancel') { 'NO-OP ONLY; changed-value Apply remains NOT_RUN' } else { 'NOT_RUN' }
+        visual_acceptance='PENDING: inspect passive frames; flashes shorter than measured gaps are not ruled out.'
+    }
+    [IO.File]::WriteAllText((Join-Path $directory 'receipt.json'),($receipt | ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
+    if ($null -ne $shared.error -or $null -ne $actorError -or -not $coverage) { throw ('S02_PASSIVE_OBSERVATION_FAILED: '+$directory) }
+    return $receipt
 }
 
 function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
@@ -4172,9 +4557,9 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
         if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
             throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground before client capture.'
         }
-        $readiness.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($Window,$script:ProcessId,7000)
-        if (@($readiness.fence.pending_after).Count -ne 0) {
-            throw 'OBSERVER_FAILURE: owned pending paint did not drain within the single render fence.'
+        $readiness.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($Window,$script:ProcessId,7000,$true)
+        if ($readiness.fence.reconciliation_blocked -or @($readiness.fence.pending_after).Count -ne 0) {
+            throw 'OBSERVER_FAILURE: owned pending paint did not drain within the bounded render fence.'
         }
         $readiness.after=Get-OwnedCaptureStamp
         if ($readiness.before.available -and $readiness.after.available) {
@@ -4574,10 +4959,65 @@ function Invoke-Rev3PanelTargetProbe {
     return $script:PanelTargetProbe
 }
 
-function Invoke-Rev3FocusedCases {
+function Invoke-Rev3PaintDependencyProbe($StartupState) {
+    $diskBefore=[ordered]@{}
+    foreach ($path in $script:UiInitialDocPaths) { $diskBefore[$path]=Get-UiSafeFileHash $path }
+    $receipt=[ordered]@{
+        diagnostic_only=$true; acceptance='NOT_ASSERTED'; screenshot='NO COPY / NO CAPTURE'
+        before=(Get-OwnedCaptureStamp); after=$null; fence=$null; error=$null
+        source_history_selection_scroll_preserved=$false; disk_before=$diskBefore
+        disk_after_record=$null; disk_after_close=$null; normal_close=$null
+        started_utc=[DateTime]::UtcNow.ToString('o'); completed_utc=$null
+        fence_started_utc=$null; fence_completed_utc=$null
+    }
+    $script:PaintDependencyProbe=$receipt
+    $receiptPath=Join-Path $script:UiRunDirectory 'paint-dependency-probe.json'
+    try {
+        Assert-UiExecutableIdentity
+        Assert-UiOwnedWindow $script:WindowHandle
+        if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $script:WindowHandle) {
+            throw 'OWNERSHIP_GATE: paint dependency probe requires the exact owned Main foreground.'
+        }
+        $receipt.fence_started_utc=[DateTime]::UtcNow.ToString('o')
+        $receipt.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($script:WindowHandle,$script:ProcessId,7000,$true)
+        $receipt.fence_completed_utc=[DateTime]::UtcNow.ToString('o')
+        $receipt.after=Get-OwnedCaptureStamp
+        # Persist the observed traversal before any new diagnostic refresh can invalidate Main.
+        [IO.File]::WriteAllText($receiptPath,($receipt | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+        $after=Read-Diagnostic
+        Assert-UiDiagnosticDragInvariants $after $StartupState 'paint dependency probe'
+        if ($after.selection.anchor -ne $StartupState.selection.anchor -or
+            $after.selection.head -ne $StartupState.selection.head -or
+            $after.scroll -ne $StartupState.scroll) {
+            throw 'PRODUCT_ASSERTION: paint dependency probe changed selection or scroll.'
+        }
+        $receipt.source_history_selection_scroll_preserved=$true
+        $diskAfter=[ordered]@{}
+        foreach ($path in $diskBefore.Keys) {
+            $diskAfter[$path]=Get-UiSafeFileHash $path
+            if ($diskAfter[$path] -cne $diskBefore[$path]) { throw 'PRODUCT_ASSERTION: paint dependency probe changed fixture document bytes.' }
+        }
+        $receipt.disk_after_record=$diskAfter
+    } catch {
+        $receipt.error=@{ message=$_.Exception.Message; stack=$_.ScriptStackTrace }
+    } finally {
+        $receipt.completed_utc=[DateTime]::UtcNow.ToString('o')
+        [IO.File]::WriteAllText($receiptPath,($receipt | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+    }
+    Add-UiParityCase 'PAINT_DEPENDENCY_PROBE' 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $receipt
+}
+
+function Invoke-Rev3FocusedCases($StartupState) {
     $script:Report['native_editor_focus_checks']=@()
     $script:Report['rev3_acceptance']='PARTIAL: case PASS means observed assertions only; visual review, actual DPI matrix and physical IME remain separate.'
     $script:Report['rev3_selected_case']=if ([string]::IsNullOrWhiteSpace($Rev3Case)) { 'ALL' } else { $Rev3Case }
+    if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
+        $script:Report['rev3_acceptance']='NOT_ASSERTED: diagnostic-only paint dependency probe; no capture or acceptance cases.'
+        Invoke-Rev3PaintDependencyProbe $StartupState
+        foreach ($id in @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS')) {
+            Add-UiParityCase $id 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $null
+        }
+    } else {
     if ($Rev3PanelTargetProbe) {
         [void](Invoke-UiParityCase 'PANEL_TARGET_PROBE' {
             $probe=Invoke-Rev3PanelTargetProbe
@@ -4689,18 +5129,49 @@ function Invoke-Rev3FocusedCases {
                 [int]$value.selection.anchor -eq $endB -and [int]$value.selection.head -eq $endB
         } 'U01 doc-01 EOF navigation destination'
         Assert-UiDiagnosticDragInvariants $pointB $documentB 'U01 destination position setup'
-        $navigation=@()
+        $forwardControl=Get-UiControlById $script:WindowHandle 169 'BUTTON' -RequireVisible
+        if ([MdliteRustAcceptanceNative]::IsWindowEnabled($forwardControl.Handle)) {
+            throw 'SETUP_FAILURE: U01 requires an initially disabled Forward button after the new Ctrl+Tab jump.'
+        }
+        $navigation=@(); $followupEvidence=@()
         foreach ($step in @(
-            @{control=168;expected=$pointA;label='Back to original doc-00 position'},
-            @{control=169;expected=$pointB;label='Forward to doc-01 EOF'},
-            @{control=168;expected=$pointA;label='Back restores the navigation baseline'}
+            @{control=168;expected=$pointA;forward_enabled=$true;label='Back to original doc-00 position'},
+            @{control=169;expected=$pointB;forward_enabled=$false;label='Forward to doc-01 EOF'},
+            @{control=168;expected=$pointA;forward_enabled=$true;label='Back restores the navigation baseline'}
         )) {
             $expected=$step.expected
-            # Navigation stores DIP scroll and clamps negative saved values to zero.
-            # Permit one physical pixel of layout rounding, never a different source position.
+            $forwardBefore=[MdliteRustAcceptanceNative]::IsWindowEnabled($forwardControl.Handle)
+            if ($forwardBefore -eq [bool]$step.forward_enabled) {
+                throw 'SETUP_FAILURE: U01 Forward enabled-state acknowledgment would not prove the queued navigation click completed.'
+            }
             $scrollExpected=[Math]::Max(0.0,[double]$expected.scroll)
             $scrollTolerance=1.0/[double]$expected.parent_root.dpi
             Invoke-UiControlById $script:WindowHandle ([int]$step.control)
+            # No WM_APP+1, paint, activation, or focus assignment until the native
+            # Forward-state transition acknowledges dispatch and Main owns focus/caret.
+            $passiveClock=[Diagnostics.Stopwatch]::StartNew()
+            $passive=[ordered]@{name='U01 passive navigation focus';control_id=[int]$step.control
+                budget_ms=$TimeoutMs;forward_enabled_before=$forwardBefore;forward_enabled_expected=[bool]$step.forward_enabled
+                status='WAITING';observations=@()}
+            $script:Report.operations+=$passive
+            $passiveReady=$false
+            do {
+                if (-not [MdliteRustAcceptanceNative]::IsOwnedWindow($forwardControl.Handle,[uint32]$script:ProcessId)) {
+                    throw 'OWNERSHIP_GATE: U01 Forward control ownership changed during passive observation.'
+                }
+                $native=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus(
+                    $script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,[uint32]$script:ProcessId)
+                $forwardNow=[MdliteRustAcceptanceNative]::IsWindowEnabled($forwardControl.Handle)
+                $passive.observations+=@{elapsed_ms=$passiveClock.ElapsedMilliseconds;forward_enabled=$forwardNow;focus=$native}
+                $passiveReady=$forwardNow -eq [bool]$step.forward_enabled -and
+                    $native.registered_editor_window -and $native.gui_thread_info_available -and
+                    $native.foreground_is_expected -and $native.active_is_expected -and
+                    $native.focus_is_expected -and $native.caret_is_expected
+                if ($passiveReady) { break }
+                if ($passiveClock.ElapsedMilliseconds -lt $TimeoutMs) { Start-Sleep -Milliseconds 15 }
+            } while ($passiveClock.ElapsedMilliseconds -lt $TimeoutMs)
+            $passive.status=if ($passiveReady) { 'PASS' } else { 'TIMEOUT' }
+            if (-not $passiveReady) { throw 'PRODUCT_ASSERTION: U01 navigation did not passively restore Main focus/caret after its native dispatch acknowledgment.' }
             $returned=Wait-UiState {
                 param($value)
                 [long]$value.document_id -eq [long]$expected.document_id -and
@@ -4714,35 +5185,115 @@ function Invoke-Rev3FocusedCases {
                 control_id=[int]$step.control;document_id=$returned.document_id;selection=$returned.selection
                 source_sha256=Get-UiTextSha256 ([string]$returned.source)
                 revision=$returned.revision;dirty=$returned.dirty;undo_count=$returned.undo_count;redo_count=$returned.redo_count
-                expected_scroll_dip=$scrollExpected;actual_scroll_dip=$returned.scroll;tolerance_dip=$scrollTolerance
+                expected_scroll_dip=$scrollExpected;actual_scroll_dip=$returned.scroll;tolerance_dip=$scrollTolerance;passive_focus=$passive
+            }
+            if ([int]$step.control -eq 169) {
+                # Exercise the self-disabling Forward return before another gesture.
+                $followupBefore=$returned
+                $focusBefore=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus(
+                    $script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,[uint32]$script:ProcessId)
+                if (-not $focusBefore.foreground_is_expected -or -not $focusBefore.active_is_expected -or
+                    -not $focusBefore.focus_is_expected -or -not $focusBefore.caret_is_expected) {
+                    throw 'PRODUCT_ASSERTION: U01 Forward lost Main input ownership before direct Unicode delivery.'
+                }
+                $followupSource=$sourceB+'A'
+                $sent=[MdliteRustAcceptanceNative]::SendUnicodeText($script:WindowHandle,[uint32]$script:ProcessId,'A')
+                if ($sent -ne 2) { throw ('U01_DIRECT_UNICODE_DELIVERY_FAILED: expected 2 events; sent '+$sent) }
+                $followupEdited=Wait-UiState {
+                    param($value)
+                    [long]$value.document_id -eq [long]$pointB.document_id -and [string]$value.source -ceq $followupSource -and
+                        [int]$value.selection.anchor -eq ($endB+1) -and [int]$value.selection.head -eq ($endB+1) -and
+                        [bool]$value.dirty -and [int]$value.undo_count -eq ([int]$pointB.undo_count+1) -and
+                        [int]$value.redo_count -eq 0 -and [long]$value.revision -gt [long]$pointB.revision
+                } 'U01 one direct synthetic Unicode character edits Forward-restored doc-01 EOF'
+                $focusEdited=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus(
+                    $script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,[uint32]$script:ProcessId)
+                if (-not $focusEdited.foreground_is_expected -or -not $focusEdited.active_is_expected -or
+                    -not $focusEdited.focus_is_expected -or -not $focusEdited.caret_is_expected) {
+                    throw 'PRODUCT_ASSERTION: U01 Main input ownership changed before direct Undo.'
+                }
+                $undoSent=[MdliteRustAcceptanceNative]::SendVirtualKey(
+                    $script:WindowHandle,[uint32]$script:ProcessId,[uint16]0x5A,[uint16[]]@(0x11))
+                if ($undoSent -ne 4) { throw ('U01_DIRECT_UNDO_DELIVERY_FAILED: expected 4 events; sent '+$undoSent) }
+                $followupUndone=Wait-UiState {
+                    param($value)
+                    [long]$value.document_id -eq [long]$pointB.document_id -and [string]$value.source -ceq $sourceB -and
+                        [int]$value.selection.anchor -eq $endB -and [int]$value.selection.head -eq $endB -and
+                        -not [bool]$value.dirty -and [int]$value.undo_count -eq [int]$pointB.undo_count -and
+                        [int]$value.redo_count -eq ([int]$pointB.redo_count+1) -and
+                        [long]$value.revision -gt [long]$followupEdited.revision
+                } 'U01 one direct Undo restores doc-01 source, EOF selection, and clean state'
+                $focusUndone=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus(
+                    $script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,[uint32]$script:ProcessId)
+                if (-not $focusUndone.foreground_is_expected -or -not $focusUndone.active_is_expected -or
+                    -not $focusUndone.focus_is_expected -or -not $focusUndone.caret_is_expected) {
+                    throw 'PRODUCT_ASSERTION: U01 direct Undo did not retain Main focus/caret.'
+                }
+                $pointB=$followupUndone
+                foreach ($item in @(
+                    @{phase='Forward-before';state=$followupBefore;focus=$focusBefore},
+                    @{phase='one-character';state=$followupEdited;focus=$focusEdited},
+                    @{phase='one-undo';state=$followupUndone;focus=$focusUndone}
+                )) {
+                    $observed=$item.state
+                    $followupEvidence+=@{phase=$item.phase;focus=$item.focus;document_id=$observed.document_id
+                        source_sha256=Get-UiTextSha256 ([string]$observed.source);selection=$observed.selection
+                        revision=$observed.revision;dirty=$observed.dirty;undo_count=$observed.undo_count;redo_count=$observed.redo_count}
+                }
+                $script:Report.operations+=@{name='U01 direct Forward follow-up';unicode_events=$sent;undo_events=$undoSent;observations=$followupEvidence}
+                # Only this exact Undo readback adopts doc-01's intentional new revision/redo item.
+                # The remaining Back assertion still compares doc-00 to its untouched pointA baseline.
             }
         }
         if ((Get-UiSafeFileHash $pathA) -cne $diskA -or (Get-UiSafeFileHash $pathB) -cne $diskB) {
-            throw 'PRODUCT_ASSERTION: U01 navigation changed fixture disk bytes.'
+            throw 'PRODUCT_ASSERTION: U01 navigation or intentional input/Undo changed fixture disk bytes.'
         }
         @{ query_rect_px=$r; outside_points_px=@(([int]$r[0]-2),([int]$r[2]+2)); navigation=$navigation
             navigation_baseline=@{document_id=$pointA.document_id;source_byte=$origin;scroll_dip=$pointA.scroll;restored=$true}
+            followup_input=@{delivery='direct guarded Unicode SendInput and Ctrl+Z immediately after Forward; synthetic, not real IME';observations=$followupEvidence;revision_and_history='intentional input advances revision; Undo restores source/selection and leaves one redo item'}
             disk_unchanged=@{doc00_sha256=$diskA;doc01_sha256=$diskB};compact='NOT_RUN';actual_dpi=$after.parent_root.dpi_raw }
 
     })
     [void](Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
-        $frames=@()
-        foreach ($close in @('Cancel','Escape','Close')) {
+        $paths=@(); $finalFrames=@()
+        foreach ($close in @('Cancel','Escape','TitlebarClose','ApplyThenCancel')) {
             $before=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
+            if ($before.selection.anchor -ne $before.selection.head) { throw 'SETUP_FAILURE: S02 needs a collapsed native caret baseline.' }
+            $point=Get-EditorRecoveryCaretDipPoint $before 'S02 pre-recorded native caret'
+            [int]$caretX=0; [int]$caretY=0
+            if (-not [MdliteRustAcceptanceNative]::OwnedClientPointToScreen($script:WindowHandle,$script:ProcessId,
+                [int][Math]::Round($point.x*$point.dpi),[int][Math]::Round($point.y*$point.dpi),[ref]$caretX,[ref]$caretY)) {
+                throw 'SETUP_FAILURE: S02 native caret point could not be recorded.'
+            }
+            $diskBefore=[ordered]@{}
+            foreach ($path in (@($script:UiInitialDocPaths)+@((Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'),(Join-Path $script:UiLocalAppData 'MDLite/settings.toml')))) {
+                $diskBefore[$path]=Get-UiSafeFileHash $path
+            }
             Invoke-UiControlById $script:WindowHandle 115
             $settings=Wait-UiThreadWindow 'MDLiteSettings' '' 3000
             Invoke-UiControlById $settings 302
-            $path=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'.png')
-            $frames+=@{ path=$path; capture=(Capture-UiOwnedWindow $settings $path) }
-            if ($close -ceq 'Cancel') { Invoke-UiDialogButton $settings 211 }
-            elseif ($close -ceq 'Escape') { Send-Key $settings 0x1B }
-            else { [void](Send-UiOwnedMessage $settings $WM_CLOSE) }
-            Wait-UiWindowGone $settings
+            $receipt=Invoke-S02PassiveClose $close $settings ([int[]]@($caretX,$caretY)) $script:S02FencedMainBounds
             $after=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
             Assert-UiDiagnosticDragInvariants $after $before 'settings close'
-            [void](Invoke-EditorViewportBodyClick 'S02' $close)
+            if ($after.selection.anchor -ne $before.selection.anchor -or $after.selection.head -ne $before.selection.head -or $after.scroll -ne $before.scroll) {
+                throw 'PRODUCT_ASSERTION: S02 close and first native-caret click changed selection or scroll.'
+            }
+            $focus=$receipt.native_focus_after_first_click
+            if (-not $focus.foreground_is_expected -or -not $focus.active_is_expected -or -not $focus.focus_is_expected -or -not $focus.caret_is_expected) {
+                throw 'PRODUCT_ASSERTION: S02 first editor click did not restore owned focus/caret without activation.'
+            }
+            foreach ($path in $diskBefore.Keys) {
+                if ((Get-UiSafeFileHash $path) -cne $diskBefore[$path]) { throw 'PRODUCT_ASSERTION: S02 changed document or no-op settings disk bytes.' }
+            }
+            $paths+=@{
+                close=$close;passive=$receipt;source_history_disk_unchanged=$true;focus_after_first_click=$focus;disk_sha256=$diskBefore
+                before=@{document_id=$before.document_id;revision=$before.revision;source_sha256=(Get-UiTextSha256 $before.source);selection=$before.selection;scroll=$before.scroll;dirty=$before.dirty;undo_count=$before.undo_count;redo_count=$before.redo_count}
+                after=@{document_id=$after.document_id;revision=$after.revision;source_sha256=(Get-UiTextSha256 $after.source);selection=$after.selection;scroll=$after.scroll;dirty=$after.dirty;undo_count=$after.undo_count;redo_count=$after.redo_count}
+            }
+            $finalPath=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'-final-fenced.png')
+            $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE FINAL FENCED SNAPSHOT' }
         }
-        @{ close_paths=@('Cancel','Escape','WM_CLOSE'); frames=$frames; apply_conflicts='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='NOT_RUN' }
+        @{ close_paths=$paths; final_fenced_frames=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
     })
     [void](Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
         $frames=@()
@@ -4753,6 +5304,7 @@ function Invoke-Rev3FocusedCases {
         }
         @{ frames=$frames; visual_acceptance='PENDING: toolbar rows, Calendar gap, font density'; menu_keyboard_help='NOT_RUN'; compact_overflow='NOT_RUN' }
     })
+    }
     $preCloseSnapshot=[ordered]@{
         observed_utc=[DateTime]::UtcNow.ToString('o'); diagnostic=$null; owned_window=$null
         query_control_count=$null; query_text=$null; candidate_151_visible=$null; candidate_151_controls=@()
@@ -4840,6 +5392,18 @@ function Invoke-Rev3FocusedCases {
     }
     $closeRecord.status='PASS'
     $script:Report.normal_close='PASS: exact owned focused Rev3 process exited with code 0.'
+    if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
+        $diskAfter=[ordered]@{}
+        foreach ($path in $script:PaintDependencyProbe.disk_before.Keys) {
+            $diskAfter[$path]=Get-UiSafeFileHash $path
+            if ($diskAfter[$path] -cne $script:PaintDependencyProbe.disk_before[$path]) {
+                $script:PaintDependencyProbe.error=@{ message='Fixture document bytes changed after normal close.' }
+            }
+        }
+        $script:PaintDependencyProbe.disk_after_close=$diskAfter
+        $script:PaintDependencyProbe.normal_close=$closeRecord
+        [IO.File]::WriteAllText((Join-Path $script:UiRunDirectory 'paint-dependency-probe.json'),($script:PaintDependencyProbe | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+    }
 }
 
 function Invoke-UiParitySuite {
@@ -4915,7 +5479,7 @@ function Invoke-UiParitySuite {
         'COMPACT_EDIT_UNDO_CLOSE_RETURN',
         'DIRTY_CLOSE_CANCEL_RESTART_RECOVERY_NORMAL_CLOSE'
     )
-    if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds } }
+    if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds }; if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') { $caseIds = @('PAINT_DEPENDENCY_PROBE') + $caseIds } }
     if ($StartupSmoke) {
         $caseIds = @('STARTUP_VISIBLE_LAYOUT')
     }
@@ -4939,9 +5503,14 @@ function Invoke-UiParitySuite {
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        $initialCapture = Capture-UiOwnedWindow $script:WindowHandle $script:UiCapturePath
-        $script:Report.initial_window_capture = '.codex-runtime/editor-acceptance/' + $runId + '/initial-window.png'
-        $script:Report.initial_window_capture_kind = [string]$initialCapture.capture_kind
+        if ($Rev3 -and $Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') {
+            $script:Report.initial_window_capture_kind='SKIPPED_DIAGNOSTIC_NO_COPY_NO_CAPTURE'
+        } else {
+            $initialCapture = Capture-UiOwnedWindow $script:WindowHandle $script:UiCapturePath
+            $script:S02FencedMainBounds=[int[]]$initialCapture.bounds
+            $script:Report.initial_window_capture = '.codex-runtime/editor-acceptance/' + $runId + '/initial-window.png'
+            $script:Report.initial_window_capture_kind = [string]$initialCapture.capture_kind
+        }
         Add-Observation ($script:Report.suite + ' startup') $initial
 
         if ($StartupSmoke) {
@@ -4972,7 +5541,7 @@ function Invoke-UiParitySuite {
             $script:Report.normal_close = 'PASS: clean owned startup smoke process exited.'
         } elseif ($Rev3) {
             $runCaseIds = $caseIds
-            Invoke-Rev3FocusedCases
+            Invoke-Rev3FocusedCases $initial
         } else {
             $runCaseIds = $caseIds
             [void](Invoke-UiParityCase 'PARENT_ROOT_METADATA' {

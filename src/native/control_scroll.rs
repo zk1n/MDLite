@@ -1429,6 +1429,229 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "visible NOACTIVATE rail invalidation regression; requires exclusive GUI lease"]
+    fn list_vertical_identical_owner_updates_preserve_clean_rail_and_visual_changes() {
+        let fixture = Fixture::explorer(100);
+        let foreground = unsafe { GetForegroundWindow() };
+        unsafe {
+            let state = fixture.state();
+            let rail = state.rail.hwnd();
+            let _ = ShowWindow(fixture.host, SW_SHOWNOACTIVATE);
+            assert!(IsWindowVisible(rail).as_bool());
+            SendMessageW(
+                fixture.adapted,
+                LB_SETSEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(-1)),
+            );
+            let bounds = || {
+                let mut rect = RECT::default();
+                GetWindowRect(rail, &mut rect).unwrap();
+                [rect.left, rect.top, rect.right, rect.bottom]
+            };
+            let damage = || {
+                let mut rect = RECT::default();
+                GetUpdateRect(rail, Some(&mut rect), false)
+                    .as_bool()
+                    .then_some([rect.left, rect.top, rect.right, rect.bottom])
+            };
+            let clean = || {
+                let _ = UpdateWindow(rail);
+                assert!(
+                    damage().is_none(),
+                    "test-only baseline rail paint must finish"
+                );
+            };
+            let range = state.range(fixture.adapted);
+            let rect = bounds();
+            let selection = SendMessageW(
+                fixture.adapted,
+                LB_GETSELCOUNT,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            )
+            .0;
+            for (label, message, wp, lp) in [
+                ("identical LB_SETSEL none", LB_SETSEL, WPARAM(0), LPARAM(-1)),
+                (
+                    "identical LB_SETTOPINDEX",
+                    LB_SETTOPINDEX,
+                    WPARAM(range.position as usize),
+                    LPARAM(0),
+                ),
+            ] {
+                clean();
+                SendMessageW(fixture.adapted, message, Some(wp), Some(lp));
+                assert!(state.range(fixture.adapted) == range);
+                assert_eq!(bounds(), rect);
+                assert_eq!(
+                    SendMessageW(
+                        fixture.adapted,
+                        LB_GETSELCOUNT,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0))
+                    )
+                    .0,
+                    selection
+                );
+                assert!(
+                    damage().is_none(),
+                    "{label} must not dirty an unchanged rail"
+                );
+                println!(
+                    "rail-cause {label}: damage={:?} range={}/{}/{} rect={rect:?} selection={selection} state_unchanged=true",
+                    damage(),
+                    range.content,
+                    range.page,
+                    range.position
+                );
+            }
+            clean();
+            refresh_listbox(fixture.adapted, shell::Tokens::default()).unwrap();
+            assert!(state.range(fixture.adapted) == range);
+            assert_eq!(bounds(), rect);
+            assert!(
+                damage().is_none(),
+                "identical refresh must leave a clean rail clean"
+            );
+            println!(
+                "rail-cause identical theme refresh: damage={:?} state_unchanged=true",
+                damage()
+            );
+
+            let _ = InvalidateRect(Some(rail), None, false);
+            refresh_listbox(fixture.adapted, shell::Tokens::default()).unwrap();
+            assert!(
+                damage().is_some(),
+                "identical refresh must preserve independently pending damage"
+            );
+
+            clean();
+            SendMessageW(
+                fixture.adapted,
+                LB_SETTOPINDEX,
+                Some(WPARAM(1)),
+                Some(LPARAM(0)),
+            );
+            assert_eq!(state.range(fixture.adapted).position, 1);
+            assert!(damage().is_some());
+            println!("rail-cause changed position: damage={:?}", damage());
+            clean();
+            let mut tokens = shell::Tokens::default();
+            tokens.muted.r = (tokens.muted.r + 0.2).min(1.);
+            refresh_listbox(fixture.adapted, tokens).unwrap();
+            assert!(damage().is_some());
+            println!("rail-cause changed theme: damage={:?}", damage());
+            clean();
+            SetWindowPos(
+                fixture.adapted,
+                None,
+                350,
+                10,
+                320,
+                250,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .unwrap();
+            assert_ne!(bounds(), rect);
+            assert!(damage().is_some());
+            println!(
+                "rail-cause changed geometry: damage={:?} rect={:?}",
+                damage(),
+                bounds()
+            );
+            clean();
+            SendMessageW(rail, WM_MOUSEMOVE, Some(WPARAM(0)), Some(LPARAM(5 << 16)));
+            assert!(damage().is_some());
+            println!("rail-cause native hover: damage={:?}", damage());
+            clean();
+            SendMessageW(rail, WM_CANCELMODE, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(damage().is_some());
+            println!(
+                "rail-cause native cancel after hover: damage={:?}",
+                damage()
+            );
+            clean();
+            SendMessageW(rail, WM_MOUSEMOVE, Some(WPARAM(0)), Some(LPARAM(5 << 16)));
+            clean();
+            assert_ne!(
+                GetCapture(),
+                rail,
+                "public cancellation case must have no capture"
+            );
+            state.rail.cancel();
+            refresh_listbox(fixture.adapted, state.tokens.get()).unwrap();
+            assert!(
+                damage().is_some(),
+                "public hover-only cancellation must redraw after identical update"
+            );
+            clean();
+            state.rail.cancel();
+            refresh_listbox(fixture.adapted, state.tokens.get()).unwrap();
+            assert!(
+                damage().is_none(),
+                "unchanged public cancellation must leave a clean rail clean"
+            );
+            let _ = InvalidateRect(Some(rail), None, false);
+            state.rail.cancel();
+            assert!(
+                damage().is_some(),
+                "public cancellation must preserve independently pending damage"
+            );
+            println!(
+                "rail-cause no-capture public cancellation redraw/no-op/independent damage: verified"
+            );
+            set_horizontal_extent(fixture.adapted, 1800).unwrap();
+            let horizontal = state.horizontal.get().unwrap();
+            let hrail = horizontal.rail.hwnd();
+            let mut hbounds = RECT::default();
+            GetWindowRect(hrail, &mut hbounds).unwrap();
+            let mut origin = POINT {
+                x: hbounds.left,
+                y: hbounds.top,
+            };
+            assert!(ScreenToClient(fixture.host, &mut origin).as_bool());
+            let hrect = RECT {
+                left: origin.x,
+                top: origin.y,
+                right: origin.x + hbounds.right - hbounds.left,
+                bottom: origin.y + hbounds.bottom - hbounds.top,
+            };
+            let hrange = state.h_range(fixture.adapted);
+            let corner = state.reserve.get() + 1;
+            let _ = UpdateWindow(hrail);
+            assert!(!GetUpdateRect(hrail, None, false).as_bool());
+            assert!(horizontal.rail.update_horizontal_sibling(
+                hrange,
+                96,
+                state.tokens.get(),
+                false,
+                hrect,
+                corner
+            ));
+            assert!(
+                GetUpdateRect(hrail, None, false).as_bool(),
+                "corner-only change must redraw horizontal thumb geometry"
+            );
+            let _ = UpdateWindow(hrail);
+            assert!(horizontal.rail.update_horizontal_sibling(
+                hrange,
+                96,
+                state.tokens.get(),
+                false,
+                hrect,
+                corner
+            ));
+            assert!(
+                !GetUpdateRect(hrail, None, false).as_bool(),
+                "identical horizontal update must leave the rail clean"
+            );
+            println!("rail-cause horizontal corner-only redraw and identical update: verified");
+            assert_eq!(GetForegroundWindow(), foreground);
+        }
+    }
+
+    #[test]
     fn list_vertical_wheel_partial_modifiers_and_native_keys_match() {
         let f = Fixture::new(500);
         unsafe {

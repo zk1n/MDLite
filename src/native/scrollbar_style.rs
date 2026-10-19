@@ -183,7 +183,18 @@ impl VerticalRail {
 
     pub(super) unsafe fn cancel(&self) {
         unsafe {
+            let state = &self.0;
+            let hwnd = state.hwnd.get();
+            let redraw = state.hover.get()
+                || state.drag_offset.get().is_some()
+                || state
+                    .pending
+                    .get()
+                    .is_some_and(|position| position != state.range.get().position);
             self.0.cancel();
+            if redraw && hwnd != HWND::default() && state.hwnd.get() == hwnd {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
         }
     }
 
@@ -205,9 +216,14 @@ impl VerticalRail {
     /// stale input; a position-only acknowledgment preserves newer queued targets.
     pub(super) unsafe fn update(&self, range: Range, dpi: u32, tokens: shell::Tokens, hc: bool) {
         unsafe {
-            let Some(hwnd) = self.begin_update(range, dpi, tokens, hc) else {
+            let Some((hwnd, redraw)) = self.begin_update(range, dpi, tokens, hc) else {
                 return;
             };
+            let mut before = WINDOWINFO {
+                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            let geometry_known = GetWindowInfo(hwnd, &mut before).is_ok();
             let s = &self.0;
             if hc {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -263,7 +279,7 @@ impl VerticalRail {
                     SetScrollInfo(s.owner, SB_VERT, &scroll_info(range), true);
                 }
             }
-            self.end_update(hwnd);
+            self.end_update(hwnd, redraw || !geometry_known, &before);
         }
     }
 
@@ -278,9 +294,14 @@ impl VerticalRail {
         rect: RECT,
     ) -> bool {
         unsafe {
-            let Some(hwnd) = self.begin_update(range, dpi, tokens, native) else {
+            let Some((hwnd, redraw)) = self.begin_update(range, dpi, tokens, native) else {
                 return false;
             };
+            let mut before = WINDOWINFO {
+                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            let geometry_known = GetWindowInfo(hwnd, &mut before).is_ok();
             let placed = native
                 || SetWindowPos(
                     hwnd,
@@ -302,7 +323,7 @@ impl VerticalRail {
                     },
                 );
             }
-            self.end_update(hwnd);
+            self.end_update(hwnd, redraw || !geometry_known, &before);
             placed
         }
     }
@@ -317,7 +338,13 @@ impl VerticalRail {
         corner: i32,
     ) -> bool {
         unsafe {
-            self.0.trailing_gap.set(corner.max(0));
+            let corner = corner.max(0);
+            if self.0.trailing_gap.replace(corner) != corner {
+                let hwnd = self.hwnd();
+                if hwnd != HWND::default() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
             self.update_sibling(range, dpi, tokens, native, rect)
         }
     }
@@ -328,7 +355,7 @@ impl VerticalRail {
         dpi: u32,
         tokens: shell::Tokens,
         native: bool,
-    ) -> Option<HWND> {
+    ) -> Option<(HWND, bool)> {
         unsafe {
             let s = &self.0;
             let hwnd = self.hwnd();
@@ -336,6 +363,14 @@ impl VerticalRail {
                 return None;
             }
             let old = s.range.replace(range);
+            let old_tokens = s.tokens.get();
+            let redraw = native
+                || s.native.get()
+                || old != range
+                || s.dpi.get() != dpi
+                || old_tokens.panel != tokens.panel
+                || old_tokens.border != tokens.border
+                || old_tokens.muted != tokens.muted;
             if old.content != range.content
                 || old.page != range.page
                 || s.dpi.get() != dpi
@@ -350,15 +385,25 @@ impl VerticalRail {
             s.dpi.set(dpi.max(1));
             s.tokens.set(tokens);
             s.native.set(native);
-            Some(hwnd)
+            Some((hwnd, redraw))
         }
     }
 
-    unsafe fn end_update(&self, hwnd: HWND) {
+    unsafe fn end_update(&self, hwnd: HWND, redraw: bool, before: &WINDOWINFO) {
         unsafe {
             self.0.updating.set(false);
             if self.hwnd() == hwnd {
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                let mut after = WINDOWINFO {
+                    cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                    ..Default::default()
+                };
+                if redraw
+                    || GetWindowInfo(hwnd, &mut after).is_err()
+                    || before.rcWindow != after.rcWindow
+                    || (before.dwStyle.0 ^ after.dwStyle.0) & WS_VISIBLE.0 != 0
+                {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
         }
     }

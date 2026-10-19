@@ -6942,15 +6942,23 @@ function Invoke-Rev3FocusedCases($StartupState) {
     $preCloseSnapshot=[ordered]@{
         observed_utc=[DateTime]::UtcNow.ToString('o'); diagnostic=$null; owned_window=$null
         query_control_count=$null; query_text=$null; candidate_151_visible=$null; candidate_151_controls=@()
+        raw_diagnostic_reference=$null; close_gate_status='NOT_CHECKED'; close_gate_failure=$null
         observation_error=$null
     }
+    $preCloseState=$null
     try {
-        $preCloseState=Wait-Diagnostic { param($value) $true } 'fresh diagnostic before focused suite normal close'
+        $preCloseState=Read-Diagnostic
         $preCloseSnapshot.diagnostic=[ordered]@{
             source_sha256=Get-UiTextSha256 ([string]$preCloseState.source)
             document_id=[long]$preCloseState.document_id; revision=[int]$preCloseState.revision
             dirty=[bool]$preCloseState.dirty; undo_count=[int]$preCloseState.undo_count
             redo_count=[int]$preCloseState.redo_count; selection=$preCloseState.selection
+        }
+        $preCloseSnapshot.raw_diagnostic_reference=[ordered]@{
+            path=$script:DiagnosticPath
+            file_sha256=(Get-FileHash -LiteralPath $script:DiagnosticPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            file_write_utc=[IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath).ToString('o')
+            read_freshness='Read-Diagnostic succeeded only after WM_APP+1 send completion, LRESULT=1, and diagnostic timestamp advance.'
         }
         $preCloseSnapshot.owned_window=Get-OwnedActivationState $script:WindowHandle
         $ownedControls=@(Get-UiOwnedChildren $script:WindowHandle)
@@ -6965,6 +6973,54 @@ function Invoke-Rev3FocusedCases($StartupState) {
     } catch {
         $preCloseSnapshot.observation_error=$_.Exception.Message
     }
+    $preCloseGateFailure=$null
+    if ($null -ne $preCloseSnapshot.observation_error -or $null -eq $preCloseState) {
+        $preCloseGateFailure='FRESH_PRE_CLOSE_OBSERVATION_UNAVAILABLE'
+    } elseif ([bool]$preCloseState.dirty) {
+        $preCloseGateFailure='DIRTY_PRE_CLOSE_STATE'
+    } else {
+        $ownerState=$preCloseSnapshot.owned_window
+        $mainValue=$script:WindowHandle.ToInt64()
+        $preCloseIdentityMatches=$null -ne $ownerState -and
+            [long]$ownerState.target_hwnd -eq $mainValue -and
+            [uint32]$ownerState.target_pid -eq [uint32]$script:ProcessId -and
+            [long]$ownerState.foreground_hwnd -eq $mainValue -and
+            [uint32]$ownerState.foreground_pid -eq [uint32]$script:ProcessId -and
+            [uint32]$ownerState.foreground_thread -eq [uint32]$ownerState.target_thread -and
+            [uint32]$ownerState.runner_session -eq [uint32]$ownerState.target_session -and
+            [long]$ownerState.active_hwnd -eq $mainValue
+        if (-not $preCloseIdentityMatches) { $preCloseGateFailure='OWNED_MAIN_FOREGROUND_SESSION_GATE_FAILED' }
+    }
+    $closeProcess=$null
+    $processHandle=$null
+    if ($null -eq $preCloseGateFailure) {
+        try {
+            Assert-UiExecutableIdentity
+            Assert-UiOwnedWindow $script:WindowHandle
+            $closeProcess=$script:Process
+            $processHandle=$closeProcess.Handle
+        } catch {
+            $preCloseGateFailure='OWNED_PROCESS_IDENTITY_GUARD_FAILED: '+$_.Exception.Message
+        }
+    }
+    if ($null -ne $preCloseGateFailure) {
+        $preCloseSnapshot.close_gate_status='BLOCKED'
+        $preCloseSnapshot.close_gate_failure=$preCloseGateFailure
+        $script:Report['rev3_preclose_snapshot']=$preCloseSnapshot
+        $processRetained=$null
+        try { if ($null -ne $script:Process) { $processRetained=-not [bool]$script:Process.HasExited } } catch { }
+        $blockedClose=[ordered]@{
+            message='WM_CLOSE'; close_sent=$false; process_handle_retained=$false
+            process_wait_completed=$false; process_still_running=$processRetained; process_retained=$processRetained
+            process_exit_code=$null; actual_exit_code='UNKNOWN'; status='BLOCKED_PRE_CLOSE_GATE'
+            preclose_gate_failure=$preCloseGateFailure
+        }
+        $script:Report['normal_close_details']=$blockedClose
+        $script:Report.process_still_running=$processRetained
+        $script:Report.normal_close='BLOCKED: fresh clean owned pre-close proof unavailable; WM_CLOSE was not sent.'
+        throw [System.NotSupportedException]::new('REV3_NORMAL_CLOSE_BLOCKED_PRE_CLOSE_GATE')
+    }
+    $preCloseSnapshot.close_gate_status='PASS'
     $script:Report['rev3_preclose_snapshot']=$preCloseSnapshot
 
     $closeTimer=[Diagnostics.Stopwatch]::StartNew()
@@ -6973,8 +7029,6 @@ function Invoke-Rev3FocusedCases($StartupState) {
     $closeSent=$false
     $closeWin32Error=$null
     $closeSendException=$null
-    Assert-UiExecutableIdentity
-    Assert-UiOwnedWindow $script:WindowHandle
     try {
         $closeSent=[MdliteRustAcceptanceNative]::SendMessageTimeoutW(
             $script:WindowHandle,[uint32]$WM_CLOSE,[IntPtr]::Zero,[IntPtr]::Zero,
@@ -6988,12 +7042,19 @@ function Invoke-Rev3FocusedCases($StartupState) {
     $closeSendElapsedMs=$closeTimer.ElapsedMilliseconds
 
     $exitWaitTimer=[Diagnostics.Stopwatch]::StartNew()
-    $processExited=$false
+    $processExited=$null
     $processExitCode=$null
+    $exitCodeAvailable=$false
     $exitWaitException=$null
     try {
-        $processExited=$script:Process.WaitForExit(5000)
-        if ($processExited) { $processExitCode=[int]$script:Process.ExitCode }
+        $processExited=$closeProcess.WaitForExit(5000)
+        if ($processExited) {
+            $closeProcess.Refresh()
+            if ($closeProcess.HasExited) {
+                $processExitCode=$closeProcess.ExitCode
+                $exitCodeAvailable=$null -ne $processExitCode
+            }
+        }
     } catch {
         $exitWaitException=$_.Exception.Message
     }
@@ -7003,16 +7064,25 @@ function Invoke-Rev3FocusedCases($StartupState) {
         send_succeeded=[bool]$closeSent; send_result=$closeResult.ToInt64()
         send_win32_error=$closeWin32Error; send_elapsed_ms=$closeSendElapsedMs
         send_exception=$closeSendException; wait_for_exit_timeout_ms=5000
-        process_wait_completed=[bool]$processExited; process_exit_code=$processExitCode
+        process_handle_retained=($null -ne $processHandle)
+        process_wait_completed=$processExited; process_exit_code=$processExitCode
+        actual_exit_code=if ($exitCodeAvailable) { $processExitCode } else { 'UNKNOWN' }
+        exit_code_available=$exitCodeAvailable
+        process_retained=if ($processExited -eq $true) { $false } elseif ($processExited -eq $false) { $true } else { $null }
         process_wait_elapsed_ms=$exitWaitElapsedMs; process_wait_exception=$exitWaitException
         status=$null
     }
     $script:Report['normal_close_details']=$closeRecord
-    $script:Report.process_still_running=(-not $processExited)
-    if (-not $processExited) {
-        $closeRecord.status='FAIL_PROCESS_DID_NOT_EXIT'
-        $script:Report.normal_close='FAIL: owned process did not exit within the existing 5000 ms wait.'
-        throw 'REV3_NORMAL_CLOSE_FAILED: owned process did not exit within the existing 5000 ms wait.'
+    $script:Report.process_still_running=$closeRecord.process_retained
+    if ($processExited -ne $true) {
+        $closeRecord.status=if ($processExited -eq $false) { 'FAIL_PROCESS_RETAINED_EXIT_UNKNOWN' } else { 'FAIL_PROCESS_EXIT_UNCONFIRMED' }
+        $script:Report.normal_close='FAIL: process exit was not confirmed after the existing 5000 ms wait; actual exit code UNKNOWN.'
+        throw 'REV3_NORMAL_CLOSE_FAILED: exit not confirmed; actual exit code UNKNOWN after the existing 5000 ms wait.'
+    }
+    if (-not $exitCodeAvailable) {
+        $closeRecord.status='FAIL_EXIT_CODE_UNKNOWN'
+        $script:Report.normal_close='FAIL: process exit was observed but actual exit code is UNKNOWN.'
+        throw 'REV3_NORMAL_CLOSE_FAILED: process exited but actual exit code is UNKNOWN.'
     }
     if ($processExitCode -ne 0) {
         $closeRecord.status='FAIL_NONZERO_EXIT'

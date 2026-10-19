@@ -924,6 +924,88 @@ public static class MdliteRustAcceptanceNative
     private static extern IntPtr GetWindow(IntPtr window, uint command);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+
+    public static Dictionary<string, object> OwnedWindowMetadata(IntPtr window, IntPtr main, uint pid)
+    {
+        if (!IsOwnedWindow(main, pid) || !IsOwnedWindow(window, pid)) throw new InvalidOperationException("OWNERSHIP_GATE");
+        uint actualPid, mainPid;
+        uint thread = GetWindowThreadProcessId(window, out actualPid);
+        uint mainThread = GetWindowThreadProcessId(main, out mainPid);
+        return new Dictionary<string, object> {
+            {"Visible", IsWindowVisible(window)}, {"Enabled", IsWindowEnabled(window)},
+            {"OwnerHwnd", GetWindow(window, 4).ToInt64()}, {"ThreadId", thread},
+            {"ProcessId", actualPid}, {"MainThreadId", mainThread}, {"MainEnabled", IsWindowEnabled(main)}
+        };
+    }
+
+    public static bool SettingsClickPointReady(int[] client, int[] control, bool recipientMatchesControl)
+    {
+        if (client == null || control == null || client.Length != 4 || control.Length != 4 ||
+            client[2] <= client[0] || client[3] <= client[1] || control[2] <= control[0] || control[3] <= control[1]) return false;
+        int x = (int)Math.Floor(((long)control[0] + control[2]) / 2.0);
+        int y = (int)Math.Floor(((long)control[1] + control[3]) / 2.0);
+        return recipientMatchesControl && x >= client[0] && x < client[2] && y >= client[1] && y < client[3];
+    }
+
+    public static Dictionary<string, object> OwnedSettingsControls(IntPtr window, IntPtr main, uint pid)
+    {
+        var metadata = OwnedWindowMetadata(window, main, pid);
+        bool ready = WindowClass(window) == "MDLiteSettings" && (long)metadata["OwnerHwnd"] == main.ToInt64() &&
+            (uint)metadata["ThreadId"] == (uint)metadata["MainThreadId"];
+        RECT client;
+        POINT topLeft = new POINT(), bottomRight = new POINT();
+        bool clientBoundsValid = GetClientRect(window, out client);
+        if (clientBoundsValid) {
+            topLeft.X = client.Left; topLeft.Y = client.Top;
+            bottomRight.X = client.Right; bottomRight.Y = client.Bottom;
+            clientBoundsValid = ClientToScreen(window, ref topLeft) && ClientToScreen(window, ref bottomRight);
+        }
+        int[] clientBounds = clientBoundsValid ? new int[] {topLeft.X, topLeft.Y, bottomRight.X, bottomRight.Y} : null;
+        var controls = new List<object>();
+        foreach (int id in new int[] {200, 210, 211, 300, 301, 302, 303}) {
+            IntPtr control = GetDlgItem(window, id);
+            uint controlPid;
+            uint thread = GetWindowThreadProcessId(control, out controlPid);
+            bool owned = control != IntPtr.Zero && IsOwnedWindow(control, pid) &&
+                GetParent(control) == window && thread == (uint)metadata["ThreadId"];
+            string name = control == IntPtr.Zero ? String.Empty : WindowClass(control);
+            bool classMatches = String.Equals(name, id == 200 ? "ComboBox" : "Button", StringComparison.OrdinalIgnoreCase);
+            bool visible = control != IntPtr.Zero && IsWindowVisible(control);
+            bool enabled = control != IntPtr.Zero && IsWindowEnabled(control);
+            int[] controlBounds = null, clickPoint = null;
+            IntPtr recipient = IntPtr.Zero;
+            uint recipientPid = 0, recipientThread = 0;
+            bool recipientMatches = false, clickReady = false;
+            if (id < 300 && owned && visible && enabled) {
+                RECT bounds;
+                if (GetWindowRect(control, out bounds)) {
+                    controlBounds = new int[] {bounds.Left, bounds.Top, bounds.Right, bounds.Bottom};
+                    POINT point = new POINT();
+                    point.X = (int)Math.Floor(((long)bounds.Left + bounds.Right) / 2.0);
+                    point.Y = (int)Math.Floor(((long)bounds.Top + bounds.Bottom) / 2.0);
+                    clickPoint = new int[] {point.X, point.Y};
+                    recipient = WindowFromPoint(point);
+                    recipientThread = GetWindowThreadProcessId(recipient, out recipientPid);
+                    recipientMatches = recipientPid == pid && recipientThread == thread && IsOwnedWindow(recipient, pid) &&
+                        (recipient == control || IsChild(control, recipient));
+                    clickReady = SettingsClickPointReady(clientBounds, controlBounds, recipientMatches);
+                }
+            }
+            bool available = owned && classMatches && (id >= 300 || (visible && enabled && clickReady));
+            ready &= available;
+            controls.Add(new Dictionary<string, object> {
+                {"id", id}, {"hwnd", control.ToInt64()}, {"class", name}, {"owned", owned},
+                {"thread_id", thread}, {"visible", visible}, {"enabled", enabled}, {"available", available},
+                {"control_screen_bounds", controlBounds}, {"click_center", clickPoint}, {"click_ready", id >= 300 ? (object)null : clickReady},
+                {"recipient_hwnd", recipient.ToInt64()}, {"recipient_pid", recipientPid}, {"recipient_thread", recipientThread},
+                {"recipient_matches_control", recipientMatches}
+            });
+        }
+        return new Dictionary<string, object> {{"controls_ready", ready}, {"client_screen_bounds", clientBounds}, {"controls", controls.ToArray()}};
+    }
+
+    [DllImport("user32.dll")]
     public static extern IntPtr GetParent(IntPtr window);
 
     [DllImport("user32.dll")]
@@ -3384,17 +3466,22 @@ function Set-UiEditText(
     if ($Value.Length -gt 0) { Send-UnicodeText $Value $ForegroundWindow }
 }
 
-function Get-UiThreadWindows {
+function Get-UiThreadWindows([switch]$IncludeHidden) {
     Assert-UiOwnedWindow $script:WindowHandle
     foreach ($handleValue in [MdliteRustAcceptanceNative]::OwnedThreadWindows(
         $script:WindowHandle, $script:ProcessId)) {
         $handle = [IntPtr]([long]$handleValue)
-        if ([MdliteRustAcceptanceNative]::IsWindowVisible($handle)) {
-            [pscustomobject]@{
+        if ($IncludeHidden -or [MdliteRustAcceptanceNative]::IsWindowVisible($handle)) {
+            $entry=[ordered]@{
                 Handle = $handle
                 Class = [MdliteRustAcceptanceNative]::WindowClass($handle)
                 Title = [MdliteRustAcceptanceNative]::WindowTitle($handle)
             }
+            if ($IncludeHidden) {
+                $metadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($handle,$script:WindowHandle,$script:ProcessId)
+                foreach ($field in $metadata.GetEnumerator()) { $entry[$field.Key]=$field.Value }
+            }
+            [pscustomobject]$entry
         }
     }
 }
@@ -3402,8 +3489,11 @@ function Get-UiThreadWindows {
 function Wait-UiThreadWindow(
     [string]$Class,
     [string]$Title = '',
-    [int]$WaitMs = 3000
+    [int]$WaitMs = 3000,
+    [switch]$SettingsReady
 ) {
+    if ($SettingsReady -and $Class -cne 'MDLiteSettings') { throw 'SETUP_FAILURE: SettingsReady requires MDLiteSettings.' }
+    if ($SettingsReady -and -not $PSBoundParameters.ContainsKey('WaitMs')) { $WaitMs=$TimeoutMs }
     $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMs)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $receipt = [ordered]@{
@@ -3411,6 +3501,9 @@ function Wait-UiThreadWindow(
         requested_class = $Class
         requested_title = $Title
         wait_ms = $WaitMs
+        settings_ready_mode = [bool]$SettingsReady
+        first_seen_ms = $null; first_visible_ms = $null; first_ready_ms = $null
+        first_seen_definition = 'first poll observation, not window creation time'
         samples = @()
         elapsed_ms = $null
         final_status = $null
@@ -3420,16 +3513,28 @@ function Wait-UiThreadWindow(
     $finalStatus = $null
     try {
         do {
-            $windows = @(Get-UiThreadWindows)
+            $windows = @(Get-UiThreadWindows -IncludeHidden:$SettingsReady)
             $matches = @(
                 $windows | Where-Object {
                     $_.Class -ceq $Class -and
                     ([string]::IsNullOrEmpty($Title) -or $_.Title -ceq $Title)
                 }
             )
+            $settingsState=$null; $ready=$matches.Count -eq 1
+            if ($SettingsReady -and $matches.Count -eq 1) {
+                $match=$matches[0]
+                if ($null -eq $receipt.first_seen_ms) { $receipt.first_seen_ms=$clock.ElapsedMilliseconds }
+                if ($match.Visible -and $null -eq $receipt.first_visible_ms) { $receipt.first_visible_ms=$clock.ElapsedMilliseconds }
+                $settingsState=[MdliteRustAcceptanceNative]::OwnedSettingsControls($match.Handle,$script:WindowHandle,$script:ProcessId)
+                $ready=$match.Visible -and $match.Enabled -and $match.OwnerHwnd -eq $script:WindowHandle.ToInt64() -and
+                    $match.ProcessId -eq $script:ProcessId -and $match.ThreadId -eq $match.MainThreadId -and $settingsState.controls_ready
+                if ($ready -and $null -eq $receipt.first_ready_ms) { $receipt.first_ready_ms=$clock.ElapsedMilliseconds }
+            }
             $receipt.samples += [pscustomobject]@{
                 elapsed_ms = [long]$clock.ElapsedMilliseconds
                 matching_count = $matches.Count
+                settings_controls = $settingsState
+                settings_metadata = if ($SettingsReady) { $matches } else { $null }
                 windows = @($windows | ForEach-Object {
                     [pscustomobject]@{
                         handle = '0x{0:X}' -f $_.Handle.ToInt64()
@@ -3438,7 +3543,7 @@ function Wait-UiThreadWindow(
                     }
                 })
             }
-            if ($matches.Count -eq 1) {
+            if ($ready) {
                 $finalStatus = 'MATCHED'
                 return $matches[0].Handle
             }
@@ -3486,7 +3591,7 @@ function Invoke-UiOwnedDialogOk([IntPtr]$Dialog) {
         throw [System.InvalidOperationException]::new('OWNED_OK_DIALOG_UNAVAILABLE')
     }
     $buttons = @(Get-UiOwnedChildren $Dialog | Where-Object {
-        $_.Class -ceq 'BUTTON' -and $_.Text -ceq 'OK' -and $_.Visible -and $_.Enabled
+        $_.Class -ieq 'BUTTON' -and $_.Text -ceq 'OK' -and $_.Visible -and $_.Enabled
     })
     if ($buttons.Count -ne 1) {
         throw [System.NotSupportedException]::new('OWNED_DIALOG_OK_BUTTON_NOT_UNIQUE')
@@ -4392,12 +4497,11 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     $directory=Join-Path $script:UiRunDirectory ('s02-passive-'+$Close)
     [void][IO.Directory]::CreateDirectory($directory)
     $cancel=Get-UiControlById $Settings 211 'BUTTON' -RequireVisible -RequireEnabled
-    $cancelPoint=[int[]]@(($cancel.Rect[0]+$cancel.Rect[2])/2,($cancel.Rect[1]+$cancel.Rect[3])/2)
-    $applyPoint=$null; $closePoint=$null
-    if ($Close -ceq 'ApplyThenCancel') {
-        $apply=Get-UiControlById $Settings 210 'BUTTON' -RequireVisible -RequireEnabled
-        $applyPoint=[int[]]@(($apply.Rect[0]+$apply.Rect[2])/2,($apply.Rect[1]+$apply.Rect[3])/2)
-    }
+    $cancelPoint=[int[]]@(
+        [Math]::Floor(([double]$cancel.Rect[0]+[double]$cancel.Rect[2])/2.0),
+        [Math]::Floor(([double]$cancel.Rect[1]+[double]$cancel.Rect[3])/2.0)
+    )
+    $closePoint=$null
     if ($Close -ceq 'TitlebarClose') { $closePoint=[MdliteRustAcceptanceNative]::S02ClosePoint($Settings,$script:ProcessId) }
     $shared=[hashtable]::Synchronized(@{
         ready=[Threading.ManualResetEvent]::new($false); stop=[Threading.ManualResetEvent]::new($false)
@@ -4476,7 +4580,6 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     }
     try {
         if (-not $shared.ready.WaitOne(2000) -or $null -ne $shared.error -or $shared.frames.Count -eq 0) { throw 'S02_PASSIVE_FIRST_FRAME_UNAVAILABLE' }
-        if ($Close -ceq 'ApplyThenCancel') { & $click $Settings $applyPoint 'no-op Apply' }
         if ($Close -ceq 'Escape') {
             $entry=[ordered]@{action='Escape';start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;sent=0}
             $actions.Add($entry)
@@ -4516,19 +4619,50 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     [object[]]$frameRecords=@()
     if ($workerCompleted) { $frameRecords=$shared.frames.ToArray() }
     $copied=@($frameRecords | Where-Object { $null -ne $_.file })
-    $maxGap=if ($copied.Count -gt 1) { ($copied | Measure-Object start_gap_ms -Maximum).Maximum } else { $null }
-    $coverage=$copied.Count -ge 2 -and $null -ne $clickCompleted -and $copied[-1].copy_started_ms -ge $clickCompleted
+    $coverageInputs=[ordered]@{
+        copied_frame_count=$copied.Count; click_completed_ms=$clickCompleted
+        final_copy_started_ms=if ($copied.Count -gt 0) { $copied[-1]['copy_started_ms'] } else { $null }
+        required_frame_count=2
+    }
+    $rawEvidencePath=Join-Path $directory 'raw-evidence-before-metrics.json'
+    $rawEvidence=[ordered]@{
+        path=$Close; crop=$Crop; frame_records=$frameRecords; actions=$actions.ToArray()
+        sampler_error=$shared.error; actor_error=$actorError; worker_completion_confirmed=$workerCompleted
+        native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
+        dropped_slots=$shared.dropped_slots; coverage_inputs=$coverageInputs
+    }
+    try {
+        [IO.File]::WriteAllText($rawEvidencePath,($rawEvidence | ConvertTo-Json -Depth 22),[Text.UTF8Encoding]::new($false))
+    } catch {
+        throw ('S02_PASSIVE_RAW_EVIDENCE_WRITE_FAILED: '+$directory+': '+$_.Exception.Message)
+    }
+    $metricError=$null; $maxGap=$null; $coverage=$false
+    try {
+        $maxGap=if ($copied.Count -gt 0) {
+            $gapValues=[double[]]@($copied | ForEach-Object {
+                $gap=$_[ 'start_gap_ms' ]
+                if ($null -ne $gap) { [double]$gap }
+            })
+            if ($gapValues.Count -gt 0) { ($gapValues | Measure-Object -Maximum).Maximum } else { $null }
+        } else { $null }
+        $coverage=$copied.Count -ge 2 -and $null -ne $clickCompleted -and $copied[-1]['copy_started_ms'] -ge $clickCompleted
+    } catch {
+        $metricError=[ordered]@{message=$_.Exception.Message;stack=$_.ScriptStackTrace}
+    }
+    $rawEvidenceSha256=(Get-FileHash -LiteralPath $rawEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $receipt=[ordered]@{
         path=$Close; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
+        raw_evidence_path=$rawEvidencePath; raw_evidence_sha256=$rawEvidenceSha256; coverage_inputs=$coverageInputs; metric_error=$metricError
         worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
         native_focus_observation_order='BEFORE_ANY_DIAGNOSTIC_REFRESH'
         sampling_target_ms=16; bounded_duration_ms=2000; dropped_slots=$shared.dropped_slots; max_actual_start_gap_ms=$maxGap
         covers_first_editor_click=$coverage; paint_forced=$false; activation_during_interval=$false
-        apply=if ($Close -ceq 'ApplyThenCancel') { 'NO-OP ONLY; changed-value Apply remains NOT_RUN' } else { 'NOT_RUN' }
+        apply=if ($Close -ceq 'ApplyThenCancel') { 'CLOSE AFTER NO-OP APPLY ONLY; Apply-phase pixels NOT_OBSERVED; changed-value Apply NOT_RUN' } else { 'NOT_RUN' }
         visual_acceptance='PENDING: inspect passive frames; flashes shorter than measured gaps are not ruled out.'
     }
     [IO.File]::WriteAllText((Join-Path $directory 'receipt.json'),($receipt | ConvertTo-Json -Depth 18),[Text.UTF8Encoding]::new($false))
+    if ($null -ne $metricError) { throw ('S02_PASSIVE_METRIC_FAILED: '+$directory+': '+$metricError.message) }
     if ($null -ne $shared.error -or $null -ne $actorError -or -not $coverage) { throw ('S02_PASSIVE_OBSERVATION_FAILED: '+$directory) }
     return $receipt
 }
@@ -5341,8 +5475,41 @@ function Invoke-Rev3FocusedCases($StartupState) {
                 $diskBefore[$path]=Get-UiSafeFileHash $path
             }
             Invoke-UiControlById $script:WindowHandle 115
-            $settings=Wait-UiThreadWindow 'MDLiteSettings' '' 3000
-            Invoke-UiControlById $settings 302
+            $settings=Wait-UiThreadWindow 'MDLiteSettings' -SettingsReady -WaitMs $TimeoutMs
+            if ($close -ceq 'ApplyThenCancel') {
+                $setupClock=[Diagnostics.Stopwatch]::StartNew()
+                $setup=[ordered]@{name='S02 no-op Apply setup before passive close';started_utc=[DateTime]::UtcNow.ToString('o')
+                    apply_click_completed_ms=$null;notice_ready_ms=$null;notice_acknowledged_ms=$null;notice=$null
+                    status='RUNNING';apply_phase_pixels='NOT_OBSERVED';changed_value_apply='NOT_RUN'}
+                $script:Report.operations+=$setup
+                $applyReadiness=[MdliteRustAcceptanceNative]::OwnedSettingsControls($settings,$script:WindowHandle,$script:ProcessId)
+                $applyControl=@($applyReadiness.controls | Where-Object { $_.id -eq 210 })
+                if (-not $applyReadiness.controls_ready -or $applyControl.Count -ne 1 -or -not $applyControl[0].available) {
+                    throw 'OWNERSHIP_GATE: S02 no-op Apply control is not ready on the exact Settings modal.'
+                }
+                $applyHandle=[IntPtr][long]$applyControl[0].hwnd
+                Invoke-UiControlClick $settings ([pscustomobject]@{Handle=$applyHandle;Rect=[MdliteRustAcceptanceNative]::WindowRect($applyHandle)})
+                $setup.apply_click_completed_ms=$setupClock.ElapsedMilliseconds
+                $notice=Wait-UiThreadWindow '#32770' '設定' $TimeoutMs
+                $noticeMetadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($notice,$script:WindowHandle,$script:ProcessId)
+                $settingsMetadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($settings,$script:WindowHandle,$script:ProcessId)
+                if ($noticeMetadata.OwnerHwnd -ne $settings.ToInt64() -or $noticeMetadata.ProcessId -ne $script:ProcessId -or
+                    $noticeMetadata.ThreadId -ne $settingsMetadata.ThreadId -or -not $noticeMetadata.Visible -or -not $noticeMetadata.Enabled -or
+                    [MdliteRustAcceptanceNative]::WindowClass($notice) -cne '#32770' -or
+                    [MdliteRustAcceptanceNative]::WindowTitle($notice) -cne '設定') {
+                    throw 'OWNERSHIP_GATE: S02 no-op Apply success notice does not belong to the exact Settings modal.'
+                }
+                $ok=Get-UiControlById $notice 1 'BUTTON' -RequireVisible -RequireEnabled
+                $setup.notice=@{hwnd=$notice.ToInt64();owner=$noticeMetadata.OwnerHwnd;pid=$noticeMetadata.ProcessId;thread_id=$noticeMetadata.ThreadId;ok_control_id=$ok.Id}
+                $setup.notice_ready_ms=$setupClock.ElapsedMilliseconds
+                Invoke-UiOwnedDialogOk $notice
+                Wait-UiWindowGone $notice
+                $setup.notice_acknowledged_ms=$setupClock.ElapsedMilliseconds
+                foreach ($path in $diskBefore.Keys) {
+                    if ((Get-UiSafeFileHash $path) -cne $diskBefore[$path]) { throw 'PRODUCT_ASSERTION: S02 no-op Apply changed fixture document or settings bytes.' }
+                }
+                $setup.status='PASS: exact owned success notice acknowledged before sampling; fixture disk bytes unchanged'
+            }
             $receipt=Invoke-S02PassiveClose $close $settings ([int[]]@($caretX,$caretY)) $script:S02FencedMainBounds
             $after=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
             Assert-UiDiagnosticDragInvariants $after $before 'settings close'
@@ -5364,7 +5531,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
             $finalPath=Join-Path $script:UiRunDirectory ('rev3-settings-'+$close+'-final-owned-snapshot.png')
             $finalFrames+=@{ path=$finalPath; capture=(Capture-UiOwnedWindow $script:WindowHandle $finalPath); evidence_kind='SEPARATE OWNED SNAPSHOT; NOT SETTLED OR FLICKER PROOF' }
         }
-        @{ close_paths=$paths; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
+        @{ settings_layout='COMPACT_INITIAL_FORM_REPRESENTATIVE'; settings_scroll='NOT_RUN'; close_paths=$paths; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
     })
     [void](Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
         $frames=@()

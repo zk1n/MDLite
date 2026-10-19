@@ -1105,6 +1105,10 @@ impl App {
             self.tabs[self.active].scroll = point.scroll.max(0.);
             self.layout_key = None;
             unsafe {
+                // A successful explicit navigation resumes editing at the
+                // restored position. Move focus before layout can disable the
+                // invoking Back/Forward button as its history stack empties.
+                let _ = SetFocus(Some(self.editing_window()));
                 self.after_input();
             }
             return;

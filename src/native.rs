@@ -9814,6 +9814,158 @@ mod tests {
 
     #[test]
     #[ignore = "visible focus fixture; requires exclusive GUI lease"]
+    fn explicit_navigation_toolbar_returns_editor_focus_before_first_followup_character() {
+        let source_a = "source A first\n日本語\n";
+        let source_b = "source B 日本語 and ASCII\n";
+        let mut app = composing_test_app(source_a);
+        app.clear_composition();
+        let mut fixture = MessagePumpFixture::new(app);
+        let main = fixture.hwnd;
+        let (id_a, id_b, before_a, before_b) = unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_shell();
+            app.doc_mut().set_selection(0, 0).unwrap();
+            app.record_navigation();
+            app.doc_mut().set_selection(14, 14).unwrap();
+            let id_a = app.doc().id();
+            let before_a = document_state(app.doc());
+            app.new_document();
+            let id_b = app.doc().id();
+            let active = app.active;
+            app.tabs[active].doc = Document::new(id_b, source_b.into());
+            app.doc_mut()
+                .set_selection(source_b.len(), source_b.len())
+                .unwrap();
+            let before_b = document_state(app.doc());
+            app.refresh();
+            let _ = ShowWindow(main, SW_SHOWNOACTIVATE);
+            (id_a, id_b, before_a, before_b)
+        };
+        unsafe {
+            SetFocus(Some(main)).unwrap();
+            let back = GetDlgItem(Some(main), 168).unwrap();
+            let forward = GetDlgItem(Some(main), 169).unwrap();
+            for (button, expected_document, expected_position) in
+                [(back, id_a, 14), (forward, id_b, source_b.len())]
+            {
+                assert!(IsWindowEnabled(button).as_bool());
+                SendMessageW(
+                    button,
+                    WM_LBUTTONDOWN,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(5 | (5 << 16))),
+                );
+                assert_eq!(
+                    GetFocus(),
+                    button,
+                    "native mouse-down must focus the real navigation button"
+                );
+                SendMessageW(
+                    button,
+                    WM_LBUTTONUP,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(5 | (5 << 16))),
+                );
+                let app = fixture.state.app.borrow();
+                assert_eq!(app.doc().id(), expected_document);
+                assert_eq!(app.doc().selection(), Selection::caret(expected_position));
+                println!(
+                    "navigation pid={} button={button:?} enabled={} focus={:?} editor={main:?}",
+                    std::process::id(),
+                    IsWindowEnabled(button).as_bool(),
+                    GetFocus()
+                );
+            }
+            assert!(
+                !IsWindowEnabled(forward).as_bool(),
+                "Forward must disable itself after consuming the last forward entry"
+            );
+            assert_eq!(
+                GetFocus(),
+                main,
+                "successful Forward must retain a keyboard target after its button disables"
+            );
+            {
+                let app = fixture.state.app.borrow();
+                assert_eq!(
+                    document_state(
+                        &app.tabs
+                            .iter()
+                            .find(|tab| tab.doc.id() == id_a)
+                            .unwrap()
+                            .doc
+                    ),
+                    before_a
+                );
+                assert_eq!(document_state(app.doc()), before_b);
+            }
+            SendMessageW(
+                GetFocus(),
+                WM_CHAR,
+                Some(WPARAM('X' as usize)),
+                Some(LPARAM(0)),
+            );
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                assert_eq!(app.doc().source(), format!("{source_b}X"));
+                app.key_with_modifiers(0x5a, true, false);
+                assert_eq!(app.doc().source(), source_b);
+                assert_eq!(app.doc().selection(), before_b.6);
+                assert_eq!(app.doc().is_dirty(), before_b.3);
+                assert_eq!(app.doc().undo_count(), before_b.4);
+                assert_eq!(app.doc().redo_count(), before_b.5 + 1);
+            }
+
+            let other = shell::control(
+                main,
+                w!("BUTTON"),
+                "owned no-op focus",
+                999,
+                WINDOW_STYLE(0),
+            );
+            SetFocus(Some(other)).unwrap();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                let restored = document_state(app.doc());
+                app.command(169); // Empty forward stack is a no-op.
+                assert_eq!(GetFocus(), other);
+                app.tabs.retain(|tab| tab.doc.id() != id_a);
+                app.active = 0;
+                app.command(168); // Only closed-document targets remain.
+                assert_eq!(GetFocus(), other);
+                assert_eq!(document_state(app.doc()), restored);
+                app.doc_mut().set_selection(0, 0).unwrap();
+                app.record_navigation();
+                app.doc_mut()
+                    .set_selection(source_b.len(), source_b.len())
+                    .unwrap();
+            }
+            let compact = fixture.create_compact();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.compact_window = compact;
+                app.select_surface(compact);
+                let _ = ShowWindow(compact, SW_SHOWNOACTIVATE);
+                let child = shell::control(
+                    compact,
+                    w!("BUTTON"),
+                    "owned Compact focus",
+                    999,
+                    WINDOW_STYLE(0),
+                );
+                SetFocus(Some(child)).unwrap();
+                app.command(168);
+                assert_eq!(GetFocus(), compact);
+                assert_eq!(app.editing_window(), compact);
+                assert_eq!(app.doc().selection(), Selection::caret(0));
+                assert_eq!(app.doc().source(), source_b);
+            }
+            let _ = ShowWindow(compact, SW_HIDE);
+            let _ = ShowWindow(main, SW_HIDE);
+        }
+    }
+    #[test]
+    #[ignore = "visible focus fixture; requires exclusive GUI lease"]
     fn native_caret_ownership_preserves_focused_query_through_palette_and_diagnostic() {
         let fixture = EditorFixture::new("selected body", false);
         fixture.state.main_window.set(fixture.hwnd);

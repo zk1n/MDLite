@@ -553,7 +553,9 @@ impl FormWindow {
                     self.ime.push((control, shell::track_control_ime(control)));
                 }
                 self.controls.push(control);
-                let _ = SetWindowTheme(control, w!("Explorer"), None);
+                if let Err(error) = edit_scroll::set_explorer_theme(control) {
+                    eprintln!("Settings control theme failed: {error}");
+                }
             }
             for (i, (id, label)) in [
                 (APPLY, "Apply"),
@@ -621,6 +623,11 @@ unsafe fn scroll_window(state: &Window, position: i32) {
         }
         if GetWindowLongPtrW(change.hwnd, GWLP_USERDATA) != state as *const Window as isize {
             return;
+        }
+        let mut tokens = change.tokens;
+        tokens.high_contrast |= state.high_contrast.get();
+        if let Err(error) = shell::refresh_native_scrollbars(change.hwnd, tokens) {
+            eprintln!("Settings scrollbar refresh failed: {error}");
         }
         let rail = { state.rail.borrow().clone() };
         if let Some(rail) = rail {
@@ -1679,6 +1686,59 @@ mod tests {
                     "roundtrip must preserve each content child's absolute origin"
                 );
             }
+        }
+    }
+    #[test]
+    fn settings_edit_rails_follow_content_without_becoming_form_content() {
+        let fixture = FormFixture::new();
+        fixture.enable_rail();
+        unsafe {
+            let edit = shell::control(
+                fixture.hwnd,
+                w!("EDIT"),
+                "",
+                207,
+                WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+            );
+            SetWindowPos(edit, None, 16, 200, 300, 90, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            let text = "設定の試料😀\r\n".repeat(40);
+            SetWindowTextW(edit, PCWSTR(wide(&text).as_ptr())).unwrap();
+            shell::send(edit, EM_SETSEL, WPARAM(3), LPARAM(8));
+            let selection = shell::send(edit, EM_GETSEL, WPARAM(0), LPARAM(0)).0;
+            let rails = edit_scroll::rail_handles(edit).unwrap();
+            let extent = fixture.state.form.borrow().content_extent();
+            assert!(
+                rails
+                    .into_iter()
+                    .all(|rail| !children(fixture.hwnd).contains(&rail))
+            );
+            let mut initial_edit = RECT::default();
+            let mut initial_rail = RECT::default();
+            GetWindowRect(edit, &mut initial_edit).unwrap();
+            GetWindowRect(rails[1], &mut initial_rail).unwrap();
+            for position in [100, 0, 100, 0] {
+                scroll_window(&fixture.state, position);
+                assert_eq!(fixture.state.form.borrow().content_extent(), extent);
+                let mut edit_rect = RECT::default();
+                let mut rail_rect = RECT::default();
+                GetWindowRect(edit, &mut edit_rect).unwrap();
+                GetWindowRect(rails[1], &mut rail_rect).unwrap();
+                assert_eq!(edit_rect.top, initial_edit.top - position);
+                assert_eq!(rail_rect.top, initial_rail.top - position);
+                assert_eq!(shell::text_of(edit), text);
+                assert_eq!(shell::send(edit, EM_GETMODIFY, WPARAM(0), LPARAM(0)).0, 0);
+                assert_eq!(shell::send(edit, EM_CANUNDO, WPARAM(0), LPARAM(0)).0, 0);
+                assert_eq!(
+                    shell::send(edit, EM_GETSEL, WPARAM(0), LPARAM(0)).0,
+                    selection
+                );
+            }
+            fixture.state.high_contrast.set(true);
+            scroll_window(&fixture.state, 0);
+            assert_eq!(GetWindowLongW(rails[1], GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            fixture.state.high_contrast.set(false);
+            scroll_window(&fixture.state, 0);
+            assert_ne!(GetWindowLongW(rails[1], GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
         }
     }
     #[test]

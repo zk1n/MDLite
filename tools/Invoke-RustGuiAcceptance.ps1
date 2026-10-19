@@ -35,6 +35,18 @@ using System.Text;
 
 public static class MdliteRustAcceptanceNative
 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder path, ref uint size);
+
+    public static string ProcessImagePath(IntPtr process)
+    {
+        uint size = 32768;
+        StringBuilder path = new StringBuilder((int)size);
+        if (!QueryFullProcessImageNameW(process, 0, path, ref size))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return path.ToString();
+    }
+
     public static string LastSaveAsFilenameFocusFailure = String.Empty;
     private const uint INPUT_KEYBOARD = 1;
     private const uint INPUT_MOUSE = 0;
@@ -1174,8 +1186,8 @@ function Set-OwnedForeground(
                     [Text.UTF8Encoding]::new($false))
             }
             $activationLogged = $true
+            [void][MdliteRustAcceptanceNative]::SetForegroundWindow($Window)
         }
-        [void][MdliteRustAcceptanceNative]::SetForegroundWindow($Window)
         if ([DateTime]::UtcNow -ge $deadline) {
             throw "The verified owned HWND did not become foreground within $WaitMs ms."
         }
@@ -2540,6 +2552,22 @@ function Invoke-UiDialogButton([IntPtr]$Dialog, [int]$ButtonId) {
     Invoke-UiControlById -ForegroundWindow $Dialog -ControlId $ButtonId -Class 'BUTTON'
 }
 
+function Invoke-UiOwnedDialogOk([IntPtr]$Dialog) {
+    Assert-UiOwnedWindow $Dialog
+    if ([MdliteRustAcceptanceNative]::WindowClass($Dialog) -cne '#32770' -or
+        -not [MdliteRustAcceptanceNative]::IsWindowVisible($Dialog) -or
+        -not [MdliteRustAcceptanceNative]::IsWindowEnabled($Dialog)) {
+        throw [System.InvalidOperationException]::new('OWNED_OK_DIALOG_UNAVAILABLE')
+    }
+    $buttons = @(Get-UiOwnedChildren $Dialog | Where-Object {
+        $_.Class -ceq 'BUTTON' -and $_.Text -ceq 'OK' -and $_.Visible -and $_.Enabled
+    })
+    if ($buttons.Count -ne 1) {
+        throw [System.NotSupportedException]::new('OWNED_DIALOG_OK_BUTTON_NOT_UNIQUE')
+    }
+    Invoke-UiControlClick $Dialog $buttons[0]
+}
+
 function Wait-UiListCount(
     [IntPtr]$Root,
     [int]$ControlId,
@@ -3573,7 +3601,7 @@ function Assert-UiExecutableIdentity {
         throw [System.InvalidOperationException]::new('OWNED_PROCESS_NOT_RUNNING')
     }
     $script:Process.Refresh()
-    $imagePath = [IO.Path]::GetFullPath($script:Process.MainModule.FileName)
+    $imagePath = [IO.Path]::GetFullPath([MdliteRustAcceptanceNative]::ProcessImagePath($script:Process.Handle))
     $expectedPath = [IO.Path]::GetFullPath($ExecutablePath)
     if (-not [string]::Equals($imagePath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw [System.InvalidOperationException]::new('PROCESS_IMAGE_PATH_MISMATCH')
@@ -3582,12 +3610,12 @@ function Assert-UiExecutableIdentity {
     if ($imageHash -cne [string]$ExpectedExecutableSha256.ToLowerInvariant()) {
         throw [System.InvalidOperationException]::new('PROCESS_IMAGE_HASH_MISMATCH')
     }
-    $script:Report.process_image_path = [string]$script:Report.executable_path
+    $script:Report.process_image_path = $imagePath
     $script:Report.process_image_sha256 = $imageHash
     $script:Report.process_identity_matches_expected = $true
     $script:Report.process_identities += [pscustomobject]@{
         pid = [int]$script:Process.Id
-        image_path = [string]$script:Report.executable_path
+        image_path = $imagePath
         image_sha256 = $imageHash
     }
 }
@@ -3979,7 +4007,7 @@ function Invoke-UiParitySuite {
             }
             Invoke-UiDialogButton $settings 210
             $notice = Wait-UiThreadWindow '#32770' '設定' 3000
-            Invoke-UiDialogButton $notice 1
+            Invoke-UiOwnedDialogOk $notice
             $settingsBytes = [IO.File]::ReadAllText($settingsPath, [Text.Encoding]::UTF8)
             if ($settingsBytes -notmatch '(?im)^\s*auto_save\s*=\s*false\s*$') {
                 throw [System.InvalidOperationException]::new('SETTINGS_APPLY_NOT_PERSISTED')
@@ -3987,7 +4015,7 @@ function Invoke-UiParitySuite {
             Set-UiEditText $settings 208 'file.quickOpen=Ctrl+Shift+Q'
             Invoke-UiDialogButton $settings 210
             $notice = Wait-UiThreadWindow '#32770' '設定' 3000
-            Invoke-UiDialogButton $notice 1
+            Invoke-UiOwnedDialogOk $notice
             Invoke-UiDialogButton $settings 211
             Send-Key $script:WindowHandle 0x51 ([uint16[]]@(0x11, 0x10))
             $quickList = Wait-UiState {
@@ -7929,7 +7957,7 @@ $e12NoticeThreadA=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($e12Not
 if ($e12NoticePidA -ne $script:ProcessId -or $e12NoticeThreadA -ne $e12DialogThread) {
     throw 'ENVIRONMENT_BLOCKED: E12 first Apply notice is not owned by the exact SettingsGUI process.'
 }
-Invoke-UiDialogButton $e12NoticeA 1
+Invoke-UiOwnedDialogOk $e12NoticeA
 Wait-UiWindowGone $e12NoticeA
 if (-not [MdliteRustAcceptanceNative]::IsWindow($e12SettingsWindow)) {
     throw 'PRODUCT_ASSERTION: E12 Apply unexpectedly closed the SettingsGUI.'
@@ -8178,7 +8206,7 @@ $e12NoticeThreadB=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($e12Not
 if ($e12NoticePidB -ne $script:ProcessId -or $e12NoticeThreadB -ne $e12DialogThreadB) {
     throw 'ENVIRONMENT_BLOCKED: E12 restore Apply notice is not owned by the exact SettingsGUI process.'
 }
-Invoke-UiDialogButton $e12NoticeB 1
+Invoke-UiOwnedDialogOk $e12NoticeB
 Wait-UiWindowGone $e12NoticeB
 if (-not [MdliteRustAcceptanceNative]::IsWindow($e12SettingsWindow)) {
     throw 'PRODUCT_ASSERTION: E12 restore Apply unexpectedly closed the SettingsGUI.'
@@ -8829,7 +8857,7 @@ Set-EditorRecoveryCase 'E14' 'NOT_RUN' @{
         Invoke-UiDialogButton $e13SettingsWindow 210
         $e13SettingsNotice=Wait-UiThreadWindow '#32770' '設定' 3000
         Assert-UiOwnedWindow $e13SettingsNotice
-        Invoke-UiDialogButton $e13SettingsNotice 1
+        Invoke-UiOwnedDialogOk $e13SettingsNotice
         Wait-UiWindowGone $e13SettingsNotice
         $expectedWorkspaceSettingsAfter=$expectedWorkspaceSettingsBefore.Replace('auto_save = false','auto_save = true')
         $expectedWorkspaceSettingsAfterBytes=[Text.UTF8Encoding]::new($false).GetBytes($expectedWorkspaceSettingsAfter)

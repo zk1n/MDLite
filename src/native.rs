@@ -2,8 +2,10 @@
 //! WindowState lives until the message loop exits. Synchronous native reentry
 //! snapshots IME notifications outside App's borrow and drains them in order.
 
+mod control_scroll;
 mod control_style;
 mod diagnostics;
+mod edit_scroll;
 mod editing;
 mod editor_actions;
 mod explorer_icons;
@@ -458,6 +460,7 @@ struct App {
     close_after_composition: Option<(u32, WPARAM, LPARAM)>,
     pending_surrogate: Option<u16>,
     diagnostic: Option<PathBuf>,
+    phase_trace: Option<Rc<PhaseTrace>>,
     caret: (f32, f32, f32),
     native_caret: NativeCaretState,
     status: String,
@@ -475,6 +478,7 @@ struct App {
 // App is never mutably aliased. Only owned, synchronous notification snapshots
 // may be queued while a modal/native callback holds its RefCell borrow.
 struct WindowState {
+    phase_trace: Option<Rc<PhaseTrace>>,
     app: RefCell<App>,
     notifications: RefCell<VecDeque<(ImeEnvelope, NativeNotification)>>,
     document_id: Cell<u64>,
@@ -487,6 +491,7 @@ struct WindowState {
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
+    explorer_paint: features::ExplorerPaintSlot,
     deferred_paints: Cell<[Option<(HWND, RECT)>; 2]>,
     ime_input: Cell<Option<ImeInputContext>>,
     ime_dispatch_key: Cell<Option<(HWND, u32, usize, isize)>>,
@@ -495,7 +500,10 @@ impl WindowState {
     fn new(app: App) -> Self {
         let document_id = Cell::new(app.doc().id());
         let ime_ingress = Rc::clone(&app.ime_ingress);
+        let phase_trace = app.phase_trace.clone();
+        let explorer_paint = app.features.explorer_paint_handle();
         Self {
+            phase_trace,
             app: RefCell::new(app),
             notifications: RefCell::new(VecDeque::new()),
             document_id,
@@ -508,6 +516,7 @@ impl WindowState {
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
+            explorer_paint,
             deferred_paints: Cell::new([None, None]),
             ime_input: Cell::new(None),
             ime_dispatch_key: Cell::new(None),
@@ -584,6 +593,72 @@ impl WindowState {
                 && IsWindow(Some(hwnd)).as_bool()
                 && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == self as *const WindowState as isize
         }
+    }
+}
+
+// Opt-in, constant-size phase records. No document text, paths or maps enter
+// this sidecar; never overwrite an earlier run's evidence or affect editing.
+struct PhaseTrace {
+    started: Instant,
+    file: RefCell<std::fs::File>,
+    dropped: Cell<u64>,
+}
+impl PhaseTrace {
+    fn open(diagnostic: &Path) -> Option<Rc<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(diagnostic.with_extension("phases.jsonl"))
+            .ok()?;
+        let trace = Rc::new(Self {
+            started: Instant::now(),
+            file: RefCell::new(file),
+            dropped: Cell::new(0),
+        });
+        trace.record("trace", "opened");
+        Some(trace)
+    }
+    fn record(&self, phase: &'static str, event: &'static str) {
+        use std::io::Write;
+        let Ok(mut file) = self.file.try_borrow_mut() else {
+            self.dropped.set(self.dropped.get().saturating_add(1));
+            return;
+        };
+        if writeln!(
+            file,
+            "{{\"t_us\":{},\"phase\":\"{}\",\"event\":\"{}\",\"dropped_total\":{}}}",
+            self.started.elapsed().as_micros(),
+            phase,
+            event,
+            self.dropped.get()
+        )
+        .is_err()
+        {
+            self.dropped.set(self.dropped.get().saturating_add(1));
+        }
+    }
+}
+fn record_phase(trace: &Option<Rc<PhaseTrace>>, phase: &'static str, event: &'static str) {
+    if let Some(trace) = trace {
+        trace.record(phase, event);
+    }
+}
+struct PhaseSpan {
+    trace: Option<Rc<PhaseTrace>>,
+    phase: &'static str,
+}
+impl PhaseSpan {
+    fn new(trace: &Option<Rc<PhaseTrace>>, phase: &'static str) -> Self {
+        record_phase(trace, phase, "begin");
+        Self {
+            trace: trace.clone(),
+            phase,
+        }
+    }
+}
+impl Drop for PhaseSpan {
+    fn drop(&mut self) {
+        record_phase(&self.trace, self.phase, "end");
     }
 }
 
@@ -977,6 +1052,7 @@ fn startup_window_state(
     diagnostic: Option<PathBuf>,
     paths: Vec<PathBuf>,
 ) -> WindowState {
+    let phase_trace = diagnostic.as_deref().and_then(PhaseTrace::open);
     let mut app = App {
         hwnd: HWND::default(),
         graphics,
@@ -1026,6 +1102,7 @@ fn startup_window_state(
         close_after_composition: None,
         pending_surrogate: None,
         diagnostic,
+        phase_trace,
         caret: (LEFT, TOP, 28.0),
         native_caret: NativeCaretState::default(),
         status: String::new(),
@@ -1203,8 +1280,16 @@ pub fn run() -> windows::core::Result<()> {
             }
         }
         // NCDESTROY has cleared userdata; the last callback has returned.
-        drop(app);
-        CoUninitialize();
+        let phase_trace = app.phase_trace.clone();
+        record_phase(&phase_trace, "message_loop", "ended");
+        {
+            let _phase = PhaseSpan::new(&phase_trace, "app.drop");
+            drop(app);
+        }
+        {
+            let _phase = PhaseSpan::new(&phase_trace, "com.uninitialize");
+            CoUninitialize();
+        }
         Ok(())
     }
 }
@@ -1230,6 +1315,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if msg == WM_NCDESTROY {
             if !pointer.is_null() {
                 let state = &*pointer;
+                if state.main_window.get() == hwnd {
+                    record_phase(&state.phase_trace, "main.destroy", "nc_destroy");
+                    let retired = state.explorer_paint.replace(None);
+                    drop(retired);
+                }
                 state.button_paint.borrow_mut().take();
                 if state.compact_window.get() == hwnd {
                     state.compact_window.set(HWND::default());
@@ -1245,6 +1335,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let state = &*pointer;
+        if msg == WM_CLOSE {
+            record_phase(&state.phase_trace, "close", "received");
+        }
         state.observe_ime_input_message(hwnd, msg, wp, lp);
         if ((msg == WM_ACTIVATE && matches!(wp.0 & 0xffff, 1 | 2) && (wp.0 >> 16) & 0xffff == 0)
             || (msg == WM_NCACTIVATE && wp.0 != 0 && !IsIconic(hwnd).as_bool()))
@@ -1295,6 +1388,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if state.main_window.get() == hwnd {
+                record_phase(&state.phase_trace, "main.destroy", "post_quit");
                 PostQuitMessage(0);
             }
             return LRESULT(0);
@@ -1342,6 +1436,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 .insert(queue_position, (envelope.unwrap(), notification));
         }
         let Ok(mut app) = app_borrow else {
+            if msg == WM_CLOSE {
+                record_phase(&state.phase_trace, "close", "app_unavailable_consumed");
+            }
             if matches!(
                 msg,
                 WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN
@@ -1354,6 +1451,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if msg == WM_DRAWITEM && lp.0 != 0 {
+                if hwnd == state.main_window.get()
+                    && state.owns_paint_surface(hwnd)
+                    && wp.0 == features::EXPLORER_LIST
+                {
+                    let item = &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+                    if item.CtlID as usize == features::EXPLORER_LIST
+                        && item.CtlType == windows::Win32::UI::Controls::ODT_LISTBOX
+                        && GetDlgCtrlID(item.hwndItem) as usize == features::EXPLORER_LIST
+                        && GetParent(item.hwndItem).ok() == Some(hwnd)
+                    {
+                        let paint = state.explorer_paint.borrow().clone();
+                        if let Some(paint) = paint
+                            && paint.draw(item, control_scroll::horizontal_offset(item.hwndItem))
+                        {
+                            return LRESULT(1);
+                        }
+                    }
+                }
                 if state.owns_paint_surface(hwnd) {
                     let colors = state.control_colors.borrow().clone();
                     if let Some(colors) = colors
@@ -1470,6 +1585,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         } else if (msg == WM_CLOSE || (msg == WM_COMMAND && wp.0 & 0xffff == CMD_CLOSE))
             && app.composing
         {
+            record_phase(&state.phase_trace, "close", "ime_deferred");
             if app.close_after_composition.is_none() {
                 app.close_after_composition = Some((msg, wp, lp));
                 app.close_target = Some(hwnd);
@@ -1604,6 +1720,7 @@ unsafe fn dispatch_window_message(
 ) -> Option<LRESULT> {
     unsafe {
         if msg == WM_CLOSE && (app.search_busy() || app.git_job_busy()) {
+            record_phase(&app.phase_trace, "close", "busy_rejected");
             app.status = "処理中です。取消を行い、処理結果を確認してから閉じてください".into();
             app.refresh();
             return Some(LRESULT(0));
@@ -1856,11 +1973,16 @@ unsafe fn dispatch_window_message(
             }
             WM_DRAWITEM => {
                 if lp.0 != 0
-                    && app.explorer_icons.draw(
+                    && app.explorer_icons.draw_offset(
                         &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
                         app.shell.tokens,
+                        control_scroll::horizontal_offset(
+                            (*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT))
+                                .hwndItem,
+                        ),
                     )
                 {
+                    app.features_refresh_explorer_paint(false);
                     LRESULT(1)
                 } else {
                     return None;
@@ -1975,10 +2097,31 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_CLOSE => {
+                record_phase(&app.phase_trace, "close", "dispatch");
+                let confirm_phase = PhaseSpan::new(&app.phase_trace, "close.confirm");
                 if app.confirm_all() {
-                    app.persist_session();
-                    let _ = DestroyWindow(hwnd);
+                    drop(confirm_phase);
+                    record_phase(&app.phase_trace, "close", "confirmed");
+                    {
+                        let _phase = PhaseSpan::new(&app.phase_trace, "close.session");
+                        app.persist_session();
+                    }
+                    {
+                        let _phase = PhaseSpan::new(&app.phase_trace, "close.destroy_window");
+                        let result = DestroyWindow(hwnd);
+                        record_phase(
+                            &app.phase_trace,
+                            "close.destroy_window",
+                            if result.is_ok() {
+                                "returned_ok"
+                            } else {
+                                "returned_error"
+                            },
+                        );
+                    }
                 } else {
+                    drop(confirm_phase);
+                    record_phase(&app.phase_trace, "close", "confirmation_rejected");
                     app.refresh();
                 }
                 LRESULT(0)
@@ -4240,7 +4383,10 @@ impl App {
             self.visible_tokens.extend(tokens);
             let layout = self.text_layout(text, width, size)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut metrics)?;
+            {
+                let _phase = PhaseSpan::new(&self.phase_trace, "layout.view_get_metrics");
+                layout.GetMetrics(&mut metrics)?;
+            }
             let height = metrics.height.max(presentation::line_height(size));
             self.views.push(TextView {
                 layout,
@@ -4336,6 +4482,7 @@ impl App {
             if self.layout_key == Some(key) && self.revealed_source == reveal {
                 return Ok(());
             }
+            let _phase = PhaseSpan::new(&self.phase_trace, "layout.rebuild");
             self.revealed_source = reveal;
             self.views.clear();
             self.visible_tokens.clear();
@@ -4720,17 +4867,31 @@ impl App {
         source: Range<usize>,
     ) -> windows::core::Result<()> {
         unsafe {
+            let rope = self.doc().rope();
+            let source_units = rope.utf16_code_unit_of_byte(source.start);
             for run in &projection.runs {
+                if !run.kinds.iter().any(|kind| {
+                    use mdlite::projection::InlineKind;
+                    matches!(
+                        kind,
+                        InlineKind::Strong
+                            | InlineKind::Emphasis
+                            | InlineKind::Code
+                            | InlineKind::Link { .. }
+                            | InlineKind::Strikethrough
+                    )
+                }) {
+                    continue;
+                }
                 let start = run.source.start.max(source.start);
                 let end = run.source.end.min(source.end);
                 if start >= end {
                     continue;
                 }
                 let range = DWRITE_TEXT_RANGE {
-                    startPosition: self.doc().source()[source.start..start]
-                        .encode_utf16()
-                        .count() as u32,
-                    length: self.doc().source()[start..end].encode_utf16().count() as u32,
+                    startPosition: (rope.utf16_code_unit_of_byte(start) - source_units) as u32,
+                    length: (rope.utf16_code_unit_of_byte(end)
+                        - rope.utf16_code_unit_of_byte(start)) as u32,
                 };
                 for kind in &run.kinds {
                     use mdlite::projection::InlineKind;
@@ -4997,6 +5158,7 @@ impl App {
         }
     }
     fn rebuild_gutter_rows(&mut self) {
+        let _phase = PhaseSpan::new(&self.phase_trace, "layout.gutter_metrics_rows");
         let mut rows = Vec::new();
         let source = self.doc().source();
         for (view_index, view) in self.views.iter().enumerate() {
@@ -5766,6 +5928,7 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            let _phase = PhaseSpan::new(&self.phase_trace, "paint.total");
             if self.minimized {
                 return Ok(());
             }
@@ -5817,7 +5980,10 @@ impl App {
                 paint_fault(PaintFault::Drawing)?;
                 self.features_draw(&t)?;
                 self.git_draw(&t)?;
-                frame.finish()?;
+                {
+                    let _phase = PhaseSpan::new(&self.phase_trace, "paint.frame_finish");
+                    frame.finish()?;
+                }
                 self.full_paint = false;
                 return Ok(());
             }
@@ -6152,14 +6318,18 @@ impl App {
                             );
                         }
                     }
-                    t.DrawTextLayout(
-                        point(visual.x, visual.y),
-                        &visual.layout,
-                        view_text,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    );
+                    {
+                        let _phase = PhaseSpan::new(&self.phase_trace, "paint.paragraph_draw");
+                        t.DrawTextLayout(
+                            point(visual.x, visual.y),
+                            &visual.layout,
+                            view_text,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        );
+                    }
                     frame.pop_clip();
                 } else {
+                    let _phase = PhaseSpan::new(&self.phase_trace, "paint.paragraph_draw");
                     t.DrawTextLayout(
                         point(view.x, y),
                         &view.layout,
@@ -6259,7 +6429,10 @@ impl App {
             );
             frame.pop_clip();
             frame.pop_clip();
-            let draw_result = frame.finish();
+            let draw_result = {
+                let _phase = PhaseSpan::new(&self.phase_trace, "paint.frame_finish");
+                frame.finish()
+            };
             drop(hidden_caret);
             draw_result?;
             self.full_paint = false;
@@ -6812,12 +6985,19 @@ impl App {
         let Some(path) = &self.diagnostic else {
             return;
         };
+        let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.total");
+        let build_phase = PhaseSpan::new(&self.phase_trace, "diagnostic.build");
         let sel = self.doc().selection();
         let views:Vec<_>=self.views.iter().map(|v|serde_json::json!({"source_start":v.source.start,"source_end":v.source.end,"x":v.x,"y":v.y-self.tabs[self.active].scroll,"width":v.width,"height":v.height,"table":v.table,"map":v.map})).collect();
         let tables:Vec<_>=self.tables.iter().map(|t|serde_json::json!({"source_start":t.table.range.start,"source_end":t.table.range.end,"y":t.y,"height":t.height,"width":t.width})).collect();
         // Only the opt-in diagnostic path queries the current owner-thread TIP.
-        let active_input_profile = active_input_profile_diagnostic();
-        let ime_open_status = ime_open_status_diagnostic(self.hwnd);
+        let (active_input_profile, ime_open_status) = {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.input_profile");
+            (
+                active_input_profile_diagnostic(),
+                ime_open_status_diagnostic(self.hwnd),
+            )
+        };
         let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
         let mut data = data;
         data["line_numbers"] = serde_json::json!({
@@ -6831,7 +7011,13 @@ impl App {
             serde_json::json!(format!("{:?}", self.doc().selection_affinity()));
         let (x, y, height) = self.composition_caret();
         data["composition_caret"] = serde_json::json!({"x": x, "y": y, "height": height});
-        if let Ok(data) = serde_json::to_vec_pretty(&data) {
+        drop(build_phase);
+        let serialized = {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.serialize");
+            serde_json::to_vec_pretty(&data)
+        };
+        if let Ok(data) = serialized {
+            let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.write");
             let _ = std::fs::write(path, data);
         }
     }
@@ -7970,6 +8156,48 @@ mod tests {
     }
 
     #[test]
+    fn phase_trace_preserves_prior_evidence_and_counts_reentrant_drops() {
+        let directory = TestDirectory::new("phase-trace");
+        let diagnostic = directory.path().join("fixture.json");
+        let sidecar = diagnostic.with_extension("phases.jsonl");
+        let trace = PhaseTrace::open(&diagnostic).unwrap();
+        assert!(PhaseTrace::open(&diagnostic).is_none());
+        {
+            let _file = trace.file.borrow_mut();
+            trace.record("test", "reentrant");
+        }
+        {
+            let _phase = PhaseSpan::new(&Some(Rc::clone(&trace)), "test.scope");
+        }
+        drop(trace);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["event"], "opened");
+        assert_eq!(records[1]["event"], "begin");
+        assert_eq!(records[2]["event"], "end");
+        assert_eq!(records[2]["dropped_total"], 1);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0]["t_us"].as_u64() <= pair[1]["t_us"].as_u64())
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.as_object().unwrap().len() == 4)
+        );
+        let before = std::fs::read(&sidecar).unwrap();
+        {
+            let _phase = PhaseSpan::new(&None, "disabled");
+        }
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[test]
     fn document_identity_duplicate_open_activates_existing_for_path_aliases() {
         let directory = TestDirectory::new("duplicate-open");
         let original = directory.path().join("note.md");
@@ -8699,6 +8927,68 @@ mod tests {
             assert_eq!(GetForegroundWindow(), foreground);
         }
     }
+    #[test]
+    fn revealed_source_styles_keep_utf16_ranges_after_unicode_prefix_and_clipping() {
+        let source = "prefix😀\n\n前置 e\u{301} **太字😀** と ***両方😀***、~~取消~~、[リンク](u) と `code` 末尾";
+        let fixture = EditorFixture::new(source, false);
+        let app = fixture.state.app.borrow();
+        let projection = DisplayProjection::parse(source);
+        // A nonzero source origin and a clip inside bold text exercise metric
+        // subtraction independently of display/projection coordinates.
+        for start in [source.find("前置").unwrap(), source.find("字😀").unwrap()] {
+            let layout = unsafe {
+                app.text_layout(&source[start..], 900., app.font_size())
+                    .unwrap()
+            };
+            unsafe {
+                app.apply_source_styles(&layout, &projection, start..source.len())
+                    .unwrap()
+            };
+            for (needle, bold, italic) in [
+                ("字😀", true, false),
+                ("両方😀", true, true),
+                ("末尾", false, false),
+            ] {
+                let byte = source.find(needle).unwrap();
+                let position = source[start..byte].encode_utf16().count() as u32;
+                let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
+                let mut style = DWRITE_FONT_STYLE_NORMAL;
+                unsafe {
+                    layout.GetFontWeight(position, &mut weight, None).unwrap();
+                    layout.GetFontStyle(position, &mut style, None).unwrap();
+                }
+                assert_eq!(
+                    weight == DWRITE_FONT_WEIGHT_BOLD,
+                    bold,
+                    "{needle} at {start}"
+                );
+                assert_eq!(
+                    style == DWRITE_FONT_STYLE_ITALIC,
+                    italic,
+                    "{needle} at {start}"
+                );
+            }
+            for (needle, strike) in [("リンク", false), ("取消", true)] {
+                let position = source[start..source.find(needle).unwrap()]
+                    .encode_utf16()
+                    .count() as u32;
+                let mut applied = windows::core::BOOL::default();
+                unsafe {
+                    if strike {
+                        layout
+                            .GetStrikethrough(position, &mut applied, None)
+                            .unwrap();
+                    } else {
+                        layout.GetUnderline(position, &mut applied, None).unwrap();
+                    }
+                }
+                assert!(applied.as_bool(), "{needle} at {start}");
+            }
+        }
+        assert_eq!(app.doc().source(), source);
+        assert!(!app.doc().is_dirty());
+    }
+
     impl EditorFixture {
         fn new(source: &str, raw: bool) -> Self {
             let mut app = composing_test_app(source);
@@ -11619,6 +11909,7 @@ mod tests {
             close_after_composition: None,
             pending_surrogate: None,
             diagnostic: None,
+            phase_trace: None,
             caret: (LEFT, TOP, 28.0),
             native_caret: NativeCaretState::default(),
             status: String::new(),

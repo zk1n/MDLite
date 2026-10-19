@@ -39,6 +39,8 @@ impl Range {
 }
 
 struct State {
+    horizontal: bool,
+    trailing_gap: Cell<i32>,
     owner: HWND,
     hwnd: Cell<HWND>,
     token: usize,
@@ -85,12 +87,38 @@ pub(super) fn is_rail(hwnd: HWND) -> bool {
     unsafe {
         let mut name = [0u16; 32];
         let count = GetClassNameW(hwnd, &mut name);
-        &name[..count as usize] == CLASS.as_wide()
+        &name[..count as usize] == CLASS.as_wide() || super::edit_scroll::is_rail(hwnd)
     }
 }
 
 impl VerticalRail {
     pub(super) unsafe fn new(owner: HWND, message: u32, tokens: shell::Tokens) -> Option<Self> {
+        unsafe { Self::new_in(owner, owner, message, tokens, false) }
+    }
+
+    pub(super) unsafe fn new_sibling(
+        owner: HWND,
+        message: u32,
+        tokens: shell::Tokens,
+    ) -> Option<Self> {
+        unsafe { Self::new_in(owner, GetParent(owner).ok()?, message, tokens, false) }
+    }
+
+    pub(super) unsafe fn new_horizontal_sibling(
+        owner: HWND,
+        message: u32,
+        tokens: shell::Tokens,
+    ) -> Option<Self> {
+        unsafe { Self::new_in(owner, GetParent(owner).ok()?, message, tokens, true) }
+    }
+
+    unsafe fn new_in(
+        owner: HWND,
+        parent: HWND,
+        message: u32,
+        tokens: shell::Tokens,
+        horizontal: bool,
+    ) -> Option<Self> {
         unsafe {
             let instance = GetModuleHandleW(None).ok()?.into();
             RegisterClassW(&WNDCLASSW {
@@ -101,6 +129,8 @@ impl VerticalRail {
                 ..Default::default()
             });
             let state = Rc::new(State {
+                horizontal,
+                trailing_gap: Cell::new(0),
                 owner,
                 hwnd: Cell::new(HWND::default()),
                 token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
@@ -118,13 +148,13 @@ impl VerticalRail {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS,
-                w!("Settings vertical scroll"),
+                w!("Vertical scroll"),
                 WS_CHILD | WS_CLIPSIBLINGS,
                 0,
                 0,
                 0,
                 0,
-                Some(owner),
+                Some(parent),
                 None,
                 Some(instance),
                 Some((&state as *const Rc<State>).cast()),
@@ -136,6 +166,19 @@ impl VerticalRail {
 
     pub(super) fn native(&self) -> bool {
         self.0.native.get()
+    }
+
+    pub(super) fn hwnd(&self) -> HWND {
+        self.0.hwnd.get()
+    }
+
+    pub(super) unsafe fn destroy(&self) {
+        unsafe {
+            let hwnd = self.hwnd();
+            if hwnd != HWND::default() {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
     }
 
     pub(super) unsafe fn cancel(&self) {
@@ -162,26 +205,10 @@ impl VerticalRail {
     /// stale input; a position-only acknowledgment preserves newer queued targets.
     pub(super) unsafe fn update(&self, range: Range, dpi: u32, tokens: shell::Tokens, hc: bool) {
         unsafe {
+            let Some(hwnd) = self.begin_update(range, dpi, tokens, hc) else {
+                return;
+            };
             let s = &self.0;
-            let hwnd = s.hwnd.get();
-            if hwnd == HWND::default() || s.updating.replace(true) {
-                return;
-            }
-            let old = s.range.replace(range);
-            if old.content != range.content
-                || old.page != range.page
-                || s.dpi.get() != dpi
-                || s.native.get() != hc
-            {
-                s.cancel();
-            }
-            if s.hwnd.get() != hwnd {
-                s.updating.set(false);
-                return;
-            }
-            s.dpi.set(dpi.max(1));
-            s.tokens.set(tokens);
-            s.native.set(hc);
             if hc {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 if s.hwnd.get() == hwnd {
@@ -236,8 +263,101 @@ impl VerticalRail {
                     SetScrollInfo(s.owner, SB_VERT, &scroll_info(range), true);
                 }
             }
-            s.updating.set(false);
-            if s.hwnd.get() == hwnd {
+            self.end_update(hwnd);
+        }
+    }
+
+    /// The LISTBOX adapter owns native policy and NC reservation; this only places
+    /// its non-focusable sibling rail in the already reserved rectangle.
+    pub(super) unsafe fn update_sibling(
+        &self,
+        range: Range,
+        dpi: u32,
+        tokens: shell::Tokens,
+        native: bool,
+        rect: RECT,
+    ) -> bool {
+        unsafe {
+            let Some(hwnd) = self.begin_update(range, dpi, tokens, native) else {
+                return false;
+            };
+            let placed = native
+                || SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE,
+                )
+                .is_ok();
+            if self.hwnd() == hwnd {
+                let _ = ShowWindow(
+                    hwnd,
+                    if !native && placed && range.maximum() > 0 {
+                        SW_SHOWNA
+                    } else {
+                        SW_HIDE
+                    },
+                );
+            }
+            self.end_update(hwnd);
+            placed
+        }
+    }
+
+    pub(super) unsafe fn update_horizontal_sibling(
+        &self,
+        range: Range,
+        dpi: u32,
+        tokens: shell::Tokens,
+        native: bool,
+        rect: RECT,
+        corner: i32,
+    ) -> bool {
+        unsafe {
+            self.0.trailing_gap.set(corner.max(0));
+            self.update_sibling(range, dpi, tokens, native, rect)
+        }
+    }
+
+    unsafe fn begin_update(
+        &self,
+        range: Range,
+        dpi: u32,
+        tokens: shell::Tokens,
+        native: bool,
+    ) -> Option<HWND> {
+        unsafe {
+            let s = &self.0;
+            let hwnd = self.hwnd();
+            if hwnd == HWND::default() || s.updating.replace(true) {
+                return None;
+            }
+            let old = s.range.replace(range);
+            if old.content != range.content
+                || old.page != range.page
+                || s.dpi.get() != dpi
+                || s.native.get() != native
+            {
+                s.cancel();
+            }
+            if s.hwnd.get() != hwnd {
+                s.updating.set(false);
+                return None;
+            }
+            s.dpi.set(dpi.max(1));
+            s.tokens.set(tokens);
+            s.native.set(native);
+            Some(hwnd)
+        }
+    }
+
+    unsafe fn end_update(&self, hwnd: HWND) {
+        unsafe {
+            self.0.updating.set(false);
+            if self.hwnd() == hwnd {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
@@ -257,6 +377,20 @@ pub(super) fn scroll_info(range: Range) -> SCROLLINFO {
 }
 
 impl State {
+    fn length(&self, client: RECT) -> i32 {
+        if self.horizontal {
+            (client.right - self.trailing_gap.get()).max(0)
+        } else {
+            client.bottom.max(0)
+        }
+    }
+    fn coordinate(&self, lp: LPARAM) -> i32 {
+        if self.horizontal {
+            lp.0 as u16 as i16 as i32
+        } else {
+            (lp.0 as u32 >> 16) as u16 as i16 as i32
+        }
+    }
     unsafe fn cancel(&self) {
         unsafe {
             self.drag_offset.set(None);
@@ -310,11 +444,15 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             drop(Rc::from_raw(pointer));
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let y = ((lp.0 as u32 >> 16) as u16 as i16) as i32;
+        let y = state.coordinate(lp);
         match msg {
-            WM_PAINT => {
+            WM_PAINT | WM_PRINTCLIENT => {
                 let mut ps = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut ps);
+                let dc = if msg == WM_PAINT {
+                    BeginPaint(hwnd, &mut ps)
+                } else {
+                    HDC(wp.0 as *mut _)
+                };
                 let mut client = RECT::default();
                 let _ = GetClientRect(hwnd, &mut client);
                 let tokens = state.tokens.get();
@@ -326,7 +464,8 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 fill(&client, tokens.panel);
                 let mut range = state.range.get();
                 range.position = state.pending.get().unwrap_or(range.position);
-                let (top, height) = range.thumb(client.bottom, state.dpi.get());
+                let length = state.length(client);
+                let (top, height) = range.thumb(length, state.dpi.get());
                 let width = ((if state.hover.get() || state.drag_offset.get().is_some() {
                     10.
                 } else {
@@ -335,26 +474,47 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     / 96.)
                     .round()
                     .max(1.) as i32;
-                let left = (client.right - width) / 2;
-                fill(
-                    &RECT {
+                let cross = if state.horizontal {
+                    client.bottom
+                } else {
+                    client.right
+                };
+                let left = (cross - width) / 2;
+                let track = if state.horizontal {
+                    RECT {
+                        left: 0,
+                        top: left,
+                        right: length,
+                        bottom: left + width,
+                    }
+                } else {
+                    RECT {
                         left,
                         top: 0,
                         right: left + width,
-                        bottom: client.bottom,
-                    },
-                    tokens.border,
-                );
-                fill(
-                    &RECT {
+                        bottom: length,
+                    }
+                };
+                let thumb = if state.horizontal {
+                    RECT {
+                        left: top,
+                        top: left,
+                        right: top + height,
+                        bottom: left + width,
+                    }
+                } else {
+                    RECT {
                         left,
                         top,
                         right: left + width,
                         bottom: top + height,
-                    },
-                    tokens.muted,
-                );
-                let _ = EndPaint(hwnd, &ps);
+                    }
+                };
+                fill(&track, tokens.border);
+                fill(&thumb, tokens.muted);
+                if msg == WM_PAINT {
+                    let _ = EndPaint(hwnd, &ps);
+                }
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -362,7 +522,11 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let mut client = RECT::default();
                 let _ = GetClientRect(hwnd, &mut client);
                 let range = state.range.get();
-                let (top, height) = range.thumb(client.bottom, state.dpi.get());
+                let length = state.length(client);
+                if y >= length {
+                    return LRESULT(0);
+                }
+                let (top, height) = range.thumb(length, state.dpi.get());
                 if y >= top && y < top + height {
                     state.drag_offset.set(Some(y - top));
                     SetCapture(hwnd);
@@ -371,16 +535,24 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                 } else {
                     let position = state.pending.get().unwrap_or(range.position);
-                    state.request(if y < top {
-                        position.saturating_sub(range.page)
+                    let page = if state.horizontal {
+                        (range.page / 3 * 2).max(1)
                     } else {
-                        position.saturating_add(range.page)
+                        range.page
+                    };
+                    state.request(if y < top {
+                        position.saturating_sub(page)
+                    } else {
+                        position.saturating_add(page)
                     });
                 }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                if !state.hover.replace(true) {
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let hot = y >= 0 && y < state.length(client);
+                if state.hover.replace(hot) != hot {
                     let mut track = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
@@ -395,12 +567,11 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 {
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
-                    state.request(
-                        state
-                            .range
-                            .get()
-                            .at(y - offset, client.bottom, state.dpi.get()),
-                    );
+                    state.request(state.range.get().at(
+                        y - offset,
+                        state.length(client),
+                        state.dpi.get(),
+                    ));
                 }
                 LRESULT(0)
             }
@@ -408,12 +579,11 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if let Some(offset) = state.drag_offset.take() {
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
-                    state.request(
-                        state
-                            .range
-                            .get()
-                            .at(y - offset, client.bottom, state.dpi.get()),
-                    );
+                    state.request(state.range.get().at(
+                        y - offset,
+                        state.length(client),
+                        state.dpi.get(),
+                    ));
                     if GetCapture() == hwnd {
                         let _ = ReleaseCapture();
                     }
@@ -438,6 +608,7 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => SendMessageW(state.owner, msg, Some(wp), Some(lp)),
+            WM_MOUSEHWHEEL => SendMessageW(state.owner, msg, Some(wp), Some(lp)),
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }

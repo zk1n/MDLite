@@ -3,7 +3,7 @@
 //! This module owns pane state and child controls. It never owns document text
 //! and all source edits go through Document transactions on the UI thread.
 
-use super::{App, shell};
+use super::{App, explorer_icons::ExplorerPaint, shell};
 use mdlite::{
     calendar::{
         CalendarCell, CalendarDate, CalendarInteraction, CalendarListRequest, CalendarListResult,
@@ -24,10 +24,11 @@ use mdlite::{
     workspace_search::{QuickOpen, quick_open},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     fs,
     path::{Component, Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -66,7 +67,7 @@ const QUERY_EDIT: usize = 4700;
 const PROMPT_EDIT: usize = 4701;
 const PROFILE_FIELD_BASE: usize = 4710;
 const TEMPLATE_EDIT: usize = 4720;
-const EXPLORER_LIST: usize = 4690;
+pub(super) const EXPLORER_LIST: usize = 4690;
 const QUICK_OPEN_LIST: usize = 4691;
 const CONTROL_BASE: usize = 4800;
 const BUTTON_OWNERDRAW: u32 = 0x0000000B;
@@ -546,12 +547,25 @@ impl Default for FeatureControls {
     }
 }
 
+pub(super) type ExplorerPaintSlot = Rc<RefCell<Option<Rc<ExplorerPaint>>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExplorerPaintKey {
+    hwnd: HWND,
+    font: isize,
+    dpi: u32,
+    colors: [u32; 3],
+    icons: u64,
+}
+
 pub(super) struct FeaturePanes {
     initialized: bool,
     workspace: Option<Workspace>,
     workspace_identity: Option<WorkspaceIdentity>,
     explorer: ExplorerState,
     explorer_list_dirty: bool,
+    explorer_paint: ExplorerPaintSlot,
+    explorer_paint_key: Option<ExplorerPaintKey>,
     quick_open: QuickOpenState,
     outline: Option<Outline>,
     outline_selected: usize,
@@ -584,6 +598,8 @@ impl Default for FeaturePanes {
             workspace_identity: None,
             explorer: ExplorerState::default(),
             explorer_list_dirty: true,
+            explorer_paint: Rc::new(RefCell::new(None)),
+            explorer_paint_key: None,
             quick_open: QuickOpenState::default(),
             outline: None,
             outline_selected: 0,
@@ -612,6 +628,8 @@ impl Default for FeaturePanes {
 
 impl Drop for FeaturePanes {
     fn drop(&mut self) {
+        let retired = self.explorer_paint.replace(None);
+        drop(retired);
         if let Some(worker) = self.quick_open.worker.take() {
             worker.cancel.store(true, Ordering::Release);
         }
@@ -670,6 +688,9 @@ const PROFILE_BUTTONS: [usize; 6] = [4080, 4081, 4082, 4083, 4084, 4088];
 const FORM_BUTTONS: [usize; 3] = [4085, 4086, 4087];
 
 impl FeaturePanes {
+    pub(super) fn explorer_paint_handle(&self) -> ExplorerPaintSlot {
+        Rc::clone(&self.explorer_paint)
+    }
     pub(super) unsafe fn owner_draw_button(
         &self,
         owner: HWND,
@@ -821,6 +842,7 @@ impl FeaturePanes {
             )
             .unwrap_or_default();
             if self.controls.tooltip != HWND::default() {
+                let _ = super::control_style::inherit_font(self.controls.tooltip, owner);
                 for (_, command, hwnd, _) in &self.controls.buttons {
                     let Some((_, label, _)) = COMMANDS.iter().find(|(id, _, _)| id == command)
                     else {
@@ -2838,11 +2860,57 @@ impl App {
             self.features
                 .ensure_outline_selection_visible(outline_visible_rows(body.height));
         }
+        let explorer_changed = self.features.explorer_list_dirty;
         self.features.sync_explorer_control();
         let layout = FeatureControlLayout::capture(self);
         self.features.position_controls(self, layout);
+        self.features_refresh_explorer_paint(explorer_changed);
         if let Some(status) = self.features.status.take() {
             self.status = status;
+        }
+    }
+
+    pub(super) fn features_refresh_explorer_paint(&mut self, force: bool) {
+        let list = self.features.controls.explorer_list;
+        if list == HWND::default() || !unsafe { IsWindow(Some(list)).as_bool() } {
+            self.features.explorer_paint_key = None;
+            let retired = self.features.explorer_paint.replace(None);
+            drop(retired);
+            return;
+        }
+        let tokens = self.shell.tokens;
+        let mut key = ExplorerPaintKey {
+            hwnd: list,
+            font: unsafe { shell::send(list, WM_GETFONT, WPARAM(0), LPARAM(0)).0 },
+            dpi: unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(list) },
+            colors: [
+                shell::rgb(tokens.panel).0,
+                shell::rgb(tokens.selected).0,
+                shell::rgb(tokens.foreground).0,
+            ],
+            icons: self.explorer_icons.generation(),
+        };
+        if !force && self.features.explorer_paint_key == Some(key) {
+            return;
+        }
+        let geometry_changed = force
+            || self.features.explorer_paint_key.is_none_or(|previous| {
+                previous.hwnd != key.hwnd || previous.font != key.font || previous.dpi != key.dpi
+            });
+        // Preparation may reenter; the old immutable snapshot remains available.
+        let next = self
+            .explorer_icons
+            .paint_snapshot(list, tokens)
+            .map(Rc::new);
+        key.icons = self.explorer_icons.generation();
+        self.features.explorer_paint_key = next.as_ref().map(|_| key);
+        // Retiring font/icon handles can make native calls. Never drop them
+        // while the publication slot is borrowed by a synchronous callback.
+        let retired = self.features.explorer_paint.replace(next);
+        drop(retired);
+        // Native H geometry changes can synchronously request painting.
+        if geometry_changed && let Some(extent) = self.explorer_icons.measure_extent(list) {
+            let _ = unsafe { super::control_scroll::set_horizontal_extent(list, extent) };
         }
     }
 
@@ -5721,6 +5789,282 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    struct ExplorerPaintFixture {
+        main: super::super::tests::MessagePumpFixture,
+        list: HWND,
+        dc: windows::Win32::Graphics::Gdi::HDC,
+        bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+        previous: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    }
+    impl ExplorerPaintFixture {
+        fn new() -> Self {
+            use windows::Win32::Graphics::Gdi::*;
+            let mut app = super::super::tests::composing_test_app("# 原文\n本文 e\u{301} 👩‍💻\n");
+            app.clear_composition();
+            let main = super::super::tests::MessagePumpFixture::new(app);
+            let list;
+            unsafe {
+                let mut app = main.state.app.borrow_mut();
+                app.shell.enabled = true;
+                app.shell.main_window = main.hwnd;
+                app.features.controls.owner = main.hwnd;
+                list = shell::control(
+                    main.hwnd,
+                    w!("LISTBOX"),
+                    "Explorer paint",
+                    EXPLORER_LIST,
+                    WINDOW_STYLE(
+                        (LBS_OWNERDRAWFIXED
+                            | LBS_HASSTRINGS
+                            | LBS_EXTENDEDSEL
+                            | LBS_NOINTEGRALHEIGHT) as u32,
+                    ),
+                );
+                app.features.controls.explorer_list = list;
+                app.features.explorer.entries.push(ExplorerEntry {
+                    name: "fixture_日本語.md".into(),
+                    path: PathBuf::from("synthetic/fixture_日本語.md"),
+                    kind: ExplorerEntryKind::File,
+                });
+                app.features.explorer.depths.push(0);
+                app.features_sync();
+                SetWindowPos(list, None, 0, 0, 160, 32, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            }
+            unsafe {
+                let source = GetDC(Some(main.hwnd));
+                let dc = CreateCompatibleDC(Some(source));
+                let bitmap = CreateCompatibleBitmap(source, 160, 32);
+                ReleaseDC(Some(main.hwnd), source);
+                let previous = SelectObject(dc, bitmap.into());
+                Self {
+                    main,
+                    list,
+                    dc,
+                    bitmap,
+                    previous,
+                }
+            }
+        }
+        fn item(&self) -> DRAWITEMSTRUCT {
+            DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::ODT_LISTBOX,
+                CtlID: EXPLORER_LIST as u32,
+                itemID: 0,
+                hwndItem: self.list,
+                hDC: self.dc,
+                itemData: 0,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 160,
+                    bottom: 32,
+                },
+                ..Default::default()
+            }
+        }
+        fn draw(&self, owner: HWND, id: usize, item: &DRAWITEMSTRUCT) -> LRESULT {
+            unsafe {
+                super::super::window_proc(
+                    owner,
+                    WM_DRAWITEM,
+                    WPARAM(id),
+                    LPARAM((item as *const DRAWITEMSTRUCT) as isize),
+                )
+            }
+        }
+    }
+    impl Drop for ExplorerPaintFixture {
+        fn drop(&mut self) {
+            use windows::Win32::Graphics::Gdi::*;
+            unsafe {
+                SelectObject(self.dc, self.previous);
+                let _ = DeleteObject(self.bitmap.into());
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
+
+    #[test]
+    fn explorer_runtime_snapshot_paints_reentrant_reset_and_rejects_foreign_routes() {
+        use windows::Win32::Graphics::Gdi::GetPixel;
+        struct Probe {
+            slot: ExplorerPaintSlot,
+            calls: Cell<usize>,
+            released: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                if msg == LB_GETTEXTLEN {
+                    let probe = &*(data as *const Probe);
+                    probe.calls.set(probe.calls.get() + 1);
+                    probe
+                        .released
+                        .set(probe.released.get() && probe.slot.try_borrow_mut().is_ok());
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let fixture = ExplorerPaintFixture::new();
+        let probe = Probe {
+            slot: Rc::clone(&fixture.main.state.explorer_paint),
+            calls: Cell::new(0),
+            released: Cell::new(true),
+        };
+        unsafe {
+            SetWindowSubclass(
+                fixture.list,
+                Some(observe),
+                776,
+                (&probe as *const Probe) as usize,
+            )
+            .unwrap();
+        }
+        let mut item = fixture.item();
+        let app = fixture.main.state.app.borrow_mut();
+        let before = (
+            app.doc().source().to_owned(),
+            app.doc().revision(),
+            app.doc().is_dirty(),
+            app.doc().undo_count(),
+            app.doc().redo_count(),
+            app.doc().selection(),
+        );
+        assert_eq!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        assert!(probe.calls.get() > 0 && probe.released.get());
+        assert!(!fixture.main.state.deferred_control_redraw.get());
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST + 1, &item),
+            LRESULT(1)
+        );
+        item.CtlID += 1;
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        item.CtlID -= 1;
+        item.CtlType = ODT_BUTTON;
+        assert_ne!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        item.CtlType = windows::Win32::UI::Controls::ODT_LISTBOX;
+        unsafe {
+            SetWindowLongPtrW(fixture.list, GWLP_ID, (EXPLORER_LIST + 1) as isize);
+            assert_ne!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+                LRESULT(1)
+            );
+            SetWindowLongPtrW(fixture.list, GWLP_ID, EXPLORER_LIST as isize);
+            let other = super::super::tests::hidden_test_window_size(160, 32);
+            assert_ne!(fixture.draw(other, EXPLORER_LIST, &item), LRESULT(1));
+            DestroyWindow(other).unwrap();
+            shell::send(fixture.list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+            assert_eq!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+                LRESULT(1)
+            );
+            let background = shell::rgb(app.shell.tokens.panel);
+            assert!((0..32).all(|y| (0..160).all(|x| GetPixel(fixture.dc, x, y) == background)));
+            let _ =
+                windows::Win32::UI::Shell::RemoveWindowSubclass(fixture.list, Some(observe), 776);
+        }
+        assert_eq!(
+            (
+                app.doc().source().to_owned(),
+                app.doc().revision(),
+                app.doc().is_dirty(),
+                app.doc().undo_count(),
+                app.doc().redo_count(),
+                app.doc().selection()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn explorer_runtime_snapshot_refreshes_content_cache_theme_and_font() {
+        let fixture = ExplorerPaintFixture::new();
+        let original = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.features_refresh_explorer_paint(false);
+        }
+        assert!(Rc::ptr_eq(
+            &original,
+            fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+        ));
+        let mut font = super::super::control_style::UiFont::new(96, 28.).unwrap();
+        font.apply_to(fixture.main.hwnd).unwrap();
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.features_refresh_explorer_paint(false);
+        }
+        let changed_font = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&original, &changed_font));
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            app.shell.tokens.panel = super::super::color(0.2, 0.3, 0.4);
+            app.features_refresh_explorer_paint(false);
+        }
+        let changed_theme = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&changed_font, &changed_theme));
+        unsafe {
+            shell::send(
+                fixture.list,
+                LB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(super::super::wide("  fresh.cache_generation_test").as_ptr() as isize),
+            );
+        }
+        let mut item = fixture.item();
+        item.itemID = 1;
+        assert_eq!(
+            fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &item),
+            LRESULT(1)
+        );
+        let changed_icons = fixture.main.state.explorer_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&changed_theme, &changed_icons));
+        {
+            let mut app = fixture.main.state.app.borrow_mut();
+            assert_eq!(
+                app.features.explorer_paint_key.unwrap().icons,
+                app.explorer_icons.generation()
+            );
+            app.features_refresh_explorer_paint(false);
+            assert!(Rc::ptr_eq(
+                &changed_icons,
+                fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+            ));
+            app.features.explorer_list_dirty = true;
+            app.features_sync();
+        }
+        assert!(!Rc::ptr_eq(
+            &changed_icons,
+            fixture.main.state.explorer_paint.borrow().as_ref().unwrap()
+        ));
+        {
+            let _app = fixture.main.state.app.borrow_mut();
+            assert_eq!(
+                fixture.draw(fixture.main.hwnd, EXPLORER_LIST, &fixture.item()),
+                LRESULT(1)
+            );
+        }
+        unsafe {
+            DestroyWindow(fixture.main.hwnd).unwrap();
+        }
+        assert!(fixture.main.state.explorer_paint.borrow().is_none());
     }
 
     fn send_explorer_key(app: &mut App, list: HWND, key: u16) -> bool {

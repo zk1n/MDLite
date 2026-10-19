@@ -620,34 +620,122 @@ pub(super) unsafe fn control(
     style: WINDOW_STYLE,
 ) -> HWND {
     unsafe {
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class,
-            PCWSTR(wide(label).as_ptr()),
-            WS_CHILD
-                | WS_VISIBLE
-                | WS_CLIPSIBLINGS
-                | if class.to_string().is_ok_and(|s| s == "STATIC") {
-                    WINDOW_STYLE(0)
-                } else {
-                    WS_TABSTOP
-                }
-                | style,
-            0,
-            0,
-            10,
-            10,
-            Some(parent),
-            Some(HMENU(id as *mut _)),
-            None,
-            None,
-        )
-        .unwrap_or_default();
-        if hwnd != HWND::default() {
+        let role = class.to_string().unwrap_or_default();
+        let list_adapter = role.eq_ignore_ascii_case("LISTBOX")
+            && style.0 & (LBS_MULTICOLUMN as u32 | LBS_OWNERDRAWVARIABLE as u32) == 0;
+        let edit_adapter = role.eq_ignore_ascii_case("EDIT")
+            && style.0 & ES_MULTILINE as u32 != 0
+            && style.0 & (WS_HSCROLL.0 | WS_VSCROLL.0) != 0;
+        let create = |requested: WINDOW_STYLE| {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class,
+                PCWSTR(wide(label).as_ptr()),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_CLIPSIBLINGS
+                    | if class.to_string().is_ok_and(|s| s == "STATIC") {
+                        WINDOW_STYLE(0)
+                    } else {
+                        WS_TABSTOP
+                    }
+                    | requested,
+                0,
+                0,
+                10,
+                10,
+                Some(parent),
+                Some(HMENU(id as *mut _)),
+                None,
+                None,
+            )
+            .unwrap_or_default()
+        };
+        let mut hwnd = create(if list_adapter {
+            WINDOW_STYLE(style.0 & !WS_VSCROLL.0)
+        } else {
+            style
+        });
+        if hwnd != HWND::default()
+            && list_adapter
+            && super::control_scroll::attach_listbox(hwnd, Tokens::default()).is_err()
+        {
+            // Before publication or population, recreate with the native policy
+            // established at creation; toggling V later changes wheel semantics.
+            let _ = DestroyWindow(hwnd);
+            hwnd = create(style);
+        }
+        let configure = |hwnd| {
             let _ = control_style::inherit_font(hwnd, parent);
             let _ = control_style::install_child_cursor(hwnd);
+        };
+        if hwnd != HWND::default() {
+            configure(hwnd);
+            if edit_adapter && let Err(error) = super::edit_scroll::attach(hwnd, Tokens::default())
+            {
+                // This HWND is unpublished. Recreate ONCE with its original
+                // native policy, including when attach rollback failed.
+                eprintln!("Native EDIT scrollbar fallback (ID {id}): {error}");
+                if let Err(error) = DestroyWindow(hwnd) {
+                    eprintln!("Cannot retire unpublished EDIT (ID {id}): {error}");
+                    return HWND::default();
+                }
+                hwnd = create(style);
+                if hwnd != HWND::default() {
+                    configure(hwnd);
+                }
+            }
         }
         hwnd
+    }
+}
+
+struct NativeRailRefresh {
+    tokens: Tokens,
+    errors: Vec<String>,
+}
+unsafe extern "system" fn refresh_native_rails(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+    unsafe {
+        let context = data.0 as *mut NativeRailRefresh;
+        // Snapshot before any synchronous native call; hold no context borrow.
+        let tokens = (*context).tokens;
+        let _ = super::control_scroll::refresh_listbox(hwnd, tokens);
+        if let Err(error) = super::edit_scroll::refresh(hwnd, tokens) {
+            let id = GetDlgCtrlID(hwnd);
+            (*context).errors.push(format!("ID {id}: {error}"));
+        }
+        true.into()
+    }
+}
+
+/// Refresh already attached native rails below an owned UI-thread surface.
+/// No App access is needed during synchronous child/native paint reentry.
+pub(super) unsafe fn refresh_native_scrollbars(
+    surface: HWND,
+    tokens: Tokens,
+) -> Result<(), String> {
+    unsafe {
+        let mut process = 0;
+        if GetWindowThreadProcessId(surface, Some(&mut process))
+            != windows_sys::Win32::System::Threading::GetCurrentThreadId()
+            || process != std::process::id()
+        {
+            return Err("Native scrollbar refresh requires its owning UI thread".into());
+        }
+        let mut context = NativeRailRefresh {
+            tokens,
+            errors: Vec::new(),
+        };
+        let _ = EnumChildWindows(
+            Some(surface),
+            Some(refresh_native_rails),
+            LPARAM((&mut context as *mut NativeRailRefresh) as isize),
+        );
+        if context.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(context.errors.join("; "))
+        }
     }
 }
 
@@ -1508,6 +1596,14 @@ impl App {
                 tokens.high_contrast = true;
             }
             self.shell.tokens = tokens;
+            self.diagnostics.refresh_theme(tokens);
+            for surface in [self.shell.main_window, self.shell.compact_window] {
+                if surface != HWND::default()
+                    && let Err(error) = refresh_native_scrollbars(surface, tokens)
+                {
+                    self.status = format!("スクロール表示の更新に失敗しました: {error}");
+                }
+            }
             self.shell.colors = Rc::new(ControlColors::new(tokens));
             let pointer =
                 GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
@@ -1731,7 +1827,7 @@ fn owner_button_icon(label: &str) -> Option<&'static str> {
         "新しいファイル" => include_str!("../../assets/ui/icons/file-plus.svg"),
         "新しいフォルダー" => include_str!("../../assets/ui/icons/folder-plus.svg"),
         "前月" => include_str!("../../assets/ui/icons/chevron-left.svg"),
-        "翌月" => include_str!("../../assets/ui/icons/chevron-right.svg"),
+        "次月" => include_str!("../../assets/ui/icons/chevron-right.svg"),
         "今日" => include_str!("../../assets/ui/icons/calendar.svg"),
         "更新" => include_str!("../../assets/ui/icons/refresh.svg"),
         "Stage" => include_str!("../../assets/ui/icons/add.svg"),
@@ -3203,6 +3299,72 @@ pub(super) unsafe fn track_control_ime(hwnd: HWND) -> Box<Cell<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_native_edit_factory_eligibility_tokens_and_shared_rail_lifecycle() {
+        unsafe {
+            let owner = super::super::tests::hidden_test_window_size(800, 600);
+            let mut font = control_style::UiFont::new(96, 14.).unwrap();
+            font.apply_to(owner).unwrap();
+            let text = "行 漢字e\u{301}😀\r\n".repeat(100);
+            let styles = [
+                WS_BORDER | WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+                WS_BORDER
+                    | WS_VSCROLL
+                    | WS_HSCROLL
+                    | WINDOW_STYLE(
+                        (ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY) as u32,
+                    ),
+                WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                WS_BORDER | WINDOW_STYLE(ES_MULTILINE as u32),
+            ];
+            let mut owned_rails = Vec::new();
+            for (index, style) in styles.into_iter().enumerate() {
+                let edit = control(owner, w!("EDIT"), &text, 9800 + index, style);
+                assert_ne!(edit, HWND::default());
+                assert_eq!(GetParent(edit).unwrap(), owner);
+                assert_eq!(GetDlgCtrlID(edit), 9800 + index as i32);
+                assert_eq!(
+                    send(edit, WM_GETFONT, WPARAM(0), LPARAM(0)).0,
+                    font.handle().0 as isize
+                );
+                assert_eq!(text_of(edit), text);
+                let actual = GetWindowLongW(edit, GWL_STYLE) as u32;
+                assert_eq!(
+                    actual & (ES_MULTILINE as u32 | ES_AUTOHSCROLL as u32 | ES_READONLY as u32),
+                    style.0 & (ES_MULTILINE as u32 | ES_AUTOHSCROLL as u32 | ES_READONLY as u32)
+                );
+                let attached = super::super::edit_scroll::refresh(edit, Tokens::default()).unwrap();
+                assert_eq!(attached, index < 2);
+                if index < 2 {
+                    let rails = super::super::edit_scroll::rail_handles(edit).unwrap();
+                    for rail in rails {
+                        assert!(super::super::scrollbar_style::is_rail(rail));
+                        assert_eq!(GetParent(rail).unwrap(), owner);
+                        owned_rails.push(rail);
+                    }
+                }
+            }
+            assert!(!super::super::edit_scroll::refresh(owner, Tokens::default()).unwrap());
+            let tokens = Tokens {
+                high_contrast: true,
+                ..Default::default()
+            };
+            refresh_native_scrollbars(owner, tokens).unwrap();
+            assert!(
+                owned_rails
+                    .iter()
+                    .all(|rail| GetWindowLongW(*rail, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0)
+            );
+            refresh_native_scrollbars(owner, Tokens::default()).unwrap();
+            DestroyWindow(owner).unwrap();
+            assert!(
+                owned_rails
+                    .into_iter()
+                    .all(|rail| !IsWindow(Some(rail)).as_bool())
+            );
+        }
+    }
+
     #[test]
     fn shell_native_font_surfaces_and_cursor_regions_preserve_document() {
         let window = super::super::tests::hidden_test_window_size(1280, 800);

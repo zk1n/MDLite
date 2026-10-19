@@ -1094,7 +1094,7 @@ impl App {
                     match diff {
                         Ok(diff) => {
                             self.git_ui.diff =
-                                format!("対象: {}\r\n{}", display_path(&path), diff_text(diff));
+                                format!("対象: {}\r\n{}", display_path(&path), diff_text(&diff));
                             self.git_ui.diff_dirty = true;
                             self.git_ui.notice =
                                 "選択ファイルのread-only Diffです。本文・indexは変更していません。"
@@ -2175,11 +2175,16 @@ fn position(hwnd: HWND, r: Rect, dpi: f32) {
         );
     }
 }
-fn diff_text(diff: GitDiff) -> String {
+fn diff_text(diff: &GitDiff) -> String {
     diff.parts
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(i, p)| {
+            // Native multiline EDIT needs CRLF. Normalize the display copy only;
+            // retain existing CRLF and the original Git stdout bytes unchanged.
+            let display = String::from_utf8_lossy(&p.stdout)
+                .replace("\r\n", "\n")
+                .replace('\n', "\r\n");
             format!(
                 "=== {}{} ===\r\n{}\r\n",
                 if i == 0 {
@@ -2188,7 +2193,7 @@ fn diff_text(diff: GitDiff) -> String {
                     "worktree"
                 },
                 if p.truncated { " (truncated)" } else { "" },
-                String::from_utf8_lossy(&p.stdout)
+                display
             )
         })
         .collect::<Vec<_>>()
@@ -2217,6 +2222,40 @@ fn selection_after_source_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn git_diff_text_normalizes_native_crlf_without_changing_stdout() {
+        let diff = GitDiff {
+            parts: [
+                (
+                    "--- a/日本語.md\n+++ b/日本語.md\r\n@@ -1 +1 @@\n-旧\r\n+新😀",
+                    false,
+                ),
+                ("context e\u{301}\r\n+LF行\n+既存CRLF行\r\n", true),
+            ]
+            .into_iter()
+            .map(|(text, truncated)| ProcessResult {
+                outcome: ProcessOutcome::Exited(0),
+                stdout: text.as_bytes().to_vec(),
+                stderr: vec![],
+                truncated,
+                generation: 1,
+            })
+            .collect(),
+        };
+        let original: Vec<_> = diff.parts.iter().map(|p| p.stdout.clone()).collect();
+        assert_eq!(
+            diff_text(&diff),
+            concat!(
+                "=== index / untracked ===\r\n",
+                "--- a/日本語.md\r\n+++ b/日本語.md\r\n@@ -1 +1 @@\r\n-旧\r\n+新😀\r\n",
+                "\r\n=== worktree (truncated) ===\r\n",
+                "context e\u{301}\r\n+LF行\r\n+既存CRLF行\r\n\r\n",
+            )
+        );
+        for (part, original) in diff.parts.iter().zip(original) {
+            assert_eq!(part.stdout, original);
+        }
+    }
     #[test]
     fn git_display_paths_and_utf8_diagnostics_preserve_internal_values() {
         for (internal, display) in [
@@ -2631,6 +2670,8 @@ mod tests {
             app.doc().redo_count(),
         );
         let c = app.git_ui.controls.as_ref().unwrap();
+        let diff = c.diff;
+        let diff_rails = unsafe { edit_scroll::rail_handles(diff).unwrap() };
         let controls = [
             c.host,
             c.summary,
@@ -2710,6 +2751,15 @@ mod tests {
                 actual, expected,
                 "final visibility: {prompt:?}, pane={pane_visible}"
             );
+            if !pane_visible || prompt_visible {
+                assert!(
+                    diff_rails.into_iter().all(|rail| unsafe {
+                        GetWindowLongPtrW(rail, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0
+                    }),
+                    "hidden Diff must not leave sibling scroll rails visible"
+                );
+            }
+            assert_eq!(unsafe { GetParent(diff).unwrap() }, controls[0]);
             println!(
                 "git visibility prompt={prompt:?} pane={pane_visible} actual_transitions={} required={needed}",
                 counts.transitions.get()
@@ -2840,7 +2890,7 @@ mod tests {
         else {
             panic!("diff fixture failed");
         };
-        assert!(diff_text(diff).contains("selected"));
+        assert!(diff_text(&diff).contains("selected"));
         f.trust.set_trusted(&f.repo, false).unwrap();
         assert!(matches!(
             f.run(Task::Refresh),

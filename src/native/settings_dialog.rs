@@ -13,6 +13,222 @@ const ENSURE_VISIBLE: u32 = WM_APP + 51;
 const RAIL_REQUEST: u32 = WM_APP + 52;
 const FONT_REFRESH: u32 = WM_APP + 53;
 const CATEGORY_BASE: usize = 300;
+const COMPLETION_TRACKED: usize = 4;
+const COMPLETION_INSTANCE: PCWSTR = w!("MDLite.Settings.Completion.Instance.v1");
+const COMPLETION_SERIAL: PCWSTR = w!("MDLite.Settings.Completion.Serial.v1");
+const COMPLETION_ISSUED: PCWSTR = w!("MDLite.Settings.Completion.Issued.v1");
+const COMPLETION_TARGET: PCWSTR = w!("MDLite.Settings.Completion.Target.v1");
+const COMPLETION_READY: PCWSTR = w!("MDLite.Settings.Completion.Ready.v1");
+const COMPLETION_ROOT: PCWSTR = w!("MDLite.Settings.Completion.Root.v1");
+
+// Diagnostic-only, owner-produced receipt. Odd serial means work is in flight;
+// an even serial is published last, after the matching focus ENSURE has finished.
+struct Completion {
+    enabled: bool,
+    healthy: Cell<bool>,
+    hwnd: Cell<HWND>,
+    instance: usize,
+    serial: Cell<usize>,
+    issued: Cell<usize>,
+    target: Cell<HWND>,
+    ensured: Cell<usize>,
+    pending_ensure: Cell<usize>,
+    pending_font: Cell<usize>,
+    depth: Cell<usize>,
+    initialized: Cell<bool>,
+    #[cfg(test)]
+    fail_next_ensure_post: Cell<bool>,
+}
+impl Completion {
+    fn new(enabled: bool) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let instance = if enabled {
+            NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value
+                    .checked_add(1)
+                    .filter(|next| *next <= isize::MAX as usize)
+            })
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        Self {
+            enabled,
+            healthy: Cell::new(instance != 0),
+            hwnd: Cell::new(HWND::default()),
+            instance,
+            serial: Cell::new(1),
+            issued: Cell::new(0),
+            target: Cell::new(HWND::default()),
+            ensured: Cell::new(0),
+            pending_ensure: Cell::new(0),
+            pending_font: Cell::new(0),
+            depth: Cell::new(0),
+            initialized: Cell::new(false),
+            #[cfg(test)]
+            fail_next_ensure_post: Cell::new(false),
+        }
+    }
+    fn put(&self, name: PCWSTR, value: usize) {
+        if self.enabled
+            && self.healthy.get()
+            && unsafe { SetPropW(self.hwnd.get(), name, Some(HANDLE(value as *mut _))) }.is_err()
+        {
+            self.fail();
+        }
+    }
+    fn bind(&self, hwnd: HWND) {
+        if !self.enabled {
+            return;
+        }
+        self.hwnd.set(hwnd);
+        self.put(COMPLETION_INSTANCE, self.instance);
+        self.put(COMPLETION_SERIAL, 1);
+    }
+    fn fail(&self) {
+        self.healthy.set(false);
+        unsafe {
+            let _ = RemovePropW(self.hwnd.get(), COMPLETION_READY);
+            let _ = RemovePropW(self.hwnd.get(), COMPLETION_ROOT);
+            let _ = RemovePropW(self.hwnd.get(), COMPLETION_SERIAL);
+        }
+    }
+    fn retire(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.healthy.set(false);
+        for name in [
+            COMPLETION_READY,
+            COMPLETION_ROOT,
+            COMPLETION_SERIAL,
+            COMPLETION_ISSUED,
+            COMPLETION_TARGET,
+            COMPLETION_INSTANCE,
+        ] {
+            unsafe {
+                let _ = RemovePropW(self.hwnd.get(), name);
+            }
+        }
+        self.hwnd.set(HWND::default());
+    }
+    fn invalidate(&self) {
+        if !self.enabled || !self.healthy.get() {
+            return;
+        }
+        if self.serial.get().is_multiple_of(2) {
+            let Some(next) = self
+                .serial
+                .get()
+                .checked_add(1)
+                .filter(|value| *value <= isize::MAX as usize)
+            else {
+                self.fail();
+                return;
+            };
+            self.serial.set(next);
+        }
+        self.put(COMPLETION_SERIAL, self.serial.get());
+        self.put(COMPLETION_READY, 0);
+        self.put(COMPLETION_ROOT, 0);
+    }
+    fn focus(&self, target: HWND) -> usize {
+        if !self.enabled || !self.healthy.get() {
+            return 0;
+        }
+        let Some(next) = self
+            .issued
+            .get()
+            .checked_add(1)
+            .filter(|value| *value <= isize::MAX as usize)
+        else {
+            self.fail();
+            return 0;
+        };
+        self.issued.set(next);
+        self.target.set(target);
+        self.put(COMPLETION_ISSUED, next);
+        self.put(COMPLETION_TARGET, target.0 as usize);
+        next
+    }
+}
+
+struct CompletionWork<'a>(&'a Window);
+impl<'a> CompletionWork<'a> {
+    fn begin(state: &'a Window) -> Self {
+        if state.completion.enabled {
+            state.completion.depth.set(state.completion.depth.get() + 1);
+            state.completion.invalidate();
+        }
+        Self(state)
+    }
+    unsafe fn window(hwnd: HWND) -> Option<Self> {
+        unsafe {
+            (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Window)
+                .as_ref()
+                .map(Self::begin)
+        }
+    }
+}
+impl Drop for CompletionWork<'_> {
+    fn drop(&mut self) {
+        let state = self.0;
+        let c = &state.completion;
+        if !c.enabled {
+            return;
+        }
+        c.depth.set(c.depth.get() - 1);
+        if c.depth.get() != 0
+            || !c.healthy.get()
+            || state.closed.get()
+            || c.pending_ensure.get() != 0
+            || c.pending_font.get() != 0
+            || state.font_pending.get()
+            || state.font_updating.get()
+        {
+            return;
+        }
+        let Ok(rail) = state.rail.try_borrow() else {
+            return;
+        };
+        if rail.as_ref().is_some_and(|rail| rail.has_pending()) {
+            return;
+        }
+        drop(rail);
+        let root;
+        unsafe {
+            let focus = GetFocus();
+            root = focus == HWND::default() || focus == c.hwnd.get();
+            if root {
+                // Layout-only receipt, including natural post-notice root focus.
+                // Never claim the old child target/ENSURE completed current focus.
+                if !c.initialized.get() || !IsWindowVisible(c.hwnd.get()).as_bool() {
+                    return;
+                }
+            } else if c.issued.get() == 0
+                || c.ensured.get() != c.issued.get()
+                || focus != c.target.get()
+                || GetParent(c.target.get()).ok() != Some(c.hwnd.get())
+            {
+                return;
+            }
+        }
+        let Some(next) = c
+            .serial
+            .get()
+            .checked_add(1)
+            .filter(|value| *value <= isize::MAX as usize)
+        else {
+            c.fail();
+            return;
+        };
+        c.put(COMPLETION_READY, if root { 0 } else { c.issued.get() });
+        c.put(COMPLETION_ROOT, usize::from(root));
+        c.serial.set(next);
+        c.put(COMPLETION_SERIAL, next); // publish last; no UI callbacks in SetProp
+    }
+}
 const INHERIT_BASE: usize = 1_000;
 const ACTION_BASE: usize = 2_000;
 
@@ -88,6 +304,7 @@ struct FormWindow {
     dpi: u32,
 }
 struct Window {
+    completion: Completion,
     form: RefCell<FormWindow>,
     font: RefCell<Option<control_style::UiFont>>,
     font_updating: Cell<bool>,
@@ -131,6 +348,23 @@ unsafe extern "system" fn scroll_control_proc(
 ) -> LRESULT {
     unsafe {
         let owner = GetParent(hwnd).unwrap_or_default();
+        let tracked = kind & COMPLETION_TRACKED != 0;
+        let kind = kind & 3;
+        let _work = if tracked {
+            CompletionWork::window(owner)
+        } else {
+            None
+        };
+        let completion = _work.as_ref().map(|work| &work.0.completion);
+        let generation = if msg == WM_SETFOCUS {
+            completion.map_or(0, |c| c.focus(hwnd))
+        } else {
+            0
+        };
+        if kind == 1 && msg == WM_CHAR && wp.0 == 1 {
+            shell::send(hwnd, EM_SETSEL, WPARAM(0), LPARAM(-1));
+            return LRESULT(0);
+        }
         let dropped = kind == 2
             && matches!(msg, WM_MOUSEWHEEL | WM_KEYDOWN)
             && shell::send(hwnd, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0;
@@ -155,12 +389,25 @@ unsafe extern "system" fn scroll_control_proc(
         }
         let result = DefSubclassProc(hwnd, msg, wp, lp);
         if msg == WM_SETFOCUS {
-            let _ = PostMessageW(
-                Some(owner),
-                ENSURE_VISIBLE,
-                WPARAM(0),
-                LPARAM(hwnd.0 as isize),
-            );
+            if let Some(c) = completion {
+                c.pending_ensure.set(c.pending_ensure.get() + 1);
+            }
+            #[cfg(test)]
+            let forced_failure = completion.is_some_and(|c| c.fail_next_ensure_post.replace(false));
+            #[cfg(not(test))]
+            let forced_failure = false;
+            if (forced_failure
+                || PostMessageW(
+                    Some(owner),
+                    ENSURE_VISIBLE,
+                    WPARAM(generation),
+                    LPARAM(hwnd.0 as isize),
+                )
+                .is_err())
+                && let Some(c) = completion
+            {
+                c.fail();
+            }
         }
         result
     }
@@ -794,6 +1041,7 @@ impl FormWindow {
     }
     unsafe fn layout_controls(&mut self) {
         unsafe {
+            let _work = CompletionWork::window(self.hwnd);
             let mut client = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut client);
             let scale = self.dpi as f32 / 96.;
@@ -1082,7 +1330,15 @@ impl FormWindow {
                 } else {
                     0
                 };
-                let _ = SetWindowSubclass(child, Some(scroll_control_proc), 51, kind);
+                let tracked = (GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const Window)
+                    .as_ref()
+                    .is_some_and(|state| state.completion.enabled);
+                let _ = SetWindowSubclass(
+                    child,
+                    Some(scroll_control_proc),
+                    51,
+                    kind | if tracked { COMPLETION_TRACKED } else { 0 },
+                );
             }
         }
     }
@@ -1095,6 +1351,7 @@ struct ScrollChange {
     tokens: shell::Tokens,
 }
 unsafe fn scroll_window(state: &Window, position: i32) {
+    let _work = CompletionWork::begin(state);
     unsafe {
         let change = { state.form.borrow_mut().scroll_to(position) };
         // Move only content children, without a form borrow across native callbacks.
@@ -1144,6 +1401,7 @@ unsafe fn scroll_window(state: &Window, position: i32) {
     }
 }
 unsafe fn change_dpi(state: &Window, dpi: u32) {
+    let _work = CompletionWork::begin(state);
     unsafe {
         let positions = { state.form.borrow_mut().change_dpi(dpi) };
         for (child, r) in positions {
@@ -1163,6 +1421,7 @@ unsafe fn change_dpi(state: &Window, dpi: u32) {
     }
 }
 fn update_font(state: &Window) {
+    let _work = CompletionWork::begin(state);
     state.font_pending.set(true);
     let (hwnd, dpi) = {
         let Ok(form) = state.form.try_borrow() else {
@@ -1194,11 +1453,22 @@ fn update_font(state: &Window) {
     if state.font_pending.get() && !state.closed.get() {
         // Coalesce a nested DPI update after this font's synchronous deliveries.
         unsafe {
-            let _ = PostMessageW(Some(hwnd), FONT_REFRESH, WPARAM(0), LPARAM(0));
+            if state.completion.enabled {
+                state
+                    .completion
+                    .pending_font
+                    .set(state.completion.pending_font.get() + 1);
+            }
+            if PostMessageW(Some(hwnd), FONT_REFRESH, WPARAM(0), LPARAM(0)).is_err()
+                && state.completion.enabled
+            {
+                state.completion.fail();
+            }
         }
     }
 }
 unsafe fn drain_rail_request(state: &Window, wp: WPARAM, lp: LPARAM) {
+    let _work = CompletionWork::begin(state);
     unsafe {
         // A modal command may own the form. Leave the coalesced request intact;
         // its command-end drain will apply it after releasing that borrow.
@@ -1216,6 +1486,7 @@ unsafe fn drain_rail_request(state: &Window, wp: WPARAM, lp: LPARAM) {
 unsafe fn close_window(hwnd: HWND, state: &Window) {
     unsafe {
         state.closed.set(true);
+        state.completion.retire();
         // Keep an eligible activation target while Windows destroys the modal
         // surface instead of leaving its owner disabled during activation handoff.
         if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
@@ -1234,11 +1505,16 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         if pointer.is_null() {
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
+        if msg == WM_NCCREATE {
+            (*pointer).completion.bind(hwnd);
+        }
         if msg == WM_NCDESTROY {
+            (*pointer).completion.retire();
             (*pointer).closed.set(true);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
+        let _work = CompletionWork::begin(&*pointer);
         if msg == WM_DESTROY {
             (*pointer).closed.set(true);
             return LRESULT(0);
@@ -1248,6 +1524,8 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         if msg == FONT_REFRESH {
+            let c = &(*pointer).completion;
+            c.pending_font.set(c.pending_font.get().saturating_sub(1));
             update_font(&*pointer);
             return LRESULT(0);
         }
@@ -1269,6 +1547,9 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let Ok(mut form) = (*pointer).form.try_borrow_mut() else {
+            if msg == ENSURE_VISIBLE && (*pointer).completion.enabled {
+                (*pointer).completion.fail();
+            }
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
         match msg {
@@ -1296,10 +1577,28 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             ENSURE_VISIBLE => {
+                let c = &(*pointer).completion;
+                if c.enabled && wp.0 != 0 {
+                    if c.pending_ensure.get() == 0 || wp.0 > c.issued.get() {
+                        c.fail();
+                    }
+                    c.pending_ensure
+                        .set(c.pending_ensure.get().saturating_sub(1));
+                }
                 let position = form.ensure_visible(HWND(lp.0 as *mut _));
                 drop(form);
                 if let Some(position) = position {
                     scroll_window(&*pointer, position);
+                    if c.enabled
+                        && wp.0 != 0
+                        && wp.0 == c.issued.get()
+                        && HWND(lp.0 as *mut _) == c.target.get()
+                        && GetFocus() == c.target.get()
+                    {
+                        c.ensured.set(wp.0);
+                    }
+                } else if c.enabled {
+                    c.fail();
                 }
                 LRESULT(0)
             }
@@ -1612,6 +1911,7 @@ impl App {
             }
             let brush = CreateSolidBrush(shell::rgb(self.shell.tokens.panel));
             let state = Box::new(Window {
+                completion: Completion::new(self.diagnostic.is_some()),
                 font: RefCell::new(None),
                 font_updating: Cell::new(false),
                 font_pending: Cell::new(false),
@@ -1705,12 +2005,22 @@ impl App {
     }
 }
 
+unsafe fn show_settings(state: &Window, hwnd: HWND, owner: HWND) {
+    let _initialization = CompletionWork::begin(state);
+    unsafe {
+        let _ = EnableWindow(owner, false);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+    // Publish only when the real ShowWindow call and all its synchronous native
+    // postprocessing have returned. Pending work and enclosing scopes still gate it.
+    state.completion.initialized.set(true);
+}
+
 impl PreparedSettings {
     unsafe fn pump(self) -> SettingsOutcome {
         unsafe {
             let Self { state, hwnd, owner } = self;
-            let _ = EnableWindow(owner, false);
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            show_settings(&state, hwnd, owner);
             let mut msg = MSG::default();
             let mut quit = None;
 
@@ -1720,6 +2030,10 @@ impl PreparedSettings {
                     quit = Some(msg.wParam);
                     break;
                 }
+                // A nested native pump can dispatch ENSURE while dialog
+                // pretranslation is still running. Publish only after this
+                // entire owner dispatch boundary, including its postprocessing.
+                let _completion_work = CompletionWork::begin(&state);
                 // Disabled owners do not receive new physical input, but keys
                 // already queued for an editor/child must not run in this pump.
                 if (msg.hwnd == owner || IsChild(owner, msg.hwnd).as_bool())
@@ -1798,6 +2112,703 @@ unsafe fn run_prepared(state: &WindowState, prepared: PreparedSettings) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn settings_completion_root_quiescence_after_actual_invalid_apply_notice() {
+        const TIMER: usize = 795;
+        const PROBE: PCWSTR = w!("MDLiteSettingsRootCompletionProbe");
+        struct Probe {
+            root: HWND,
+            state: *const Window,
+            seen: Cell<bool>,
+            correct_notice: Cell<bool>,
+            blocked_in_notice: Cell<bool>,
+            close_posted: Cell<bool>,
+        }
+        struct NoticeTimer(HWND);
+        impl Drop for NoticeTimer {
+            fn drop(&mut self) {
+                unsafe {
+                    // Queued timer callbacks must lose the scoped address BEFORE
+                    // KillTimer; the timer ID is never interpreted as a pointer.
+                    let _ = RemovePropW(self.0, PROBE);
+                    let _ = KillTimer(Some(self.0), TIMER);
+                }
+            }
+        }
+        unsafe extern "system" fn dismiss(hwnd: HWND, _: u32, id: usize, _: u32) {
+            unsafe {
+                if id != TIMER {
+                    return;
+                }
+                let property = GetPropW(hwnd, PROBE);
+                if property.0.is_null() {
+                    return;
+                }
+                let p = &*(property.0 as *const Probe);
+                if hwnd != p.root || p.seen.get() {
+                    return;
+                }
+                let popup = GetLastActivePopup(hwnd);
+                let mut class = [0u16; 32];
+                let n = GetClassNameW(popup, &mut class);
+                let mut pid = 0;
+                let thread = GetWindowThreadProcessId(popup, Some(&mut pid));
+                if popup == hwnd
+                    || GetWindow(popup, GW_OWNER).ok() != Some(hwnd)
+                    || pid != std::process::id()
+                    || thread != GetWindowThreadProcessId(hwnd, None)
+                    || String::from_utf16_lossy(&class[..n.max(0) as usize]) != "#32770"
+                {
+                    return;
+                }
+                p.seen.set(true);
+                let body = children(popup)
+                    .into_iter()
+                    .map(shell::text_of)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                p.correct_notice.set(
+                    shell::text_of(popup).starts_with("設定を保存できません")
+                        && body.contains("auto_save_delay_ms")
+                        && body.contains("100..=60000"),
+                );
+                p.blocked_in_notice.set(
+                    (*p.state).form.try_borrow_mut().is_err()
+                        && GetPropW(hwnd, COMPLETION_ROOT).0.is_null()
+                        && GetPropW(hwnd, COMPLETION_READY).0.is_null(),
+                );
+                // Native dismissal of only this fixture's real validation notice.
+                p.close_posted
+                    .set(PostMessageW(Some(popup), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok());
+            }
+        }
+        let tmp = SettingsTempDir::new();
+        let common = tmp.0.join("common.toml");
+        let workspace = tmp.0.join("workspace.toml");
+        let common_bytes = b"schema_version = 1\nauto_save_delay_ms = 750\n";
+        let workspace_bytes = b"schema_version = 1\nauto_save = false\n";
+        fs::write(&common, common_bytes).unwrap();
+        fs::write(&workspace, workspace_bytes).unwrap();
+        let owner = FormFixture::new();
+        let f = FormFixture::new();
+        unsafe {
+            SetWindowPos(
+                f.hwnd,
+                None,
+                0,
+                0,
+                960,
+                700,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let fields = field_specs();
+            let delay_index = fields
+                .iter()
+                .position(|field| field.key == "auto_save_delay_ms")
+                .unwrap();
+            {
+                let mut form = f.state.form.borrow_mut();
+                form.fields = fields.clone();
+                for path in [&common, &workspace] {
+                    let file = CapturedSettings::capture(path).unwrap();
+                    let baseline = values(&file, &fields);
+                    form.forms.push(Form {
+                        file,
+                        expected: raw(path).unwrap(),
+                        baseline: baseline.clone(),
+                        draft: baseline,
+                    });
+                }
+                form.selected = 1;
+                form.create_controls();
+            }
+            show_settings(&f.state, f.hwnd, owner.hwnd);
+            let (delay, apply) = {
+                let form = f.state.form.borrow();
+                (form.rows[delay_index].input, form.buttons[0])
+            };
+            SetWindowTextW(delay, w!("0")).unwrap();
+            // Ordinary button down gives actual child focus. Dispatch its posted
+            // ENSURE before up, as the production owner pump does before input.
+            SendMessageW(
+                apply,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(1)),
+                Some(LPARAM((10 << 16) | 10)),
+            );
+            pump_ensure(f.hwnd, false);
+            let child = receipt(f.hwnd);
+            assert!(child.2 > 0);
+            assert_eq!(child.2, child.4);
+            assert_eq!(child.3, apply);
+            let p = Probe {
+                root: f.hwnd,
+                state: &*f.state,
+                seen: Cell::new(false),
+                correct_notice: Cell::new(false),
+                blocked_in_notice: Cell::new(false),
+                close_posted: Cell::new(false),
+            };
+            SetPropW(
+                f.hwnd,
+                PROBE,
+                Some(HANDLE((&p as *const Probe).cast_mut().cast())),
+            )
+            .unwrap();
+            let timer = NoticeTimer(f.hwnd);
+            assert_ne!(SetTimer(Some(f.hwnd), TIMER, 25, Some(dismiss)), 0);
+            {
+                let _owner_postprocessing = CompletionWork::begin(&f.state);
+                SendMessageW(
+                    apply,
+                    WM_LBUTTONUP,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((10 << 16) | 10)),
+                );
+                drop(timer);
+                assert!(
+                    p.seen.get() && p.correct_notice.get() && p.close_posted.get(),
+                    "real invalid0 Apply notice must be observed and normally dismissed"
+                );
+                assert!(p.blocked_in_notice.get());
+                assert!(
+                    GetFocus() == HWND::default() || GetFocus() == f.hwnd,
+                    "native notice must naturally return root/zero; no manufactured focus is accepted"
+                );
+                assert_eq!(
+                    GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize,
+                    0,
+                    "enclosing native work still blocks root layout readiness"
+                );
+                assert_eq!(receipt(f.hwnd).4, 0);
+            }
+            // Stale queued callbacks see no pointer; no callback accesses p by ID.
+            dismiss(f.hwnd, WM_TIMER, TIMER, 0);
+            dismiss(f.hwnd, WM_TIMER, usize::MAX, 0);
+            assert!(GetPropW(f.hwnd, PROBE).0.is_null());
+            assert!(f.state.completion.healthy.get());
+            assert_eq!(f.state.completion.pending_ensure.get(), 0);
+            assert_eq!(f.state.completion.pending_font.get(), 0);
+            let root = receipt(f.hwnd);
+            assert_eq!(root.2, child.2);
+            assert_eq!(root.3, apply);
+            assert_eq!(
+                root.4, 0,
+                "root layout is NOT a child ENSURE completion or Tab baseline"
+            );
+            assert!(root.1 > 0 && root.1.is_multiple_of(2));
+            assert_eq!(GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize, 1);
+            let mut r = RECT::default();
+            let mut client = RECT::default();
+            GetWindowRect(delay, &mut r).unwrap();
+            GetClientRect(f.hwnd, &mut client).unwrap();
+            let mut origin = POINT::default();
+            let _ = ClientToScreen(f.hwnd, &mut origin);
+            assert!(
+                r.left >= origin.x
+                    && r.top >= origin.y
+                    && r.right <= origin.x + client.right
+                    && r.bottom <= origin.y + client.bottom
+            );
+            SendMessageW(
+                delay,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(1)),
+                Some(LPARAM((10 << 16) | 10)),
+            );
+            SendMessageW(
+                delay,
+                WM_LBUTTONUP,
+                Some(WPARAM(0)),
+                Some(LPARAM((10 << 16) | 10)),
+            );
+            let next = receipt(f.hwnd);
+            assert!(next.2 > root.2);
+            assert_eq!(GetFocus(), delay);
+            assert_eq!(next.4, 0);
+            assert_eq!(GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize, 0);
+            pump_ensure(f.hwnd, false);
+            let done = receipt(f.hwnd);
+            assert_eq!(done.2, done.4);
+            assert_eq!(done.3, delay);
+            assert_eq!(shell::text_of(delay), "0");
+            assert_eq!(fs::read(&common).unwrap(), common_bytes);
+            assert_eq!(fs::read(&workspace).unwrap(), workspace_bytes);
+            println!(
+                "actual_invalid0_notice=true root_return_natural=true old_child_generation={} root_layout_ready=true child_ready=0 next_contained401_generation={} completed={}",
+                root.2, done.2, done.4
+            );
+        }
+    }
+
+    #[test]
+    fn settings_completion_initial_layout_allows_first_click_without_fabricating_focus() {
+        struct Probe {
+            showed: Cell<bool>,
+            blocked: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                if msg == WM_SHOWWINDOW && wp.0 != 0 {
+                    let probe = &*(data as *const Probe);
+                    probe.showed.set(true);
+                    probe
+                        .blocked
+                        .set(GetPropW(hwnd, COMPLETION_ROOT).0.is_null());
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let owner = FormFixture::new();
+        let f = FormFixture::new();
+        unsafe {
+            let scope = shell::control(
+                f.hwnd,
+                w!("COMBOBOX"),
+                "scope",
+                200,
+                WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_VSCROLL,
+            );
+            SetWindowPos(scope, None, 16, 16, 200, 100, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            assert!(
+                SetWindowSubclass(scope, Some(scroll_control_proc), 51, COMPLETION_TRACKED | 2)
+                    .as_bool()
+            );
+            shell::send(
+                scope,
+                CB_ADDSTRING,
+                WPARAM(0),
+                LPARAM(w!("Workspace").as_ptr() as isize),
+            );
+            shell::send(scope, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            let probe = Probe {
+                showed: Cell::new(false),
+                blocked: Cell::new(false),
+            };
+            assert!(
+                SetWindowSubclass(
+                    f.hwnd,
+                    Some(observe),
+                    792,
+                    (&probe as *const Probe) as usize,
+                )
+                .as_bool()
+            );
+            assert_eq!(receipt(f.hwnd).2, 0);
+            assert_eq!(
+                GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize,
+                0,
+                "unshown initialization is not ready"
+            );
+            {
+                let _enclosing_native_postprocessing = CompletionWork::begin(&f.state);
+                show_settings(&f.state, f.hwnd, owner.hwnd);
+                assert_eq!(
+                    GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize,
+                    0,
+                    "ShowWindow return cannot bypass enclosing native work"
+                );
+            }
+            let initial = receipt(f.hwnd);
+            assert!(probe.showed.get() && probe.blocked.get());
+            assert!(
+                GetFocus() == HWND::default() || GetFocus() == f.hwnd,
+                "shown Settings starts at root/zero, no child focus was assigned"
+            );
+            assert_eq!(initial.2, 0);
+            assert_eq!(initial.3, HWND::default());
+            assert_eq!(initial.4, 0);
+            assert!(initial.1 > 0 && initial.1.is_multiple_of(2));
+            assert_eq!(GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize, 1);
+            let mut control = RECT::default();
+            let mut client = RECT::default();
+            GetWindowRect(scope, &mut control).unwrap();
+            GetClientRect(f.hwnd, &mut client).unwrap();
+            let mut origin = POINT::default();
+            let _ = ClientToScreen(f.hwnd, &mut origin);
+            assert!(
+                control.left >= origin.x
+                    && control.top >= origin.y
+                    && control.right <= origin.x + client.right
+                    && control.bottom <= origin.y + client.bottom
+            );
+            // The ordinary first contained-control click, not SetFocus or a
+            // fabricated WM_SETFOCUS/ENSURE, initiates the first real generation.
+            SendMessageW(
+                scope,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(1)),
+                Some(LPARAM((10 << 16) | 10)),
+            );
+            SendMessageW(
+                scope,
+                WM_LBUTTONUP,
+                Some(WPARAM(0)),
+                Some(LPARAM((10 << 16) | 10)),
+            );
+            shell::send(scope, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+            assert_eq!(GetFocus(), scope);
+            let issued = receipt(f.hwnd);
+            assert!(issued.2 > 0);
+            assert_eq!(issued.4, 0);
+            assert_eq!(GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize, 0);
+            pump_ensure(f.hwnd, false);
+            let done = receipt(f.hwnd);
+            assert_eq!(done.2, done.4);
+            assert_eq!(done.3, scope);
+            assert_eq!(
+                GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize,
+                0,
+                "initial mode never acknowledges a real focus generation"
+            );
+            println!(
+                "shown_root_generation=0 initial_layout_ready=true old_focus_ready=0 first_contained_scope_click_generation={} real_completed={}",
+                issued.2, done.4
+            );
+            SendMessageW(f.hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert_eq!(GetPropW(f.hwnd, COMPLETION_ROOT).0 as usize, 0);
+            assert_eq!(receipt(f.hwnd).0, 0);
+        }
+    }
+
+    unsafe fn receipt(hwnd: HWND) -> (usize, usize, usize, HWND, usize) {
+        unsafe {
+            (
+                GetPropW(hwnd, COMPLETION_INSTANCE).0 as usize,
+                GetPropW(hwnd, COMPLETION_SERIAL).0 as usize,
+                GetPropW(hwnd, COMPLETION_ISSUED).0 as usize,
+                HWND(GetPropW(hwnd, COMPLETION_TARGET).0),
+                GetPropW(hwnd, COMPLETION_READY).0 as usize,
+            )
+        }
+    }
+    unsafe fn pump_ensure(hwnd: HWND, one: bool) -> usize {
+        unsafe {
+            let mut count = 0;
+            let mut msg = MSG::default();
+            while PeekMessageW(
+                &mut msg,
+                Some(hwnd),
+                ENSURE_VISIBLE,
+                ENSURE_VISIBLE,
+                PM_REMOVE,
+            )
+            .as_bool()
+            {
+                DispatchMessageW(&msg);
+                count += 1;
+                if one {
+                    break;
+                }
+            }
+            count
+        }
+    }
+    unsafe fn focus_control(fixture: &FormFixture, class: PCWSTR, id: usize, y: i32) -> HWND {
+        unsafe {
+            let h = shell::control(
+                fixture.hwnd,
+                class,
+                "owned completion fixture",
+                id,
+                WINDOW_STYLE(0),
+            );
+            SetWindowPos(h, None, 16, y, 200, 28, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            assert!(
+                SetWindowSubclass(
+                    h,
+                    Some(scroll_control_proc),
+                    51,
+                    COMPLETION_TRACKED | if class == w!("EDIT") { 1 } else { 0 },
+                )
+                .as_bool()
+            );
+            h
+        }
+    }
+
+    #[test]
+    fn settings_completion_waits_for_whole_ensure_after_partial_303_move() {
+        struct Probe {
+            owner: HWND,
+            edit: HWND,
+            old_edit: RECT,
+            client_bottom: i32,
+            old_contract: Cell<bool>,
+            busy: Cell<bool>,
+        }
+        unsafe extern "system" fn probe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                if msg == WM_WINDOWPOSCHANGED {
+                    let p = &*(data as *const Probe);
+                    let mut r = RECT::default();
+                    let mut e = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut r);
+                    let _ = GetWindowRect(p.edit, &mut e);
+                    let mut bottom = POINT {
+                        x: 0,
+                        y: p.client_bottom,
+                    };
+                    let _ = ClientToScreen(p.owner, &mut bottom);
+                    if r.bottom <= bottom.y && e.top == p.old_edit.top {
+                        p.old_contract.set(true);
+                        let state = receipt(p.owner);
+                        p.busy.set(!state.1.is_multiple_of(2) && state.4 == 0);
+                    }
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let f = FormFixture::new();
+        unsafe {
+            let mut client = RECT::default();
+            GetClientRect(f.hwnd, &mut client).unwrap();
+            let before = focus_control(&f, w!("BUTTON"), 302, 16);
+            let next = focus_control(&f, w!("BUTTON"), 303, client.bottom + 23 - 28);
+            let edit = focus_control(&f, w!("EDIT"), 408, 120);
+            let _edit409 = focus_control(&f, w!("EDIT"), 409, 154);
+            let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetFocus(Some(before));
+            assert_eq!(GetFocus(), before);
+            assert_eq!(
+                receipt(f.hwnd).4,
+                0,
+                "pending prior focus cannot be a Tab baseline"
+            );
+            pump_ensure(f.hwnd, false);
+            let baseline = receipt(f.hwnd);
+            assert_eq!(baseline.2, baseline.4);
+            assert_ne!(baseline.4, 0);
+            let mut old = RECT::default();
+            GetWindowRect(edit, &mut old).unwrap();
+            let p = Probe {
+                owner: f.hwnd,
+                edit,
+                old_edit: old,
+                client_bottom: client.bottom,
+                old_contract: Cell::new(false),
+                busy: Cell::new(false),
+            };
+            assert!(
+                SetWindowSubclass(next, Some(probe), 791, (&p as *const Probe) as usize).as_bool()
+            );
+            // A queued new Tab must not be acknowledged by the settled previous generation.
+            PostMessageW(
+                Some(before),
+                WM_KEYDOWN,
+                WPARAM(VK_TAB.0 as usize),
+                LPARAM(0),
+            )
+            .unwrap();
+            assert_eq!(receipt(f.hwnd).2, baseline.2);
+            let mut msg = MSG::default();
+            assert!(
+                PeekMessageW(&mut msg, Some(f.hwnd), WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE).as_bool()
+            );
+            assert!(IsDialogMessageW(f.hwnd, &msg).as_bool());
+            assert_eq!(GetFocus(), next);
+            let issued = receipt(f.hwnd);
+            assert!(issued.2 > baseline.2);
+            assert_eq!(issued.4, 0);
+            {
+                let _owner_dispatch = CompletionWork::begin(&f.state);
+                pump_ensure(f.hwnd, false);
+                assert_eq!(
+                    receipt(f.hwnd).4,
+                    0,
+                    "handler end must not publish inside an enclosing native dispatch"
+                );
+            }
+            let _ = RemoveWindowSubclass(next, Some(probe), 791);
+            let done = receipt(f.hwnd);
+            let mut final_rect = RECT::default();
+            GetWindowRect(edit, &mut final_rect).unwrap();
+            assert!(
+                p.old_contract.get(),
+                "real callback must observe303 contained before408 moves"
+            );
+            assert!(
+                p.busy.get(),
+                "new receipt must reject the old geometric counterexample"
+            );
+            assert_eq!(old.top - final_rect.top, 23);
+            assert_eq!(done.0, baseline.0);
+            assert!(done.1.is_multiple_of(2));
+            assert_eq!(done.2, issued.2);
+            assert_eq!(done.3, next);
+            assert_eq!(done.4, issued.2);
+            println!(
+                "old_contract_partial=true new_receipt_mid_move=busy prior_generation={} completed_new_generation={} moved408={}px",
+                baseline.2,
+                done.4,
+                old.top - final_rect.top
+            );
+        }
+    }
+
+    #[test]
+    fn settings_completion_rejects_stale_focus_post_failure_and_retired_lifetime() {
+        let f = FormFixture::new();
+        unsafe {
+            let a = focus_control(&f, w!("BUTTON"), 302, 16);
+            let b = focus_control(&f, w!("BUTTON"), 303, 60);
+            let c = focus_control(&f, w!("EDIT"), 409, 104);
+            let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetFocus(Some(a));
+            pump_ensure(f.hwnd, false);
+            let old = receipt(f.hwnd);
+            let _ = SetFocus(Some(b));
+            let stale = receipt(f.hwnd).2;
+            let _ = SetFocus(Some(c));
+            let current = receipt(f.hwnd).2;
+            assert!(current > stale && stale > old.2);
+            assert_eq!(pump_ensure(f.hwnd, true), 1);
+            assert_eq!(
+                receipt(f.hwnd).4,
+                0,
+                "older ensure cannot acknowledge currentfocus"
+            );
+            pump_ensure(f.hwnd, false);
+            let done = receipt(f.hwnd);
+            assert_eq!(done.3, c);
+            assert_eq!(done.4, current);
+            f.state.completion.fail_next_ensure_post.set(true);
+            let _ = SetFocus(Some(b));
+            assert!(!f.state.completion.healthy.get());
+            assert_eq!(receipt(f.hwnd).4, 0);
+            assert_eq!(receipt(f.hwnd).1, 0);
+            DestroyWindow(f.hwnd).unwrap();
+            assert_eq!(
+                receipt(f.hwnd).0,
+                0,
+                "destroyed surface must remove instance and receipt"
+            );
+            let replacement = FormFixture::new();
+            assert_ne!(
+                receipt(replacement.hwnd).0,
+                old.0,
+                "old lifetime cookie cannot match replacement"
+            );
+            println!(
+                "stale_generation={stale} current_generation={current} post_failure=closed lifetime_removed=true"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_completion_blocks_pending_font_and_rail_without_consuming_it() {
+        let f = FormFixture::new();
+        unsafe {
+            let input = focus_control(&f, w!("EDIT"), 408, 40);
+            let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetFocus(Some(input));
+            pump_ensure(f.hwnd, false);
+            let generation = receipt(f.hwnd).4;
+            assert_ne!(generation, 0);
+            let rail_hwnd = f.enable_rail();
+            let mut r = RECT::default();
+            GetClientRect(rail_hwnd, &mut r).unwrap();
+            SendMessageW(
+                rail_hwnd,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(LPARAM(((r.bottom - 2) as isize) << 16)),
+            );
+            assert!(f.state.rail.borrow().as_ref().unwrap().has_pending());
+            {
+                let _work = CompletionWork::begin(&f.state);
+            }
+            assert_eq!(receipt(f.hwnd).4, 0);
+            assert!(
+                f.state.rail.borrow().as_ref().unwrap().has_pending(),
+                "receipt observation must not consume rail request"
+            );
+            let mut msg = MSG::default();
+            assert!(
+                PeekMessageW(
+                    &mut msg,
+                    Some(f.hwnd),
+                    RAIL_REQUEST,
+                    RAIL_REQUEST,
+                    PM_REMOVE
+                )
+                .as_bool()
+            );
+            DispatchMessageW(&msg);
+            assert!(!f.state.rail.borrow().as_ref().unwrap().has_pending());
+            f.state.font_pending.set(true);
+            {
+                let _work = CompletionWork::begin(&f.state);
+            }
+            assert_eq!(receipt(f.hwnd).4, 0);
+            update_font(&f.state);
+            assert_eq!(receipt(f.hwnd).4, generation);
+            println!(
+                "pending_rail_blocked_nonconsuming=true pending_font_blocked=true completed_generation={generation}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_edit_control_a_selects_existing_text_before_native_replacement() {
+        let fixture = FormFixture::new();
+        let files = SettingsTempDir::new();
+        let document = files.0.join("unchanged.md");
+        fs::write(&document, b"unchanged document\n").unwrap();
+        unsafe {
+            let edit = shell::control(
+                fixture.hwnd,
+                w!("EDIT"),
+                "750",
+                401,
+                WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            );
+            SetWindowSubclass(edit, Some(scroll_control_proc), 51, COMPLETION_TRACKED | 1).unwrap();
+            // Only fixture setup places the caret; selection must come from
+            // the actual Settings subclass handling the ordinary character.
+            shell::send(edit, EM_SETSEL, WPARAM(3), LPARAM(3));
+            assert_eq!(
+                shell::send(edit, EM_GETSEL, WPARAM(0), LPARAM(0)).0,
+                0x0003_0003
+            );
+            shell::send(edit, WM_CHAR, WPARAM(1), LPARAM(1));
+            assert_eq!(shell::text_of(edit), "750");
+            assert_eq!(
+                shell::send(edit, EM_GETSEL, WPARAM(0), LPARAM(0)).0,
+                0x0003_0000
+            );
+            shell::send(edit, WM_CHAR, WPARAM(8), LPARAM(1));
+            assert_eq!(shell::text_of(edit), "");
+            assert_eq!(shell::send(edit, EM_GETSEL, WPARAM(0), LPARAM(0)).0, 0);
+            for unit in "880".encode_utf16() {
+                shell::send(edit, WM_CHAR, WPARAM(unit as usize), LPARAM(1));
+            }
+            assert_eq!(shell::text_of(edit), "880");
+            shell::send(edit, WM_CHAR, WPARAM('x' as usize), LPARAM(1));
+            assert_eq!(
+                shell::text_of(edit),
+                "880x",
+                "ordinary characters stay native"
+            );
+        }
+        assert_eq!(fs::read(document).unwrap(), b"unchanged document\n");
+    }
+
     struct FormFixture {
         state: Box<Window>,
         hwnd: HWND,
@@ -1826,6 +2837,7 @@ mod tests {
         fn new() -> Self {
             unsafe {
                 let state = Box::new(Window {
+                    completion: Completion::new(true),
                     font: RefCell::new(None),
                     font_updating: Cell::new(false),
                     font_pending: Cell::new(false),

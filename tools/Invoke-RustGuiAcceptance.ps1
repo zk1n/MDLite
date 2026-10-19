@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$UiParity,
     [switch]$Rev3,
@@ -996,6 +996,49 @@ public static class MdliteRustAcceptanceNative
         int x = (int)Math.Floor(((long)control[0] + control[2]) / 2.0);
         int y = (int)Math.Floor(((long)control[1] + control[3]) / 2.0);
         return recipientMatchesControl && x >= client[0] && x < client[2] && y >= client[1] && y < client[3];
+    }
+
+    // Read-only window properties: no sent-message polling or queue draining.
+    public static Dictionary<string, object> ObserveOwnedSettingsCompletion(IntPtr window, IntPtr main, uint pid)
+    {
+        uint actualPid, mainPid;
+        uint thread = GetWindowThreadProcessId(window, out actualPid);
+        uint mainThread = GetWindowThreadProcessId(main, out mainPid);
+        if (thread == 0 || thread != mainThread || actualPid != pid || mainPid != pid ||
+            !IsOwnedWindow(window,pid) || !IsOwnedWindow(main,pid) ||
+            WindowClass(window) != "MDLiteSettings" || GetWindow(window,4) != main)
+            throw new InvalidOperationException("OWNERSHIP_GATE: Settings completion identity changed.");
+        const string prefix = "MDLite.Settings.Completion.";
+        long instance = GetPropW(window,prefix+"Instance.v1").ToInt64();
+        long serial = GetPropW(window,prefix+"Serial.v1").ToInt64();
+        long issued = GetPropW(window,prefix+"Issued.v1").ToInt64();
+        IntPtr target = GetPropW(window,prefix+"Target.v1");
+        long completed = GetPropW(window,prefix+"Ready.v1").ToInt64();
+        long root = GetPropW(window,prefix+"Root.v1").ToInt64();
+        GUITHREADINFO gui = new GUITHREADINFO(); gui.cbSize=(uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+        bool guiOk = GetGUIThreadInfo(thread,ref gui);
+        uint targetPid; uint targetThread=GetWindowThreadProcessId(target,out targetPid);
+        RECT focusRect=new RECT(), clientRect=new RECT();
+        POINT origin=new POINT();
+        bool geometry = GetWindowRect(target,out focusRect) && GetClientRect(window,out clientRect) && ClientToScreen(window,ref origin);
+        bool inside = geometry && focusRect.Left>=origin.X && focusRect.Top>=origin.Y &&
+            focusRect.Right<=origin.X+clientRect.Right && focusRect.Bottom<=origin.Y+clientRect.Bottom;
+        long serialAfter = GetPropW(window,prefix+"Serial.v1").ToInt64();
+        long instanceAfter = GetPropW(window,prefix+"Instance.v1").ToInt64();
+        bool settled = instance>0 && instance==instanceAfter && serial>0 && serial==serialAfter && (serial&1)==0 && guiOk &&
+            IsWindowVisible(window) && IsWindowEnabled(window) && GetForegroundWindow()==window && gui.hwndActive==window;
+        bool focusReady = settled && root==0 && issued>0 && completed==issued && gui.hwndFocus==target && target!=IntPtr.Zero &&
+            targetPid==pid && targetThread==thread && GetParent(target)==window && IsWindow(target);
+        bool rootReady = settled && root==1 && completed==0 &&
+            (gui.hwndFocus==IntPtr.Zero || gui.hwndFocus==window);
+        return new Dictionary<string,object> {
+            {"instance",instance},{"serial",serial},{"issued",issued},{"completed",completed},
+            {"target_hwnd",target.ToInt64()},{"focus_hwnd",gui.hwndFocus.ToInt64()},{"ready",focusReady || rootReady},
+            {"focus_ready",focusReady},{"root_ready",rootReady},
+            {"focused_window_rect",new int[]{focusRect.Left,focusRect.Top,focusRect.Right,focusRect.Bottom}},
+            {"settings_client_screen_rect",new int[]{origin.X,origin.Y,origin.X+clientRect.Right,origin.Y+clientRect.Bottom}},
+            {"fully_inside_settings_client",inside}
+        };
     }
 
     public static Dictionary<string, object> OwnedSettingsControls(IntPtr window, IntPtr main, uint pid)
@@ -5470,6 +5513,560 @@ function Invoke-Rev3PaintDependencyProbe($StartupState) {
     Add-UiParityCase 'PAINT_DEPENDENCY_PROBE' 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $receipt
 }
 
+# S01-only helpers. Real mutations use existing guarded pointer/keyboard helpers.
+function Assert-S01Dialog([IntPtr]$Dialog) {
+    Assert-OwnedWindow $script:WindowHandle
+    Assert-UiOwnedWindow $Dialog
+    $m=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($Dialog,$script:WindowHandle,$script:ProcessId)
+    if ([MdliteRustAcceptanceNative]::WindowClass($Dialog) -cne 'MDLiteSettings' -or
+        $m.OwnerHwnd -ne $script:WindowHandle.ToInt64() -or $m.ProcessId -ne $script:ProcessId -or
+        $m.ThreadId -ne $m.MainThreadId -or -not $m.Visible -or -not $m.Enabled) { throw 'OWNERSHIP_GATE: S01 exact Settings identity changed.' }
+}
+
+function Wait-S01Observation([IntPtr]$Dialog,[scriptblock]$Read,[scriptblock]$Ready,[string]$Stage) {
+    $clock=[Diagnostics.Stopwatch]::StartNew(); $last=$null
+    do {
+        Assert-S01Dialog $Dialog
+        if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { break }
+        $last=& $Read $clock
+        $conditionMatched=& $Ready $last
+        $completedMs=$clock.Elapsed.TotalMilliseconds
+        if ($completedMs -ge $TimeoutMs) { break }
+        if ($conditionMatched) {
+            $script:Report.operations+=@{name='S01 semantic observation';stage=$Stage;elapsed_ms=$completedMs;value=$last}
+            return $last
+        }
+        # Yield only while a named semantic condition is pending; never delay input.
+        [void][Threading.Thread]::Yield()
+    } while ($clock.Elapsed.TotalMilliseconds -lt $TimeoutMs)
+    $script:Report.operations+=@{name='S01 semantic observation';stage=$Stage;elapsed_ms=$clock.Elapsed.TotalMilliseconds;value=$last;status='TIMEOUT'}
+    throw ('PRODUCT_ASSERTION: S01 semantic observation timed out: '+$Stage)
+}
+
+function Get-S01Control([IntPtr]$Dialog,[int]$Id) {
+    Assert-S01Dialog $Dialog
+    $c=Get-UiControlById $Dialog $Id
+    [uint32]$pidNow=0
+    $thread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($c.Handle,[ref]$pidNow)
+    $m=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($Dialog,$script:WindowHandle,$script:ProcessId)
+    if ($pidNow -ne $script:ProcessId -or $thread -ne $m.ThreadId -or
+        [MdliteRustAcceptanceNative]::GetParent($c.Handle) -ne $Dialog) { throw 'OWNERSHIP_GATE: S01 control parent/thread changed.' }
+    return $c
+}
+
+function Read-S01FieldSnapshot([IntPtr]$Dialog,[int]$Id) {
+    Assert-S01Dialog $Dialog
+    $before=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+    $pending=[pscustomobject]@{ready=$false;id=$Id;before=$before;after=$null;input=$null;checked_rect=$null;candidates=@()}
+    if (-not $before.ready -or $before.instance -le 0 -or $before.serial -le 0 -or ($before.serial % 2) -ne 0) { return $pending }
+    # Input and STATIC geometry belong to one enumeration bracketed by the
+    # owner's completion serial. Native Visible is not viewport/pixel evidence.
+    $children=@(Get-UiOwnedChildren $Dialog)
+    $inputs=@($children | Where-Object { $_.Id -eq $Id })
+    $c=if ($inputs.Count -eq 1) { $inputs[0] } else { $null }
+    $pending.input=$c
+    # Form layout places the effective/draft STATIC between the label and input.
+    # Resolve by unique row geometry, never by enumeration order or private state.
+    $summaries=@($children | Where-Object {
+        $null -ne $c -and
+        $_.Class -ieq 'STATIC' -and $_.Visible -and [MdliteRustAcceptanceNative]::GetParent($_.Handle) -eq $Dialog -and $_.Rect[0] -lt $c.Rect[0] -and
+        $_.Rect[2] -le $c.Rect[0] -and $_.Rect[1] -lt $c.Rect[3] -and $_.Rect[3] -gt $c.Rect[1]
+    } | Sort-Object { $_.Rect[0] } -Descending)
+    $pending.candidates=$summaries
+    [uint32]$dialogPid=0
+    $dialogThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($Dialog,[ref]$dialogPid)
+    foreach ($control in @($c)+$summaries) {
+        if ($null -eq $control) { continue }
+        [uint32]$pidNow=0
+        $thread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($control.Handle,[ref]$pidNow)
+        if ($dialogPid -ne $script:ProcessId -or $pidNow -ne $script:ProcessId -or $thread -ne $dialogThread -or
+            -not [MdliteRustAcceptanceNative]::IsOwnedWindow($control.Handle,$script:ProcessId) -or
+            [MdliteRustAcceptanceNative]::GetParent($control.Handle) -ne $Dialog) { throw 'OWNERSHIP_GATE: S01 row parent/thread changed.' }
+    }
+    if ($null -ne $c) {
+        if ([MdliteRustAcceptanceNative]::GetDlgItem($Dialog,$Id) -ne $c.Handle) { throw 'OWNERSHIP_GATE: S01 field changed during row read.' }
+        $pending.checked_rect=[MdliteRustAcceptanceNative]::WindowRect($c.Handle)
+    }
+    $after=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+    $pending.after=$after
+    Assert-S01Dialog $Dialog
+    if ($after.instance -ne $before.instance) { throw 'OWNERSHIP_GATE: S01 Settings lifetime changed during row read.' }
+    if (-not $after.ready -or $after.serial -ne $before.serial -or ($after.serial % 2) -ne 0 -or
+        ($null -ne $c -and (($pending.checked_rect -join ',') -cne ($c.Rect -join ',')))) { return $pending }
+    if ($inputs.Count -ne 1 -or $summaries.Count -ne 2 -or ($summaries[0].Rect[0] -eq $summaries[1].Rect[0])) {
+        $script:Report.operations+=@{name='S01 row observer failure';stage=('field '+$Id);value=$pending;input_count=$inputs.Count}
+        throw ('OBSERVER_FAILURE: S01 coherent effective row is ambiguous: field '+$Id+', inputs '+$inputs.Count+', candidates '+$summaries.Count+'.')
+    }
+    $summary=$summaries[0]
+    # Bounded WM_GETTEXT can itself enter tracked child callbacks. Read text
+    # after the geometry bracket so our own requests cannot invalidate it.
+    return [pscustomobject]@{ready=$true;id=$Id;hwnd=$c.Handle.ToInt64();text=[MdliteRustAcceptanceNative]::OwnedControlText($c.Handle,$script:ProcessId)
+        summary=[MdliteRustAcceptanceNative]::OwnedControlText($summary.Handle,$script:ProcessId);rect=$c.Rect;visible=$c.Visible;enabled=$c.Enabled;before=$before;after=$after}
+}
+
+function Get-S01Field([IntPtr]$Dialog,[int]$Id,[scriptblock]$FieldReady={param($v) $true},[string]$Stage='') {
+    if ([string]::IsNullOrEmpty($Stage)) { $Stage='field coherent row '+$Id }
+    return Wait-S01Observation $Dialog {Read-S01FieldSnapshot $Dialog $Id} {param($v) $v.ready -and (& $FieldReady $v)} $Stage
+}
+
+function Wait-S01Field([IntPtr]$Dialog,[int]$Id,[string]$Text,[string]$Suffix) {
+    return Get-S01Field $Dialog $Id {param($v) $v.text -ceq $Text -and $v.summary.EndsWith($Suffix)} ('field semantic state '+$Id)
+}
+
+function Move-S01ToControl([IntPtr]$Dialog,[int]$Id) {
+    Assert-S01Dialog $Dialog
+    # A completed focus ENSURE, not one child's position, acknowledges the owner.
+    for ($step=0;$step -lt 100;$step++) {
+        $receipt=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+        $c=Get-S01Control $Dialog $Id
+        $client=[int[]][MdliteRustAcceptanceNative]::ClientRect($Dialog)
+        [int]$left=0;[int]$top=0;[int]$right=0;[int]$bottom=0
+        if (-not [MdliteRustAcceptanceNative]::OwnedClientPointToScreen($Dialog,$script:ProcessId,$client[0],$client[1],[ref]$left,[ref]$top) -or
+            -not [MdliteRustAcceptanceNative]::OwnedClientPointToScreen($Dialog,$script:ProcessId,$client[2],$client[3],[ref]$right,[ref]$bottom)) { throw 'OWNERSHIP_GATE: S01 client geometry unavailable.' }
+        $inside=$c.Visible -and $c.Enabled -and $c.Rect[0] -ge $left -and $c.Rect[1] -ge $top -and $c.Rect[2] -le $right -and $c.Rect[3] -le $bottom
+        $after=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+        if ($receipt.instance -gt 0 -and $after.instance -ne $receipt.instance) { throw 'OWNERSHIP_GATE: S01 Settings lifetime changed.' }
+        if ($inside -and $receipt.ready -and $after.ready -and $receipt.serial -eq $after.serial) {
+            if ($after.root_ready) { $script:Report.operations+=@{name='S01 semantic observation';stage='Settings root layout completion';value=$after} }
+            return $c
+        }
+        # The SAME original action deadline includes pending baseline completion,
+        # the single Tab insertion (if needed), and its matching new ENSURE.
+        $tab=[pscustomobject]@{sent=$false;before=$null;instance=$receipt.instance;settle_only=$inside}
+        [void](Wait-S01Observation $Dialog {
+            $current=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+            if ($tab.instance -gt 0 -and $current.instance -ne $tab.instance) { throw 'OWNERSHIP_GATE: S01 Settings lifetime changed while awaiting completion.' }
+            if ($tab.instance -eq 0 -and $current.instance -gt 0) { $tab.instance=$current.instance }
+            if (-not $tab.sent) {
+                if ($current.ready -and ($tab.settle_only -or $current.focus_ready)) {
+                    $tab.before=$current
+                    if ($tab.settle_only) {
+                        return [pscustomobject]@{ready=$true;tab_sent=$false;before=$current;completion=$current}
+                    }
+                    Send-Key $Dialog 0x09
+                    $tab.sent=$true
+                }
+                return [pscustomobject]@{ready=$false;tab_sent=$tab.sent;before=$tab.before;completion=$current}
+            }
+            $matching=$current.focus_ready -and $current.fully_inside_settings_client -and $current.instance -eq $tab.before.instance -and
+                $current.issued -gt $tab.before.issued -and $current.completed -eq $current.issued -and
+                $current.focus_hwnd -ne $tab.before.focus_hwnd -and $current.target_hwnd -eq $current.focus_hwnd
+            return [pscustomobject]@{ready=$matching;tab_sent=$true;before=$tab.before;completion=$current}
+        } {param($v) $v.ready} ('Tab reach control '+$Id))
+        # Re-read the target and client rectangle after owner completion. The
+        # unchanged guarded direct-click path consumes this fresh returned row.
+    }
+    throw ('PRODUCT_ASSERTION: S01 Tab could not reach visible control '+$Id)
+}
+
+function Invoke-S01Button([IntPtr]$Dialog,[int]$Id) {
+    $c=Move-S01ToControl $Dialog $Id
+    if ($c.Class -ine 'BUTTON') {throw 'OWNERSHIP_GATE: S01 expected BUTTON.'}
+    Invoke-UiControlClick $Dialog $c
+}
+
+function Set-S01Text([IntPtr]$Dialog,[int]$Id,[string]$Text) {
+    $c=Move-S01ToControl $Dialog $Id
+    if ($c.Class -ine 'EDIT') { throw 'OWNERSHIP_GATE: S01 expected EDIT.' }
+    Invoke-UiControlClick $Dialog $c
+    [void](Wait-S01Observation $Dialog { Get-OwnedActivationState $Dialog } {param($v) $v.focus_hwnd -eq $c.Handle.ToInt64()} ('edit focus '+$Id))
+    $initial=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+    $replacement=[pscustomobject]@{phase='CTRL_A';instance=$initial.instance;ctrl_a_sent=$false;backspace_sent=$false;unicode_sent=$false
+        selection_ack=$null;clear_ack=$null;selection_ack_idempotent_empty=$false;selection_queries=0}
+    $guardEdit={param($budget)
+        Assert-S01Dialog $Dialog
+        Assert-UiOwnedWindow $c.Handle
+        [uint32]$editPid=0;[uint32]$dialogPid=0
+        $editThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($c.Handle,[ref]$editPid)
+        $dialogThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($Dialog,[ref]$dialogPid)
+        $completion=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+        $activation=Get-OwnedActivationState $Dialog
+        if ($completion.instance -ne $replacement.instance -or $editPid -ne $script:ProcessId -or $dialogPid -ne $script:ProcessId -or
+            $editThread -ne $dialogThread -or [MdliteRustAcceptanceNative]::GetParent($c.Handle) -ne $Dialog -or
+            [MdliteRustAcceptanceNative]::GetDlgItem($Dialog,$Id) -ne $c.Handle -or [MdliteRustAcceptanceNative]::WindowClass($c.Handle) -ine 'EDIT' -or
+            $activation.foreground_hwnd -ne $Dialog.ToInt64() -or $activation.active_hwnd -ne $Dialog.ToInt64() -or
+            $activation.focus_hwnd -ne $c.Handle.ToInt64() -or $activation.capture_hwnd -ne 0 -or $activation.menu_owner_hwnd -ne 0 -or
+            $activation.move_size_hwnd -ne 0 -or $activation.runner_session -ne $activation.target_session -or
+            $activation.runner_desktop -cne $activation.target_desktop -or $activation.runner_desktop -cne $activation.input_desktop -or
+            $activation.target_integrity -gt $activation.runner_integrity -or -not $activation.visible -or -not $activation.enabled -or $activation.minimized) {
+            throw 'OWNERSHIP_GATE: S01 replacement EDIT focus/recipient changed.'
+        }
+        return $completion.focus_ready -and $completion.fully_inside_settings_client -and $completion.target_hwnd -eq $c.Handle.ToInt64() -and
+            $budget.Elapsed.TotalMilliseconds -lt $TimeoutMs
+    }
+    # One original observation clock starts before Ctrl+A and covers every
+    # acknowledgement and one-shot input phase. No nested field wait is used.
+    $result=Wait-S01Observation $Dialog {param($budget)
+        $completion=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+        if ($completion.instance -ne $replacement.instance) { throw 'OWNERSHIP_GATE: S01 replacement lifetime changed.' }
+        $field=Read-S01FieldSnapshot $Dialog $Id
+        $observation=[pscustomobject]@{ready=$false;phase=$replacement.phase;field=$field;selection=$null;selection_query_count=0;actions=$replacement}
+        if (-not $field.ready) { return $observation }
+        if ($field.hwnd -ne $c.Handle.ToInt64() -or $field.after.instance -ne $replacement.instance) { throw 'OWNERSHIP_GATE: S01 replacement field changed.' }
+        if (-not (& $guardEdit $budget)) { return $observation }
+        if ($replacement.phase -eq 'CTRL_A') {
+            Send-Key $Dialog 0x41 ([uint16[]]@(0x11))
+            $replacement.ctrl_a_sent=$true;$replacement.phase='SELECT_ALL';$observation.phase=$replacement.phase
+            return $observation
+        }
+        if ($replacement.phase -eq 'FINAL') {
+            if ($field.text -ceq $Text) { $replacement.phase='DONE';$observation.phase='DONE';$observation.ready=$true }
+            return $observation
+        }
+        # Exactly one selection query per coherent, focused EDIT row snapshot.
+        $packed=Send-UiOwnedMessage $c.Handle 0x00B0
+        $replacement.selection_queries++;$observation.selection_query_count=1
+        $selection=[pscustomobject]@{packed=$packed;start=($packed -band 65535);end=(($packed -shr 16) -band 65535)}
+        $observation.selection=$selection
+        $textAfter=[MdliteRustAcceptanceNative]::OwnedControlText($c.Handle,$script:ProcessId)
+        if ($textAfter -cne $field.text -or -not (& $guardEdit $budget)) { return $observation }
+        if ($field.text.Length -ge 65535 -or $packed -lt 0 -or $packed -ge 4294967295 -or
+            $selection.start -gt $selection.end -or $selection.end -gt $field.text.Length) {
+            $script:Report.operations+=@{name='S01 replacement observer failure';stage=('field '+$Id);value=$observation}
+            throw 'OBSERVER_FAILURE: S01 replacement selection is malformed or unrepresentable.'
+        }
+        if ($replacement.phase -eq 'SELECT_ALL' -and $selection.start -eq 0 -and $selection.end -eq $field.text.Length) {
+            $replacement.selection_ack=@{text=$field.text;start=$selection.start;end=$selection.end}
+            $replacement.selection_ack_idempotent_empty=($field.text.Length -eq 0)
+            if (-not (& $guardEdit $budget)) { return $observation }
+            Send-Key $Dialog 0x08
+            $replacement.backspace_sent=$true;$replacement.phase='CLEAR'
+        } elseif ($replacement.phase -eq 'CLEAR' -and $field.text -ceq '' -and $selection.start -eq 0 -and $selection.end -eq 0) {
+            $replacement.clear_ack=@{text=$field.text;start=$selection.start;end=$selection.end}
+            if (-not (& $guardEdit $budget)) { return $observation }
+            if ($Text.Length -gt 0) { Send-UnicodeText $Text $Dialog;$replacement.unicode_sent=$true;$replacement.phase='FINAL' }
+            else { $replacement.phase='DONE';$observation.ready=$true }
+        }
+        $observation.phase=$replacement.phase
+        return $observation
+    } {param($v) $null -ne $v -and $v.ready} ('field replacement '+$Id)
+    return $result.field
+}
+
+function Select-S01Combo([IntPtr]$Dialog,[int]$Id,[int]$Index,[string]$Text) {
+    $c=Move-S01ToControl $Dialog $Id
+    if ($c.Class -ine 'COMBOBOX') {throw 'OWNERSHIP_GATE: S01 expected ComboBox.'}
+    Invoke-UiControlClick $Dialog $c
+    [void](Wait-S01Observation $Dialog {Get-OwnedActivationState $Dialog} {param($v) $v.focus_hwnd -eq $c.Handle.ToInt64()} ('combo focus '+$Id))
+    [void](Wait-S01Observation $Dialog {[int](Send-UiOwnedMessage $c.Handle 0x0157)} {param($v) $v -ne 0} ('combo dropdown open '+$Id))
+    Send-Key $Dialog 0x24
+    for($i=0;$i -lt $Index;$i++){Send-Key $Dialog 0x28}
+    # A pointer-opened list is committed by Enter; no direct CB_SETCURSEL mutation.
+    Send-Key $Dialog 0x0D
+    [void](Wait-S01Observation $Dialog { [int](Send-UiOwnedMessage $c.Handle 0x0147) } {param($v) $v -eq $Index} ('combo index '+$Id))
+    return Get-UiOwnedSettingsComboSelection $Dialog $Id $Index $Text
+}
+
+function Expand-S01Category([IntPtr]$Dialog,[int]$Id) {
+    $c=Move-S01ToControl $Dialog $Id
+    if ($c.Text.StartsWith('＋')) {
+        Invoke-UiControlClick $Dialog $c
+        [void](Wait-S01Observation $Dialog {
+            $before=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+            $category=Get-S01Control $Dialog $Id
+            $after=[MdliteRustAcceptanceNative]::ObserveOwnedSettingsCompletion($Dialog,$script:WindowHandle,$script:ProcessId)
+            if ($before.instance -gt 0 -and $after.instance -ne $before.instance) { throw 'OWNERSHIP_GATE: S01 Settings lifetime changed during category read.' }
+            [pscustomobject]@{before=$before;after=$after;control=$category;ready=($before.ready -and $after.ready -and
+                $before.instance -gt 0 -and $before.serial -gt 0 -and ($before.serial % 2) -eq 0 -and
+                $before.serial -eq $after.serial -and $category.Text.StartsWith('−'))}
+        } {param($v) $v.ready} ('category expanded '+$Id))
+    }
+}
+
+function Invoke-S01Notice([IntPtr]$Dialog,[string]$Title,[string]$ExpectedBody) {
+    $notice=Wait-UiThreadWindow '#32770' $Title
+    Assert-UiOwnedWindow $notice
+    $nm=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($notice,$script:WindowHandle,$script:ProcessId)
+    $sm=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($Dialog,$script:WindowHandle,$script:ProcessId)
+    if ($nm.OwnerHwnd -ne $Dialog.ToInt64() -or $nm.ProcessId -ne $script:ProcessId -or $nm.ThreadId -ne $sm.ThreadId -or
+        -not $nm.Visible -or -not $nm.Enabled -or [MdliteRustAcceptanceNative]::WindowClass($notice) -cne '#32770') {throw 'OWNERSHIP_GATE: S01 notice identity changed.'}
+    $children=@(Get-UiOwnedChildren $notice)
+    $body=@($children | Where-Object {$_.Class -ieq 'STATIC' -and $_.Text -ceq $ExpectedBody})
+    if ($body.Count -ne 1) {throw ('PRODUCT_ASSERTION: S01 exact notice text mismatch: '+$ExpectedBody)}
+    $okButtons=@($children | Where-Object {
+        $_.Class -ieq 'BUTTON' -and $_.Text -ceq 'OK' -and $_.Visible -and $_.Enabled -and
+        [MdliteRustAcceptanceNative]::GetParent($_.Handle) -eq $notice
+    })
+    if ($okButtons.Count -ne 1) {throw [System.NotSupportedException]::new('CONTROL_UNAVAILABLE')}
+    $ok=$okButtons[0]
+    if ([MdliteRustAcceptanceNative]::GetParent($ok.Handle) -ne $notice) {throw 'OWNERSHIP_GATE: S01 notice OK button parent changed.'}
+    [uint32]$okPid=0;$okThread=[MdliteRustAcceptanceNative]::GetWindowThreadProcessId($ok.Handle,[ref]$okPid)
+    if($okPid -ne $script:ProcessId -or $okThread -ne $nm.ThreadId){throw 'OWNERSHIP_GATE: S01 notice OK button thread changed.'}
+    $script:Report.operations+=@{name='S01 exact owned notice';title=$Title;body=$ExpectedBody;metadata=$nm;ok_button_control_id=$ok.Id;ok_button_hwnd=$ok.Handle.ToInt64()}
+    Invoke-UiOwnedDialogOk $notice
+    Wait-UiWindowGone $notice
+}
+
+function Get-S01Files([string]$Common,[string]$Workspace) {
+    return [ordered]@{common_sha256=Get-UiSafeFileHash $Common;workspace_sha256=Get-UiSafeFileHash $Workspace
+        common=[IO.File]::ReadAllText($Common);workspace=[IO.File]::ReadAllText($Workspace)}
+}
+
+function Assert-S01FilesEqual($Before,$After,[string]$Stage) {
+    if($Before.common_sha256 -cne $After.common_sha256 -or $Before.workspace_sha256 -cne $After.workspace_sha256){throw ('PRODUCT_ASSERTION: S01 file bytes changed: '+$Stage)}
+}
+
+function Read-S01Assignments([string]$Text) {
+    # Bounded readback of the synthetic fixture's simple native-supported TOML.
+    $values=@{};$section=''
+    foreach($line in ($Text -split "`r?`n")) {
+        if($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$'){$section=$Matches[1];continue}
+        if($line -match '^\s*([\w.]+)\s*=\s*("[^"\r\n]*"|false|true|\d+)\s*(?:#.*)?$') {
+            $key=$Matches[1];if($section){$key=$section+'.'+$key}
+            if($values.ContainsKey($key)){throw 'OBSERVER_FAILURE: S01 duplicate readback assignment.'}
+            $values[$key]=$Matches[2].Trim('"')
+        }
+    }
+    return $values
+}
+
+function Assert-S01Document($Baseline,[string]$Stage) {
+    $after=Wait-Diagnostic {$true} ('S01 '+$Stage)
+    Assert-UiDiagnosticDragInvariants $after $Baseline ('S01 '+$Stage)
+    if($after.selection.anchor -ne $Baseline.selection.anchor -or $after.selection.head -ne $Baseline.selection.head -or $after.scroll -ne $Baseline.scroll){throw 'PRODUCT_ASSERTION: S01 selection/scroll changed.'}
+    foreach($path in $script:S01DocumentHashes.Keys){if((Get-UiSafeFileHash $path) -cne $script:S01DocumentHashes[$path]){throw 'PRODUCT_ASSERTION: S01 document disk bytes changed.'}}
+    return @{stage=$Stage;source_sha256=Get-UiTextSha256 $after.source;revision=$after.revision;dirty=$after.dirty;undo_count=$after.undo_count;redo_count=$after.redo_count;selection=$after.selection;scroll=$after.scroll;document_disk_sha256=$script:S01DocumentHashes}
+}
+
+function Open-S01Workspace {
+    Invoke-UiControlById $script:WindowHandle 115
+    $dialog=Wait-UiThreadWindow 'MDLiteSettings' -SettingsReady -WaitMs $TimeoutMs
+    [void](Select-S01Combo $dialog 200 1 'Workspace')
+    return $dialog
+}
+
+function Close-S01Cancel([IntPtr]$Dialog) {
+    Invoke-S01Button $Dialog 211
+    Wait-UiWindowGone $Dialog
+}
+
+function Capture-S01Composite([IntPtr]$Dialog,[string]$Name) {
+    # Only a Main-client composite; portions of Settings outside this crop are NOT_OBSERVED.
+    Assert-S01Dialog $Dialog
+    $crop=$script:S02FixedMainBounds
+    $metadata=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($Dialog,$script:WindowHandle,$script:ProcessId)
+    $settingsBounds=[int[]][MdliteRustAcceptanceNative]::WindowRect($Dialog)
+    $before=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($script:WindowHandle,$Dialog,$script:ProcessId,$crop)
+    if(-not $before.safe){throw 'OWNERSHIP_GATE: S01 composite unsafe before COPY.'}
+    Add-Type -AssemblyName System.Drawing
+    $bitmap=[Drawing.Bitmap]::new(($crop[2]-$crop[0]),($crop[3]-$crop[1]));$graphics=[Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $start=[DateTime]::UtcNow.ToString('o')
+        $graphics.CopyFromScreen($crop[0],$crop[1],0,0,$bitmap.Size,[Drawing.CopyPixelOperation]::SourceCopy)
+        $end=[DateTime]::UtcNow.ToString('o')
+        Assert-S01Dialog $Dialog
+        $after=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($script:WindowHandle,$Dialog,$script:ProcessId,$crop)
+        if(-not $after.safe){throw 'OWNERSHIP_GATE: S01 composite unsafe after COPY; image discarded.'}
+        $metadataAfter=[MdliteRustAcceptanceNative]::OwnedWindowMetadata($Dialog,$script:WindowHandle,$script:ProcessId)
+        $settingsBoundsAfter=[int[]][MdliteRustAcceptanceNative]::WindowRect($Dialog)
+        if(($settingsBounds -join ',') -cne ($settingsBoundsAfter -join ',')){throw 'OWNERSHIP_GATE: S01 Settings bounds changed during COPY; image discarded.'}
+        $path=Join-Path $script:UiRunDirectory ('s01-'+$Name+'.png')
+        $bitmap.Save($path,[Drawing.Imaging.ImageFormat]::Png)
+        return @{path=$path;crop=$crop;settings_bounds=$settingsBounds;settings_bounds_after=$settingsBoundsAfter;settings_metadata=$metadata;settings_metadata_after=$metadataAfter;before=$before;after=$after;copy_started_utc=$start;copy_completed_utc=$end
+            observation='UNFORCED_OWNED_MAIN_CLIENT_COMPOSITE';visual_acceptance='PENDING_VISUAL_REVIEW';covered_regions='Only pixels inside fixed Main client crop';outside_crop='NOT_OBSERVED';paint_forced=$false;activation_during_copy=$false}
+    } finally {$graphics.Dispose();$bitmap.Dispose()}
+}
+
+function Invoke-S01FormFields {
+    $common=Join-Path $script:UiLocalAppData 'MDLite/settings.toml'
+    $workspace=Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'
+    # These two paths are synthetic per-run files. Never resolve host AppData.
+    foreach($path in @($common,$workspace)) {
+        $full=[IO.Path]::GetFullPath($path);$run=[IO.Path]::GetFullPath($script:UiRunDirectory).TrimEnd('\')+'\'
+        if(-not $full.StartsWith($run,[StringComparison]::OrdinalIgnoreCase)){throw 'OWNERSHIP_GATE: S01 settings path escapes synthetic run.'}
+    }
+    $baseline=Wait-Diagnostic {$true} 'S01 document baseline'
+    $script:S01DocumentHashes=[ordered]@{};foreach($path in $script:UiInitialDocPaths){$script:S01DocumentHashes[$path]=Get-UiSafeFileHash $path}
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $common))
+    [IO.File]::WriteAllText($common,"schema_version = 1`nauto_save = true`nauto_save_delay_ms = 750`n# s01 common sentinel`ns01_common_unknown = `"keep-common`"`n",[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($workspace,"schema_version = 1`nauto_save = false`n# s01 workspace sentinel`ns01_workspace_unknown = `"keep-workspace`"`n",[Text.UTF8Encoding]::new($false))
+    $seed=Get-S01Files $common $workspace
+    $evidence=[ordered]@{seed=$seed;scenarios=@();visual_receipts=@();document_invariants=@();reset='NOT_RUN: separate draft-only Reset/Cancel/Apply GUI coverage required';g01='NOT_RUN';physical_ime='NOT_RUN';other_task_conditions='NOT_RUN'}
+    # Persist progress in the normal run report even if a later assertion fails.
+    $script:Report['s01_form_fields']=$evidence
+
+    # A: invalid zero is a value, not inheritance; distinct draft semantics; Cancel.
+    $dialog=Open-S01Workspace
+    $evidence.visual_receipts+=Capture-S01Composite $dialog 'initial-form'
+    [void](Select-S01Combo $dialog 200 0 'ユーザー共通')
+    [void](Get-UiOwnedSettingsComboSelection $dialog 400 1 '有効')
+    [void](Select-S01Combo $dialog 200 1 'Workspace')
+    [void](Select-S01Combo $dialog 400 0 '継承')
+    # Effective column reflects captured applied layers, not the uncommitted draft.
+    $inherited=Wait-S01Field $dialog 400 '継承' ' / 継承'
+    if($inherited.summary -cne '無効 / 継承'){throw 'PRODUCT_ASSERTION: S01 inherited boolean draft/applied summary mismatch.'}
+    [void](Select-S01Combo $dialog 400 2 '無効')
+    [void](Set-S01Text $dialog 401 '0')
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定を保存できません — 入力保持' 'invalid setting `auto_save_delay_ms`: expected 100..=60000 ms'
+    $zero=Get-S01Field $dialog 401
+    if($zero.text -cne '0' -or -not $zero.summary.EndsWith(' / 上書き')){throw 'PRODUCT_ASSERTION: S01 invalid zero draft lost or inherited.'}
+    Assert-S01FilesEqual $seed (Get-S01Files $common $workspace) 'invalid zero'
+    [void](Set-S01Text $dialog 401 '900')
+    Expand-S01Category $dialog 303
+    [void](Set-S01Text $dialog 418 'Ctrl+S')
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定を保存できません — 入力保持' 'keybinding conflicts prevent Apply: Ctrl+S is reserved for file.save'
+    if((Get-S01Field $dialog 418).text -cne 'Ctrl+S' -or (Get-S01Field $dialog 401).text -cne '900'){throw 'PRODUCT_ASSERTION: S01 conflict lost draft.'}
+    Assert-S01FilesEqual $seed (Get-S01Files $common $workspace) 'binding conflict'
+    Invoke-S01Button $dialog 2002
+    $empty=Wait-S01Field $dialog 402 '' ' / 空を指定'
+    if($empty.text -cne '' -or -not $empty.summary.EndsWith(' / 空を指定')){throw 'PRODUCT_ASSERTION: S01 explicit empty memo not distinguished.'}
+    Invoke-S01Button $dialog 1002
+    [void](Wait-S01Field $dialog 402 '' ' / 継承')
+    Invoke-S01Button $dialog 2015
+    $unbound=Wait-S01Field $dialog 415 'NONE' ' / 解除'
+    if($unbound.text -cne 'NONE' -or -not $unbound.summary.EndsWith(' / 解除')){throw 'PRODUCT_ASSERTION: S01 Save unbind not distinguished.'}
+    Invoke-S01Button $dialog 1015
+    [void](Wait-S01Field $dialog 415 '' ' / 継承')
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $seed (Get-S01Files $common $workspace) 'Cancel A'
+    $evidence.scenarios+=@{id='A';zero=$zero;boolean_inherit=$inherited;explicit_empty=$empty;save_unbound=$unbound;cancel_bytes_unchanged=$true}
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after A Cancel'
+
+    # B: apply valid Workspace values, reopen/read effective rows, inherit only touched keys.
+    $dialog=Open-S01Workspace
+    [void](Set-S01Text $dialog 401 '900')
+    Expand-S01Category $dialog 302
+    [void](Set-S01Text $dialog 408 '#123456')
+    Expand-S01Category $dialog 303
+    [void](Set-S01Text $dialog 418 'Ctrl+Shift+Q')
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定' '保存しました。Workspace/Commonの編集対象は変更していません。'
+    $applied=Get-S01Files $common $workspace;$values=Read-S01Assignments $applied.workspace
+    if($applied.common_sha256 -cne $seed.common_sha256 -or $values['auto_save'] -cne 'false' -or $values['auto_save_delay_ms'] -cne '900' -or
+        $values['color.link'] -cne '#123456' -or $values['bind.file.quickOpen'] -cne 'Ctrl+Shift+Q' -or
+        -not $applied.workspace.Contains('# s01 workspace sentinel') -or $values['s01_workspace_unknown'] -cne 'keep-workspace'){throw 'PRODUCT_ASSERTION: S01 Apply readback/preservation mismatch.'}
+    Close-S01Cancel $dialog
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after B Apply'
+    $dialog=Open-S01Workspace
+    $delay=Get-S01Field $dialog 401
+    if($delay.text -cne '900' -or $delay.summary -cne '900 ms / 上書き'){throw 'PRODUCT_ASSERTION: S01 reopened delay/effective mismatch.'}
+    [void](Get-UiOwnedSettingsComboSelection $dialog 400 2 '無効')
+    Expand-S01Category $dialog 302
+    $link=Get-S01Field $dialog 408
+    if($link.text -cne '#123456' -or -not $link.summary.EndsWith(' / 上書き')){throw 'PRODUCT_ASSERTION: S01 reopened link mismatch.'}
+    # Color effective display is theme-dependent; this case does not change theme.
+    Expand-S01Category $dialog 303
+    $quick=Get-S01Field $dialog 418
+    if($quick.text -cne 'Ctrl+Shift+Q' -or $quick.summary -cne 'Ctrl+Shift+Q / 上書き'){throw 'PRODUCT_ASSERTION: S01 reopened shortcut effective mismatch.'}
+    $evidence.visual_receipts+=Capture-S01Composite $dialog 'expanded-fields'
+    foreach($id in @(1001,1008,1018)){Invoke-S01Button $dialog $id;[void](Wait-S01Field $dialog ($id-600) '' ' / 継承')}
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定' '保存しました。Workspace/Commonの編集対象は変更していません。'
+    $restored=Get-S01Files $common $workspace;$restoredValues=Read-S01Assignments $restored.workspace
+    foreach($key in @('auto_save_delay_ms','color.link','bind.file.quickOpen')){if($restoredValues.ContainsKey($key)){throw 'PRODUCT_ASSERTION: S01 inherit did not remove touched assignment.'}}
+    if($restored.common_sha256 -cne $seed.common_sha256 -or $restoredValues['auto_save'] -cne 'false' -or
+        $restoredValues['s01_workspace_unknown'] -cne 'keep-workspace' -or -not $restored.workspace.Contains('# s01 workspace sentinel')){throw 'PRODUCT_ASSERTION: S01 inherit damaged untouched settings.'}
+    Close-S01Cancel $dialog
+    $evidence.scenarios+=@{id='B';applied=$applied;restored=$restored;reopened_delay=$delay;reopened_link=$link;reopened_quickopen=$quick;restored_bytes_equal_seed=($seed.workspace_sha256 -ceq $restored.workspace_sha256);whitespace_equality_required=$false;color_theme_application='NOT_RUN: stored value and current displayed summary recorded separately'}
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after B inherit'
+
+    # C: modify only the owned Common peer while a Workspace draft is open.
+    $dialog=Open-S01Workspace
+    [void](Set-S01Text $dialog 401 '901')
+    [IO.File]::AppendAllText($common,"# s01 peer append while form open`n",[Text.UTF8Encoding]::new($false))
+    $peer=Get-S01Files $common $workspace
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定を保存できません' '設定ファイルが外部で変更・作成・削除されています。上書きせずフォームを保持しています。閉じて開き直してください。'
+    Assert-S01FilesEqual $peer (Get-S01Files $common $workspace) 'peer conflict'
+    if((Get-S01Field $dialog 401).text -cne '901'){throw 'PRODUCT_ASSERTION: S01 peer conflict lost Workspace draft.'}
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $peer (Get-S01Files $common $workspace) 'peer Cancel'
+    $dialog=Open-S01Workspace
+    $reopened=Get-S01Field $dialog 401
+    if($reopened.text -cne '' -or $reopened.summary -cne '750 ms / 継承'){throw 'PRODUCT_ASSERTION: S01 peer reopen baseline mismatch.'}
+    # A no-op Apply succeeding proves the reopened peer snapshot accepts the current file baseline.
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定' '保存しました。Workspace/Commonの編集対象は変更していません。'
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $peer (Get-S01Files $common $workspace) 'peer reopen no-op'
+    $evidence.scenarios+=@{id='C';external_change='comment appended only to synthetic Common';peer_files=$peer;draft_retained='901';reopened=$reopened;reopened_noop_apply=$true}
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after C'
+
+    # D: selected Workspace Reset is draft-only; Cancel versus explicit Apply.
+    # Reuse C's owned files; do not reseed or replace peer/unknown content.
+    $resetBefore=Get-S01Files $common $workspace
+    $resetBeforeValues=Read-S01Assignments $resetBefore.workspace
+    if($resetBeforeValues['auto_save'] -cne 'false' -or $resetBeforeValues.ContainsKey('auto_save_delay_ms')) {
+        throw 'SETUP_FAILURE: S01 D requires C baseline Workspace false with inherited delay.'
+    }
+    $dialog=Open-S01Workspace
+    [void](Select-S01Combo $dialog 200 0 'ユーザー共通')
+    [void](Set-S01Text $dialog 401 '880')
+    [void](Select-S01Combo $dialog 200 1 'Workspace')
+    [void](Set-S01Text $dialog 401 '901')
+    Invoke-S01Button $dialog 212
+    $resetDraftBoolean=Wait-S01Field $dialog 400 '継承' ' / 継承'
+    [void](Get-UiOwnedSettingsComboSelection $dialog 400 0 '継承')
+    $resetDraftDelay=Wait-S01Field $dialog 401 '' ' / 継承'
+    $resetDraftMemo=Wait-S01Field $dialog 402 '' ' / 継承'
+    # Applied Workspace false remains effective until Apply, even though draft inherits.
+    if($resetDraftBoolean.summary -cne '無効 / 継承' -or $resetDraftDelay.summary -cne '750 ms / 継承') {
+        throw 'PRODUCT_ASSERTION: S01 D Reset confused unapplied draft with effective settings.'
+    }
+    Assert-S01FilesEqual $resetBefore (Get-S01Files $common $workspace) 'D Reset draft'
+    [void](Select-S01Combo $dialog 200 0 'ユーザー共通')
+    $commonDraftAfterReset=Wait-S01Field $dialog 401 '880' ' / 上書き'
+    if($commonDraftAfterReset.summary -cne '750 ms / 上書き') {
+        throw 'PRODUCT_ASSERTION: S01 D Workspace Reset changed the Common applied/draft distinction.'
+    }
+    [void](Select-S01Combo $dialog 200 1 'Workspace')
+    [void](Wait-S01Field $dialog 401 '' ' / 継承')
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $resetBefore (Get-S01Files $common $workspace) 'D Reset Cancel'
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after D Reset Cancel'
+
+    # Reopen proves Cancel discarded both uncommitted drafts and retained file baseline.
+    $dialog=Open-S01Workspace
+    [void](Get-UiOwnedSettingsComboSelection $dialog 400 2 '無効')
+    $resetCancelDelay=Wait-S01Field $dialog 401 '' ' / 継承'
+    if($resetCancelDelay.summary -cne '750 ms / 継承') {throw 'PRODUCT_ASSERTION: S01 D Cancel changed inherited delay.'}
+    [void](Select-S01Combo $dialog 200 0 'ユーザー共通')
+    $commonAfterCancel=Wait-S01Field $dialog 401 '750' ' / 上書き'
+    if($commonAfterCancel.summary -cne '750 ms / 上書き') {throw 'PRODUCT_ASSERTION: S01 D Common draft survived Cancel as applied data.'}
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $resetBefore (Get-S01Files $common $workspace) 'D Cancel reopen baseline'
+
+    # Reset again; only explicit Apply may now remove Workspace managed values.
+    $dialog=Open-S01Workspace
+    Invoke-S01Button $dialog 212
+    [void](Wait-S01Field $dialog 400 '継承' ' / 継承')
+    [void](Wait-S01Field $dialog 401 '' ' / 継承')
+    Assert-S01FilesEqual $resetBefore (Get-S01Files $common $workspace) 'D second Reset before Apply'
+    Invoke-S01Button $dialog 210
+    Invoke-S01Notice $dialog '設定' '保存しました。Workspace/Commonの編集対象は変更していません。'
+    $resetApplied=Get-S01Files $common $workspace
+    $resetAppliedValues=Read-S01Assignments $resetApplied.workspace
+    if($resetApplied.common_sha256 -cne $resetBefore.common_sha256 -or
+        $resetAppliedValues.ContainsKey('auto_save') -or $resetAppliedValues.ContainsKey('auto_save_delay_ms') -or
+        $resetAppliedValues['schema_version'] -cne '1' -or $resetAppliedValues['s01_workspace_unknown'] -cne 'keep-workspace' -or
+        -not $resetApplied.workspace.Contains('# s01 workspace sentinel')) {
+        throw 'PRODUCT_ASSERTION: S01 D Reset Apply changed Common/unknown content or retained Workspace managed baseline.'
+    }
+    Close-S01Cancel $dialog
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after D Reset Apply'
+    $dialog=Open-S01Workspace
+    [void](Get-UiOwnedSettingsComboSelection $dialog 400 0 '継承')
+    $resetEffectiveBoolean=Wait-S01Field $dialog 400 '継承' ' / 継承'
+    $resetEffectiveDelay=Wait-S01Field $dialog 401 '' ' / 継承'
+    if($resetEffectiveBoolean.summary -cne '有効 / 継承' -or $resetEffectiveDelay.summary -cne '750 ms / 継承') {
+        throw 'PRODUCT_ASSERTION: S01 D reopened Reset Apply did not inherit Common true/delay750.'
+    }
+    Close-S01Cancel $dialog
+    Assert-S01FilesEqual $resetApplied (Get-S01Files $common $workspace) 'D final reopen Cancel'
+    $evidence.document_invariants+=Assert-S01Document $baseline 'after D final reopen'
+    $evidence.scenarios+=@{id='D';before=$resetBefore;reset_draft_boolean=$resetDraftBoolean;reset_draft_delay=$resetDraftDelay;reset_draft_memo=$resetDraftMemo
+        other_common_draft_retained=$commonDraftAfterReset;common_after_cancel=$commonAfterCancel;reset_cancel_reopened_delay=$resetCancelDelay
+        applied=$resetApplied;reopened_effective_boolean=$resetEffectiveBoolean;reopened_effective_delay=$resetEffectiveDelay
+        selected_representative_controls=@(400,401,402);all_23_controls='NOT_RUN';other_common_fields='NOT_RUN';whitespace_equality_required=$false
+        effective_auto_save_after_apply=$true;document_input_after_enabling_autosave='NOT_RUN: no document edits in D';visual_reset_receipt='NOT_RUN'}
+    $evidence.reset='OBSERVED_REPRESENTATIVE_WORKSPACE_RESET_DRAFT_CANCEL_EXPLICIT_APPLY_REOPEN; all23 fields NOT_RUN'
+    $evidence['scope']='S01_SELECTED_FIELDS_VALIDATION_LAYER_READBACK_ONLY; no complete S01/S02/G01/Task claim'
+    return $evidence
+}
+
+
 function Invoke-Rev3FocusedCases($StartupState) {
     $script:Report['native_editor_focus_checks']=@()
     $script:Report['rev3_acceptance']='PARTIAL: case PASS means observed assertions only; visual review, actual DPI matrix and physical IME remain separate.'
@@ -5788,6 +6385,9 @@ function Invoke-Rev3FocusedCases($StartupState) {
             disk_unchanged=@{doc00_sha256=$diskA;doc01_sha256=$diskB};compact='NOT_RUN';actual_dpi=$after.parent_root.dpi_raw }
 
     })
+    if ($Rev3Case -ceq 'S01_FORM_FIELDS') {
+        [void](Invoke-UiParityCase 'S01_FORM_FIELDS' { Invoke-S01FormFields })
+    }
     [void](Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
         $paths=@(); $finalFrames=@()
         $closeNames=@('Cancel')
@@ -6050,6 +6650,7 @@ function Invoke-UiParitySuite {
     )
     if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds }; if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') { $caseIds = @('PAINT_DEPENDENCY_PROBE') + $caseIds } }
     if ($Rev3 -and $Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') { $caseIds = @('SETTINGS_ENUMERATION_PROBE') + $caseIds }
+    if ($Rev3 -and $Rev3Case -ceq 'S01_FORM_FIELDS') { $caseIds = @('S01_FORM_FIELDS') + $caseIds }
     if ($StartupSmoke) {
         $caseIds = @('STARTUP_VISIBLE_LAYOUT')
     }
@@ -6073,7 +6674,7 @@ function Invoke-UiParitySuite {
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        if ($Rev3 -and $Rev3Case -ceq 'S02_CANCEL_ONLY') {
+        if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S01_FORM_FIELDS')) {
             Assert-OwnedWindow $script:WindowHandle
             if ([MdliteRustAcceptanceNative]::WindowClass($script:WindowHandle) -cne 'MDLiteRustEditor') {
                 throw 'OWNERSHIP_GATE: S02 geometry-only startup requires the exact owned Main instance.'
@@ -6114,6 +6715,11 @@ function Invoke-UiParitySuite {
             $script:S02FixedMainBounds=[int[]]$initialCapture.bounds
             $script:Report.initial_window_capture = '.codex-runtime/editor-acceptance/' + $runId + '/initial-window.png'
             $script:Report.initial_window_capture_kind = [string]$initialCapture.capture_kind
+        }
+        if ($Rev3 -and $Rev3Case -ceq 'S01_FORM_FIELDS') {
+            $script:Report.initial_window_capture_kind='SKIPPED_S01_GEOMETRY_ONLY_NO_COPY_NO_FENCE'
+            $script:Report.g01_startup_capture='NOT_RUN: isolated S01 fields case omits startup capture/fence'
+            $script:Report.s02_geometry_only_crop.limitation='GEOMETRY_ONLY for isolated S01; no G01 startup/source/EndDraw/pixel proof. S02 NOT_RUN.'
         }
         Add-Observation ($script:Report.suite + ' startup') $initial
 

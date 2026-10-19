@@ -205,6 +205,10 @@ impl VerticalRail {
         self.take_pending()
     }
 
+    pub(super) fn has_pending(&self) -> bool {
+        self.0.pending.get().is_some()
+    }
+
     pub(super) fn take_pending(&self) -> Option<i32> {
         if self.0.hwnd.get() == HWND::default() || self.0.native.get() {
             return None;

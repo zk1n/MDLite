@@ -2,12 +2,66 @@
 
 ## Live移動・UI・Git候補のcheckpoint（2026年10月19日 JST、未完了）
 
+### 最終修正後の結果（未完了checkpoint）
+
+製品sourceのlocal保存commit: `4702012a7daf1bfe08ea7aed8e874d6778031b0f`。developへは未統合。
+
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`、
+最終Release EXE SHA256 `7dfdaccac11c965e86c20dcdb9103b2bd9058001788fe65ce3e7b42a05645267`。
+Debug／Release BIN各269件（ignored5件）PASS。LIB各141件は再compile後の同一EXE hashを照合して既存結果を再利用。
+排他visibleは各構成4件：editor reentry、palette focus、EDIT mutation、EDIT exposure。Debugの後2件は同一BIN hashの直前結果を再利用。
+exposureは各31段階。fmt、Debug／Release strict all-targets Clippy、登録済みRelease build PASS。
+同じ独立Sol High reviewerの追加修正限定reviewは指摘なし。Ponytail確認とは別。
+
+この最終EXEの製品GUIは96 DPIで起動したが、1回の通常前面化をWindowsが拒否したため入力・撮影なし。
+対象PID24400のsource／履歴／disk不変を読戻し、通常終了exit0を確認した。利用者へ追加操作を依頼していない。
+従って修正後の製品Settings railのpixel確認、Trust→init等のGit GUI代表、150 DPI、全必須GUIは未確認。
+直前の`3ac8b609...`／source `fbacf547...`での上下13steps、四つの設定閉鎖、外側thumb drag、light Apply、Source／Live画像は履歴に限定し、新EXEの成功証拠へ流用しない。
+初期化promptは旧runの所有dialogを通常処理済み。最終runは状態folderを用意して起動し、promptで停止していない。
+
+Task12未達のためdevelop統合・pushは行わず、Inboxと未統合作業branchを保持する。
+GitBookは候補明記のdraft CR6のみを保存し、現行公開revisionは変更していない。
+
+
+### 同日machine確認の継続記録
+
+hidden native確認でLISTBOX V6、Explorer H6、共通settings rail 3件、runtime snapshot 2件がPASS。
+publication order修正後のruntime snapshot 2件と、module order修正後のformatterもPASS。
+全i32／H範囲、既知suffix pixel >65535、native font units 8/7/13、独立V wheel／key／geometry／HC／lifecycleを確認。
+`apply_source_styles`のUTF-16 prefix再走査を既存crop metricに置換し、対象外kindをskipした。
+native DWrite Unicode／clipped styleは1件PASS。
+
+診断Debug source aggregate `97de2d6e094dfc47ce63b5c779afacad50a478523d7d3c20f71e81d2f1bef136`、
+EXE SHA256 `9d570249ca18ba9f5557b49bbb45bd6ea4b86e1caaa10c0e7a053760597fee16`。
+100,000行観測はready 3691ms、gutter 100001、59.4375 DIP、通常close exit 0。
+別の自然paint観測は59.9ms、frame finish 5.6ms、paint total 299.8msでpending phaseなし。
+任意WaitForPaint observerは失敗し、証拠に採用しない。
+
+EDITの共通factory接続10欄とDiagnostics出力1欄を追加し、統合focused 12件PASS。
+native style・入力・selection・Undoを維持し、native nonclient部位への操作委譲と描画領域の除外を行う。
+独立reviewで見つかったnative文字変更／selection／scroll後の同期漏れを修正。
+
+Settings実画面で見つかったExplorerテーマ適用時のnative EDIT rail消失を追加修正した。
+原因はregion除外中のSetWindowThemeがmessage dispatchの外でもnonclient geometryを更新すること。
+既存API呼出し全体で元regionを保持し、完了後にnative geometryを再取得する最小helperへ変更した。
+Debug重点6件（hidden4・visible mutation・exposure31段階）PASS、同じ独立reviewerの限定再確認で追加指摘なし。
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`。
+最終Release実画面はこの修正後に改めて確認するまで未確認として扱う。
+
+専用NOACTIVATE visible試験で実WM_PAINT／native geometry／本文・selection・Undo同値を確認し、指摘は解消済み。
+専用GUI比較ではV69989、移動後取消・capture解除を確認。製品pilot ReleaseのGit DiffではH5174／V71、
+文書・履歴保持、通常closeを確認した。LFのDiffは表示コピーだけCRLFへ変換し、元stdout不変の回帰1件PASS。
+
+これらは診断Debug／pilotの限定結果であり、最終Release、50MB、全GUI／Human受入ではない。
+正式UiParityはmetadataのみPASS、Save As dialogの制限時間内検出でBLOCKED、後続の全件受入は未成立。
+150 DPI、physical HC／IME、UIA visibilityは未証明。最終machine／GUI確認とHANDOFFは進行中。
+
 Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 1の作業branch
 `fix/live-navigation-ui-git-polish-20261018`。全native scrollbarのstyle統一と
 必須GUI条件が未達のため、developへ統合・pushしない。Task Inboxは保持する。
-ユーザーのGUI利用開始により、画面操作は再開の連絡まで停止した。
+GUI利用の予約は解除され作業を再開した。以降、利用者への追加手動操作依頼は行わない。
 
-最終ReleaseはRust 1.99.1、source集約
+保存済み旧checkpointのReleaseはRust 1.99.1、source集約
 `65cd3cc9b935a01e0de500cef88523a8ec87ce781ec0be534fd92271a32aa312`、EXE SHA256
 `81b30d4669aecca7166b8b378d71e4e0f788800a6040967ce6c7933054f23be6`。
 compile-time入力20件と正式GUI harnessのhashはlocal HANDOFFで対応付ける。

@@ -5,6 +5,13 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## 2026年10月19日・未統合候補の下書き
+
+GitBook draft CR #6 `GEWkXQliAGYt3jQyWpVW` に「構成と検証の境界」と
+「検索・置換・Git」の候補節だけを追加した。revision `4OFWYabNwGB6bjwKYQ7w`。
+読戻しで候補節と従来本文の完全保持を確認。CRはdraftで、merge／公開は行っていない。
+Task12未成立のため現行develop仕様へ採用せず、150 DPI・全GUI未確認を明記した。
+
 ## 2026年10月18日・Live移動／UI／Git候補（未公開）
 
 今回の候補は全native scrollbar共通化と必須GUI条件が未達であり、developへ統合しない。
@@ -13,7 +20,7 @@
 「編集とMarkdown」（物理行番号、実空行、上下移動）、
 「検索・置換・Git」（Trust明示操作後だけlocal init、親repo／worktree、remoteなし）、
 「設定と保存形式」（modal ownershipと縦scroll）、
-「実装と検証状況」（最終buildと未確認境界）。旧C++節とstable linkは維持する。
+「構成と検証の境界」（最終buildと未確認境界）。旧C++節とstable linkは維持する。
 公開時には候補・統合・実GUI・Human受入の区別と、その時点のHANDOFF根拠を明記する。
 
 ## Rev3の文字重なり修正と確認範囲

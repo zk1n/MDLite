@@ -1,5 +1,65 @@
 # Rust UI・周辺機能の実装記録
 
+## 2026年10月19日・同一Taskの継続（未統合・未完了）
+
+### 最終修正後の結果（未完了checkpoint）
+
+製品sourceのlocal保存commit: `4702012a7daf1bfe08ea7aed8e874d6778031b0f`。developへは未統合。
+
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`、
+最終Release EXE SHA256 `7dfdaccac11c965e86c20dcdb9103b2bd9058001788fe65ce3e7b42a05645267`。
+Debug／Release BIN各269件（ignored5件）PASS。LIB各141件は再compile後の同一EXE hashを照合して既存結果を再利用。
+排他visibleは各構成4件：editor reentry、palette focus、EDIT mutation、EDIT exposure。Debugの後2件は同一BIN hashの直前結果を再利用。
+exposureは各31段階。fmt、Debug／Release strict all-targets Clippy、登録済みRelease build PASS。
+同じ独立Sol High reviewerの追加修正限定reviewは指摘なし。Ponytail確認とは別。
+
+この最終EXEの製品GUIは96 DPIで起動したが、1回の通常前面化をWindowsが拒否したため入力・撮影なし。
+対象PID24400のsource／履歴／disk不変を読戻し、通常終了exit0を確認した。利用者へ追加操作を依頼していない。
+従って修正後の製品Settings railのpixel確認、Trust→init等のGit GUI代表、150 DPI、全必須GUIは未確認。
+直前の`3ac8b609...`／source `fbacf547...`での上下13steps、四つの設定閉鎖、外側thumb drag、light Apply、Source／Live画像は履歴に限定し、新EXEの成功証拠へ流用しない。
+初期化promptは旧runの所有dialogを通常処理済み。最終runは状態folderを用意して起動し、promptで停止していない。
+
+Task12未達のためdevelop統合・pushは行わず、Inboxと未統合作業branchを保持する。
+GitBookは候補明記のdraft CR6のみを保存し、現行公開revisionは変更していない。
+
+
+hidden native machine checksでLISTBOX V6、Explorer H6、共通settings rail 3件、runtime snapshot 2件がPASS。
+Explorer publication order後のruntime snapshot 2件もPASSし、formatterはmodule order修正後にPASS。
+全i32／H範囲、既知suffix pixel（>65535）、native font units 8/7/13、独立V wheel／key／geometry／HC／lifecycleの機械確認を追加した。
+
+`apply_source_styles`のUTF-16 prefix再走査を既存crop metricへ置換し、対象外kindをskip。
+native DWrite Unicode／clipped style確認は1件PASS。診断Debugのsource aggregateは
+`97de2d6e094dfc47ce63b5c779afacad50a478523d7d3c20f71e81d2f1bef136`、EXE SHA256は
+`9d570249ca18ba9f5557b49bbb45bd6ea4b86e1caaa10c0e7a053760597fee16`。
+100,000行観測はready 3691ms、gutter 100001、59.4375 DIP、通常close exit 0。
+別の自然paint観測は59.9ms、frame finish 5.6ms、paint total 299.8msでpending phaseなし。
+任意WaitForPaint observerは失敗しており、受入証拠に含めない。
+
+EDITはnative H/V style・入力・selection・Undoを保ったまま、native nonclient barの描画領域を除外し、
+同じnative部位へ操作を渡す共通railへ接続した。factory経由10欄とDiagnostics出力1欄が対象。
+Settingsではrailをcontent列挙から除外し、Diagnosticsは独立したUI font／DPI／theme更新を持つ。
+統合focused 12件PASS。文字変更・selection・scroll・IME処理完了後の同期漏れは独立reviewで指摘され修正した。
+
+Settings実画面で見つかったExplorerテーマ適用時のnative EDIT rail消失を追加修正した。
+原因はregion除外中のSetWindowThemeがmessage dispatchの外でもnonclient geometryを更新すること。
+既存API呼出し全体で元regionを保持し、完了後にnative geometryを再取得する最小helperへ変更した。
+Debug重点6件（hidden4・visible mutation・exposure31段階）PASS、同じ独立reviewerの限定再確認で追加指摘なし。
+source aggregate `a204bc7fe5922515967895869c2772fefc03ea42dc4ea592d08e108c7094f5d0`。
+最終Release実画面はこの修正後に改めて確認するまで未確認として扱う。
+
+専用NOACTIVATE visible試験では実WM_PAINTとnative geometryの更新、本文・selection・Undoの同値を確認した。
+独立reviewの指摘は解消済み。これはphysical IMEやpixel外観の受入ではない。
+
+専用GUI比較でnative reference／新rail双方が縦69989へ到達し、移動後取消でもcaptureを解除した。
+製品pilot ReleaseではGit DiffのH5174／V71と文書・履歴保持、通常closeを確認。
+Git DiffのLF改行は表示コピーだけCRLFへ変換し、元のstdout bytesを維持する回帰1件PASS。
+人工的な巨大fontでのnative H位置切詰めは既存native側でも発生し、解消済みとは扱わない。
+
+診断Debugやpilotの結果は最終Release／50MB／全GUIの合格ではない。
+正式UiParityはmetadataのみPASS、Save As dialogの制限時間内検出に失敗し、全15件は未成立。
+150 DPI、physical high contrast／IME、UIA visibilityは未証明。最終machine／GUI確認とHANDOFFは進行中で、
+develop統合・pushは行っていない。利用者への追加手動操作依頼は行わない。
+
 ## 2026年10月18日・Live移動／UI／Git候補
 
 Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 1の作業branch候補。

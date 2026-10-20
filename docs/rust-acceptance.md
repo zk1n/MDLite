@@ -564,6 +564,101 @@ Rust開発の主線はdevelop。旧実装の正確なdevelop tipは
 `cpp-archive/pre-rust-20261013`とGit履歴に保持する。
 開発主線の選択は、全製品・全入力機器の受入合格を意味しない。
 
+## Rev4 残件修正の受入記録
+
+Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 4を受領し、Rev3の成果を継続する。
+以下は進行中の対応表であり、今回の最終実行体の全項目合格を示さない。
+旧節の結果は各実行時点の履歴として保持する。今回の対象表示倍率は100%。
+150%等の追加倍率は対象外であり、保留・本人判断待ちにはしない。
+旧報告の「本人指定の150 DPI保留」は撤回し、本人指示として引き継がない。
+実測の96 DPIという値と、追加倍率の受入範囲は区別する。
+
+| ID | 要求 | 有効な既存証拠と不足 | 次の確認 |
+|---|---|---|---|
+| G01 | 通常起動で本文・controlが描画され、入力へ進める | 現行製品の白画面を再現。Main描画通知だけでは不十分 | 子windowとMainの描画順を修正し、初期画面と最初の入力を確認 |
+| P01 | 新規初期配置と旧配置の移行、幅・順序・折畳み保全 | 旧schema v1の移行・再serialize試験に加え、旧候補のAppロードとschema v2保存で幅210/230・順序・flagsを観測。最終buildの起動fenceは未成立、実再起動は未確認 | Appでの配置ロード・保存読戻し、新規起動と再起動 |
+| P02 | 左右独立のgroup切替と代表icon | 独立性の状態試験、限定代表のみ | 左groupの連続切替中に右groupの配置・内容を確認 |
+| P03 | 明示的移動・追加・解除、重複なし、再起動・Compact | persistence/layout試験のみでは全GUI経路を満たさない | 操作ごとの表示・保存、再起動・Compact復帰 |
+| P04 | 左右4状態で連続resize、本文幅回収、focus/hit test整合 | 旧候補の左幅3地点と保存・原文不変を観測したが途中control空白で描画FAIL。描画borderのDOWN優先処理は修正・直接試験済。最終buildのdrag画像は未確認 | 正しいsplitter経路と新描画候補の中間・復帰frameを確認 |
+| E01 | fenceの区切り・言語・未完状態を直接編集 | raw projection試験、新候補の言語指定への直接入力・保存・Undo代表成立。全delimiter条件ではない | 残る区切り・未完状態を既存機械証拠と対応 |
+| E02 | Front Matter・水平線・Setext・code内literalの区別 | 分類・source mapping試験あり。操作時表示は未確認 | move/scroll/resize/edit/Undoで分類と原文を確認 |
+| E03 | 各見出しの直接入力、端・折返し・scroll後のcaret | 境界試験、新候補の直接click・ASCII/Unicode日本語・caret代表成立 | 残るlevel・端・折返し・scrollを既存機械証拠と対応 |
+| E04 | 原文物理行番号、Source/Live切替と先頭末尾移動 | 混在改行・行番号試験あり。全GUI代表は未成立 | 切替・移動と本文・dirty・revision・履歴不変 |
+| U01 | query周辺の当たり判定、戻る/進むの文書・位置復元 | hit area/永続query試験と限定GUI代表 | 各境界と文書・位置復元をUndoとは別に確認 |
+| U02 | 短いmenu、必要な説明・無効理由、keyboard/theme/focus | menu/style/mnemonic試験と限定操作のみ。新selected driverは初回準備失敗でmenu前に停止 | UI定義照合、残るhover/keyboard・説明表示 |
+| U03 | Git toolbar・Calendar余白・共通密度、狭幅の到達性 | geometry試験と限定静止画のみ | 通常幅と狭幅の操作・可視性 |
+| S01 | 全設定項目、層・継承・false/0/空、色・key・競合・Reset | 全23行への到達・実効値・入力・継承と代表A–D、Custom/Darkリンクの実色・保存読戻し・復元が成立 | 最終描画変更の影響を確認。全項目の全値組合せをGUI済とはしない |
+| S02 | Apply後Main復帰と次入力、遷移中の空白・混在なし | 隔離共通DC候補の46frameで混在なし、各125回のwindow DC最大13.4/6.8/3.8ms、実ATOK成立。製品最終確認は未完 | 診断追加を除いた製品へ反映し、最終buildで必要なclose/inputを確認 |
+| R01 | 影響するCalendar/Git/Search/実IME/表/画像/保存と履歴 | Rev3同sourceのBIN各302/LIB各150などを対応範囲で再利用 | 変更した共有経路の回帰。Unicode合成を実IMEに代替しない |
+
+S01の現行定義は23項目（scalar 6、登録色7、登録keybinding 10）。
+General/Appearance/Colors/Keysの各生成行はlabel・実効値・入力・継承を接続し、
+Pathの明示空欄化とShortcutの割当解除を別に扱う。Commonと利用可能なWorkspaceを対象とする。
+全定義のUI接続に欠落は見つからず、registry・false/0/空/解除・patch・下書きResetの
+同source機械証拠を再利用する。全23行の到達・表示と代表値操作を確認したが、
+全項目の全値・全層の組合せをGUIで網羅したという意味ではない。
+
+再開基準はbranch `fix/live-navigation-ui-git-polish-20261018`、HEAD `59ce952`、
+既存製品compiler inputs `6abe0168…`、Release EXE `f9713b5e…`。
+起動観測 `20261020T161634Z-3ad006c41ee941f39e17e42d07cc9266` は、
+強制paintなしでMainの白画面を確認した。採取は所有ATOK補助windowの重なりで安全停止し、
+run全体はFAIL。保存された安全frameだけを採用し、採取失敗を製品合格にしない。
+原文・selection・dirty・履歴を変えた操作は送っていない。
+独立review、最終GUI、Git統合・配送、HANDOFF保存の完了は今後の実結果で追記する。
+
+modal/theme修正候補の登録Releaseはsource `dcd9e8be…`、EXE `33321808…`。
+局所9試験・format・Debug strict Clippyは成立した。実GUI run
+`20261020T163224Z-b1880bd0de964f7292fca86d580f150e` では、Apply後のclose状態保持と
+Mainへの一度のクリック・Unicode文字入力を確認した。後者はnative focusと26個のtyped stamp、
+期待する原文・selection・履歴が対応する。診断ファイルの一時lockで一つのstampが取得不能となり、
+collectorはUNBOUNDとしてrun全体をFAILにした。取得不能なframeを合格へ補間しない。
+また実画像014～018に白いボタン・空のExplorer・異なるテーマの混在が残るため、
+テーマ描画の製品受入もFAILである。最終静止画像の正常表示でこの未達を覆わない。
+
+同製品候補のrun `20261020T164604Z-ceaaede268c14fa3abf94609c4aa6bcf` は
+`E01_E04_DIRECT_LIVE` の二つの直接click・入力・保存・Undo代表がPASS。
+初期client画像と見出し・fence言語指定の画像を確認し、表示とsource/selectionの対応を採用した。
+Front Matterと全fence区切りmatrixはこのrunではNOT_RUN。Unicode合成は実IMEではない。
+他caseはNOT_SELECTEDのため全体表示はINCOMPLETEであり、全項目PASSとはしない。
+fresh clean gateによる通常終了・actual exit 0も成立した。
+
+第2修正のsource `927c8015…` / Release `38943a26…` のrun
+`20261020T172933Z-102a6f12b07c445491f55176c45642f3` は、選択した
+S02 Apply/closeと実ATOKのpreedit・Space変換・候補段階・Esc取消・Enter確定・
+一単位Undo/RedoがPASS。元の入力profileとapp-local IME open=falseへ復元し、
+既知の一回Undoでfixtureはclean、undo=0/redo=1、全11個のdisk hash不変、通常終了exit 0。
+候補popupの物理操作・実表示位置を確認したとはしない。
+44枚の安全frame（最大COPY開始間隔67.3684ms）ではExplorerは完全な旧表示から新表示へ移ったが、
+015–016のtoolbar空白と017–018のLight Main/Dark Explorer混在が残り、S02描画受入はFAIL。
+同じ順序調整の反復を止め、独立した方式検討を経て隔離候補を準備中。製品採用は未実施。
+
+同source/EXEのrun `20261020T173606Z-68011a20210341238a9a7dbea3b29895` は
+S01_FIELDS_COLORの選択caseがPASS。全23行（6/7/10）へのscroll到達と4枚の所有Settings画像を採取し、代表2枚を目視した。
+CustomリンクのmagentaとDarkのblueの本文画像、保存値と実効値の区別、再open読戻し、
+元のtheme/link設定への復元を確認。Common・未知key・文書の原文/dirty/履歴を保った。
+両runの他caseはNOT_SELECTEDのため全体はINCOMPLETE。これを全要件合格へ読み替えない。
+P01のrun `20261020T180644Z-f4a1a9f164ab410fb6e29932989dcb84` は旧配置のApp load/save、
+左幅3地点のheld-drag・幅264保存を観測。4枚の画像では途中のtoolbar/Explorer controlに空白が
+残り、P04描画はFAIL。右幅の押下点は描画borderとSIZEWEカーソルに一致するが、Outline本文左端でもあるため、
+feature操作がsplitter操作より先に始まり期待幅待ちがtimeoutとなった。これはP04の製品側
+hit-test不一致であり、試験点を描画線外へずらして受入にはしない。判定順の修正が残る。
+Compact・実再起動・残るdragはNOT_RUN。fresh clean gate後の一回WM_CLOSE、exit 0、
+全9文書disk不変、元のFAIL記録と停止時diagnostic保全を確認した。
+
+共通DC/合成描画の隔離候補 `cc3bef2a…` / EXE `9d2cc8da…` のrun
+`20261020T185738Z-ac17762e464741f4b3ea7bc2f7ddb040` は、元の121行fixtureで
+S02 ApplyThenCancel/CloseStateと実ATOKがPASS、通常終了exit 0、proof valid。
+全46枚と切替直前/直後を目視し、以前の空白・Main/Explorer混在は観測されなかった。
+最大COPY開始間隔78.7975msより短い変化まで観測したとはしない。
+Main/Explorer/準備用window DCは各125組完結、最大13.352/6.764/3.804ms、100ms以上0。
+Explorerの準備最大179.431msはwindow DC取得前へ移り、全125回buffered、fallback/dropは0。
+この方式を製品反映へ進めるが、診断追加を除いた最終buildの受入・独立reviewは残る。
+
+途中のrun `20261020T183527Z-ac3e13f02e994d6ab1d731a8091198b9` はSettings準備待ち7秒超過。
+後の観測で描画待ちは解消しており、dialog不在・永久停止とは扱わない。同runの多数の再描画は
+短い診断と元の操作列では再現せず、原因未確定の記録として保持する。診断タグで修正したとはしない。
+この失敗を後のPASSへ付け替えず、所有するSettings/Mainは通常終了し文書を保全した。
+
 ## Editorの確認対象
 
 入力→原文→selection→layout→次の入力を一つの契約として確認する。
@@ -655,3 +750,92 @@ Narrator、主観的UIと全製品Human受入はNOT_RUNまたはHuman/機器確�
 | R-18 Large files | 自動機能削除を行わず、今回の測定・試験限界を明記 |
 | R-19 Development | Cargo／F5の再現経路と実行確認範囲を今回記録 |
 | R-20 Public Git | Rust専用developを両remoteへ配送。main、tag、Releaseは別指示 |
+
+Rev4の現在の最終製品候補はsource47 `bd6b9500cae50d087d3407fbe5ecd036c674e9864fbdf139dc867593280515b5`、
+登録Release EXE `8f4e76b02ec31fc06c594118fb315b6513d7b767bce2d3373a2423fcee2dc109`。
+共通DC描画とsplitter優先処理を統合し、隠れたnative scrollbarの無変更更新での再描画要求も局所修正した。
+後者の5関連native試験は成立したが、同じ旧配置でのP01実行
+`20261020T194919Z-51e825d781e54c01a660e1bbe0724102`は操作前の初期fenceで再び停止した。
+13個の可視Main/button/query surfaceにpending damageがあり、1411msで未収束と分類した。
+7秒待機を使い切ったtimeoutではない。診断追加を除いた候補なので、このrunの再描画頻度は測定していない。
+単独のidempotence修正を全体解消として採用せず、隔離した既存診断機構で発生箇所を確認する。
+
+U02/U03初回実行 `20261020T195313Z-d4fa8b97244c41468be7653f6c33ec77` は、
+準備時のpanel-layout読出しがクリック処理完了を確認しておらず停止した。メニュー・狭幅の合否は未観測。
+Explorer選択時の保存は製品sourceで無条件に接続されており、「選択済みだから保存されない」という初期仮説は撤回した。
+両fixtureは新鮮な原文・履歴・IME・所有確認後に通常WM_CLOSE各1回でexit0、文書9個と設定・配置・session bytesを保全した。
+
+独立したSol Highの静的正しさreviewは、製品の追加不具合を特定しなかった一方、harnessに2点の必須修正を返した。
+held dragの到達済みframeよりさらに新しいframeを要求して正常な静止状態を拒否し得ること、
+menuのEscape後focusを開いた後のfocusと比較し、開く前のfocusを判定に用いていないことである。
+両点の局所修正・反例確認・安定差分の独立再reviewは完了した。実GUI確認の代わりにはしない。
+元のdamage再登録を省いた隔離候補（source47 `5da073fe…`、EXE `80162feb…`）では、
+対象分岐の機会5回に対してMain描画は約478秒で6回だった。変更前の約145秒で3490回とは異なり、
+持続的な再描画は再現していない。deferred damage・full frame・失敗時の回復は保持し、
+実際のborrowed WM_PAINT後に正しいpartial damageを描く試験を含む関連5試験を通した。
+これは完全な原因説明や全パネル受入を意味しない。
+
+同候補の `20261020T210013Z-5f2f155cbada43189e381cfda882fe44` は、既存の1回のpaint pass後、
+追加のpaint／invalidationなしで13個のpendingが818msでゼロとなり、presentation後の最終確認も849msだった。
+元の7000ms期限とsource／frame／COPYの一致を維持し、Rootは保存画像で本文・toolbar・右Outlineを確認した。
+自律的な最初のpaintと入力を含むG01全体は別に確認する。run全体は、正常終了送信の1500ms応答待ちが切れ、
+その88ms後にprocess exit0となったため `REV3_NORMAL_CLOSE_UNCERTAIN`。配送確認とexit0を同一視しない。
+終了後は対象process／windowなし、文書9個・設定・panel seedのhash一致を確認したが、同runの終了前session hashはない。
+
+full P01試行 `20261020T210839Z-26e0c6000fba4566b9b73d368c577c51` では、App移行保存と、
+両側表示で左幅を押下保持した3地点の画像を採取した。3画像はsource／履歴と到達geometryの観測に対応し、
+Root確認で以前のtoolbar／Explorer headerの空白を認めなかった。各COPY間の画面は未観測である。
+その後のsettled確認は162回の受動観測でも可視childのpendingが残り、7006msで期限切れとなった。
+右幅・内部height・全4状態・Compact／再起動へは未到達。P01～P04全体をPASSにしない。
+失敗後は通常終了し、pre-actor disk_beforeを独立oracleとして文書9個のhash一致を確認した。
+部分操作によるschema2／左幅264の配置は復元せず保全した。
+
+U02は、Home後には項目選択が観測されず、同じ所有menuへのDown1回でcommand1のstate128と実画像のhighlightが一致した。
+仕様のAlt／矢印／Enter／Escに沿って検証を矢印へ合わせ、Home固有の未確定挙動を製品不具合としない。
+説明表示・disabled理由・後続menuと狭幅の全経路は未確認である。menu shadowの採取は、同PID／UI thread、
+検証済みpopupとの直接z-order隣接と限定geometryを満たす正確なHWNDだけを対象にし、下位foreign overlap確認は保持した。
+ネイティブLISTBOXの測定では、最初の標準STATIC親クラスにCS_PARENTDCがあり、WS_EX_COMPOSITEDとの互換性を欠いていた。
+互換性のある専用CS_DBLCLKSクラスで1回測り直すと、非空選択の解除・再設定はLISTBOXと対応する親領域をdamageにした。
+空選択の解除、同じtop／行高、変更のないadapter同期ではdamageを認めなかった。
+したがって以前の「親へ伝播しない」という推論は採用しない。実際の失敗場面のnative選択は未記録で、原因の確定や製品修正の根拠にはまだ不足する。
+
+U02追加試行 `20261020T214539Z-c753bdee8b1b427096cabf74c6abfe5f` では、Fileの矢印選択、Viewの無効項目hover、Calendar headerの3画像をRootが確認した。
+File／Viewの約1秒のhelp観測はいずれもtooltip候補0・textなしで、説明文と無効理由は未確認のままである。
+region menuはMainのcrop外へ伸び、既存の厳格な所有・採取条件が停止した。範囲を緩めたPASSにはしていない。
+その後の所有確認付きEscapeと通常WM_CLOSEは535msでexit0、所有windowなし、文書9個はpre-actor oracleと一致した。
+menu選択自体、説明表示、crop外popupの安全な観測を分けて原因を確認する。
+
+隔離候補の追加測定 `20261020T215547Z-a14fda35583847d09b0375b16a470956` は、
+同じ左幅drag後のsettled確認で7018msに失敗した。3地点の画像はRoot確認で一貫して読めるが、P01全体は未達。
+終了後traceはzero dropsでMain1581回／250.926秒。両側表示では1541回中1540回、EndPaint後はMainの要求がなく、
+次のprepare入口までに再び全面要求が入っていた。子surfaceは各同期境界で既にdirtyのため、同期処理の再無効化を除外しない。
+失敗後の所有確認付きnative queryはExplorer選択数0・top0・行高20だった。通常終了exit0、文書9個と保護対象のhashを保全。
+この記録は原因の区間を絞るもので、合成描画の因果や出荷修正を確定しない。
+
+U02の `20261020T220127Z-e06df088fd6c4f37bc6d3f7aba58bd51` はCalendar headerのpopup所有確認で停止した。
+region本体採取・狭幅確認には未到達。停止後の安定した所有metadataから、元の瞬間の失敗条件は推定しない。
+所有確認付きEscapeと通常終了は595ms／exit0、文書・保護hash一致。繰り返しを止め、方法の再評価待ちとする。
+
+MainのみWS_EX_COMPOSITEDを外した隔離比較 `20261020T221920Z-077e8eef02fb4e67bc69232b130e6414` は、
+左264・右216の幅変更後に元のsettled fenceを通過した。Mainは229.124秒で90回、両側表示48回すべてEndPaint後clean。
+一方、Rootが確認した全12画像では、左幅押下中のExplorer／Calendarボタン行欠落、右幅・内部高さ押下中の古い輪郭やボタンの重複がある。
+静止後の画像が正常でもP04表示品質を満たさない。このフラグ除去を出荷修正として採用しない。
+比率保存assertionで停止したが、原因はdriverの整数pixel丸めを期待値に反映していなかったことだった。
+410.5 DIPの要求は410pxとして届き、実際の374/701に対応したweights256.0913/223.90869が保存されていた。
+ISO検証式は要求座標のpixel丸めから独立に期待値を計算するよう修正し、許容差0.1は維持した。元runのFAILは書き換えない。
+再起動・Compact・全状態の受入は未達。通常終了exit0、文書9個と保護hashを保全した。
+このrunでは一度だけのATOK後再採取branchは使われず、各対象captureはCOPY1回だった。
+
+Mainを私用DCへ描いてから転送する隔離候補（source30058505…／EXEed769393…）は、限定13試験と独立reviewを通したが、
+実P01 `20261020T230602Z-186bfe636a024dcd8de9573220e793b3` では最初の左幅settledが7003msに失敗した。
+166回の受動観測後も17surfaceがpending。閉鎖traceはMain644回／121.052秒、両側表示604組で描画後clear→次入口fulldirtyだった。
+Root確認の初期＋押下中3画像は一貫していたが、実場面の収束は解消していない。この方式を正本へ統合しない。
+
+同方式のMain互換性参照だけを表示装置DCへ変えた比較（source7e63c38a…／EXE0ac54a10…）の実行
+`20261020T231721Z-495fab8379d949f1a76540bba15968cd` は、診断要求の延期応答で押下中採取前に停止した。
+閉鎖traceにはMain728回／136.149秒、両側表示691組のclear→fulldirtyが残る。操作の受入は未観測とし、Main参照先だけでは収束しないと判断する。
+どちらも通常終了exit0、文書・設定・配置・保護hashを保全した。次の比較は保全したdirect-Main基準へ戻し、Explorerの私用bitmap互換性参照だけを分離する。
+
+Rev4は利用者の終了指示でUSER_CUTOFF／INCOMPLETEとして保存する。必須受入は未達で、developへの統合は行わない。
+作業branchのみcheckpoint配送する。最後に推奨されたExplorer互換性参照の比較は未実装・未実行のまま停止した。
+表示倍率100%が対象で、150%等は対象外。「本人指示の保留」という旧記述は撤回済みである。

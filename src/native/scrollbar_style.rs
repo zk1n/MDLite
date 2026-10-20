@@ -368,8 +368,7 @@ impl VerticalRail {
             }
             let old = s.range.replace(range);
             let old_tokens = s.tokens.get();
-            let redraw = native
-                || s.native.get()
+            let redraw = s.native.get() != native
                 || old != range
                 || s.dpi.get() != dpi
                 || old_tokens.panel != tokens.panel
@@ -825,6 +824,69 @@ mod tests {
             assert_eq!(rail.take_request(rail.0.token, hwnd), None);
         }
     }
+    #[test]
+    fn settings_rail_identical_hidden_native_updates_are_idempotent() {
+        let fixture = Fixture::new();
+        let rail = &fixture.rail;
+        let mut range = Range {
+            content: 200_000,
+            page: 500,
+            position: 0,
+        };
+        let mut dpi = 96;
+        let mut tokens = shell::Tokens::default();
+        let update = |range, dpi, tokens, native| unsafe {
+            let mut before = WINDOWINFO {
+                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            GetWindowInfo(rail.hwnd(), &mut before).unwrap();
+            let (hwnd, redraw) = rail.begin_update(range, dpi, tokens, native).unwrap();
+            rail.end_update(hwnd, redraw, &before);
+            redraw
+        };
+        assert!(
+            update(range, dpi, tokens, true),
+            "custom to native/hidden transition"
+        );
+        assert!(
+            !update(range, dpi, tokens, true),
+            "unchanged native/hidden mode"
+        );
+        range.position += 1;
+        assert!(update(range, dpi, tokens, true), "position");
+        assert!(!update(range, dpi, tokens, true));
+        range.page += 1;
+        assert!(update(range, dpi, tokens, true), "page");
+        assert!(!update(range, dpi, tokens, true));
+        range.content += 1;
+        assert!(update(range, dpi, tokens, true), "content");
+        assert!(!update(range, dpi, tokens, true));
+        dpi = 144;
+        assert!(update(range, dpi, tokens, true), "DPI");
+        assert!(!update(range, dpi, tokens, true));
+        tokens.panel.r += 0.01;
+        assert!(update(range, dpi, tokens, true), "panel color");
+        assert!(!update(range, dpi, tokens, true));
+        tokens.border.r += 0.01;
+        assert!(update(range, dpi, tokens, true), "track color");
+        assert!(!update(range, dpi, tokens, true));
+        tokens.muted.r += 0.01;
+        assert!(update(range, dpi, tokens, true), "thumb color");
+        assert!(!update(range, dpi, tokens, true));
+        assert!(
+            update(range, dpi, tokens, false),
+            "native/hidden to custom transition"
+        );
+        assert!(!update(range, dpi, tokens, false));
+        assert!(
+            update(range, dpi, tokens, true),
+            "custom to native/hidden transition"
+        );
+        assert!(!update(range, dpi, tokens, true));
+        assert!(!unsafe { IsWindowVisible(fixture.parent) }.as_bool());
+    }
+
     #[test]
     fn settings_rail_range_dpi_hc_fit_and_attachment_invalidate_stale_requests() {
         let fixture = Fixture::new();

@@ -939,10 +939,7 @@ impl App {
         }
         self.git_ui.list_dirty = false;
     }
-    pub(super) unsafe fn git_draw(
-        &self,
-        target: &ID2D1HwndRenderTarget,
-    ) -> windows::core::Result<()> {
+    pub(super) unsafe fn git_draw(&self, target: &ID2D1RenderTarget) -> windows::core::Result<()> {
         unsafe {
             if self.git_ui.controls.is_none()
                 && let Some(r) = self.feature_panel_rect(PanelId::Git)

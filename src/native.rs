@@ -305,7 +305,7 @@ struct CachedImage {
 struct Graphics {
     factory: ID2D1Factory,
     write: IDWriteFactory,
-    target: Option<ID2D1HwndRenderTarget>,
+    target: Option<ID2D1DCRenderTarget>,
 }
 #[derive(Default, Clone, Copy)]
 struct NativeCaretState {
@@ -332,7 +332,7 @@ impl Drop for HiddenCaret {
 // Each frame owns all clips it pushes and ends its draw exactly once, including
 // an early DirectWrite/resource error. A failed frame is discarded by WM_PAINT.
 struct DrawFrame<'a> {
-    target: &'a ID2D1HwndRenderTarget,
+    target: &'a ID2D1RenderTarget,
     clips: usize,
     ended: bool,
 }
@@ -342,7 +342,7 @@ enum PaintFault {
     Target,
     Drawing,
     EndDraw,
-    Resize,
+    Bind,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -353,6 +353,7 @@ struct PaintTestState {
     ended: usize,
     unwound_clips: usize,
     damage: Option<D2D_RECT_F>,
+    bound_surface: Option<usize>,
 }
 #[cfg(test)]
 thread_local! {
@@ -371,7 +372,7 @@ fn paint_fault(stage: PaintFault) -> windows::core::Result<()> {
     })
 }
 impl<'a> DrawFrame<'a> {
-    unsafe fn new(target: &'a ID2D1HwndRenderTarget) -> Self {
+    unsafe fn new(target: &'a ID2D1RenderTarget) -> Self {
         unsafe { target.BeginDraw() };
         #[cfg(test)]
         PAINT_TEST.with(|state| state.borrow_mut().began += 1);
@@ -483,6 +484,9 @@ struct App {
     diagnostics: DiagnosticsPane,
     close_target: Option<HWND>,
     settings_requested: bool,
+    defer_theme_updates: bool,
+    theme_update_pending: bool,
+    staged_explorer_paint: Option<Option<Rc<explorer_icons::ExplorerPaint>>>,
 }
 
 // App is never mutably aliased. Only owned, synchronous notification snapshots
@@ -501,6 +505,7 @@ struct WindowState {
     settings_open: Cell<bool>,
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
+    shell_button_paint: RefCell<Option<Rc<shell::ShellButtonPaint>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
     menu_paint: RefCell<Vec<Rc<menu_style::MenuPaint>>>,
     explorer_paint: features::ExplorerPaintSlot,
@@ -528,6 +533,7 @@ impl WindowState {
             settings_open: Cell::new(false),
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
+            shell_button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
             menu_paint: RefCell::new(Vec::new()),
             explorer_paint,
@@ -1147,6 +1153,9 @@ fn startup_window_state(
         diagnostics: DiagnosticsPane::default(),
         close_target: None,
         settings_requested: false,
+        defer_theme_updates: false,
+        theme_update_pending: false,
+        staged_explorer_paint: None,
     };
     for path in paths {
         if path.is_dir() {
@@ -1196,7 +1205,7 @@ pub fn run() -> windows::core::Result<()> {
         let mut app = Box::new(startup_window_state(graphics, diagnostic, paths));
         let pointer = (&*app as *const WindowState).cast();
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_COMPOSITED,
             w!("MDLiteRustEditor"),
             w!("MDLite — Rust 編集基盤"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -1352,6 +1361,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let state = &*pointer;
                 if state.main_window.get() == hwnd {
                     record_phase(&state.phase_trace, "main.destroy", "nc_destroy");
+                    state.shell_button_paint.borrow_mut().take();
                     let retired = state.explorer_paint.replace(None);
                     drop(retired);
                 }
@@ -1511,6 +1521,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             if msg == WM_DRAWITEM && lp.0 != 0 {
+                let paint = state.shell_button_paint.borrow().clone();
+                if let Some(paint) = paint
+                    && state.owns_paint_surface(hwnd)
+                    && paint.draw(
+                        hwnd,
+                        wp.0,
+                        &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT),
+                    )
+                {
+                    return LRESULT(1);
+                }
                 if hwnd == state.main_window.get()
                     && state.owns_paint_surface(hwnd)
                     && wp.0 == features::EXPLORER_LIST
@@ -1659,6 +1680,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 app.refresh();
             }
             Some(LRESULT(0))
+        } else if msg == WM_PAINT {
+            Some(paint_owned_window(hwnd, state, &mut app))
         } else {
             dispatch_window_message(hwnd, msg, wp, lp, &mut app)
         };
@@ -1777,6 +1800,56 @@ unsafe fn drain_native_notifications(state: &WindowState, app: &mut App) {
     }
 }
 
+unsafe fn paint_owned_window(hwnd: HWND, state: &WindowState, app: &mut App) -> LRESULT {
+    unsafe {
+        let mut pending = RECT::default();
+        let had_damage = GetUpdateRect(hwnd, Some(&mut pending), false).as_bool();
+        let prepared = app.prepare_paint();
+        // Preparation can synchronously validate damage through the borrowed
+        // WM_PAINT route. Re-arm it before acquiring the actual paint DC.
+        let deferred = state.deferred_paints.replace([None, None]);
+        let mut remaining = [None, None];
+        for (index, item) in deferred.into_iter().enumerate() {
+            if let Some((surface, damage)) = item {
+                if surface == hwnd {
+                    let _ = InvalidateRect(Some(hwnd), Some(&damage), false);
+                } else {
+                    remaining[index] = Some((surface, damage));
+                }
+            }
+        }
+        state.deferred_paints.set(remaining);
+        if app.full_paint {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        } else if had_damage {
+            let _ = InvalidateRect(Some(hwnd), Some(&pending), false);
+        }
+        let mut ps = PAINTSTRUCT::default();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let damage = rect(
+            ps.rcPaint.left as f32 / app.dpi,
+            ps.rcPaint.top as f32 / app.dpi,
+            (ps.rcPaint.right - ps.rcPaint.left) as f32 / app.dpi,
+            (ps.rcPaint.bottom - ps.rcPaint.top) as f32 / app.dpi,
+        );
+        let result = prepared.and_then(|()| app.paint_prepared_to_dc(dc, damage));
+        let retry = result.is_err() && !app.paint_retry_pending;
+        let _ = EndPaint(hwnd, &ps);
+        if let Err(error) = result {
+            app.status = error.to_string();
+            app.discard_target();
+            app.paint_retry_pending = true;
+        } else {
+            app.paint_retry_pending = false;
+            app.after_paint_release();
+        }
+        if retry {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        LRESULT(0)
+    }
+}
+
 unsafe fn dispatch_window_message(
     hwnd: HWND,
     msg: u32,
@@ -1833,32 +1906,6 @@ unsafe fn dispatch_window_message(
                 LRESULT(1)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_PAINT => {
-                let mut ps = PAINTSTRUCT::default();
-                BeginPaint(hwnd, &mut ps);
-                let damage = rect(
-                    ps.rcPaint.left as f32 / app.dpi,
-                    ps.rcPaint.top as f32 / app.dpi,
-                    (ps.rcPaint.right - ps.rcPaint.left) as f32 / app.dpi,
-                    (ps.rcPaint.bottom - ps.rcPaint.top) as f32 / app.dpi,
-                );
-                let result = app.paint(damage);
-                let retry = result.is_err() && !app.paint_retry_pending;
-                if let Err(e) = result {
-                    app.status = e.to_string();
-                    app.discard_target();
-                    app.paint_retry_pending = true;
-                } else {
-                    app.paint_retry_pending = false;
-                }
-                let _ = EndPaint(hwnd, &ps);
-                if retry {
-                    // EndPaint consumes this damage. Reserve one recovery
-                    // frame afterward, never an unbounded WM_PAINT loop.
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
             WM_SIZE => {
                 app.minimized = wp.0 == SIZE_MINIMIZED as usize;
                 if app.minimized {
@@ -1909,6 +1956,10 @@ unsafe fn dispatch_window_message(
                     app.features_reset_calendar_click();
                 }
                 if app.shell.enabled {
+                    if hwnd == app.shell.main_window && app.begin_shell_splitter(x, y) {
+                        app.refresh();
+                        return Some(LRESULT(0));
+                    }
                     for id in [
                         mdlite::panel::PanelId::Explorer,
                         mdlite::panel::PanelId::Calendar,
@@ -5918,22 +5969,12 @@ impl App {
         self.layout_key = None;
         self.full_paint = true;
     }
-    unsafe fn resize_target(&mut self, size: D2D_SIZE_U) {
-        // Resize invalidates the backbuffer even with RETAIN_CONTENTS.
+    unsafe fn resize_target(&mut self, _size: D2D_SIZE_U) {
+        // BindDC reads the current full client rectangle on the next paint and
+        // resizes its backing bitmap. No screen DC is kept between callbacks.
         self.full_paint = true;
-        if let Some(target) = &self.graphics.target {
-            #[cfg(test)]
-            let result =
-                paint_fault(PaintFault::Resize).and_then(|()| unsafe { target.Resize(&size) });
-            #[cfg(not(test))]
-            let result = unsafe { target.Resize(&size) };
-            if let Err(error) = result {
-                self.status = error.to_string();
-                self.discard_target();
-            }
-        }
     }
-    unsafe fn target(&mut self) -> windows::core::Result<ID2D1HwndRenderTarget> {
+    unsafe fn target(&mut self) -> windows::core::Result<ID2D1DCRenderTarget> {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -5942,12 +5983,9 @@ impl App {
             }
             #[cfg(test)]
             paint_fault(PaintFault::Target)?;
-            let mut r = RECT::default();
-            GetClientRect(self.hwnd, &mut r)?;
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
-                // DEFAULT incurred ~50 MB more private memory at creation in
-                // the VM. Keep native Direct2D rendering with the same
-                // DirectWrite layout and Win32 input paths.
+                // Feasibility path: Direct2D renders into each BeginPaint DC.
+                // Memory/presentation performance is not established by a build.
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -5957,17 +5995,7 @@ impl App {
                 dpiY: self.dpi * 96.0,
                 ..Default::default()
             };
-            let target = self.graphics.factory.CreateHwndRenderTarget(
-                &properties,
-                &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd: self.hwnd,
-                    pixelSize: D2D_SIZE_U {
-                        width: r.right as u32,
-                        height: r.bottom as u32,
-                    },
-                    presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
-                },
-            )?;
+            let target = self.graphics.factory.CreateDCRenderTarget(&properties)?;
             self.graphics.target = Some(target.clone());
             self.full_paint = true;
             Ok(target)
@@ -5975,7 +6003,7 @@ impl App {
     }
     unsafe fn draw_gutter_numbers(
         &self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         scroll: f32,
         viewport: f32,
         composition: Option<&CompositionVisual>,
@@ -6055,11 +6083,12 @@ impl App {
             Ok(())
         }
     }
+    #[cfg(test)]
     unsafe fn paint(&mut self, damage: D2D_RECT_F) -> windows::core::Result<()> {
-        // SAFETY: called on the window owner thread; handles and COM resources
-        // remain owned by App, and borrowed buffers outlive each synchronous call.
+        unsafe { tests::paint_into_private_dc(self, damage) }
+    }
+    unsafe fn prepare_paint(&mut self) -> windows::core::Result<()> {
         unsafe {
-            let _phase = PhaseSpan::new(&self.phase_trace, "paint.total");
             if self.minimized {
                 return Ok(());
             }
@@ -6073,8 +6102,44 @@ impl App {
                 self.update_caret();
                 self.prepare_images();
             }
-            let t = self.target()?;
-            let damage = if self.full_paint || layout_invalid {
+            self.target()?;
+            self.full_paint |= layout_invalid;
+            Ok(())
+        }
+    }
+    unsafe fn paint_prepared_to_dc(
+        &mut self,
+        dc: HDC,
+        damage: D2D_RECT_F,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let _phase = PhaseSpan::new(&self.phase_trace, "paint.total");
+            if self.minimized {
+                return Ok(());
+            }
+            let inactive_main = self.shell.enabled
+                && self.hwnd == self.shell.main_window
+                && self.shell.compact_window != HWND::default();
+            // No cold resource preparation is permitted with a paint DC held.
+            let t = self
+                .graphics
+                .target
+                .clone()
+                .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+            let mut client = RECT::default();
+            GetClientRect(self.hwnd, &mut client)?;
+            if dc == HDC::default() {
+                return Err(E_FAIL.into());
+            }
+            #[cfg(test)]
+            paint_fault(PaintFault::Bind)?;
+            t.BindDC(dc, &client)?;
+            #[cfg(test)]
+            PAINT_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.bound_surface = Some(self.hwnd.0 as usize);
+            });
+            let damage = if self.full_paint {
                 let size = t.GetSize();
                 rect(0.0, 0.0, size.width, size.height)
             } else {
@@ -6580,9 +6645,18 @@ impl App {
                     .painted_frame
                     .map_or(1, |frame| frame.sequence.saturating_add(1)),
             });
-            self.sync_animations();
-            self.diagnostic();
             Ok(())
+        }
+    }
+    unsafe fn after_paint_release(&mut self) {
+        unsafe {
+            let inactive_main = self.shell.enabled
+                && self.hwnd == self.shell.main_window
+                && self.shell.compact_window != HWND::default();
+            if !self.minimized && !inactive_main {
+                self.sync_animations();
+                self.diagnostic();
+            }
         }
     }
     unsafe fn release_caret(&mut self) {
@@ -8789,10 +8863,13 @@ mod tests {
                 GetClientRect(hwnd, &mut client).unwrap();
                 let mut app = state.app.borrow_mut();
                 app.select_surface(hwnd);
+                paint_into_private_dc(
+                    &mut app,
+                    rect(0.0, 0.0, client.right as f32, client.bottom as f32),
+                )
+                .unwrap();
                 let target = app.target().unwrap();
                 let size = target.GetPixelSize();
-                target.BeginDraw();
-                target.EndDraw(None, None).unwrap();
                 let same = [size.width, size.height] == [client.right as u32, client.bottom as u32];
                 println!(
                     "default-boundary {label} hwnd={:?} client={}x{} target={}x{} visible={} iconic={} app_minimized={} foreground={:?} match={same} EndDraw=Ok",
@@ -9198,6 +9275,71 @@ mod tests {
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
                 let _ = DestroyWindow(self.hwnd);
             }
+        }
+    }
+
+    struct PaintBitmap {
+        dc: HDC,
+        bitmap: HBITMAP,
+        old: HGDIOBJ,
+        client: RECT,
+    }
+    impl PaintBitmap {
+        unsafe fn new(hwnd: HWND) -> windows::core::Result<Self> {
+            unsafe {
+                let mut client = RECT::default();
+                GetClientRect(hwnd, &mut client)?;
+                let source = GetDC(Some(hwnd));
+                let dc = CreateCompatibleDC(Some(source));
+                let bitmap =
+                    CreateCompatibleBitmap(source, client.right.max(1), client.bottom.max(1));
+                ReleaseDC(Some(hwnd), source);
+                if dc == HDC::default() || bitmap == HBITMAP::default() {
+                    if bitmap != HBITMAP::default() {
+                        let _ = DeleteObject(bitmap.into());
+                    }
+                    if dc != HDC::default() {
+                        let _ = DeleteDC(dc);
+                    }
+                    return Err(E_FAIL.into());
+                }
+                let old = SelectObject(dc, bitmap.into());
+                if old == HGDIOBJ::default() || old.0 as isize == -1 {
+                    let _ = DeleteObject(bitmap.into());
+                    let _ = DeleteDC(dc);
+                    return Err(E_FAIL.into());
+                }
+                Ok(Self {
+                    dc,
+                    bitmap,
+                    old,
+                    client,
+                })
+            }
+        }
+    }
+    impl Drop for PaintBitmap {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.dc, self.old);
+                let _ = DeleteObject(self.bitmap.into());
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
+    pub(super) unsafe fn paint_into_private_dc(
+        app: &mut App,
+        damage: D2D_RECT_F,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let surface = PaintBitmap::new(app.hwnd)?;
+            app.prepare_paint()?;
+            let result = app.paint_prepared_to_dc(surface.dc, damage);
+            drop(surface);
+            if result.is_ok() {
+                app.after_paint_release();
+            }
+            result
         }
     }
 
@@ -10423,6 +10565,120 @@ mod tests {
         }
     }
     #[test]
+    fn shell_buttons_draw_during_app_borrow_with_current_theme_and_owned_identity() {
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODT_BUTTON, ODT_STATIC};
+        let mut seed = composing_test_app("unsaved 日本語");
+        seed.clear_composition();
+        seed.doc_mut().replace_selection("x").unwrap();
+        let fixture = MessagePumpFixture::new(seed);
+        unsafe {
+            fixture.state.app.borrow_mut().start_shell();
+            let before = document_state(fixture.state.app.borrow().doc());
+            let source = GetDC(Some(fixture.hwnd));
+            let dc = CreateCompatibleDC(Some(source));
+            let bitmap = CreateCompatibleBitmap(source, 40, 32);
+            ReleaseDC(Some(fixture.hwnd), source);
+            let previous = SelectObject(dc, bitmap.into());
+            fixture.state.deferred_control_redraw.set(false);
+            let mut all_pixels = Vec::new();
+            for theme in [
+                mdlite::settings::ThemeMode::Light,
+                mdlite::settings::ThemeMode::Dark,
+            ] {
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    let mut settings = app.shell.settings.clone();
+                    settings.theme = theme;
+                    app.apply_shell_settings(settings);
+                    app.ensure_layout().unwrap();
+                }
+                let tokens = fixture.state.app.borrow().shell.tokens;
+                for id in [
+                    107, CMD_NEW, CMD_SAVE, 168, 169, 108, 109, 110, 111, 112, 113, 114, 115, 130,
+                    131, 132, 133, 134,
+                ] {
+                    let child = GetDlgItem(Some(fixture.hwnd), id as i32).unwrap();
+                    let item = DRAWITEMSTRUCT {
+                        CtlType: ODT_BUTTON,
+                        CtlID: id as u32,
+                        hwndItem: child,
+                        hDC: dc,
+                        rcItem: RECT {
+                            left: 0,
+                            top: 0,
+                            right: 40,
+                            bottom: 32,
+                        },
+                        ..Default::default()
+                    };
+                    let render = || {
+                        PatBlt(dc, 0, 0, 40, 32, BLACKNESS).unwrap();
+                        assert_eq!(
+                            SendMessageW(
+                                fixture.hwnd,
+                                WM_DRAWITEM,
+                                Some(WPARAM(id)),
+                                Some(LPARAM((&item as *const DRAWITEMSTRUCT) as isize))
+                            ),
+                            LRESULT(1)
+                        );
+                        (0..32)
+                            .flat_map(|y| (0..40).map(move |x| GetPixel(dc, x, y)))
+                            .collect::<Vec<_>>()
+                    };
+                    let ordinary = render();
+                    let borrowed = {
+                        let _app = fixture.state.app.borrow_mut();
+                        render()
+                    };
+                    assert_eq!(ordinary, borrowed, "theme={theme:?} id={id}");
+                    let background = borrowed[0];
+                    let ink = (4..26)
+                        .flat_map(|y| (8..32).map(move |x| y * 40 + x))
+                        .filter(|index| borrowed[*index] != background)
+                        .count();
+                    assert!(ink > 4, "missing icon id={id}; interior ink pixels={ink}");
+                    if id == 107 {
+                        assert_eq!(borrowed[0], shell::rgb(tokens.panel));
+                    }
+                    if id == 108 {
+                        assert_eq!(borrowed[0], shell::rgb(tokens.selected));
+                    }
+                    all_pixels.push(borrowed);
+                    let paint = fixture.state.shell_button_paint.borrow().clone().unwrap();
+                    let mut wrong = item;
+                    wrong.CtlID += 1;
+                    assert!(!paint.draw(fixture.hwnd, id, &wrong));
+                    wrong = item;
+                    wrong.CtlType = ODT_STATIC;
+                    assert!(!paint.draw(fixture.hwnd, id, &wrong));
+                    assert!(!paint.draw(fixture.hwnd, id + 1, &item));
+                    assert!(!paint.draw(HWND::default(), id, &item));
+                    let foreign = shell::control(
+                        fixture.hwnd,
+                        w!("BUTTON"),
+                        "foreign same id",
+                        id,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    );
+                    wrong = item;
+                    wrong.hwndItem = foreign;
+                    assert!(!paint.draw(fixture.hwnd, id, &wrong));
+                    DestroyWindow(foreign).unwrap();
+                }
+            }
+            assert_ne!(
+                all_pixels[0], all_pixels[18],
+                "light and dark must not reuse stale colors"
+            );
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            assert!(!fixture.state.deferred_control_redraw.get());
+            SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+        }
+    }
+    #[test]
     fn editor_reentrant_control_paint_waits_for_themed_owner() {
         let fixture = EditorFixture::new("body", false);
         unsafe {
@@ -10850,6 +11106,151 @@ mod tests {
     }
 
     #[test]
+    fn composited_dc_hidden_binding_damage_resize_and_compact_keep_source() {
+        let mut seed = composing_test_app("# DC fixture\nsource 日本語\n");
+        seed.clear_composition();
+        seed.doc_mut().replace_selection("x").unwrap();
+        let mut fixture = MessagePumpFixture::new(seed);
+        let compact = fixture.create_compact();
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+        unsafe {
+            assert!(
+                !IsWindowVisible(fixture.hwnd).as_bool() && !IsWindowVisible(compact).as_bool()
+            );
+            let focus = GetFocus();
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.main_window = fixture.hwnd;
+            app.shell.compact_window = compact;
+            app.select_surface(fixture.hwnd);
+            let main = PaintBitmap::new(fixture.hwnd).unwrap();
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(main.dc, rect(0., 0., 900., 700.))
+                .unwrap();
+            let main_target = app.target().unwrap();
+            let size = main_target.GetPixelSize();
+            assert_eq!(
+                (size.width, size.height),
+                (main.client.right as u32, main.client.bottom as u32)
+            );
+            let sentinel = COLORREF(0x0031_72b4);
+            SetPixel(
+                main.dc,
+                main.client.right - 2,
+                main.client.bottom - 2,
+                sentinel,
+            );
+            SetPixel(main.dc, 425, 305, sentinel);
+            let saved = SaveDC(main.dc);
+            IntersectClipRect(main.dc, 420, 300, 430, 310);
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(main.dc, rect(420., 300., 10., 10.))
+                .unwrap();
+            RestoreDC(main.dc, saved).ok().unwrap();
+            assert_eq!(
+                GetPixel(main.dc, main.client.right - 2, main.client.bottom - 2),
+                sentinel,
+                "BeginPaint-equivalent DC clipping preserves outside damage"
+            );
+            let actual = GetPixel(main.dc, 425, 305).0;
+            let expected = shell::rgb(app.shell.tokens.background).0;
+            for shift in [0, 8, 16] {
+                assert!(
+                    ((actual >> shift) & 255).abs_diff((expected >> shift) & 255) <= 1,
+                    "D2D BGRA conversion may round one level; the damaged pixel must be repainted"
+                );
+            }
+            app.select_surface(compact);
+            let small = PaintBitmap::new(compact).unwrap();
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(small.dc, rect(0., 0., 640., 480.))
+                .unwrap();
+            assert_ne!(
+                app.target().unwrap().as_raw(),
+                main_target.as_raw(),
+                "separate surface resource domains"
+            );
+            PAINT_TEST
+                .with(|state| assert_eq!(state.borrow().bound_surface, Some(compact.0 as usize)));
+            app.select_surface(fixture.hwnd);
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(main.dc, rect(0., 0., 900., 700.))
+                .unwrap();
+            assert_eq!(app.target().unwrap().as_raw(), main_target.as_raw());
+            SetWindowPos(
+                fixture.hwnd,
+                None,
+                0,
+                0,
+                960,
+                720,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            app.resize_target(D2D_SIZE_U {
+                width: 960,
+                height: 720,
+            });
+            let resized = PaintBitmap::new(fixture.hwnd).unwrap();
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(resized.dc, rect(1., 1., 2., 2.))
+                .unwrap();
+            let pixels = app.target().unwrap().GetPixelSize();
+            assert_eq!(
+                (pixels.width, pixels.height),
+                (resized.client.right as u32, resized.client.bottom as u32)
+            );
+            let frame = app.painted_frame;
+            PAINT_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.fault = Some(PaintFault::Bind);
+                state.failures = 1;
+            });
+            assert!(
+                app.paint_prepared_to_dc(resized.dc, rect(1., 1., 2., 2.))
+                    .is_err()
+            );
+            assert_eq!(app.painted_frame, frame, "failed BindDC publishes no frame");
+            app.discard_target();
+            app.prepare_paint().unwrap();
+            app.paint_prepared_to_dc(resized.dc, rect(1., 1., 2., 2.))
+                .unwrap();
+            assert_ne!(app.target().unwrap().as_raw(), main_target.as_raw());
+            assert_eq!(document_state(app.doc()), before);
+            assert_eq!(GetFocus(), focus);
+        }
+    }
+    #[test]
+    fn composited_dc_hidden_native_paint_bind_failure_uses_existing_recovery() {
+        let mut seed = composing_test_app("native paint source");
+        seed.clear_composition();
+        let fixture = MessagePumpFixture::new(seed);
+        let before = document_state(fixture.state.app.borrow().doc());
+        PAINT_TEST.with(|state| {
+            *state.borrow_mut() = PaintTestState {
+                fault: Some(PaintFault::Bind),
+                failures: 1,
+                ..Default::default()
+            }
+        });
+        unsafe {
+            SendMessageW(fixture.hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(fixture.state.app.borrow().paint_retry_pending);
+            assert!(fixture.state.app.borrow().graphics.target.is_none());
+            SendMessageW(fixture.hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(!fixture.state.app.borrow().paint_retry_pending);
+            assert!(fixture.state.app.borrow().graphics.target.is_some());
+            PAINT_TEST.with(|state| {
+                let state = state.borrow();
+                assert_eq!((state.began, state.ended), (1, 1));
+                assert_eq!(state.bound_surface, Some(fixture.hwnd.0 as usize));
+            });
+            assert!(!IsWindowVisible(fixture.hwnd).as_bool());
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+        }
+    }
+
+    #[test]
     fn paint_recovery_hidden_startup_prepares_controls_before_first_frame() {
         let fixture = EditorFixture::new("# Startup\n\nbody", false);
         let before = document_state(fixture.state.app.borrow().doc());
@@ -11088,7 +11489,7 @@ mod tests {
 
     #[test]
     fn paint_recovery_target_and_enddraw_failures_recreate_full_frame() {
-        for fault in [PaintFault::Target, PaintFault::EndDraw] {
+        for fault in [PaintFault::Target, PaintFault::Bind, PaintFault::EndDraw] {
             let fixture = visible_paint_fixture("retained body");
             let before = document_state(fixture.state.app.borrow().doc());
             PAINT_TEST.with(|state| {
@@ -11115,7 +11516,11 @@ mod tests {
                 PAINT_TEST.with(|state| {
                     let state = state.borrow();
                     assert_eq!(state.damage, Some(rect(0., 0., size.width, size.height)));
-                    let expected = if fault == PaintFault::Target { 1 } else { 2 };
+                    let expected = if matches!(fault, PaintFault::Target | PaintFault::Bind) {
+                        1
+                    } else {
+                        2
+                    };
                     assert_eq!((state.began, state.ended), (expected, expected));
                 });
                 let small = rect(2., 3., 4., 5.);
@@ -11151,7 +11556,9 @@ mod tests {
             assert!(GetUpdateRect(fixture.hwnd, None, false).as_bool());
             let _ = UpdateWindow(fixture.hwnd);
             let mut app = fixture.state.app.borrow_mut();
-            assert_eq!(app.target().unwrap().GetHwnd(), fixture.hwnd);
+            PAINT_TEST.with(|state| {
+                assert_eq!(state.borrow().bound_surface, Some(fixture.hwnd.0 as usize))
+            });
             PAINT_TEST.with(|state| {
                 let state = state.borrow();
                 assert_eq!((state.began, state.ended, state.unwound_clips), (2, 2, 2));
@@ -11160,7 +11567,9 @@ mod tests {
                 app.select_surface(surface);
                 assert!(app.full_paint);
                 app.paint(rect(1., 2., 3., 4.)).unwrap();
-                assert_eq!(app.target().unwrap().GetHwnd(), surface);
+                PAINT_TEST.with(|state| {
+                    assert_eq!(state.borrow().bound_surface, Some(surface.0 as usize))
+                });
                 assert!(!app.full_paint);
             }
             assert_eq!(document_state(app.doc()), before);
@@ -11250,10 +11659,15 @@ mod tests {
             });
             PAINT_TEST.with(|state| {
                 let mut state = state.borrow_mut();
-                state.fault = Some(PaintFault::Resize);
+                state.fault = Some(PaintFault::Bind);
                 state.failures = 1;
             });
             app.resize_target(size);
+            assert!(
+                app.paint(small).is_err(),
+                "resize's next DC binding can fail"
+            );
+            app.discard_target();
             assert!(app.graphics.target.is_none());
             app.paint(small).unwrap();
             assert_ne!(app.target().unwrap().as_raw(), target.as_raw());
@@ -12843,6 +13257,9 @@ mod tests {
             diagnostics: DiagnosticsPane::default(),
             close_target: None,
             settings_requested: false,
+            defer_theme_updates: false,
+            theme_update_pending: false,
+            staged_explorer_paint: None,
         }
     }
     fn hidden_test_window() -> HWND {

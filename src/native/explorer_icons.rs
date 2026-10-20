@@ -4,25 +4,29 @@ use super::{draw_gdi_text, shell, wide};
 use std::{path::Path, rc::Rc};
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, RECT, SIZE, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM},
         Graphics::Gdi::{
+            BeginPaint, BitBlt, COLOR_WINDOW, CreateCompatibleBitmap, CreateCompatibleDC,
             CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT, DT_NOPREFIX, DT_SINGLELINE,
-            DT_VCENTER, DeleteObject, FillRect, GetDC, GetObjectW, GetStockObject,
-            GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ, IntersectClipRect, LOGFONTW, ReleaseDC,
-            RestoreDC, SaveDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+            DT_VCENTER, DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetObjectW,
+            GetStockObject, GetSysColorBrush, GetTextExtentPoint32W, HBITMAP, HBRUSH, HDC, HFONT,
+            HGDIOBJ, IntersectClipRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, RestoreDC, SRCCOPY,
+            SaveDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
         },
         Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
         UI::{
             Controls::{DRAWITEMSTRUCT, ODS_SELECTED, ODT_LISTBOX},
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
             Shell::{
-                SHFILEINFOW, SHGFI_ICON, SHGFI_OPENICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
-                SHGetFileInfoW,
+                DefSubclassProc, RemoveWindowSubclass, SHFILEINFOW, SHGFI_ICON, SHGFI_OPENICON,
+                SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SetWindowSubclass,
             },
             WindowsAndMessaging::{
-                DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetParent, HICON, IsWindow,
-                LB_GETCOUNT, LB_GETITEMDATA, LB_GETTEXT, LB_GETTEXTLEN, SM_CXSMICON, SM_CYSMICON,
-                SendMessageW, WM_GETFONT,
+                DI_NORMAL, DestroyIcon, DrawIconEx, GetClassNameW, GetClientRect, GetDlgCtrlID,
+                GetParent, GetWindowThreadProcessId, HICON, IsWindow, LB_GETCOUNT, LB_GETITEMDATA,
+                LB_GETTEXT, LB_GETTEXTLEN, PRF_CLIENT, SM_CXSMICON, SM_CYSMICON, SendMessageW,
+                WM_CTLCOLORLISTBOX, WM_ERASEBKGND, WM_GETFONT, WM_NCDESTROY, WM_PAINT,
+                WM_PRINTCLIENT,
             },
         },
     },
@@ -30,6 +34,7 @@ use windows::{
 };
 
 const EXPLORER_LIST_ID: usize = 4690;
+const BUFFERED_PAINT_SUBCLASS: usize = 0x4d44_4550;
 const MAX_ICON_CACHE: usize = 64;
 const ROW_PADDING_DIP: i32 = 5;
 const ICON_GAP_DIP: i32 = 6;
@@ -37,6 +42,241 @@ const TREE_INDENT_DIP: usize = 12;
 const MAX_TREE_INDENT_DIP: usize = 128;
 const ITEM_IS_DIRECTORY: usize = 1;
 const ITEM_IS_EXPANDED: usize = 2;
+
+/// Keep native LISTBOX layout, selection and owner drawing, but present a whole
+/// client paint at once. The subclass owns no document data or persistent DC.
+pub(super) unsafe fn buffer_client_paint(list: HWND, owner: HWND) -> Result<(), String> {
+    unsafe {
+        if !owned_explorer_list(list, owner) {
+            return Err("Explorer paint requires its owned native LISTBOX".into());
+        }
+        SetWindowSubclass(
+            list,
+            Some(buffered_list_proc),
+            BUFFERED_PAINT_SUBCLASS,
+            owner.0 as usize,
+        )
+        .ok()
+        .map_err(|error| error.to_string())
+    }
+}
+unsafe fn owned_explorer_list(list: HWND, owner: HWND) -> bool {
+    unsafe {
+        let mut process = 0;
+        let thread = GetWindowThreadProcessId(list, Some(&mut process));
+        let mut class = [0u16; 32];
+        let length = GetClassNameW(list, &mut class);
+        thread == windows_sys::Win32::System::Threading::GetCurrentThreadId()
+            && process == std::process::id()
+            && GetParent(list).ok() == Some(owner)
+            && GetDlgCtrlID(list) as usize == EXPLORER_LIST_ID
+            && length > 0
+            && String::from_utf16_lossy(&class[..length as usize]).eq_ignore_ascii_case("ListBox")
+    }
+}
+
+struct ClientBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+}
+impl ClientBuffer {
+    unsafe fn new(source: HDC, width: i32, height: i32) -> Option<Self> {
+        unsafe {
+            #[cfg(test)]
+            if BUFFER_TEST.with(|state| state.borrow().fail_allocation) {
+                return None;
+            }
+            let dc = CreateCompatibleDC(Some(source));
+            if dc == HDC::default() {
+                return None;
+            }
+            let bitmap = CreateCompatibleBitmap(source, width, height);
+            if bitmap == HBITMAP::default() {
+                let _ = DeleteDC(dc);
+                return None;
+            }
+            let previous = SelectObject(dc, bitmap.into());
+            if previous == HGDIOBJ::default() || previous.0 as isize == -1 {
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(dc);
+                return None;
+            }
+            Some(Self {
+                dc,
+                bitmap,
+                previous,
+            })
+        }
+    }
+    unsafe fn copy_to(&self, target: HDC, client: &RECT) -> bool {
+        unsafe {
+            #[cfg(test)]
+            if BUFFER_TEST.with(|state| state.borrow().fail_copy) {
+                return false;
+            }
+            BitBlt(
+                target,
+                0,
+                0,
+                client.right,
+                client.bottom,
+                Some(self.dc),
+                0,
+                0,
+                SRCCOPY,
+            )
+            .is_ok()
+        }
+    }
+}
+impl Drop for ClientBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+unsafe fn print_list_client(list: HWND, owner: HWND, dc: HDC, client: &RECT) {
+    unsafe {
+        let _saved = SavedDc::new(dc);
+        let color = SendMessageW(
+            owner,
+            WM_CTLCOLORLISTBOX,
+            Some(WPARAM(dc.0 as usize)),
+            Some(LPARAM(list.0 as isize)),
+        );
+        let brush = if color.0 == 0 {
+            GetSysColorBrush(COLOR_WINDOW)
+        } else {
+            HBRUSH(color.0 as *mut _)
+        };
+        FillRect(dc, client, brush);
+        // This is the actual native LISTBOX implementation, not DefWindowProc.
+        // Its existing owner-draw callbacks receive this private target DC.
+        DefSubclassProc(
+            list,
+            WM_PRINTCLIENT,
+            WPARAM(dc.0 as usize),
+            LPARAM(PRF_CLIENT as isize),
+        );
+    }
+}
+unsafe extern "system" fn buffered_list_proc(
+    list: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    owner: usize,
+) -> LRESULT {
+    unsafe {
+        if msg == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(list, Some(buffered_list_proc), id);
+            return DefSubclassProc(list, msg, wp, lp);
+        }
+        let owner = HWND(owner as *mut _);
+        if GetParent(list).ok() != Some(owner) || GetDlgCtrlID(list) as usize != EXPLORER_LIST_ID {
+            return DefSubclassProc(list, msg, wp, lp);
+        }
+        if msg == WM_ERASEBKGND {
+            // Erase into the next complete client paint, keeping old pixels
+            // intact while native WM_PAINT is queued.
+            return LRESULT(1);
+        }
+        if msg == WM_PRINTCLIENT && wp.0 != 0 {
+            let mut client = RECT::default();
+            if GetClientRect(list, &mut client).is_ok() {
+                print_list_client(list, owner, HDC(wp.0 as *mut _), &client);
+                return LRESULT(0);
+            }
+        }
+        if msg != WM_PAINT || wp.0 != 0 {
+            return DefSubclassProc(list, msg, wp, lp);
+        }
+        let mut client = RECT::default();
+        if GetClientRect(list, &mut client).is_err() || client.right <= 0 || client.bottom <= 0 {
+            return DefSubclassProc(list, msg, wp, lp);
+        }
+        let source = GetDC(Some(list));
+        #[cfg(test)]
+        BUFFER_TEST.with(|state| state.borrow_mut().compat_held = source != HDC::default());
+        let buffer = if source == HDC::default() {
+            None
+        } else {
+            ClientBuffer::new(source, client.right, client.bottom)
+        };
+        if source != HDC::default() {
+            ReleaseDC(Some(list), source);
+        }
+        #[cfg(test)]
+        BUFFER_TEST.with(|state| state.borrow_mut().compat_held = false);
+        // Native row traversal can be expensive. It draws only into a private
+        // bitmap, with no window DC held and no update region consumed yet.
+        if let Some(buffer) = &buffer {
+            print_list_client(list, owner, buffer.dc, &client);
+        }
+        // Owner-draw callbacks can resize/reparent/destroy the control. Never
+        // blit a prepared bitmap into a changed surface or changed geometry.
+        if !owned_explorer_list(list, owner) {
+            return if IsWindow(Some(list)).as_bool() {
+                DefSubclassProc(list, msg, wp, lp)
+            } else {
+                LRESULT(0)
+            };
+        }
+        let mut current = RECT::default();
+        if GetClientRect(list, &mut current).is_err() || current.right <= 0 || current.bottom <= 0 {
+            return DefSubclassProc(list, msg, wp, lp);
+        }
+        let unchanged = current == client;
+        let mut paint = PAINTSTRUCT::default();
+        let dc = BeginPaint(list, &mut paint);
+        #[cfg(test)]
+        BUFFER_TEST.with(|state| state.borrow_mut().paint_held = dc != HDC::default());
+        if dc != HDC::default() {
+            let copied = unchanged
+                && buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.copy_to(dc, &current));
+            #[cfg(test)]
+            BUFFER_TEST.with(|state| {
+                let mut state = state.borrow_mut();
+                state.paints += 1;
+                state.buffered += usize::from(copied);
+                state.fallbacks += usize::from(!copied);
+                state.stale_fallbacks += usize::from(!unchanged);
+            });
+            if !copied {
+                // An allocation/copy failure must still paint the native
+                // content. This fallback can hold the paint DC longer; it is
+                // not evidence for the normal buffered path's fast lifetime.
+                print_list_client(list, owner, dc, &current);
+            }
+        }
+        let _ = EndPaint(list, &paint);
+        #[cfg(test)]
+        BUFFER_TEST.with(|state| state.borrow_mut().paint_held = false);
+        drop(buffer);
+        LRESULT(0)
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct BufferTest {
+    fail_allocation: bool,
+    fail_copy: bool,
+    compat_held: bool,
+    paint_held: bool,
+    paints: usize,
+    buffered: usize,
+    fallbacks: usize,
+    stale_fallbacks: usize,
+}
+#[cfg(test)]
+thread_local! { static BUFFER_TEST: std::cell::RefCell<BufferTest> = std::cell::RefCell::new(BufferTest::default()); }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum IconClass {
@@ -538,6 +778,260 @@ mod tests {
         },
         core::w,
     };
+
+    #[test]
+    fn explorer_native_wm_paint_buffers_rows_and_allocation_fallback_keeps_content() {
+        use std::cell::Cell;
+        use windows::Win32::{
+            Graphics::Gdi::{GetObjectType, InvalidateRect, OBJ_MEMDC},
+            UI::Controls::ODT_LISTBOX,
+            UI::WindowsAndMessaging::*,
+        };
+        struct Probe {
+            draws: Cell<usize>,
+            memory_draws: Cell<usize>,
+            ink: Cell<bool>,
+            background: Cell<COLORREF>,
+            resize_once: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                let result = DefSubclassProc(hwnd, msg, wp, lp);
+                if msg == WM_DRAWITEM && lp.0 != 0 {
+                    let item = &*(lp.0 as *const DRAWITEMSTRUCT);
+                    if item.CtlID as usize == EXPLORER_LIST_ID && item.CtlType == ODT_LISTBOX {
+                        let probe = &*(data as *const Probe);
+                        probe.draws.set(probe.draws.get() + 1);
+                        if GetObjectType(HGDIOBJ(item.hDC.0)) == OBJ_MEMDC.0 as u32 {
+                            BUFFER_TEST.with(|state| {
+                                let state = state.borrow();
+                                assert!(
+                                    !state.compat_held && !state.paint_held,
+                                    "native private row traversal must hold no window DC"
+                                );
+                            });
+                            probe.memory_draws.set(probe.memory_draws.get() + 1);
+                            if probe.resize_once.replace(false) {
+                                SetWindowPos(
+                                    item.hwndItem,
+                                    None,
+                                    0,
+                                    0,
+                                    124,
+                                    64,
+                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                                )
+                                .unwrap();
+                            }
+                            // Read only this private bitmap, never a screen DC.
+                            if item.itemState.0 & ODS_SELECTED.0 == 0 {
+                                for y in item.rcItem.top.max(0)..item.rcItem.bottom.min(60) {
+                                    for x in 8..110 {
+                                        if GetPixel(item.hDC, x, y) != probe.background.get() {
+                                            probe.ink.set(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                result
+            }
+        }
+        let mut seed = super::super::tests::composing_test_app("unsaved 日本語\n");
+        seed.clear_composition();
+        seed.doc_mut().replace_selection("x").unwrap();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.start_shell();
+                app.features_init();
+                app.ensure_layout().unwrap();
+            }
+            let list = GetDlgItem(Some(fixture.hwnd), EXPLORER_LIST_ID as i32).unwrap();
+            SetWindowPos(list, None, 0, 0, 120, 60, SWP_NOZORDER | SWP_NOACTIVATE).unwrap();
+            for index in 0..10 {
+                let label = wide(&format!("  native_{index}_日本語.md"));
+                let row = shell::send(
+                    list,
+                    LB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(label.as_ptr() as isize),
+                );
+                shell::send(list, LB_SETITEMDATA, WPARAM(row.0 as usize), LPARAM(0));
+            }
+            shell::send(list, LB_SETSEL, WPARAM(1), LPARAM(2));
+            shell::send(list, LB_SETTOPINDEX, WPARAM(2), LPARAM(0));
+            let snapshot = || {
+                let app = fixture.state.app.borrow();
+                (
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().selection(),
+                    shell::send(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
+                    shell::send(list, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0,
+                    shell::send(list, LB_GETSEL, WPARAM(2), LPARAM(0)).0,
+                )
+            };
+            let before = snapshot();
+            let probe = Probe {
+                draws: Cell::new(0),
+                memory_draws: Cell::new(0),
+                ink: Cell::new(false),
+                background: Cell::new(shell::rgb(fixture.state.app.borrow().shell.tokens.panel)),
+                resize_once: Cell::new(false),
+            };
+            SetWindowSubclass(
+                fixture.hwnd,
+                Some(observe),
+                780,
+                (&probe as *const Probe) as usize,
+            )
+            .unwrap();
+            BUFFER_TEST.with(|state| *state.borrow_mut() = BufferTest::default());
+            InvalidateRect(Some(list), None, true).ok().unwrap();
+            SendMessageW(list, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            BUFFER_TEST.with(|state| {
+                let state = state.borrow();
+                assert_eq!((state.paints, state.buffered), (1, 1));
+            });
+            assert!(
+                probe.draws.get() >= 2,
+                "real native PRINTCLIENT must draw visible rows"
+            );
+            assert_eq!(probe.draws.get(), probe.memory_draws.get());
+            assert!(
+                probe.ink.get(),
+                "native LISTBOX must render text/icons into the private bitmap"
+            );
+            assert_eq!(snapshot(), before);
+            // The same final copy used by WM_PAINT respects destination damage
+            // clipping and transfers actual native LISTBOX glyphs/background.
+            let surface = Surface::new(fixture.hwnd);
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: 120,
+                bottom: 60,
+            };
+            let buffer = ClientBuffer::new(surface.0, 120, 60).unwrap();
+            SendMessageW(
+                list,
+                WM_PRINTCLIENT,
+                Some(WPARAM(buffer.dc.0 as usize)),
+                Some(LPARAM(PRF_CLIENT as isize)),
+            );
+            let sentinel = COLORREF(0x0056_3217);
+            let brush = CreateSolidBrush(sentinel);
+            FillRect(surface.0, &client, brush);
+            DeleteObject(brush.into()).ok().unwrap();
+            let saved = SaveDC(surface.0);
+            IntersectClipRect(surface.0, 0, 0, 60, 60);
+            assert!(buffer.copy_to(surface.0, &client));
+            RestoreDC(surface.0, saved).ok().unwrap();
+            assert_eq!(
+                GetPixel(surface.0, 100, 30),
+                sentinel,
+                "copy must preserve pixels outside the current paint clip"
+            );
+            assert!(
+                (0..60).any(|y| (0..60).any(|x| {
+                    let pixel = GetPixel(surface.0, x, y);
+                    pixel != sentinel && pixel != probe.background.get()
+                })),
+                "native glyph ink must survive the partial-damage copy"
+            );
+            assert!(buffer.copy_to(surface.0, &client));
+            assert_eq!(GetPixel(surface.0, 100, 30), GetPixel(buffer.dc, 100, 30));
+            drop(buffer);
+
+            for (copy_failure, resize) in [(true, false), (false, true)] {
+                BUFFER_TEST.with(|state| {
+                    *state.borrow_mut() = BufferTest {
+                        fail_copy: copy_failure,
+                        ..Default::default()
+                    }
+                });
+                probe.resize_once.set(resize);
+                let native_draws = probe.draws.get() - probe.memory_draws.get();
+                InvalidateRect(Some(list), None, true).ok().unwrap();
+                SendMessageW(list, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+                BUFFER_TEST.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!((state.paints, state.buffered, state.fallbacks), (1, 0, 1));
+                    assert_eq!(state.stale_fallbacks, usize::from(resize));
+                    assert!(!state.compat_held && !state.paint_held);
+                });
+                assert!(
+                    probe.draws.get() - probe.memory_draws.get() > native_draws,
+                    "copy/stale fallback must invoke the actual native row painter"
+                );
+                assert!(!probe.resize_once.get());
+                assert_eq!(snapshot(), before);
+            }
+            BUFFER_TEST.with(|state| {
+                *state.borrow_mut() = BufferTest {
+                    fail_allocation: true,
+                    ..Default::default()
+                }
+            });
+            let native_draws = probe.draws.get() - probe.memory_draws.get();
+            InvalidateRect(Some(list), None, true).ok().unwrap();
+            SendMessageW(list, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            BUFFER_TEST.with(|state| {
+                let state = state.borrow();
+                assert_eq!((state.paints, state.buffered), (1, 0));
+            });
+            assert!(
+                probe.draws.get() - probe.memory_draws.get() > native_draws,
+                "allocation fallback must invoke the actual native row painter"
+            );
+            // Exercise the same native fallback backend in an observable private
+            // DC too: hidden window paint regions may legitimately be empty.
+            let draws = probe.memory_draws.get();
+            probe.ink.set(false);
+            let brush = CreateSolidBrush(probe.background.get());
+            FillRect(
+                surface.0,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 120,
+                    bottom: 60,
+                },
+                brush,
+            );
+            let _ = DeleteObject(brush.into());
+            SendMessageW(
+                list,
+                WM_PRINTCLIENT,
+                Some(WPARAM(surface.0.0 as usize)),
+                Some(LPARAM(PRF_CLIENT as isize)),
+            );
+            assert!(probe.memory_draws.get() > draws);
+            assert!(
+                probe.ink.get(),
+                "native allocation fallback must retain actual row ink"
+            );
+            assert_eq!(snapshot(), before);
+            BUFFER_TEST.with(|state| *state.borrow_mut() = BufferTest::default());
+            RemoveWindowSubclass(fixture.hwnd, Some(observe), 780).unwrap();
+            assert!(!super::super::IsWindowVisible(fixture.hwnd).as_bool());
+            assert!(buffer_client_paint(list, HWND::default()).is_err());
+        }
+    }
 
     struct List {
         owner: HWND,

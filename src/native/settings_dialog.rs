@@ -1483,6 +1483,71 @@ unsafe fn drain_rail_request(state: &Window, wp: WPARAM, lp: LPARAM) {
         }
     }
 }
+#[derive(Clone, Copy)]
+struct OwnerActivationFacts {
+    settings: HWND,
+    owner: HWND,
+    actual_owner: HWND,
+    foreground: HWND,
+    settings_thread: u32,
+    owner_thread: u32,
+    current_thread: u32,
+    settings_pid: u32,
+    owner_pid: u32,
+    current_pid: u32,
+    settings_available: bool,
+    owner_available: bool,
+}
+fn owner_activation_eligible(facts: OwnerActivationFacts) -> bool {
+    facts.settings != HWND::default()
+        && facts.owner != HWND::default()
+        && facts.settings != facts.owner
+        && facts.actual_owner == facts.owner
+        && facts.foreground == facts.settings
+        && facts.settings_available
+        && facts.owner_available
+        && facts.current_thread != 0
+        && facts.settings_thread == facts.current_thread
+        && facts.owner_thread == facts.current_thread
+        && facts.current_pid != 0
+        && facts.settings_pid == facts.current_pid
+        && facts.owner_pid == facts.current_pid
+}
+unsafe fn activate_closing_owner(settings: HWND, owner: HWND) -> bool {
+    unsafe {
+        let mut settings_pid = 0;
+        let mut owner_pid = 0;
+        let facts = OwnerActivationFacts {
+            settings,
+            owner,
+            actual_owner: GetWindow(settings, GW_OWNER).unwrap_or_default(),
+            foreground: GetForegroundWindow(),
+            settings_thread: GetWindowThreadProcessId(settings, Some(&mut settings_pid)),
+            owner_thread: GetWindowThreadProcessId(owner, Some(&mut owner_pid)),
+            current_thread: windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            settings_pid,
+            owner_pid,
+            current_pid: std::process::id(),
+            settings_available: IsWindow(Some(settings)).as_bool()
+                && IsWindowVisible(settings).as_bool()
+                && IsWindowEnabled(settings).as_bool(),
+            owner_available: IsWindow(Some(owner)).as_bool()
+                && IsWindowVisible(owner).as_bool()
+                && IsWindowEnabled(owner).as_bool(),
+        };
+        let eligible = owner_activation_eligible(facts);
+        if !eligible {
+            return false;
+        }
+        // No form/App borrow is held across the synchronous activation callbacks.
+        if GetForegroundWindow() != settings {
+            return false;
+        }
+        let _ = SetActiveWindow(owner);
+        true
+    }
+}
+
 unsafe fn close_window(hwnd: HWND, state: &Window) {
     unsafe {
         state.closed.set(true);
@@ -1491,6 +1556,7 @@ unsafe fn close_window(hwnd: HWND, state: &Window) {
         // surface instead of leaving its owner disabled during activation handoff.
         if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
             let _ = EnableWindow(owner, true);
+            let _ = activate_closing_owner(hwnd, owner);
         }
         let _ = DestroyWindow(hwnd);
     }
@@ -1987,8 +2053,9 @@ impl App {
         }
     }
 
-    unsafe fn complete_settings(&mut self, outcome: SettingsOutcome) {
+    unsafe fn complete_settings(&mut self, outcome: SettingsOutcome) -> bool {
         unsafe {
+            self.defer_theme_updates = true;
             let previous_settings = self.shell.settings.clone();
             self.load_persistence_settings();
             if self.shell.settings != previous_settings {
@@ -1998,9 +2065,22 @@ impl App {
                 self.open_path(path);
             }
             self.refresh();
+            let changed = self.finish_settings_theme();
             if let Some(code) = outcome.quit {
                 PostQuitMessage(code.0 as i32);
             }
+            changed
+        }
+    }
+    unsafe fn finish_settings_theme(&mut self) -> bool {
+        unsafe {
+            self.defer_theme_updates = false;
+            if !std::mem::take(&mut self.theme_update_pending) {
+                return false;
+            }
+            self.publish_prepared_theme_paint();
+            self.apply_shell_native_theme();
+            true
         }
     }
 }
@@ -2098,7 +2178,7 @@ unsafe fn run_prepared(state: &WindowState, prepared: PreparedSettings) {
     unsafe {
         let outcome = prepared.pump();
         let mut app = state.app.borrow_mut();
-        app.complete_settings(outcome);
+        let theme_changed = app.complete_settings(outcome);
         state.settings_open.set(false);
         if state.deferred_persistence.replace(false) {
             app.rearm_autosave(true);
@@ -2106,11 +2186,97 @@ unsafe fn run_prepared(state: &WindowState, prepared: PreparedSettings) {
         drain_native_notifications(state, &mut app);
         drop(app);
         replay_deferred_paints(state);
+        if theme_changed {
+            // No App or paint-resource borrow crosses the synchronous native
+            // callbacks. Complete the owned surfaces once, without queue delay.
+            for surface in [state.main_window.get(), state.compact_window.get()] {
+                if state.owns_paint_surface(surface) {
+                    let _ = RedrawWindow(
+                        Some(surface),
+                        None,
+                        None,
+                        RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_NOERASE,
+                    );
+                }
+            }
+        }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_theme_preparation_retains_published_colors_until_layout_is_ready() {
+        let mut seed = super::super::tests::composing_test_app("# unsaved 日本語\nbody\n");
+        seed.clear_composition();
+        seed.doc_mut().replace_selection("x").unwrap();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        unsafe {
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.start_shell();
+                app.features_init();
+                app.ensure_layout().unwrap();
+            }
+            let old = fixture.state.control_colors.borrow().clone().unwrap();
+            let snapshot = |app: &App| {
+                (
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().selection(),
+                )
+            };
+            let before = snapshot(&fixture.state.app.borrow());
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.defer_theme_updates = true;
+                let mut settings = app.shell.settings.clone();
+                settings.theme = ThemeMode::Light;
+                settings
+                    .keybindings
+                    .insert("file.save".into(), "Ctrl+Alt+S".into());
+                app.apply_shell_settings(settings);
+                app.install_shell_menu();
+                app.refresh();
+                assert!(app.theme_update_pending);
+                assert_eq!(app.shell.settings.theme, ThemeMode::Light);
+                assert_eq!(app.shell.settings.keybindings["file.save"], "Ctrl+Alt+S");
+                assert!(Rc::ptr_eq(
+                    &old,
+                    fixture.state.control_colors.borrow().as_ref().unwrap()
+                ));
+                assert!(
+                    app.layout_key.is_some(),
+                    "menu/layout preparation finishes before theme commit"
+                );
+                let prepared_layout = app.layout_key;
+                assert!(app.finish_settings_theme());
+                assert_eq!(
+                    app.layout_key, prepared_layout,
+                    "no layout invalidation after publication"
+                );
+                assert!(!app.defer_theme_updates && !app.theme_update_pending);
+                assert!(!Rc::ptr_eq(
+                    &old,
+                    fixture.state.control_colors.borrow().as_ref().unwrap()
+                ));
+                assert_eq!(snapshot(&app), before);
+                assert!(
+                    !app.finish_settings_theme(),
+                    "one pending application, no repaint loop"
+                );
+            }
+            // Real native WM_PAINT runs only after the exclusive App borrow ends.
+            let list = GetDlgItem(Some(fixture.hwnd), 4690).unwrap();
+            SendMessageW(list, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert_eq!(snapshot(&fixture.state.app.borrow()), before);
+            assert!(!IsWindowVisible(fixture.hwnd).as_bool());
+        }
+    }
 
     #[test]
     fn settings_completion_root_quiescence_after_actual_invalid_apply_notice() {
@@ -3157,6 +3323,106 @@ mod tests {
             SelectObject(dc, previous);
             let _ = DeleteObject(bitmap.into());
             let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn settings_owner_activation_guard_rejects_ineligible_facts() {
+        let settings = HWND(std::ptr::dangling_mut());
+        let owner = HWND(2usize as *mut _);
+        let other = HWND(3usize as *mut _);
+        let valid = OwnerActivationFacts {
+            settings,
+            owner,
+            actual_owner: owner,
+            foreground: settings,
+            settings_thread: 17,
+            owner_thread: 17,
+            current_thread: 17,
+            settings_pid: 23,
+            owner_pid: 23,
+            current_pid: 23,
+            settings_available: true,
+            owner_available: true,
+        };
+        assert!(owner_activation_eligible(valid));
+        for rejected in [
+            OwnerActivationFacts {
+                settings: HWND::default(),
+                ..valid
+            },
+            OwnerActivationFacts {
+                owner: HWND::default(),
+                ..valid
+            },
+            OwnerActivationFacts {
+                owner: settings,
+                actual_owner: settings,
+                ..valid
+            },
+            OwnerActivationFacts {
+                actual_owner: other,
+                ..valid
+            },
+            OwnerActivationFacts {
+                foreground: other,
+                ..valid
+            },
+            OwnerActivationFacts {
+                settings_available: false,
+                ..valid
+            },
+            OwnerActivationFacts {
+                owner_available: false,
+                ..valid
+            },
+            OwnerActivationFacts {
+                current_thread: 0,
+                ..valid
+            },
+            OwnerActivationFacts {
+                settings_thread: 0,
+                ..valid
+            },
+            OwnerActivationFacts {
+                settings_thread: 18,
+                ..valid
+            },
+            OwnerActivationFacts {
+                owner_thread: 18,
+                ..valid
+            },
+            OwnerActivationFacts {
+                current_pid: 0,
+                ..valid
+            },
+            OwnerActivationFacts {
+                settings_pid: 24,
+                ..valid
+            },
+            OwnerActivationFacts {
+                owner_pid: 24,
+                ..valid
+            },
+        ] {
+            assert!(!owner_activation_eligible(rejected));
+        }
+    }
+
+    #[test]
+    fn settings_owner_activation_hidden_fixture_skips_without_activation() {
+        let owner = FormFixture::new();
+        let fixture = FormFixture::new();
+        unsafe {
+            SetWindowLongPtrW(fixture.hwnd, GWLP_HWNDPARENT, owner.hwnd.0 as isize);
+            let _ = EnableWindow(owner.hwnd, false);
+            let active = GetActiveWindow();
+            assert!(!activate_closing_owner(fixture.hwnd, owner.hwnd));
+            assert_eq!(GetActiveWindow(), active);
+            SendMessageW(fixture.hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(!IsWindow(Some(fixture.hwnd)).as_bool());
+            assert!(IsWindowEnabled(owner.hwnd).as_bool());
+            assert_eq!(GetActiveWindow(), active);
         }
     }
 

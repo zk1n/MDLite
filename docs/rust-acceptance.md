@@ -839,3 +839,32 @@ Root確認の初期＋押下中3画像は一貫していたが、実場面の収
 Rev4は利用者の終了指示でUSER_CUTOFF／INCOMPLETEとして保存する。必須受入は未達で、developへの統合は行わない。
 作業branchのみcheckpoint配送する。最後に推奨されたExplorer互換性参照の比較は未実装・未実行のまま停止した。
 表示倍率100%が対象で、150%等は対象外。「本人指示の保留」という旧記述は撤回済みである。
+
+## Rev5 重点確認の到達点（2026年10月21日、部分完了／INCOMPLETE）
+
+Task `20261018-mdlite-live-navigation-ui-git-polish` Revision 5。旧Rev4 snapshotは固定Downloaderでhash検証・保全後、CURRENT/MANIFEST/受領ファイルを検証して更新した。旧checkpoint `6f5530fa0223c05565b8a6a116bfc239692b82e9` と隔離候補を保全し、製品ソースは変更していない。
+
+対象source47は `0faaa0c82009a1bab67d5f3ba2f7bcb2ce6b5de2e3a19db69e09d7e7ff77f917`、EXEは `.codex-runtime/live-navigation-ui-git-polish/rev4-native-tests/target/release/mdlite.exe`、SHA256 `de3087d96b1d7cf83d122e0add74e58c94aa2df6932b359675f47770eb027dd0`。登録済みRelease buildを同一targetで成功させ、同一source/EXEを読戻した（`rev5-build/build-release.json`）。Rootは実runtime `gpt-6.1-sol / medium`、VERIFIED_ROOT。倍率は実96 DPIのみ。
+
+| Rev5の要求 | 確認した動作・証拠 | 到達点と残件 |
+|---|---|---|
+| 通常起動→表示・入力・保存・Undo/Redo | 所有foregroundを既存操作で確立した通常起動の本文/control画像。run `20261021T012413Z-bfd602a07ae64537ad550c19434172bd` で独立期待文字列、保存bytes、Undo/Redo、原bytes復元。保存後50frameは全て正しい追記本文。Undoは最初の1frameだけ旧表示、以降49frameは全て正しい原文 | 観測範囲PASS。初回のEndDraw直後COPYが旧表示だった事実を保持。持続するstaleではなく自然追従を観測した。自律的背景起動・最小化/restore・全条件の即時表示まで主張しない |
+| 左右パネルの切替・代表icon・移動/resize・保存再起動 | グループ配置と左切替は既存UI操作で到達。最終run `20261021T013604Z-a58a0b9b39014eca83b300e2afbe6f52` は右regionの最初のpopup所有確認で停止 | 未完了。変更対象drag・押下中品質・Compact・通常再起動保存は未到達。既知の不採用COMPOSITED除去案のボタン欠落/残像を解消済みにしない。正本で同症状を観測した証拠もない |
+| Settings Apply→Main入力・テーマ遷移 | run `20261021T011845Z-515e851d6d954163b3236a77147fcb45` 選択S02 PASS。42frame全てを画像で確認。dialog閉鎖の透過遷移が消えた後、Main/ExplorerはDarkからLightへ揃って変化し、採取frameにtoolbar白抜け・混色なし。実ATOKの変換/Space候補移動/Esc/Enter/一単位Undo/Redoと保存、profile/open状態復元 | 今回の代表経路PASS。最大COPY開始間隔76.756ms。Apply前半の画面、別閉鎖経路、物理操作・候補popup・Human全体は別未確認 |
+| 共有focus/描画が影響するLive直接編集 | run `20261021T013406Z-f0b8910894bb4665a52bd763c7d01b87` 選択E01 PASS。実caretクリックの原文位置から見出しUnicode、fence言語、開き区切りに直接入力。原文・保存・Undoを独立期待値で確認。52/53/53frameの各PNG同値groupを目視し、言語rustunknownと4backtickに対する未閉鎖code表示を確認 | 今回の代表操作PASS。最初の旧表示frameは保持し、後続の自然追従を確認。Front Matter/全端点/Source-Liveの旧全IDを埋め直した主張ではない。Unicode合成と別runの実ATOKを区別 |
+
+### 検査側の修正と停止判断
+
+登録済みharnessだけを変更した。Rev5 opt-inのMain/Compact実画面採取は、所有・入力focus・遮蔽・固定crop・原文/成功EndDrawの前後対応を維持し、pending完全ゼロを画面採取の前提から外す。EndDrawと実画面提示を同一視せず、既存の受動2秒採取を再利用した。診断LRESULT0はApp借用中の未処理要求であり、queued成功ではない。元の3秒期限内で同じ要求だけを再試行し、各回の所有確認、LRESULT1、新しいtimestamp、既存JSON/selection検証が揃うまで受け入れない。
+
+旧比率FAILは製品不具合ではなく、driverが送る整数pixelの丸めを期待値へ反映しなかった検査誤り。保存済みISOの式を反映し、元のFAILは保持した。新しいRight切替actorの非表示rail113参照は、仕様に沿う既存region109メニュー操作へ訂正した。最初のqueryクリックを使うパレット待ちの停止原因は未確定で、終了前には151が可視だった。最後は登録済みCtrl+K入口へ方法を変更し配置まで到達したが、既存popup厳格所有guardで停止した。これらを製品の入力不能・ボタン欠落の証明にしない。
+
+最終harness SHA256は `29a1b34aa6e08539beca0fc4540a1475202ff907e50dcb6cadaeec1d2e0d9ece`。S02証拠のharnessは `c773591791eadd50696a0dbe444972506328e9ca0452910a098ec21165ab6860`、初回安定表示seriesは `331d9d47e1b8a25d0a2659f3ec4e52fa0e6720f7b7055c51b09b4c5423944796`、Liveは `f533776d565f52c091c8ee60212b96b8637fd237bebc14d587936681dd30db1c`。後続変更はpanel用actor/入口と選択の限定差分で、同一製品source/EXEの成立済み証拠を無効にする変更はない。各runの元receiptとRootのpixel reviewはlocal受入directoryに保持する。
+
+製品変更がないため、同source47を明示したserialized Release BIN314 PASS/10 ignoredと既存Debug314、条件付きLIB150を再利用した。全`-Verify` PASSではなく、既存parallel/LIB fixture失敗は保持する。追加のPowerShell構文・native C#helper compile・guard/期待値・丸め・診断retry反例確認がPASS。実装者のPonytail自己確認と、別Sol Highの静的correctness reviewは別に実施し、checkpoint保存への追加必須修正はない。reviewerは試験を再実行していない。
+
+パネル受入が進まない修正roundを引継ぎ、方法を見直しても最終的に既存popup所有の観測で止まった。guardを緩める代替は採用しない。これ以上の所有観測の調査を今回の小修正として継続せず、部分完了として保存する。単なる時間切れや検査成功による合格ではない。次担当は保持したpopup失敗と同時所有metadataの対応を既存driverで調査し、正確な所有条件を維持した方法を選んで、未到達のpanel/Compact/restartだけを確認する。成立済みの編集/Settings/Liveを担当交代だけで再実行しない。
+
+最終失敗時のmenuはfresh PID/生成時刻/path/hash/HWND/foreground/menu-owner確認後、既存guard付きEscapeを1回だけ送り、fresh clean stateで通常WM_CLOSE。exit0、残processなし。元FAILは不変、cleanupは `rev5-harness-check/panel-keyboard-cleanup.json` に別保存。以前の各runも通常終了済み。
+
+**今回の修正範囲は未完了**。依存するRev4製品変更を安全に分離する大きな切分けは行わず、作業branchのcheckpoint保存・通常配送だけを行う。develop `902dfd17754d45d782508c137c63950b2bc495c4`、main/tag/Release、GitBookの現行Rev3/CR6を保つ。未完了Inboxはcleanupしない。旧U01/U02/U03、W01/W03全背景経路、E08、pin/unpin等は既存の実不具合/未確認区分のまま後続へ残し、元Task全体や全Human受入の合格へ読み替えない。

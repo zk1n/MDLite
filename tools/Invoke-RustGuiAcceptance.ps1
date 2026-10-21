@@ -2,6 +2,7 @@
 param(
     [switch]$UiParity,
     [switch]$Rev3,
+    [switch]$Rev5Observation,
     [string]$Rev3Case = '',
     [switch]$Rev3PanelTargetProbe,
     [switch]$StartupSmoke,
@@ -2744,85 +2745,112 @@ function Get-RemainingDiagnosticMessageTimeoutMs([DateTime]$Deadline) {
 }
 
 function Read-Diagnostic([int]$MessageTimeoutMs = $DiagnosticMessageTimeoutMs) {
-    Assert-OwnedWindow $script:WindowHandle
-    $previousWriteUtc = $null
-    try {
-        if (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf) {
-            $previousWriteUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(0, $MessageTimeoutMs))
+    $lastResultWasDeferred = $false
+    do {
+        Assert-OwnedWindow $script:WindowHandle
+        $remainingMs = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remainingMs -le 0) { break }
+
+        # Bind freshness to this attempt, since a prior deferred request cannot
+        # publish a snapshot after returning through DefWindowProc.
+        $previousWriteUtc = $null
+        try {
+            if (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf) {
+                $previousWriteUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
+            }
+        } catch [IO.IOException] {
+            throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
         }
-    } catch [IO.IOException] {
-        throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
-    }
-    $messageResult = [IntPtr]::Zero
-    $sent = [MdliteRustAcceptanceNative]::SendMessageTimeoutW(
-        $script:WindowHandle, [uint32]$DiagnosticRefreshMessage,
-        [IntPtr]::Zero, [IntPtr]::Zero, [uint32]$SMTO_ABORTIFHUNG,
-        [uint32]$MessageTimeoutMs, [ref]$messageResult)
-    Assert-OwnedWindow $script:WindowHandle
-    if (-not $sent) {
-        throw [TimeoutException]::new('SendMessageTimeout did not complete.')
-    }
-    if ($messageResult.ToInt64() -ne 1) {
-        throw [TimeoutException]::new('WM_APP+1 returned LRESULT 0; the owner-thread refresh was deferred.')
-    }
-    $writeUtc = $null
-    try {
-        if (-not (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf)) {
-            throw [TimeoutException]::new('WM_APP+1 returned 1 but no diagnostic snapshot file exists yet.')
+
+        $messageResult = [IntPtr]::Zero
+        $sendTimeoutMs = [int][Math]::Min($MessageTimeoutMs, $remainingMs)
+        $sent = [MdliteRustAcceptanceNative]::SendMessageTimeoutW(
+            $script:WindowHandle, [uint32]$DiagnosticRefreshMessage,
+            [IntPtr]::Zero, [IntPtr]::Zero, [uint32]$SMTO_ABORTIFHUNG,
+            [uint32]$sendTimeoutMs, [ref]$messageResult)
+        Assert-OwnedWindow $script:WindowHandle
+        if (-not $sent) {
+            throw [TimeoutException]::new('SendMessageTimeout did not complete.')
         }
-        $writeUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
-    } catch [IO.IOException] {
-        throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
-    }
-    if ($null -ne $previousWriteUtc -and $writeUtc -le $previousWriteUtc) {
-        throw [TimeoutException]::new('WM_APP+1 returned 1 but the diagnostic snapshot timestamp did not advance.')
-    }
-    try {
-        $json = [IO.File]::ReadAllText($script:DiagnosticPath, [Text.Encoding]::UTF8)
-    } catch [IO.IOException] {
-        throw [TimeoutException]::new(('Transient diagnostic snapshot I/O: ' + $_.Exception.Message), $_.Exception)
-    }
-    try {
-        $state = $json | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw [TimeoutException]::new(('Diagnostic snapshot JSON is not complete yet: ' + $_.Exception.Message), $_.Exception)
-    }
-    if ($null -eq $state) {
-        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; object is unavailable.')
-    }
-    $sourceProperty = $state.PSObject.Properties['source']
-    $selectionProperty = $state.PSObject.Properties['selection']
-    if ($null -eq $sourceProperty -or $null -eq $selectionProperty -or
-        $null -eq $sourceProperty.Value -or $null -eq $selectionProperty.Value) {
-        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source or selection is unavailable.')
-    }
-    $selection = $selectionProperty.Value
-    if ($sourceProperty.Value -isnot [string]) {
-        throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source is not a string.')
-    }
-    foreach ($name in @('source', 'selection', 'revision', 'dirty', 'undo_count', 'redo_count', 'raw', 'tables', 'ime', 'caret', 'native_caret')) {
-        $property = $state.PSObject.Properties[$name]
-        if ($null -eq $property -or $null -eq $property.Value) {
-            throw [TimeoutException]::new("Diagnostic snapshot is incomplete; missing '$name'.")
+
+        $result = $messageResult.ToInt64()
+        if ($result -eq 0) {
+            $lastResultWasDeferred = $true
+            $remainingMs = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remainingMs -gt 0) {
+                Start-Sleep -Milliseconds ([int][Math]::Min(60, $remainingMs))
+            }
+            continue
         }
-    }
-    foreach ($name in @('anchor', 'head')) {
-        $property = $selection.PSObject.Properties[$name]
-        if ($null -eq $property -or $null -eq $property.Value) {
-            throw [TimeoutException]::new("Diagnostic selection is incomplete; missing '$name'.")
+        if ($result -ne 1) {
+            throw [TimeoutException]::new(('WM_APP+1 returned unexpected LRESULT ' + $result + '.'))
         }
-        if ($property.Value -isnot [int] -and $property.Value -isnot [long]) {
-            throw [TimeoutException]::new("Diagnostic selection is incomplete; '$name' is not an integer.")
+
+        $writeUtc = $null
+        try {
+            if (-not (Test-Path -LiteralPath $script:DiagnosticPath -PathType Leaf)) {
+                throw [TimeoutException]::new('WM_APP+1 returned 1 but no diagnostic snapshot file exists yet.')
+            }
+            $writeUtc = [IO.File]::GetLastWriteTimeUtc($script:DiagnosticPath)
+        } catch [IO.IOException] {
+            throw [TimeoutException]::new(('Transient diagnostic snapshot stat: ' + $_.Exception.Message), $_.Exception)
         }
-    }
-    foreach ($name in @('active', 'preedit', 'open_status')) {
-        $property = $state.ime.PSObject.Properties[$name]
-        if ($null -eq $property -or $null -eq $property.Value) {
-            throw [TimeoutException]::new("Diagnostic IME state is incomplete; missing '$name'.")
+        if ($null -ne $previousWriteUtc -and $writeUtc -le $previousWriteUtc) {
+            throw [TimeoutException]::new('WM_APP+1 returned 1 but the diagnostic snapshot timestamp did not advance.')
         }
+        try {
+            $json = [IO.File]::ReadAllText($script:DiagnosticPath, [Text.Encoding]::UTF8)
+        } catch [IO.IOException] {
+            throw [TimeoutException]::new(('Transient diagnostic snapshot I/O: ' + $_.Exception.Message), $_.Exception)
+        }
+        try {
+            $state = $json | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw [TimeoutException]::new(('Diagnostic snapshot JSON is not complete yet: ' + $_.Exception.Message), $_.Exception)
+        }
+        if ($null -eq $state) {
+            throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; object is unavailable.')
+        }
+        $sourceProperty = $state.PSObject.Properties['source']
+        $selectionProperty = $state.PSObject.Properties['selection']
+        if ($null -eq $sourceProperty -or $null -eq $selectionProperty -or
+            $null -eq $sourceProperty.Value -or $null -eq $selectionProperty.Value) {
+            throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source or selection is unavailable.')
+        }
+        $selection = $selectionProperty.Value
+        if ($sourceProperty.Value -isnot [string]) {
+            throw [TimeoutException]::new('Diagnostic snapshot JSON is incomplete; source is not a string.')
+        }
+        foreach ($name in @('source', 'selection', 'revision', 'dirty', 'undo_count', 'redo_count', 'raw', 'tables', 'ime', 'caret', 'native_caret')) {
+            $property = $state.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value) {
+                throw [TimeoutException]::new("Diagnostic snapshot is incomplete; missing '$name'.")
+            }
+        }
+        foreach ($name in @('anchor', 'head')) {
+            $property = $selection.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value) {
+                throw [TimeoutException]::new("Diagnostic selection is incomplete; missing '$name'.")
+            }
+            if ($property.Value -isnot [int] -and $property.Value -isnot [long]) {
+                throw [TimeoutException]::new("Diagnostic selection is incomplete; '$name' is not an integer.")
+            }
+        }
+        foreach ($name in @('active', 'preedit', 'open_status')) {
+            $property = $state.ime.PSObject.Properties[$name]
+            if ($null -eq $property -or $null -eq $property.Value) {
+                throw [TimeoutException]::new("Diagnostic IME state is incomplete; missing '$name'.")
+            }
+        }
+        Assert-SelectionBoundary $state
+        return $state
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    if ($lastResultWasDeferred) {
+        throw [TimeoutException]::new('WM_APP+1 remained deferred until the diagnostic message deadline expired.')
     }
-    Assert-SelectionBoundary $state
-    return $state
+    throw [TimeoutException]::new('Diagnostic message deadline expired before a refresh completed.')
 }
 
 function Wait-Diagnostic(
@@ -4169,7 +4197,8 @@ function Invoke-UiPaletteCommand([string]$Label, [scriptblock]$Observe = $null) 
     $paletteClock=[Diagnostics.Stopwatch]::StartNew()
     $paletteReceipt=[ordered]@{name='palette command readiness';label=$Label;controls_ready_ms=$null;focus_ready_ms=$null;input=$null;text_budget_ms=$TimeoutMs;text_progress=@();command_closed_ms=$null}
     $script:Report.operations += $paletteReceipt
-    Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 150 -Class 'EDIT'
+    if($Rev5Observation){Send-Key $script:WindowHandle 0x4B ([uint16[]]@(0x11))}
+    else{Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 150 -Class 'EDIT'}
     $query = $null
     $results = $null
     $deadline = [DateTime]::UtcNow.AddMilliseconds(2500)
@@ -5956,7 +5985,7 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
     if ($width -lt 1 -or $height -lt 1 -or $width -gt 7680 -or $height -gt 4320) {
         throw [System.InvalidOperationException]::new('OWNED_WINDOW_CAPTURE_BOUNDS_INVALID')
     }
-    $rev3MainObservation=$Rev3 -and $Window -eq $script:WindowHandle -and
+    $rev3MainObservation=$Rev3 -and ($Window -eq $script:WindowHandle -or ($Rev5Observation -and $Window -eq $script:InputWindowHandle)) -and
         [MdliteRustAcceptanceNative]::WindowClass($Window) -ceq 'MDLiteRustEditor'
     Add-Type -AssemblyName System.Drawing
     $bitmap = [System.Drawing.Bitmap]::new($width, $height)
@@ -5981,6 +6010,24 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
             throw 'ENVIRONMENT_BLOCKED: exact owned HWND lost foreground before client capture.'
         }
         if ($rev3MainObservation) { $captureClock=[Diagnostics.Stopwatch]::StartNew() }
+        if ($Rev5Observation -and $rev3MainObservation) {
+            # Reuse passive source/frame + owned crop/COPY guards; pending damage
+            # is not a prerequisite for observing actual pixels.
+            $readiness.observation_kind='REV5_OWNED_PASSIVE_PIXEL_OBSERVATION'
+            $readiness.quiescence='NOT_ASSERTED'
+            $readiness.fence_admission='NOT_RUN_PASSIVE_OBSERVATION'
+            $readiness.copied_frame_contract='UNCHANGED_SOURCE_AND_MATCHING_MAIN_ENDDRAW_BEFORE_AND_AFTER_COPY'
+            do {
+                Assert-UiOwnedWindow $Window
+                if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) { throw 'OWNERSHIP_GATE: passive Main lost foreground.' }
+                $readiness.after=Get-OwnedCaptureStamp
+                $readiness.frame_observation_state=Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64()
+                if ($readiness.frame_observation_state -cne 'FRAME_PENDING') { break }
+                [void][Threading.Thread]::Yield()
+            } while ($captureClock.Elapsed.TotalMilliseconds -lt 7000)
+            if ($readiness.frame_observation_state -cne 'READY') { throw ('OBSERVER_FAILURE: passive Main source/frame binding: '+$readiness.frame_observation_state) }
+            $readiness.source_revision_binding='MATCH: unchanged source and successful Main EndDraw; pending/quiescence NOT_ASSERTED.'
+        } else {
         try { $readiness.fence=[MdliteRustAcceptanceNative]::FlushOwnedPendingPaint($Window,$script:ProcessId,7000,$true) }
         catch {
             $fenceFailure=$_.Exception
@@ -6036,6 +6083,7 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                 $readiness.source_revision_binding='MATCH: last successful EndDraw identity; visual pixels still require inspection.'
             }
         }
+        }
         if ($rev3MainObservation) {
             Assert-OwnedWindow $Window
             $readiness.ownership_before_copy=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($Window,[IntPtr]::Zero,$script:ProcessId,$bounds)
@@ -6084,7 +6132,7 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
             if (-not $readiness.ownership_after_copy.safe) {
                 throw 'OWNERSHIP_GATE: Rev3 Main crop ownership/opacity/occlusion changed during COPY; image discarded.'
             }
-            $readiness.source_revision_binding='MATCH: unchanged source across all three stamps; matching Main EndDraw POST-FENCE and POST-COPY. Pre-fence frame observed only; layout/children/quiescence unasserted.'
+            $readiness.source_revision_binding='MATCH: unchanged source across all three stamps; matching Main EndDraw before and after COPY. Layout/children/quiescence unasserted.'
         }
         if ($rev3MainObservation -and $captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired before image persistence.' }
         $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -6450,7 +6498,10 @@ function Invoke-Rev4PanelDrag([string]$Name,[string]$PanelId,[switch]$Height) {
     if ($Height) {
         $lower=Get-UiPanelGeometry $before.parent_root 'calendar'
         $weight=$savedBefore.panels[$PanelId].height+$savedBefore.panels.calendar.height
-        $share=($points[-1].y-$rect.y)/($rect.height+$lower.rect.height)
+        $scale=$script:Report.dpi/96.0
+        $deliveredEndPixel=[int][Math]::Round($points[-1].y*$scale)
+        $deliveredEndDip=$deliveredEndPixel/$scale
+        $share=($deliveredEndDip-$rect.y)/($rect.height+$lower.rect.height)
         if ([Math]::Abs($saved.panels[$PanelId].height-$weight*$share) -gt 0.1 -or
             [Math]::Abs($saved.panels.calendar.height-$weight*(1-$share)) -gt 0.1) { throw 'PRODUCT_ASSERTION: released internal ratio was not persisted.' }
     }
@@ -6550,6 +6601,31 @@ function Invoke-Rev4PanelCompactRestart {
     return $fresh
 }
 
+function Select-Rev5RightGroup([ValidateSet('Outline','Calendar')][string]$Representative) {
+    # PanelId/IDS: Explorer=0, Calendar=1, Outline=2. region_group_menu uses 1+ID.
+    $commands=@{Calendar=2;Outline=3};$labels=@{Calendar='カレンダー';Outline='アウトライン'}
+    $before=Read-Diagnostic
+    $left=ConvertTo-Json -InputObject @($before.parent_root.panel_groups | Where-Object side -ceq 'Left') -Depth 8 -Compress
+    Set-OwnedForeground -Window $script:WindowHandle
+    $button=Get-UiControlById $script:WindowHandle 109 'BUTTON' -RequireVisible -RequireEnabled
+    $x=[int](($button.Rect[0]+$button.Rect[2])/2);$y=[int](($button.Rect[1]+$button.Rect[3])/2)
+    if([MdliteRustAcceptanceNative]::U02RightClickOwnedAt($script:WindowHandle,$script:ProcessId,$button.Handle,$x,$y) -ne 2){throw 'INPUT_FAILURE: Right region menu click incomplete.'}
+    $target=Wait-Rev4OwnedPopupItem -CommandId $commands[$Representative]
+    if($target.item.label -cne $labels[$Representative] -or $target.item.disabled){throw 'PRODUCT_ASSERTION: Right group menu command/label differs.'}
+    $selected=$false
+    for($step=0;$step -lt @($before.parent_root.panel_groups|Where-Object side -ceq 'Right').Count;$step++){
+        Send-Rev4OwnedMenuKey 0x28
+        $highlight=Wait-Rev4OwnedPopupItem -Highlighted
+        if($highlight.item.command_id -eq $commands[$Representative]){Send-Rev4OwnedMenuKey 0x0D;$selected=$true;break}
+    }
+    if(-not $selected){throw 'OBSERVER_FAILURE: Right group menu keyboard traversal did not reach expected command.'}
+    Wait-UiWindowGone ([IntPtr][long]$target.item.popup) 1500
+    $after=Wait-UiState {param($s) @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Right' -and $_.active -and $_.representative -ceq $Representative}).Count -eq 1} 'Right region menu selects expected representative'
+    if((ConvertTo-Json -InputObject @($after.parent_root.panel_groups|Where-Object side -ceq 'Left') -Depth 8 -Compress) -cne $left){throw 'PRODUCT_ASSERTION: Right group selection changed Left groups.'}
+    Assert-Rev4PanelDocument $after $before 'Right group menu selection'
+    return $after
+}
+
 function Invoke-Rev3PanelGroups {
     $getMembership = {
         param($state, [string]$side)
@@ -6601,7 +6677,8 @@ function Invoke-Rev3PanelGroups {
             (& $getMembership $state 'Right') -ceq 'Outline:Outline,Git'
     } 'Git joins Outline on Right while Explorer and Search remain on Left'
     $right=ConvertTo-Json -InputObject @($arranged.parent_root.panel_groups | Where-Object side -ceq 'Right') -Depth 8 -Compress
-    for ($round=0;$round -lt 3;$round++) {
+    $rounds=if($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')){1}else{3}
+    for ($round=0;$round -lt $rounds;$round++) {
         [void](Ensure-UiActivityPanel 111)
         $search=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
         if (@($search.parent_root.panel_rects | Where-Object { $_.id -in @('explorer','calendar') -and $_.selected }).Count) { throw 'PRODUCT_ASSERTION: Search must replace the complete left group.' }
@@ -6612,6 +6689,71 @@ function Invoke-Rev3PanelGroups {
         if ((ConvertTo-Json -InputObject @($restored.parent_root.panel_groups | Where-Object side -ceq 'Right') -Depth 8 -Compress) -cne $right) { throw 'PRODUCT_ASSERTION: left switching changed right groups.' }
         if (@(Get-UiOwnedChildren $script:WindowHandle | Where-Object { $_.Id -in @(112,113,114) -and $_.Visible }).Count) { throw 'PRODUCT_ASSERTION: grouped/right-only activity icons were duplicated.' }
         Assert-UiDiagnosticDragInvariants $restored $baseline 'group roundtrip'
+    }
+    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')) {
+        Set-UiActivePanelFromHeader 131
+        Invoke-UiPaletteCommand '右の独立グループへ'
+        $rightSwitch=Read-Diagnostic
+        $leftMembership=& $getMembership $rightSwitch 'Left'
+        foreach($representative in @('Outline','Calendar','Outline')){
+            [void](Select-Rev5RightGroup $representative)
+            $switched=Read-Diagnostic
+            if((& $getMembership $switched 'Left') -cne $leftMembership){throw 'PRODUCT_ASSERTION: Right switching changed Left membership.'}
+            Assert-Rev4PanelDocument $switched $rightSwitch 'Right group switching'
+        }
+        [void](Select-Rev5RightGroup 'Calendar')
+        Set-UiActivePanelFromHeader 131
+        Invoke-UiPaletteCommand '左のグループへ追加'
+        [void](Wait-UiState {param($s) (& $getMembership $s 'Left') -ceq 'Explorer:Explorer,Calendar|Search:Search' -and (& $getMembership $s 'Right') -ceq 'Outline:Outline,Git'} 'Rev5 restores groups after Right switching')
+        [void](Select-Rev5RightGroup 'Outline')
+        [void](Ensure-UiActivityPanel 110)
+        Invoke-Rev4PanelDrag 'rev5-both-left-width' 'explorer'
+        Invoke-Rev4PanelDrag 'rev5-both-right-width' 'outline'
+        Invoke-Rev4PanelDrag 'rev5-both-internal-height' 'explorer' -Height
+        $before=Read-Diagnostic
+        $layout=Get-Rev4SavedPanelState $before
+        $membership=ConvertTo-Json (Get-Rev4PanelState $before) -Depth 12 -Compress
+        $source=[string]$before.source
+        Invoke-UiPaletteCommand 'Compactへ移す'
+        $compactDeadline=[DateTime]::UtcNow.AddMilliseconds(3000);$compact=[IntPtr]::Zero
+        do {
+            $matches=@(Get-UiThreadWindows | Where-Object {$_.Class -ceq 'MDLiteRustEditor' -and $_.Handle -ne $script:WindowHandle -and $_.Title.IndexOf('Compact',[StringComparison]::OrdinalIgnoreCase) -ge 0})
+            if($matches.Count -eq 1){$compact=$matches[0].Handle;break}
+            Start-Sleep -Milliseconds 50
+        } while([DateTime]::UtcNow -lt $compactDeadline)
+        if($compact -eq [IntPtr]::Zero){throw [System.NotSupportedException]::new('COMPACT_WINDOW_UNAVAILABLE')}
+        $script:InputWindowHandle=$compact
+        [void](Read-Diagnostic)
+        $compactInitial=Capture-UiOwnedWindow $compact (Join-Path $script:UiRunDirectory 'rev5-compact-initial.png')
+        Send-Key $compact 0x23 ([uint16[]]@(0x11));Send-UnicodeText 'X' $compact
+        [void](Wait-UiSource ($source+'X') $true)
+        $compactEdited=Capture-UiOwnedWindow $compact (Join-Path $script:UiRunDirectory 'rev5-compact-edited.png')
+        Send-Key $compact 0x5A ([uint16[]]@(0x11))
+        [void](Wait-UiSource $source $false)
+        [void](Send-UiOwnedMessage -Window $compact -Message ([uint32]$WM_CLOSE) -MessageTimeoutMs 1500)
+        Wait-UiWindowGone $compact 3000
+        $script:InputWindowHandle=$script:WindowHandle
+        Set-OwnedForeground -Window $script:WindowHandle
+        $returned=Wait-UiSource $source $false
+        if((ConvertTo-Json (Get-Rev4PanelState $returned) -Depth 12 -Compress) -cne $membership -or (Get-UiSafeFileHash $layout.path) -cne $layout.sha256){throw 'PRODUCT_ASSERTION: Rev5 Compact changed layout.'}
+        $script:Rev4PanelProof['compact']=@{initial=$compactInitial;edited=$compactEdited;input_undone=$true;layout_preserved=$true}
+        $identity=Get-OwnedActivationState $script:WindowHandle
+        Invoke-Rev3QualifiedNormalClose
+        foreach($path in $script:Rev4PanelProof.disk_before.Keys){if((Get-UiSafeFileHash $path) -cne $script:Rev4PanelProof.disk_before[$path]){throw 'PRODUCT_ASSERTION: Rev5 close changed document bytes.'}}
+        if((Get-UiSafeFileHash $layout.path) -cne $layout.sha256){throw 'PRODUCT_ASSERTION: Rev5 close changed layout.'}
+        $diagnostic=Join-Path $script:UiRunDirectory 'rev5-restart-diagnostic.json'
+        Start-UiParityProcess (@($script:UiFixtureRoot)+@($script:UiInitialDocPaths)+@($script:UiInitialDocPaths[0])) $diagnostic
+        [void](Wait-UiState {param($s) $s.tabs -eq 9 -and -not $s.dirty -and $s.undo_count -eq 0 -and $s.redo_count -eq 0} 'Rev5 normal restart clean nine tabs' 15000)
+        if((Get-OwnedActivationState $script:WindowHandle).target_creation_utc -ceq $identity.target_creation_utc){throw 'OWNERSHIP_GATE: Rev5 restart did not create a fresh process.'}
+        foreach($name in $script:UiDocumentSources.Keys){
+            $doc=Switch-UiSource $script:UiDocumentSources[$name] 9
+            if($doc.dirty -or $doc.undo_count -ne 0 -or $doc.redo_count -ne 0){throw 'PRODUCT_ASSERTION: Rev5 restart lost clean document history.'}
+        }
+        $fresh=Switch-UiSource $source 9
+        $saved=Get-Rev4SavedPanelState $fresh
+        if((ConvertTo-Json (Get-Rev4PanelState $fresh) -Depth 12 -Compress) -cne $membership -or $saved.sha256 -cne $layout.sha256){throw 'PRODUCT_ASSERTION: Rev5 restart lost panel state.'}
+        $capture=Capture-UiOwnedWindow $script:WindowHandle (Join-Path $script:UiRunDirectory 'rev5-restarted-panels.png')
+        return @{rounds=$rounds;arranged=$arranged.parent_root;drag=$script:Rev4PanelProof.drag;compact=$script:Rev4PanelProof.compact;restart=@{before=$identity;after=Get-OwnedActivationState $script:WindowHandle;layout=$saved;capture=$capture};visual_acceptance='PENDING_ROOT_PIXEL_REVIEW';four_states='NOT_RUN'}
     }
     if ($Rev3Case -ceq 'P01_MIGRATION_RESTART_DRAG') { $baseline=Invoke-Rev4PanelCompactRestart }
     $frames=@()
@@ -7930,11 +8072,73 @@ function Invoke-Rev4U02U03Focused {
     return $proof
 }
 
+function Observe-Rev5StableSource([string]$Name,[string]$ExpectedSource) {
+    $before=Get-OwnedCaptureStamp -IncludeState
+    $expectedHash=Get-UiTextSha256 $ExpectedSource
+    if(-not $before.available -or $before.source_sha256 -cne $expectedHash){throw 'OBSERVER_FAILURE: stable series source baseline mismatch.'}
+    $record=[ordered]@{name=$Name;expected_source_sha256=$expectedHash;source_stable=$false;passive=$null;visual_acceptance='PENDING_ROOT_PIXEL_REVIEW'}
+    $script:Report['rev5_stable_source_series']+=,$record
+    $record.passive=Invoke-S02PassiveClose $Name ([IntPtr]::Zero) ([int[]]@(0,0)) $script:S02FixedMainBounds 'StartupControl'
+    if(-not $record.passive.startup_coverage -or $record.passive.paint_forced){throw 'OBSERVER_FAILURE: stable series lacks unforced coverage.'}
+    foreach($frame in $record.passive.frames){
+        if(-not $frame.copied){throw 'OWNERSHIP_GATE: stable series contains an uncaptured/unsafe frame.'}
+        foreach($stamp in @($frame.stamp,$frame.stamp_after)){
+            if(-not $stamp.available){throw 'OBSERVER_FAILURE: stable series stamp unavailable.'}
+            foreach($key in @('document_id','revision','source_sha256','selection','dirty','undo_count','redo_count','scroll')){
+                if((ConvertTo-Json $stamp[$key] -Compress) -cne (ConvertTo-Json $before[$key] -Compress)){throw ('OBSERVER_FAILURE: stable series changed '+$key)}
+            }
+        }
+    }
+    $record.source_stable=$true
+    return $record
+}
+
 function Invoke-Rev3FocusedCases($StartupState) {
     $script:Report['native_editor_focus_checks']=@()
     $script:Report['rev3_acceptance']='PARTIAL: case PASS means observed assertions only; visual review, actual DPI matrix and physical IME remain separate.'
     $script:Report['rev3_selected_case']=if ([string]::IsNullOrWhiteSpace($Rev3Case)) { 'ALL' } else { $Rev3Case }
-    if($Rev3Case -cin @('STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')){
+    if($Rev3Case -ceq 'REV5_PANEL_REMAINDER'){
+        if(-not $Rev5Observation){throw 'REV5_CASE_REQUIRES_PASSIVE_OBSERVATION'}
+        $script:Rev4PanelProof=[ordered]@{drag=@();disk_before=[ordered]@{}}
+        $script:Report['held_drag_waypoints']=@()
+        foreach($path in $script:UiInitialDocPaths){$script:Rev4PanelProof.disk_before[$path]=Get-UiSafeFileHash $path}
+        $script:Report['rev5_panel_proof']=$script:Rev4PanelProof
+        [void](Invoke-UiParityCase 'REV5_PANEL_REMAINDER' {Invoke-Rev3PanelGroups})
+    } elseif($Rev3Case -ceq 'REV5_STARTUP_EDIT_PANELS'){
+        if(-not $Rev5Observation){throw 'REV5_CASE_REQUIRES_PASSIVE_OBSERVATION'}
+        [void](Invoke-UiParityCase 'REV5_STARTUP_EDIT_PANELS' {
+            $script:Report['rev5_stable_source_series']=@()
+            $source=[string]$script:UiDocumentSources['doc-00.md']
+            $before=Switch-UiSource $source 9
+            $fixture=Join-Path $script:UiFixtureRoot 'doc-00.md'
+            $disk=Get-UiSafeFileHash $fixture
+            Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
+            $insert=' rev5'
+            Send-UnicodeText $insert
+            $edited=Wait-UiSource ($source+$insert) $true
+            $budget=[int]$edited.undo_count-[int]$before.undo_count
+            if($budget -lt 1 -or $budget -gt $insert.Length){throw 'OBSERVER_FAILURE: Rev5 Undo budget invalid.'}
+            Save-ActiveFixture ($source+$insert) $fixture
+            $editCapture=Capture-UiOwnedWindow $script:WindowHandle (Join-Path $script:UiRunDirectory 'rev5-edited-saved.png')
+            $editSeries=Observe-Rev5StableSource 'Rev5SavedEdit' ($source+$insert)
+            for($i=0;$i -lt $budget;$i++){Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))}
+            [void](Wait-UiSource $source $true)
+            $undoCapture=Capture-UiOwnedWindow $script:WindowHandle (Join-Path $script:UiRunDirectory 'rev5-undone.png')
+            $undoSeries=Observe-Rev5StableSource 'Rev5Undone' $source
+            for($i=0;$i -lt $budget;$i++){Send-Key $script:WindowHandle 0x59 ([uint16[]]@(0x11))}
+            [void](Wait-UiSource ($source+$insert) $false)
+            for($i=0;$i -lt $budget;$i++){Send-Key $script:WindowHandle 0x5A ([uint16[]]@(0x11))}
+            [void](Wait-UiSource $source $true)
+            Send-Key $script:WindowHandle 0x23 ([uint16[]]@(0x11))
+            Save-ActiveFixture $source $fixture
+            if((Get-UiSafeFileHash $fixture) -cne $disk){throw 'PRODUCT_ASSERTION: Rev5 restored bytes differ.'}
+            $script:Rev4PanelProof=[ordered]@{drag=@();disk_before=[ordered]@{}}
+            $script:Report['held_drag_waypoints']=@()
+            foreach($path in $script:UiInitialDocPaths){$script:Rev4PanelProof.disk_before[$path]=Get-UiSafeFileHash $path}
+            $script:Report['rev5_panel_proof']=$script:Rev4PanelProof
+            @{edit_capture=$editCapture;undo_capture=$undoCapture;edit_series=$editSeries;undo_series=$undoSeries;undo_redo_steps=$budget;restored_disk_sha256=$disk;input='Unicode SendInput; physical/IME NOT_ASSERTED';panels=Invoke-Rev3PanelGroups}
+        })
+    } elseif($Rev3Case -cin @('STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')){
         Invoke-StartupFenceComparison $StartupState
         foreach($id in @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS')){Add-UiParityCase $id 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $null}
     } elseif ($Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') {
@@ -8025,21 +8229,27 @@ function Invoke-Rev3FocusedCases($StartupState) {
     $panelCasePassed=Invoke-UiParityCase 'P01_P04_GROUPS' { Invoke-Rev3PanelGroups }
     if ($Rev3Case -ceq 'P01_MIGRATION_RESTART_DRAG' -and -not $panelCasePassed) { throw 'P01_MIGRATION_RESTART_DRAG_STOPPED_PROCESS_RETAINED' }
     [void](Invoke-UiParityCase 'E01_E04_DIRECT_LIVE' {
+        if($Rev5Observation){$script:Report['rev5_stable_source_series']=@()}
         $source=[string]$script:UiDocumentSources['doc-08.md']
         $state=Switch-UiSource $source 9
         if ($state.raw) { Invoke-UiPaletteCommand 'ソース / Live 切替' }
         $evidence=@()
         # Navigate to a known source byte, then directly click its actual native caret point.
         # Input expectation is computed from the resulting hit-test, never forced to a line origin.
-        foreach ($target in @(2,$source.IndexOf('rust'))) {
+        $targets=@(2,$source.IndexOf('rust'))
+        if($Rev5Observation){$targets+= $source.IndexOf('```rust')}
+        foreach ($target in $targets) {
+            $delimiter=$Rev5Observation -and $target -eq $source.IndexOf('```rust')
             Send-Key $script:WindowHandle 0x24 ([uint16[]]@(0x11))
             if ($target -eq 2) {
                 Send-Key $script:WindowHandle 0x23
             } else {
                 for ($i=0;$i -lt 4;$i++) { Send-Key $script:WindowHandle 0x28 ([uint16[]]@(0x11)) }
                 Send-Key $script:WindowHandle 0x23
+                if($delimiter){Send-Key $script:WindowHandle 0x24;Send-Key $script:WindowHandle 0x27}
             }
             $expectedCaret=if ($target -eq 2) { [Text.Encoding]::UTF8.GetByteCount($source.Split([char]10)[0].TrimEnd([char]13)) } else { [Text.Encoding]::UTF8.GetByteCount($source.Substring(0,$source.IndexOf('```rust')+7)) }
+            if($delimiter){$expectedCaret=[Text.Encoding]::UTF8.GetByteCount($source.Substring(0,$source.IndexOf('```rust')+1))}
             $before=Wait-UiState { param($value) [int]$value.selection.anchor -eq $expectedCaret -and [int]$value.selection.head -eq $expectedCaret } 'queued navigation reached the direct-edit source point'
             Assert-EditorRecoveryViewGeometryMetadata $before
             $point=Get-EditorRecoveryCaretDipPoint $before 'Rev3 direct source click'
@@ -8051,13 +8261,16 @@ function Invoke-Rev3FocusedCases($StartupState) {
             $lineStart=if ($target -eq 2) { 0 } else { [Text.Encoding]::UTF8.GetByteCount($source.Substring(0,$source.IndexOf('```rust'))) }
             $lineEnd=if ($target -eq 2) { [Text.Encoding]::UTF8.GetByteCount($source.Split([char]10)[0]) } else { $lineStart+7 }
             if ($byte -lt $lineStart -or $byte -gt $lineEnd) { throw 'PRODUCT_ASSERTION: direct pointer hit left the intended heading/fence info line.' }
+            if($delimiter -and ($byte -lt $lineStart -or $byte -gt $lineStart+3)){throw 'PRODUCT_ASSERTION: direct pointer hit left the fence delimiter.'}
             $bytes=[Text.Encoding]::UTF8.GetBytes($source)
             $char=[Text.Encoding]::UTF8.GetString($bytes,0,$byte).Length
             $insert=if ($target -eq 2) { 'A日本語' } else { 'unknown' }
+            if($delimiter){$insert='`'}
             Send-UnicodeText $insert
             $edited=Wait-UiSource ($source.Insert($char,$insert)) $true
             $path=Join-Path $script:UiRunDirectory ('rev3-live-'+$target+'.png')
             $capture=Capture-UiOwnedWindow $script:WindowHandle $path
+            $directSeries=if($Rev5Observation){Observe-Rev5StableSource ('Rev5DirectLive-'+$target) ($source.Insert($char,$insert))}else{$null}
             Send-Key $script:WindowHandle 0x53 ([uint16[]]@(0x11))
             [void](Wait-UiSource ([string]$edited.source) $false)
             $fixture=Join-Path $script:UiFixtureRoot 'doc-08.md'
@@ -8068,7 +8281,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
             [void](Wait-UiSource $source $true)
             Send-Key $script:WindowHandle 0x53 ([uint16[]]@(0x11))
             [void](Wait-UiSource $source $false)
-            $evidence+=@{ target=$target; actual_byte=$byte; caret=$point; capture=$capture; path=$path; views=$before.views }
+            $evidence+=@{ target=$target; actual_byte=$byte; caret=$point; capture=$capture; series=$directSeries; path=$path; views=$before.views }
         }
         @{ direct_clicks=$evidence; unicode_input='SendInput Unicode, not physical IME'; gutter_and_literal_pixels='PENDING'; full_fence_delimiter_matrix='NOT_RUN'; front_matter='NOT_RUN' }
     })
@@ -8375,6 +8588,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
 }
 
 function Invoke-UiParitySuite {
+    if($Rev5Observation -and -not $Rev3){throw 'Rev5Observation requires -Rev3.'}
     if ($Rev3PanelTargetProbe) {
         if (-not $Rev3) { throw 'Rev3PanelTargetProbe requires -Rev3.' }
         $Rev3Case='PANEL_TARGET_PROBE'
@@ -8449,6 +8663,7 @@ function Invoke-UiParitySuite {
     )
     if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds }; if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') { $caseIds = @('PAINT_DEPENDENCY_PROBE') + $caseIds } }
     if ($Rev3 -and $Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') { $caseIds = @('SETTINGS_ENUMERATION_PROBE') + $caseIds }
+    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')) { $caseIds=@($Rev3Case) }
     if ($Rev3 -and $Rev3Case -cin @('S01_FORM_FIELDS','S01_FIELDS_COLOR')) { $caseIds = @('S01_FORM_FIELDS') + $caseIds }
     if($Rev3 -and $Rev3Case -cin @('STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')){$caseIds=@('STARTUP_FENCE_COMPARISON')+$caseIds}
     if ($StartupSmoke) {
@@ -8473,6 +8688,7 @@ function Invoke-UiParitySuite {
         } 'owned startup with nine unique tabs and one duplicate path' 15000
         $script:Report.tabs = [int]$initial.tabs
         $script:Report.active_input_profile = $initial.active_input_profile
+        if($Rev5Observation -and $script:Report.dpi -ne 96){throw 'REV5_REQUIRES_100_PERCENT_DPI'}
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
         if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S01_FORM_FIELDS','S01_FIELDS_COLOR','U02_U03_FOCUSED','STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')) {
             Assert-OwnedWindow $script:WindowHandle
@@ -9267,6 +9483,10 @@ function Invoke-UiParitySuite {
             if ([string]::IsNullOrWhiteSpace([string]$script:Report.failure_code)) {
                 $script:Report.failure_code = $script:Report.proof_invalidators[0] + '_DURING_RUN'
             }
+        }
+        if($Rev5Observation -and $script:Report.status -ne 'PASS' -and $null -ne $script:Process -and -not $script:Process.HasExited){
+            try { Invoke-Rev3QualifiedNormalClose }
+            catch { $script:Report['rev5_failure_cleanup_error']=$_.Exception.Message }
         }
         if ($null -ne $script:Process) {
             try {

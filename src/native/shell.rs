@@ -1984,17 +1984,19 @@ impl App {
                 && state.owns_paint_surface(self.shell.main_window)
             {
                 let buttons = Rc::new(self.shell_button_paint());
+                let git_buttons = self.git_button_paint();
                 // Replace every ready slot before dropping any retired GDI
                 // resource. No RefCell guard spans a native callback.
                 let colors = state
                     .control_colors
                     .replace(Some(Rc::clone(&self.shell.colors)));
                 let buttons = state.shell_button_paint.replace(Some(buttons));
+                let git_buttons = state.git_button_paint.replace(git_buttons);
                 let explorer = self
                     .staged_explorer_paint
                     .take()
                     .map(|next| state.explorer_paint.replace(next));
-                drop((colors, buttons, explorer));
+                drop((colors, buttons, git_buttons, explorer));
             }
         }
     }

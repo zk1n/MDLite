@@ -5,6 +5,18 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## Rev6候補：Git button描画の借用中処理漏れ（2026年10月21日）
+
+Git hostから転送されるowner-draw要求が、App借用中かつenabled状態不変の場合に未処理となる経路を、
+既存native fixtureで再現した。Gitの7操作buttonのimmutableな描画状態をnative配置前に公開し、
+既存の所有同定・描画器・themeの確定時期・window破棄時の失効を維持して処理する候補へ修正した。
+TrustやGit操作の有効条件、文書source／保存／履歴の契約は変更しない。
+
+関連native 9試験、Clippy、format、登録Release buildは成立した。実画面の最終候補確認、
+親panel titleの欠落とSettings後の提示遅延、drag／Compact／配置復元の受入は別に判定する。
+この候補は未統合で、現行develop `902dfd17754d45d782508c137c63950b2bc495c4` と
+GitBookのRev3統合済み節／CR6の扱いを変更しない。最終到達点は受入記録とHANDOFFに従う。
+
 ## 2026年10月19日・Rev2候補の下書き
 
 製品source local commit `7847b04688b57a9216a9c402d7ef88fac65f6cd5` の候補契約と検証境界を、
@@ -111,3 +123,5 @@ GitBookの公開仕様へ受入済みとして反映しない。
 | 構成と検証の境界 | source／EXE／harnessの対応、借用中の再描画、機械・GUI・IMEの証拠 | 修正前の失敗と限定回帰を保持し、最終buildの実測結果と未確認条件を分ける。 |
 
 章名は2026年10月18日の現行GitBookでも照合した。今回の新しい受入結果は、最終buildのGUI・機械検証とreviewを確定してから反映する。Rev3製品source commitは`6d84d8c9762fa8857e141deb82ff38d8f9b27f78`。統合・公開の実結果は最終HANDOFFに記録する。
+
+Rev6最終候補はsource47 efed05695df9375e843006fdfbea111784ac772a74178408fd15576f7b87a909、EXE15c3e041ff0102e38c51158e06c2507ee128a7291fbb220bdd975d3acfef0e94、harness05957f223d35f4d19f6de300dfd4c12a39326cbe8f8fd11c1d70893e24edceae。Git借用中描画の限定修正とnative9件、親damage保持1件、lint/buildを確認した。Git通常／狭幅の暗背景glyph、TitlebarClose後の文字・Undo機能は実確認したが、約678–699msのΩ画面反映遅れ、親見出し欠落とpanel／Compact／restart／Calendarの残件を保持する。先行「both-hidden本文空白」「Escape残像継続」の誤注記はSol直接表示auditで撤回した。根拠付き未完了checkpointとしdevelopへ未統合。新CR7 `fkQ2xRsXyzfbDP89y6SX` はdraftの候補節だけ、現行Rev3／merged CR6は変更しない。

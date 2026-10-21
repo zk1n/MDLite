@@ -506,6 +506,7 @@ struct WindowState {
     deferred_control_redraw: Cell<bool>,
     button_paint: RefCell<Option<Rc<shell::OwnerButtonPaint>>>,
     shell_button_paint: RefCell<Option<Rc<shell::ShellButtonPaint>>>,
+    git_button_paint: RefCell<Option<Rc<Vec<shell::OwnerButtonPaint>>>>,
     control_colors: RefCell<Option<Rc<shell::ControlColors>>>,
     menu_paint: RefCell<Vec<Rc<menu_style::MenuPaint>>>,
     explorer_paint: features::ExplorerPaintSlot,
@@ -534,6 +535,7 @@ impl WindowState {
             deferred_control_redraw: Cell::new(false),
             button_paint: RefCell::new(None),
             shell_button_paint: RefCell::new(None),
+            git_button_paint: RefCell::new(None),
             control_colors: RefCell::new(None),
             menu_paint: RefCell::new(Vec::new()),
             explorer_paint,
@@ -1362,6 +1364,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if state.main_window.get() == hwnd {
                     record_phase(&state.phase_trace, "main.destroy", "nc_destroy");
                     state.shell_button_paint.borrow_mut().take();
+                    state.git_button_paint.borrow_mut().take();
                     let retired = state.explorer_paint.replace(None);
                     drop(retired);
                 }
@@ -1566,6 +1569,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                             )))
                     {
                         return LRESULT(1);
+                    }
+                }
+                let paints = state.git_button_paint.borrow().clone();
+                if let Some(paints) = paints
+                    && state.owns_paint_surface(hwnd)
+                {
+                    let item = &*(lp.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+                    for paint in paints.iter() {
+                        if let Some(button) = paint.state(hwnd, wp.0, item) {
+                            shell::draw_owner_button(paint.tokens, item, &button);
+                            return LRESULT(1);
+                        }
                     }
                 }
                 // Keep IME observation above this branch unchanged. Clone the
@@ -11681,6 +11696,131 @@ mod tests {
         }
     }
 
+    #[test]
+    fn borrowed_update_window_retains_title_outline_damage_until_normal_replay() {
+        let foreground = unsafe { GetForegroundWindow() };
+        let fixture = visible_paint_fixture("# Outline damage fixture\nunchanged body😀\n");
+        fixture.state.main_window.set(fixture.hwnd);
+        let (title, outline, dpi) = {
+            let mut app = fixture.state.app.borrow_mut();
+            unsafe { app.start_shell() };
+            app.focus_feature_panel(mdlite::panel::PanelId::Outline);
+            assert!(unsafe { app.shell_command(162) }); // Existing Right-independent-group command.
+            unsafe { app.refresh() };
+            let explorer = app.shell.panels[mdlite::panel::PanelId::Explorer as usize].1;
+            let outline = app.shell.panels[mdlite::panel::PanelId::Outline as usize].1;
+            assert!(
+                explorer.width > 50. && outline.width > 50.,
+                "fixture must expose both paint domains"
+            );
+            let pixels = |r: mdlite::panel::Rect, top: f32, bottom: f32| RECT {
+                left: ((r.x + 8.) * app.dpi).round() as i32,
+                top: ((r.y + top) * app.dpi).round() as i32,
+                right: ((r.x + r.width - 40.) * app.dpi).round() as i32,
+                bottom: ((r.y + bottom) * app.dpi).round() as i32,
+            };
+            (
+                pixels(explorer, 4., 26.),
+                pixels(outline, 32., 78.),
+                app.dpi,
+            )
+        };
+        unsafe {
+            replay_deferred_paints(&fixture.state);
+            let _ = UpdateWindow(fixture.hwnd);
+            let before = document_state(fixture.state.app.borrow().doc());
+            let before_frame = fixture
+                .state
+                .app
+                .borrow()
+                .painted_frame
+                .expect("initial fixture frame");
+            let mut pending = RECT::default();
+            assert!(
+                !GetUpdateRect(fixture.hwnd, Some(&mut pending), false).as_bool(),
+                "fixture baseline must start without unrelated Main damage"
+            );
+            assert_eq!(fixture.state.deferred_paints.get(), [None, None]);
+            PAINT_TEST.with(|state| *state.borrow_mut() = PaintTestState::default());
+            let merged = RECT {
+                left: title.left.min(outline.left),
+                top: title.top.min(outline.top),
+                right: title.right.max(outline.right),
+                bottom: title.bottom.max(outline.bottom),
+            };
+            {
+                let app = fixture.state.app.borrow_mut();
+                for region in [title, outline] {
+                    assert!(InvalidateRect(Some(fixture.hwnd), Some(&region), false).as_bool());
+                    let _ = UpdateWindow(fixture.hwnd);
+                    assert_eq!(
+                        app.painted_frame,
+                        Some(before_frame),
+                        "borrowed BeginPaint/EndPaint cannot publish a frame"
+                    );
+                    assert!(
+                        !GetUpdateRect(fixture.hwnd, Some(&mut pending), false).as_bool(),
+                        "borrowed delivery validates native damage"
+                    );
+                }
+                assert_eq!(
+                    fixture.state.deferred_paints.get(),
+                    [Some((fixture.hwnd, merged)), None],
+                    "actual borrowed WM_PAINT retains the union of both damaged domains"
+                );
+                PAINT_TEST.with(|state| {
+                    assert_eq!(
+                        state.borrow().began,
+                        0,
+                        "borrowed route never starts D2D drawing"
+                    )
+                });
+                assert_eq!(document_state(app.doc()), before);
+            }
+            replay_deferred_paints(&fixture.state);
+            assert_eq!(fixture.state.deferred_paints.get(), [None, None]);
+            assert!(GetUpdateRect(fixture.hwnd, Some(&mut pending), false).as_bool());
+            assert_eq!(
+                pending, merged,
+                "replay restores precisely the retained native damage"
+            );
+            assert_eq!(
+                fixture.state.app.borrow().painted_frame,
+                Some(before_frame),
+                "replay schedules ordinary painting without drawing synchronously"
+            );
+            let _ = UpdateWindow(fixture.hwnd);
+            let app = fixture.state.app.borrow();
+            let after = app.painted_frame.expect("ordinary replay frame");
+            assert!(after.sequence > before_frame.sequence);
+            assert_eq!(
+                (after.hwnd, after.document_id, after.revision),
+                (
+                    fixture.hwnd.0 as usize,
+                    before_frame.document_id,
+                    before_frame.revision
+                )
+            );
+            PAINT_TEST.with(|state| {
+                let state = state.borrow();
+                let damage = state.damage.expect("ordinary D2D damage binding");
+                assert!(state.began > 0 && state.ended > 0);
+                assert!(
+                    damage.left <= merged.left as f32 / dpi
+                        && damage.top <= merged.top as f32 / dpi
+                        && damage.right >= merged.right as f32 / dpi
+                        && damage.bottom >= merged.bottom as f32 / dpi,
+                    "ordinary paint must cover both retained regions"
+                );
+            });
+            assert_eq!(document_state(app.doc()), before);
+            assert_eq!(GetForegroundWindow(), foreground);
+            eprintln!(
+                "borrowed UpdateWindow title={title:?} outline={outline:?} retained={merged:?}; frame {} -> {}; ordinary damage replay covered both regions; screen pixels NOT_ASSERTED",
+                before_frame.sequence, after.sequence
+            );
+        }
+    }
     #[test]
     fn deferred_parent_paint_merges_owned_surfaces_and_preserves_editor_state() {
         let fixture = EditorFixture::new("body", false);

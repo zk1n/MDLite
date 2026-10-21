@@ -714,15 +714,35 @@ public static class MdliteRustAcceptanceNative
 
     public static Dictionary<string, object>[] U02ReadPopupItems(IntPtr popup, IntPtr main, uint pid, int[] crop)
     {
-        if (WindowClass(popup) != "#32768" || !IsU02OwnedMenuOverlay(popup, main, pid, crop))
+        return U02ReadPopupItems(popup, main, pid, crop, new Dictionary<string, object>());
+    }
+
+    public static Dictionary<string, object>[] U02ReadPopupItems(IntPtr popup, IntPtr main, uint pid, int[] crop,
+        Dictionary<string, object> observation)
+    {
+        observation["started_utc"] = DateTime.UtcNow.ToString("o");
+        observation["popup"] = popup.ToInt64(); observation["menu"] = "UNKNOWN"; observation["items"] = "UNKNOWN";
+        var entry = new Dictionary<string, object>(); observation["entry_gate"] = "UNKNOWN";
+        try {
+        string popupClass = WindowClass(popup); observation["popup_class"] = popupClass;
+        if (popupClass != "#32768")
+            throw new InvalidOperationException("OWNERSHIP_GATE: exact active owned popup required.");
+        observation["entry_gate"] = entry;
+        if (!IsU02OwnedPopupForInput(popup, main, pid, crop, entry))
             throw new InvalidOperationException("OWNERSHIP_GATE: exact active owned popup required.");
         U02MENUBARINFO bar = new U02MENUBARINFO(); bar.cbSize = (uint)Marshal.SizeOf(typeof(U02MENUBARINFO));
-        if (!GetMenuBarInfo(popup, -4, 0, ref bar) || bar.hMenu == IntPtr.Zero)
-            throw new InvalidOperationException("OBSERVER_FAILURE: documented popup OBJID_CLIENT menu unavailable; win32=" + Marshal.GetLastWin32Error());
+        bool barOk = GetMenuBarInfo(popup, -4, 0, ref bar);
+        observation["menu_bar_info_ok"] = barOk;
+        if (!barOk) observation["menu_bar_info_win32_error"] = Marshal.GetLastWin32Error();
+        observation["menu"] = bar.hMenu.ToInt64();
+        if (!barOk || bar.hMenu == IntPtr.Zero)
+            throw new InvalidOperationException("OBSERVER_FAILURE: documented popup OBJID_CLIENT menu unavailable.");
         int count = GetMenuItemCount(bar.hMenu);
+        observation["item_count"] = count;
         if (count < 1 || count > 128) throw new InvalidOperationException("OBSERVER_FAILURE: native menu count out of bound.");
         RECT popupRect; if (!GetWindowRect(popup, out popupRect)) throw new InvalidOperationException("OWNERSHIP_GATE");
         var items = new List<Dictionary<string, object>>();
+        observation["items"] = items;
         for (uint i = 0; i < count; i++) {
             U02MENUITEMINFO item = new U02MENUITEMINFO(); item.cbSize = (uint)Marshal.SizeOf(typeof(U02MENUITEMINFO));
             item.fMask = 0x107; // ID, STATE, SUBMENU, FTYPE: never dereference owner-draw item data.
@@ -755,9 +775,16 @@ public static class MdliteRustAcceptanceNative
             });
         }
         U02MENUBARINFO after = new U02MENUBARINFO(); after.cbSize = bar.cbSize;
-        if (!IsU02OwnedMenuOverlay(popup, main, pid, crop) || !GetMenuBarInfo(popup,-4,0,ref after) || after.hMenu != bar.hMenu)
+        var afterGate = new Dictionary<string, object>(); observation["after_gate"] = afterGate;
+        if (!IsU02OwnedPopupForInput(popup, main, pid, crop, afterGate) || !GetMenuBarInfo(popup,-4,0,ref after) || after.hMenu != bar.hMenu)
             throw new InvalidOperationException("OWNERSHIP_GATE: native popup changed during item readback.");
+        observation["completed_utc"] = DateTime.UtcNow.ToString("o");
         return items.ToArray();
+        } catch (Exception error) {
+            observation["failed_utc"] = DateTime.UtcNow.ToString("o");
+            error.Data["U02PopupObservation"] = observation;
+            throw;
+        }
     }
 
     public static Dictionary<string, object> U02HoverDisabledItem(IntPtr popup, IntPtr main, uint pid, int[] crop, uint command)
@@ -813,27 +840,182 @@ public static class MdliteRustAcceptanceNative
     // U02 only: exact enumerated menu/tooltip/associated-shadow HWNDs, never a class-wide allowance.
     public static bool IsU02OwnedMenuOverlay(IntPtr surface, IntPtr main, uint pid, int[] crop)
     {
-        if (crop == null || crop.Length != 4 || !IsOwnedWindow(main, pid) || !IsOwnedWindow(surface, pid) ||
-            !IsWindowVisible(surface) || WindowClass(main) != "MDLiteRustEditor" || GetForegroundWindow() != main) return false;
-        if (WindowClass(surface) == "SysShadow") return U02OwnedShadowPopup(surface,main,pid,crop) != 0;
+        return IsU02OwnedMenuOverlay(surface, main, pid, crop, new Dictionary<string, object>());
+    }
+
+    private static bool U02Gate(Dictionary<string, object> observation, string name, object actual, object expected, bool pass)
+    {
+        observation[name] = new Dictionary<string, object> {
+            {"observed_utc", DateTime.UtcNow.ToString("o")}, {"actual", actual}, {"expected", expected}, {"result", pass ? "PASS" : "FAIL"}
+        };
+        if (!pass) observation["failed_condition"] = name;
+        return pass;
+    }
+
+    // Same evaluation as the boolean gate: later short-circuited conditions remain UNKNOWN.
+    public static bool IsU02OwnedMenuOverlay(IntPtr surface, IntPtr main, uint pid, int[] crop, Dictionary<string, object> observation)
+    {
+        return EvaluateU02MenuOwnership(surface,main,pid,crop,true,observation);
+    }
+
+    public static bool IsU02OwnedPopupForInput(IntPtr popup, IntPtr main, uint pid, int[] crop, Dictionary<string, object> observation)
+    {
+        if (!EvaluateU02MenuOwnership(popup,main,pid,crop,false,observation)) return false;
+        string popupClass = WindowClass(popup);
+        if (!U02Gate(observation,"input_popup_class",popupClass,"#32768",popupClass == "#32768")) return false;
+        uint mainPid; uint thread = GetWindowThreadProcessId(main,out mainPid);
+        var candidates = new List<long>();
+        bool enumerated = EnumThreadWindows(thread,delegate(IntPtr window,IntPtr unused) {
+            if (IsWindowVisible(window) && WindowClass(window) == "#32768") candidates.Add(window.ToInt64());
+            return true;
+        },IntPtr.Zero);
+        observation["active_popup_candidates"] = candidates.ToArray();
+        if (!U02Gate(observation,"popup_enumeration_complete",enumerated,true,enumerated) ||
+            !U02Gate(observation,"unique_active_popup",candidates.ToArray(),popup.ToInt64(),candidates.Count == 1 && candidates[0] == popup.ToInt64())) return false;
+        U02MENUBARINFO bar = new U02MENUBARINFO(); bar.cbSize = (uint)Marshal.SizeOf(typeof(U02MENUBARINFO));
+        bool menuOk = GetMenuBarInfo(popup,-4,0,ref bar);
+        return U02Gate(observation,"active_hmenu",bar.hMenu.ToInt64(),"available != 0",menuOk && bar.hMenu != IntPtr.Zero);
+    }
+
+    private static bool EvaluateU02MenuOwnership(IntPtr surface, IntPtr main, uint pid, int[] crop, bool captureBounds, Dictionary<string, object> observation)
+    {
+        observation["started_utc"] = DateTime.UtcNow.ToString("o");
+        observation["non_atomic"] = true; observation["main_hwnd"] = main.ToInt64(); observation["surface_hwnd"] = surface.ToInt64();
+        observation["expected_pid"] = pid; observation["fixed_crop"] = crop; observation["capture_bounds_required"] = captureBounds;
+        foreach (string condition in new string[] {"crop_shape", "main_live", "main_pid", "surface_live", "surface_pid", "surface_visible", "main_class", "foreground",
+            "surface_class", "shadow_association", "client_rect_ok", "origin_to_screen_ok", "end_to_screen_ok", "crop_matches_client", "crop_inside_screen",
+            "main_thread", "same_thread", "thread_pids", "gui_thread_info_ok", "menu_owner", "surface_kind_owner", "surface_rect_ok", "surface_rect_positive", "surface_inside_crop"})
+            observation[condition] = "UNKNOWN";
+        uint mainPid, surfacePid;
+        if (captureBounds && !U02Gate(observation,"crop_shape",crop == null ? -1 : crop.Length,4,crop != null && crop.Length == 4)) return false;
+        bool mainLive = main != IntPtr.Zero && IsWindow(main);
+        if (!U02Gate(observation,"main_live",mainLive,true,mainLive)) return false;
+        uint mainThread = GetWindowThreadProcessId(main,out mainPid);
+        observation["main_thread_at_identity"] = mainThread; observation["main_visible"] = IsWindowVisible(main);
+        if (!U02Gate(observation,"main_pid",mainPid,pid,mainPid == pid)) return false;
+        bool surfaceLive = surface != IntPtr.Zero && IsWindow(surface);
+        if (!U02Gate(observation,"surface_live",surfaceLive,true,surfaceLive)) return false;
+        uint surfaceThread = GetWindowThreadProcessId(surface,out surfacePid);
+        observation["surface_thread_at_identity"] = surfaceThread;
+        if (!U02Gate(observation,"surface_pid",surfacePid,pid,surfacePid == pid)) return false;
+        bool visible = IsWindowVisible(surface);
+        if (!U02Gate(observation,"surface_visible",visible,true,visible)) return false;
+        string mainClass = WindowClass(main);
+        if (!U02Gate(observation,"main_class",mainClass,"MDLiteRustEditor",mainClass == "MDLiteRustEditor")) return false;
+        IntPtr foreground = GetForegroundWindow();
+        if (!U02Gate(observation,"foreground",foreground.ToInt64(),main.ToInt64(),foreground == main)) return false;
+        string name = WindowClass(surface); observation["surface_class"] = name;
+        if (name == "SysShadow") {
+            if (!captureBounds) return false;
+            long popup = U02OwnedShadowPopup(surface,main,pid,crop);
+            return U02Gate(observation,"shadow_association",popup,"exact owned popup != 0",popup != 0);
+        }
+        if (captureBounds) {
         RECT client; POINT origin = new POINT(), end = new POINT();
-        if (!GetClientRect(main,out client)) return false;
+        bool clientOk = GetClientRect(main,out client);
+        if (!U02Gate(observation,"client_rect_ok",clientOk,true,clientOk)) return false;
+        observation["main_client_rect"] = new int[]{client.Left,client.Top,client.Right,client.Bottom};
         origin.X=client.Left; origin.Y=client.Top; end.X=client.Right; end.Y=client.Bottom;
         int[] screen=GetVirtualScreenMetrics();
-        if (!ClientToScreen(main,ref origin) || !ClientToScreen(main,ref end) ||
-            crop[0]!=origin.X || crop[1]!=origin.Y || crop[2]!=end.X || crop[3]!=end.Y ||
-            crop[0]<screen[0] || crop[1]<screen[1] || crop[2]>screen[0]+screen[2] || crop[3]>screen[1]+screen[3]) return false;
-        uint mainPid, surfacePid;
-        uint mainThread = GetWindowThreadProcessId(main, out mainPid);
-        uint surfaceThread = GetWindowThreadProcessId(surface, out surfacePid);
-        string name = WindowClass(surface);
+        observation["virtual_screen_xywh"] = screen;
+        bool originOk = ClientToScreen(main,ref origin);
+        if (!U02Gate(observation,"origin_to_screen_ok",originOk,true,originOk)) return false;
+        bool endOk = ClientToScreen(main,ref end);
+        if (!U02Gate(observation,"end_to_screen_ok",endOk,true,endOk)) return false;
+        int[] current = new int[]{origin.X,origin.Y,end.X,end.Y}; observation["main_client_screen_rect"] = current;
+        if (!U02Gate(observation,"crop_matches_client",current,crop,crop[0]==origin.X && crop[1]==origin.Y && crop[2]==end.X && crop[3]==end.Y) ||
+            !U02Gate(observation,"crop_inside_screen",crop,new int[]{screen[0],screen[1],screen[0]+screen[2],screen[1]+screen[3]},
+                crop[0]>=screen[0] && crop[1]>=screen[1] && crop[2]<=screen[0]+screen[2] && crop[3]<=screen[1]+screen[3])) return false;
+        }
+        mainThread = GetWindowThreadProcessId(main,out mainPid); surfaceThread = GetWindowThreadProcessId(surface,out surfacePid);
+        if (!U02Gate(observation,"main_thread",mainThread,"!= 0",mainThread != 0) ||
+            !U02Gate(observation,"same_thread",surfaceThread,mainThread,surfaceThread == mainThread) ||
+            !U02Gate(observation,"thread_pids",new uint[]{mainPid,surfacePid},new uint[]{pid,pid},mainPid == pid && surfacePid == pid)) return false;
         GUITHREADINFO gui = new GUITHREADINFO(); gui.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+        bool guiOk = GetGUIThreadInfo(mainThread,ref gui);
+        observation["gui_flags"] = guiOk ? (object)gui.flags : "UNKNOWN";
+        if (!U02Gate(observation,"gui_thread_info_ok",guiOk,true,guiOk) ||
+            !U02Gate(observation,"menu_owner",gui.hwndMenuOwner.ToInt64(),main.ToInt64(),gui.hwndMenuOwner == main)) return false;
+        long owner = name == "tooltips_class32" ? GetWindow(surface,4).ToInt64() : 0;
+        if (!U02Gate(observation,"surface_kind_owner",new object[]{name,owner},"#32768 or Main-owned tooltip",name == "#32768" || (name == "tooltips_class32" && owner == main.ToInt64()))) return false;
         RECT r;
-        return mainThread != 0 && mainThread == surfaceThread && mainPid == pid && surfacePid == pid &&
-            GetGUIThreadInfo(mainThread, ref gui) && gui.hwndMenuOwner == main &&
-            (name == "#32768" || (name == "tooltips_class32" && GetWindow(surface, 4) == main)) &&
-            GetWindowRect(surface, out r) && r.Right > r.Left && r.Bottom > r.Top &&
-            r.Left >= crop[0] && r.Top >= crop[1] && r.Right <= crop[2] && r.Bottom <= crop[3];
+        bool rectOk = GetWindowRect(surface,out r);
+        if (!U02Gate(observation,"surface_rect_ok",rectOk,true,rectOk)) return false;
+        int[] rectangle = new int[]{r.Left,r.Top,r.Right,r.Bottom};
+        return U02Gate(observation,"surface_rect_positive",rectangle,"positive width and height",r.Right > r.Left && r.Bottom > r.Top) &&
+            (!captureBounds || U02Gate(observation,"surface_inside_crop",rectangle,crop,r.Left >= crop[0] && r.Top >= crop[1] && r.Right <= crop[2] && r.Bottom <= crop[3]));
+    }
+
+    public static int U02SendPopupKey(IntPtr popup, IntPtr main, uint pid, int[] crop, long expectedMenu, uint command, ushort key, Dictionary<string, object> observation)
+    {
+        if (key != 0x28 && key != 0x0D) throw new ArgumentException("Only Down/Enter belong to this menu selector.");
+        var items = U02ReadPopupItems(popup,main,pid,crop,observation);
+        var matches = Array.FindAll(items,v => (uint)v["command_id"] == command);
+        var highlighted = Array.FindAll(items,v => (bool)v["highlighted"]);
+        if (matches.Length != 1 || (long)matches[0]["menu"] != expectedMenu || (bool)matches[0]["disabled"] ||
+            (long)matches[0]["submenu"] != 0 || !(bool)matches[0]["rect_inside_popup"] || highlighted.Length > 1 ||
+            (key == 0x0D && (highlighted.Length != 1 || !(bool)matches[0]["highlighted"])))
+            throw new InvalidOperationException("OWNERSHIP_GATE: expected unique enabled command/HMENU/highlight changed before menu key; no input.");
+        var finalGate = new Dictionary<string,object>(); observation["immediate_pre_key_gate"] = finalGate;
+        if (!IsU02OwnedPopupForInput(popup,main,pid,crop,finalGate) ||
+            (long)((Dictionary<string,object>)finalGate["active_hmenu"])["actual"] != expectedMenu)
+            throw new InvalidOperationException("OWNERSHIP_GATE: active popup changed before menu key; no input.");
+        return SendVirtualKey(main,pid,key,new ushort[0]);
+    }
+
+    // Separate exact-popup client capture. Never enlarge the Main crop or exempt another surface.
+    public static Dictionary<string,object> ObserveU02PopupClient(IntPtr popup, IntPtr main, uint pid, long expectedMenu, int[] expectedCrop)
+    {
+        var gate = new Dictionary<string,object>();
+        var result = new Dictionary<string,object> {{"safe",false},{"gate",gate},{"crop","UNKNOWN"},{"blocker",null},{"observed_utc",DateTime.UtcNow.ToString("o")}};
+        if (!IsU02OwnedPopupForInput(popup,main,pid,null,gate) ||
+            (long)((Dictionary<string,object>)gate["active_hmenu"])["actual"] != expectedMenu) return result;
+        int cloaked;
+        bool opaque = IsWindowEnabled(popup) && (GetWindowLongW(popup,-20) & (0x00080000 | 0x00000020)) == 0 &&
+            DwmGetWindowAttribute(popup,14,out cloaked,sizeof(int)) == 0 && cloaked == 0;
+        result["opaque_enabled_uncloaked"] = opaque;
+        if (!opaque) return result;
+        RECT client; POINT origin = new POINT(), end = new POINT();
+        if (!GetClientRect(popup,out client)) return result;
+        origin.X=client.Left; origin.Y=client.Top; end.X=client.Right; end.Y=client.Bottom;
+        if (!ClientToScreen(popup,ref origin) || !ClientToScreen(popup,ref end)) return result;
+        int[] current = new int[]{origin.X,origin.Y,end.X,end.Y}; result["popup_client_screen"] = current;
+        int[] crop = expectedCrop ?? current; result["crop"] = crop;
+        int[] screen=GetVirtualScreenMetrics();
+        bool bounds = TestS02PassiveBounds(crop,crop,new int[]{screen[0],screen[1],screen[0]+screen[2],screen[1]+screen[3]}) &&
+            crop[0]>=current[0] && crop[1]>=current[1] && crop[2]<=current[2] && crop[3]<=current[3];
+        // This is a small popup-label observation, bounded independently of screen/Main dimensions.
+        bounds = bounds && (long)(crop[2]-crop[0])*(crop[3]-crop[1]) <= 262144;
+        result["bounds_safe"] = bounds;
+        if (!bounds) return result;
+        bool found = false;
+        IntPtr surface = GetTopWindow(IntPtr.Zero);
+        for (int count=0; surface != IntPtr.Zero && count<4096; count++,surface=GetWindow(surface,2)) {
+            if (surface == popup) { found=true; break; }
+            if (!IsWindowVisible(surface) || IsIconic(surface)) continue;
+            int hidden;
+            if (DwmGetWindowAttribute(surface,14,out hidden,sizeof(int)) == 0 && hidden != 0) continue;
+            RECT r; bool known=GetWindowRect(surface,out r);
+            if (TestS02PassiveRectOverlap(crop,known ? new int[]{r.Left,r.Top,r.Right,r.Bottom} : null,known)) {
+                result["blocker"] = DescribeS02PassiveWindow(surface); return result;
+            }
+        }
+        result["zorder_reached_popup"] = found;
+        if (!found) return result;
+        // Every copied pixel must hit this enabled opaque popup. This rejects shaped/rounded
+        // holes as well as checking the complete z-order for even hit-test-transparent overlaps.
+        int verified=0;
+        for (int y=crop[1];y<crop[3];y++) for (int x=crop[0];x<crop[2];x++) {
+            if (WindowFromPoint(new POINT{X=x,Y=y}) != popup) {
+                result["non_popup_pixel"] = new int[]{x,y}; return result;
+            }
+            verified++;
+        }
+        result["pixels_verified_popup"] = verified;
+        var after = new Dictionary<string,object>(); result["after_gate"] = after;
+        result["safe"] = IsU02OwnedPopupForInput(popup,main,pid,null,after) &&
+            (long)((Dictionary<string,object>)after["active_hmenu"])["actual"] == expectedMenu;
+        return result;
     }
 
     public static Dictionary<string, object> ObserveS02PassiveCrop(IntPtr main, IntPtr modal, uint pid, int[] crop)
@@ -927,23 +1109,80 @@ public static class MdliteRustAcceptanceNative
 
     public static bool VerifyS02ClosePoint(IntPtr modal, uint pid, int x, int y)
     {
-        if (!IsOwnedWindow(modal, pid) || WindowClass(modal) != "MDLiteSettings" || GetForegroundWindow() != modal)
-            return false;
+        return VerifyS02ClosePoint(modal,pid,x,y,new Dictionary<string,object>());
+    }
+
+    public static bool VerifyS02ClosePoint(IntPtr modal, uint pid, int x, int y, Dictionary<string,object> observation)
+    {
+        observation["observed_utc"]=DateTime.UtcNow.ToString("o"); observation["modal"]=modal.ToInt64();
+        observation["expected_pid"]=pid; observation["point"]=new int[]{x,y}; observation["expected_hit"]=20;
+        foreach(string key in new string[]{"live","pid","thread","class","foreground","bounds","point_hwnd","hittest_ok","hittest_result","hittest_elapsed_ms","post_live","post_pid","post_thread","post_class","post_foreground","post_bounds","post_point_hwnd"}) observation[key]="UNKNOWN";
+        bool live=modal != IntPtr.Zero && IsWindow(modal); observation["live"]=live;
+        if(!live){observation["failed_condition"]="LIVE";return false;}
+        uint actualPid; uint thread=GetWindowThreadProcessId(modal,out actualPid);
+        observation["pid"]=actualPid;observation["thread"]=thread;
+        if(actualPid != pid){observation["failed_condition"]="PID";return false;}
+        if(thread == 0){observation["failed_condition"]="THREAD";return false;}
+        string name=WindowClass(modal);observation["class"]=name;
+        if(name != "MDLiteSettings"){observation["failed_condition"]="CLASS";return false;}
+        IntPtr foreground=GetForegroundWindow();observation["foreground"]=foreground.ToInt64();
+        if(foreground != modal){observation["failed_condition"]="FOREGROUND";return false;}
+        RECT bounds;bool boundsOk=GetWindowRect(modal,out bounds);observation["bounds_ok"]=boundsOk;
+        if(boundsOk)observation["bounds"]=new int[]{bounds.Left,bounds.Top,bounds.Right,bounds.Bottom};
+        if(!boundsOk || bounds.Right <= bounds.Left || bounds.Bottom <= bounds.Top || x < bounds.Left || x >= bounds.Right || y < bounds.Top || y >= bounds.Bottom){observation["failed_condition"]="BOUNDS";return false;}
         POINT point = new POINT { X = x, Y = y };
-        if (WindowFromPoint(point) != modal) return false;
+        IntPtr pointWindow=WindowFromPoint(point);observation["point_hwnd"]=pointWindow.ToInt64();
+        if(pointWindow != modal){observation["failed_condition"]="POINT_HWND";return false;}
         IntPtr hit;
         IntPtr packed = new IntPtr(unchecked((int)(((uint)(ushort)y << 16) | (ushort)x)));
-        return SendMessageTimeoutW(modal, 0x0084, IntPtr.Zero, packed, 2, 100, out hit) && hit.ToInt64() == 20;
+        var clock=System.Diagnostics.Stopwatch.StartNew();
+        observation["hittest_requested_timeout_ms"]=500;
+        bool ok=SendMessageTimeoutW(modal,0x0084,IntPtr.Zero,packed,2,500,out hit);
+        int error=ok ? 0 : Marshal.GetLastWin32Error();
+        observation["hittest_ok"]=ok;observation["hittest_elapsed_ms"]=clock.Elapsed.TotalMilliseconds;
+        if(!ok){observation["hittest_win32_error"]=error;observation["failed_condition"]="HITTEST_CALL";return false;}
+        observation["hittest_result"]=hit.ToInt64();
+        if(hit.ToInt64()!=20){observation["failed_condition"]="HTCLOSE";return false;}
+        bool postLive=modal != IntPtr.Zero && IsWindow(modal);observation["post_live"]=postLive;
+        if(!postLive){observation["failed_condition"]="POST_LIVE";return false;}
+        uint postPid;uint postThread=GetWindowThreadProcessId(modal,out postPid);
+        observation["post_pid"]=postPid;observation["post_thread"]=postThread;
+        if(postPid!=actualPid || postPid!=pid){observation["failed_condition"]="POST_PID";return false;}
+        if(postThread==0 || postThread!=thread){observation["failed_condition"]="POST_THREAD";return false;}
+        string postClass=WindowClass(modal);observation["post_class"]=postClass;
+        if(postClass!=name){observation["failed_condition"]="POST_CLASS";return false;}
+        IntPtr postForeground=GetForegroundWindow();observation["post_foreground"]=postForeground.ToInt64();
+        if(postForeground!=modal){observation["failed_condition"]="POST_FOREGROUND";return false;}
+        RECT postBounds;bool postBoundsOk=GetWindowRect(modal,out postBounds);observation["post_bounds_ok"]=postBoundsOk;
+        if(postBoundsOk)observation["post_bounds"]=new int[]{postBounds.Left,postBounds.Top,postBounds.Right,postBounds.Bottom};
+        if(!postBoundsOk || postBounds.Right<=postBounds.Left || postBounds.Bottom<=postBounds.Top ||
+            postBounds.Left!=bounds.Left || postBounds.Top!=bounds.Top || postBounds.Right!=bounds.Right || postBounds.Bottom!=bounds.Bottom ||
+            x<postBounds.Left || x>=postBounds.Right || y<postBounds.Top || y>=postBounds.Bottom){observation["failed_condition"]="POST_BOUNDS";return false;}
+        IntPtr postPointWindow=WindowFromPoint(point);observation["post_point_hwnd"]=postPointWindow.ToInt64();
+        if(postPointWindow!=modal){observation["failed_condition"]="POST_POINT_HWND";return false;}
+        return true;
     }
 
     public static int[] S02ClosePoint(IntPtr modal, uint pid)
     {
+        return S02ClosePoint(modal,pid,new Dictionary<string,object>());
+    }
+
+    public static int[] S02ClosePoint(IntPtr modal, uint pid, Dictionary<string,object> observation)
+    {
         RECT bounds;
-        if (!IsOwnedWindow(modal, pid) || !GetWindowRect(modal, out bounds)) throw new InvalidOperationException("S02_CLOSE_IDENTITY");
+        observation["modal"]=modal.ToInt64();observation["expected_pid"]=pid;
+        bool owned=IsOwnedWindow(modal,pid);observation["owned"]=owned;
+        if(!owned)throw new InvalidOperationException("S02_CLOSE_IDENTITY");
+        bool boundsOk=GetWindowRect(modal,out bounds);observation["search_bounds_ok"]=boundsOk;
+        if(!boundsOk)throw new InvalidOperationException("S02_CLOSE_IDENTITY");
         double scale = GetDpiForWindow(modal) / 96.0;
+        observation["search_bounds"]=new int[]{bounds.Left,bounds.Top,bounds.Right,bounds.Bottom};observation["scale"]=scale;
+        var attempts=new List<object>();observation["attempts"]=attempts;
         foreach (int y in new int[] { 12, 20, 28 }) foreach (int x in new int[] { 12, 24, 36 }) {
             int px = bounds.Right - (int)Math.Round(x * scale), py = bounds.Top + (int)Math.Round(y * scale);
-            if (VerifyS02ClosePoint(modal, pid, px, py)) return new int[] { px, py };
+            var check=new Dictionary<string,object>();attempts.Add(check);
+            if (VerifyS02ClosePoint(modal,pid,px,py,check)){observation["selected_point"]=new int[]{px,py};return new int[]{px,py};}
         }
         throw new InvalidOperationException("S02_HTCLOSE_NOT_OBSERVED");
     }
@@ -3795,10 +4034,11 @@ function Send-UiOwnedMessage(
     $sent = [MdliteRustAcceptanceNative]::SendMessageTimeoutW(
         $Window, $Message, $WParam, $LParam, [uint32]$SMTO_ABORTIFHUNG,
         [uint32]$MessageTimeoutMs, [ref]$result)
-    Assert-UiOwnedWindow $Window
     if (-not $sent) {
+        if($Message -ne [uint32]$WM_CLOSE){Assert-UiOwnedWindow $Window}
         throw [System.TimeoutException]::new('OWNED_MESSAGE_TIMEOUT')
     }
+    if($Message -ne [uint32]$WM_CLOSE -or [MdliteRustAcceptanceNative]::IsWindow($Window)){Assert-UiOwnedWindow $Window}
     return $result.ToInt64()
 }
 
@@ -4195,9 +4435,11 @@ function Wait-UiListCount(
 
 function Invoke-UiPaletteCommand([string]$Label, [scriptblock]$Observe = $null) {
     $paletteClock=[Diagnostics.Stopwatch]::StartNew()
-    $paletteReceipt=[ordered]@{name='palette command readiness';label=$Label;controls_ready_ms=$null;focus_ready_ms=$null;input=$null;text_budget_ms=$TimeoutMs;text_progress=@();command_closed_ms=$null}
+    $compactRev6Route=$Rev5Observation -and $Rev3Case -ceq 'REV6_COMPACT_RESTART'
+    $entryRoute=if($Rev5Observation -and -not $compactRev6Route){'REV5_CTRL_K'}else{'OWNED_QUERY_CONTROL_150'}
+    $paletteReceipt=[ordered]@{name='palette command readiness';label=$Label;entry_route=$entryRoute;controls_ready_ms=$null;focus_ready_ms=$null;focus_budget_ms=2500;focus_started_utc=$null;focus_observation_count=0;last_focus_observation=$null;input=$null;text_budget_ms=$TimeoutMs;text_progress=@();command_closed_ms=$null}
     $script:Report.operations += $paletteReceipt
-    if($Rev5Observation){Send-Key $script:WindowHandle 0x4B ([uint16[]]@(0x11))}
+    if($Rev5Observation -and -not $compactRev6Route){Send-Key $script:WindowHandle 0x4B ([uint16[]]@(0x11))}
     else{Invoke-UiControlById -ForegroundWindow $script:WindowHandle -ControlId 150 -Class 'EDIT'}
     $query = $null
     $results = $null
@@ -4218,9 +4460,11 @@ function Invoke-UiPaletteCommand([string]$Label, [scriptblock]$Observe = $null) 
     }
     $paletteReceipt.controls_ready_ms=$paletteClock.ElapsedMilliseconds
     Invoke-UiControlClick $script:WindowHandle $query
+    $paletteReceipt.focus_started_utc=[DateTime]::UtcNow.ToString('o')
+    $focusDeadline = [DateTime]::UtcNow.AddMilliseconds($paletteReceipt.focus_budget_ms)
     $queryFocusReady = $false
     do {
-        if ([DateTime]::UtcNow -ge $deadline) { break }
+        if ([DateTime]::UtcNow -ge $focusDeadline) { break }
         try {
             $focusQuery = Get-UiControlById -Root $script:WindowHandle -ControlId 150 `
                 -Class 'EDIT' -RequireVisible -RequireEnabled
@@ -4234,11 +4478,14 @@ function Invoke-UiPaletteCommand([string]$Label, [scriptblock]$Observe = $null) 
                 $focusInfo.foreground_is_expected -and $focusInfo.active_is_expected -and
                 $focusInfo.focus_hwnd -ceq $focusQueryHandleText -and
                 $focusInfo.caret_hwnd -ceq $focusQueryHandleText
+            $paletteReceipt.focus_observation_count++
+            $paletteReceipt.last_focus_observation=@{observed_utc=[DateTime]::UtcNow.ToString('o');query_hwnd=$focusQuery.Handle.ToInt64();focus_info=$focusInfo;ready=[bool]$queryFocusReady}
             if ($queryFocusReady) { break }
         } catch [System.NotSupportedException] {
+            $paletteReceipt.last_focus_observation=@{observed_utc=[DateTime]::UtcNow.ToString('o');control_unavailable=$_.Exception.Message;focus_info='UNKNOWN';ready=$false}
         }
-        if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }
-    } while ([DateTime]::UtcNow -lt $deadline)
+        if ([DateTime]::UtcNow -lt $focusDeadline) { Start-Sleep -Milliseconds 25 }
+    } while ([DateTime]::UtcNow -lt $focusDeadline)
     if (-not $queryFocusReady) {
         throw [System.TimeoutException]::new('PALETTE_QUERY_FOCUS_TIMEOUT')
     }
@@ -4774,30 +5021,44 @@ function Get-UiHeldDragGeometry($Parent) {
     return $geometry
 }
 
-function Test-UiHeldDragWaypointStamp($Stamp,$Baseline,[long]$MinimumSequence,$ReachedGeometry,[long]$MainHwnd) {
-    if(-not (Test-UiHeldDragStamp $Stamp $Stamp $MainHwnd) -or -not $Stamp.Contains('held_geometry')){return $false}
-    return [bool]([long]$Stamp.painted_frame.sequence -ge $MinimumSequence -and
-        [long]$Stamp.document_id -eq [long]$Baseline.document_id -and [long]$Stamp.revision -eq [long]$Baseline.revision -and
-        $Stamp.source_sha256 -ceq (Get-UiTextSha256 ([string]$Baseline.source)) -and
-        (ConvertTo-Json $Stamp.selection -Compress) -ceq (ConvertTo-Json $Baseline.selection -Compress) -and
-        [bool]$Stamp.dirty -eq [bool]$Baseline.dirty -and [int]$Stamp.undo_count -eq [int]$Baseline.undo_count -and
-        [int]$Stamp.redo_count -eq [int]$Baseline.redo_count -and [double]$Stamp.scroll -eq [double]$Baseline.scroll -and
-        (ConvertTo-Json $Stamp.held_geometry -Depth 16 -Compress) -ceq (ConvertTo-Json $ReachedGeometry -Depth 16 -Compress))
+function Test-UiHeldDragWaypointStamp($Stamp,$Baseline,[long]$MinimumSequence,$ReachedGeometry,[long]$MainHwnd,[Collections.IDictionary]$Conditions=$null) {
+    $checks=[ordered]@{self_frame_state=(Test-UiHeldDragStamp $Stamp $Stamp $MainHwnd);held_geometry_present=($Stamp -is [Collections.IDictionary] -and $Stamp.Contains('held_geometry'))}
+    if($checks.self_frame_state -and $checks.held_geometry_present) {
+        $checks.sequence=[long]$Stamp.painted_frame.sequence -ge $MinimumSequence
+        $checks.document_id=[long]$Stamp.document_id -eq [long]$Baseline.document_id
+        $checks.revision=[long]$Stamp.revision -eq [long]$Baseline.revision
+        $checks.source_sha256=$Stamp.source_sha256 -ceq (Get-UiTextSha256 ([string]$Baseline.source))
+        $checks.selection=(ConvertTo-Json $Stamp.selection -Compress) -ceq (ConvertTo-Json $Baseline.selection -Compress)
+        $checks.dirty=[bool]$Stamp.dirty -eq [bool]$Baseline.dirty
+        $checks.undo_count=[int]$Stamp.undo_count -eq [int]$Baseline.undo_count
+        $checks.redo_count=[int]$Stamp.redo_count -eq [int]$Baseline.redo_count
+        $checks.scroll=[double]$Stamp.scroll -eq [double]$Baseline.scroll
+        $checks.held_geometry=(ConvertTo-Json $Stamp.held_geometry -Depth 16 -Compress) -ceq (ConvertTo-Json $ReachedGeometry -Depth 16 -Compress)
+    }
+    if($null -ne $Conditions){foreach($key in $checks.Keys){$Conditions[$key]=$checks[$key]}}
+    return [bool]($checks.self_frame_state -and $checks.held_geometry_present -and @($checks.Values|Where-Object {$_ -ne $true}).Count -eq 0)
 }
 
-function Capture-UiHeldDragWaypoint([uint32]$ThreadId,$Baseline,[string]$Path,$Clock,$Receipt,[long]$MinimumSequence,$ReachedGeometry) {
+function Capture-UiHeldDragWaypoint([uint32]$ThreadId,$Baseline,[string]$Path,$Clock,$Receipt,[long]$MinimumSequence,$ReachedGeometry,[datetime]$Deadline=[datetime]::MinValue) {
     # Passive COPY only. Do not activate, fence, send WM_APP+1, or repaint here.
     Assert-UiDiagnosticDragOwnershipWhileHeld $ThreadId
-    $deadline=[DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    if($Deadline -eq [datetime]::MinValue){$Deadline=[DateTime]::UtcNow.AddMilliseconds($TimeoutMs)}
+    if([DateTime]::UtcNow -ge $Deadline){throw 'OBSERVER_FAILURE: original held COPY deadline already exhausted.'}
+    $matched=$false;$conditions=[ordered]@{}
     do {
         Assert-UiDiagnosticDragOwnershipWhileHeld $ThreadId
         $stamp=Get-OwnedCaptureStamp -IncludeState -IncludeHeldGeometry
-        if (Test-UiHeldDragWaypointStamp $stamp $Baseline $MinimumSequence $ReachedGeometry $script:WindowHandle.ToInt64()) { break }
+        $conditions=[ordered]@{}
+        $matched=Test-UiHeldDragWaypointStamp $stamp $Baseline $MinimumSequence $ReachedGeometry $script:WindowHandle.ToInt64() $conditions
+        if ($matched) { break }
         if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 10 }
     } while ([DateTime]::UtcNow -lt $deadline)
-    if (-not (Test-UiHeldDragWaypointStamp $stamp $Baseline $MinimumSequence $ReachedGeometry $script:WindowHandle.ToInt64())) {
+    if (-not $matched) {
+        $Receipt['rejected_stamp']=$stamp;$Receipt['rejected_conditions']=$conditions
+        $Receipt['rejected_expected']=@{baseline=$Baseline;minimum_sequence=$MinimumSequence;reached_geometry=$ReachedGeometry;main_hwnd=$script:WindowHandle.ToInt64()}
         throw 'OBSERVER_FAILURE: held COPY lacks matching painted source/selection/history/view state.'
     }
+    if([DateTime]::UtcNow -ge $Deadline){throw 'OBSERVER_FAILURE: original held COPY deadline exhausted before COPY.'}
     $crop=[int[]]$script:S02FixedMainBounds
     $Receipt.stamp_before=$stamp
     $Receipt.ownership_before=[MdliteRustAcceptanceNative]::ObserveS02PassiveCrop($script:WindowHandle,[IntPtr]::Zero,$script:ProcessId,$crop)
@@ -4981,6 +5242,7 @@ function Invoke-UiDiagnosticDrag(
             }
             $waypointClock=[Diagnostics.Stopwatch]::StartNew()
             $previousCopyStart=$null
+            $waypointIndex=0
             foreach ($point in $HeldWaypoints) {
                 $sample=[ordered]@{
                     index=$script:Report.held_drag_waypoints.Count; gesture=$HeldCapturePrefix; point=@{x=$point.x;y=$point.y}
@@ -5029,9 +5291,25 @@ function Invoke-UiDiagnosticDrag(
                 $sample.reached_geometry=Get-UiHeldDragGeometry $heldState.parent_root
                 $sample['geometry_binding_limit']='Diagnostic snapshot geometry/source association; not a new producer pixel marker. Actual PNG review required.'
                 # Read-Diagnostic is outside COPY. No native message or refresh occurs inside the stamp bracket.
-                Capture-UiHeldDragWaypoint $targetThreadId $baseline (Join-Path $script:UiRunDirectory ($HeldCapturePrefix+'-'+$sample.index+'.png')) $waypointClock $sample $sample.paint_sequence_floor $sample.reached_geometry
+                $copyDeadline=[DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+                Capture-UiHeldDragWaypoint $targetThreadId $baseline (Join-Path $script:UiRunDirectory ($HeldCapturePrefix+'-'+$sample.index+'.png')) $waypointClock $sample $sample.paint_sequence_floor $sample.reached_geometry $copyDeadline
+                if(($HeldCapturePrefix -ceq 'rev4-rev5-both-left-width' -and $waypointIndex -eq 1) -or
+                    ($HeldCapturePrefix -ceq 'rev4-rev5-both-right-width' -and $waypointIndex -eq 0)) {
+                    $late=[ordered]@{};foreach($key in $sample.Keys){$late[$key]=$sample[$key]}
+                    $late.index=$script:Report.held_drag_waypoints.Count;$late['repeat_of_index']=$sample.index;$late['passive_hold_ms']=2000
+                    foreach($key in @('move_started_ms','move_completed_ms','copy_started_ms','copy_completed_ms','copy_start_gap_ms','stamp_before','stamp_after','ownership_before','ownership_after','path','crop')){$late[$key]=$null}
+                    $late.comparison_eligible=$false;$script:Report.held_drag_waypoints+=,$late
+                    $holdUntil=[DateTime]::UtcNow.AddMilliseconds(2000)
+                    do {
+                        Assert-UiDiagnosticDragOwnershipWhileHeld $targetThreadId
+                        if([DateTime]::UtcNow -ge $copyDeadline){throw 'OBSERVER_FAILURE: same-waypoint repeat exhausted original COPY deadline.'}
+                        Start-Sleep -Milliseconds 10
+                    } while([DateTime]::UtcNow -lt $holdUntil)
+                    Capture-UiHeldDragWaypoint $targetThreadId $baseline (Join-Path $script:UiRunDirectory ($HeldCapturePrefix+'-'+$late.index+'-passive-repeat.png')) $waypointClock $late $sample.paint_sequence_floor $sample.reached_geometry $copyDeadline
+                }
                 if ($null -ne $previousCopyStart) { $sample.copy_start_gap_ms=$sample.copy_started_ms-$previousCopyStart }
                 $previousCopyStart=$sample.copy_started_ms
+                $waypointIndex++
             }
         }
     } catch {
@@ -5123,7 +5401,7 @@ function Add-UiParityCase(
 }
 
 function Invoke-UiParityCase([string]$Id, [scriptblock]$Action) {
-    $selectedCase=if ($Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME')) { 'S01_S02_FORM_CLOSE' } elseif ($Rev3Case -ceq 'S01_FIELDS_COLOR') { 'S01_FORM_FIELDS' } elseif ($Rev3Case -ceq 'P01_MIGRATION_RESTART_DRAG') { 'P01_P04_GROUPS' } elseif ($Rev3Case -ceq 'U02_U03_FOCUSED') { 'U02_U03_VISUAL_RECEIPTS' } else { $Rev3Case }
+    $selectedCase=if ($Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR')) { 'S01_S02_FORM_CLOSE' } elseif ($Rev3Case -ceq 'S01_FIELDS_COLOR') { 'S01_FORM_FIELDS' } elseif ($Rev3Case -ceq 'P01_MIGRATION_RESTART_DRAG') { 'P01_P04_GROUPS' } elseif ($Rev3Case -cin @('U02_U03_FOCUSED','U03_DENSITY_ONLY')) { 'U02_U03_VISUAL_RECEIPTS' } else { $Rev3Case }
     if ($Rev3 -and -not [string]::IsNullOrWhiteSpace($selectedCase) -and $selectedCase -cne $Id) {
         Add-UiParityCase $Id 'NOT_RUN' 'NOT_SELECTED' $null
         return $false
@@ -5395,7 +5673,9 @@ function Invoke-S02ReturnProof {
     )
     if ($Rev3Case -ceq 'S02_APPLY_RETURN_PROOF') { $rows=@($rows | Where-Object { $_.close -ceq 'ApplyThenCancel' }) }
     if ($Rev3Case -ceq 'S02_APPLY_IME') { $rows=@($rows | Where-Object { $_.close -ceq 'ApplyThenCancel' -and $_.mode -ceq 'CloseState' }) }
-    $proofScope=if ($Rev3Case -ceq 'S02_APPLY_IME') { 'R01_ONE_APPLY_THEN_CANCEL_CLOSE_STATE_THEN_CONFIGURED_ATOK' } elseif ($Rev3Case -ceq 'S02_APPLY_RETURN_PROOF') { 'S02_APPLY_RETURN_PROOF_TWO_APPLY_THEN_CANCEL_REPRESENTATIVES_ONLY' } else { 'S02_EIGHT_REPRESENTATIVES_ONLY' }
+    if ($Rev3Case -ceq 'S02_TITLEBAR_CLICKCHAR') { $rows=@($rows | Where-Object { $_.close -ceq 'TitlebarClose' -and $_.mode -ceq 'ClickChar' }) }
+    if ($Rev3Case -ceq 'S02_MISSING_CLICKCHAR') { $rows=@($rows | Where-Object { $_.close -cin @('Cancel','Escape','TitlebarClose') -and $_.mode -ceq 'ClickChar' }) }
+    $proofScope=if ($Rev3Case -ceq 'S02_TITLEBAR_CLICKCHAR') { 'S02_ONE_TITLEBAR_CLOSE_CLICKCHAR_REPRESENTATIVE_ONLY' } elseif ($Rev3Case -ceq 'S02_MISSING_CLICKCHAR') { 'S02_THREE_MISSING_CLOSE_CLICKCHAR_REPRESENTATIVES_ONLY' } elseif ($Rev3Case -ceq 'S02_APPLY_IME') { 'R01_ONE_APPLY_THEN_CANCEL_CLOSE_STATE_THEN_CONFIGURED_ATOK' } elseif ($Rev3Case -ceq 'S02_APPLY_RETURN_PROOF') { 'S02_APPLY_RETURN_PROOF_TWO_APPLY_THEN_CANCEL_REPRESENTATIVES_ONLY' } else { 'S02_EIGHT_REPRESENTATIVES_ONLY' }
     $proof=[ordered]@{rows=[Collections.Generic.List[object]]::new();scope=$proofScope;g01='NOT_ASSERTED_GEOMETRY_ONLY_STARTUP';physical_ime='NOT_ASSERTED';visual_acceptance='PENDING_ACTUAL_FRAME_REVIEW';dpi_matrix='NOT_RUN'}
     $script:Report['s02_return_proof']=$proof
     foreach($spec in $rows){
@@ -5562,6 +5842,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     $suffix=if($advanced -or $startup){'-'+$Mode}else{''}
     $directory=Join-Path $script:UiRunDirectory ('s02-passive-'+$Close+$suffix)
     [void][IO.Directory]::CreateDirectory($directory)
+    $titlebarChecks=@{initial=$null;recheck=$null}
     if(-not $startup){
     $cancel=Get-UiControlById $Settings 211 'BUTTON' -RequireVisible -RequireEnabled
     $cancelPoint=[int[]]@(
@@ -5569,7 +5850,11 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
         [Math]::Floor(([double]$cancel.Rect[1]+[double]$cancel.Rect[3])/2.0)
     )
     $closePoint=$null
-    if ($Close -ceq 'TitlebarClose') { $closePoint=[MdliteRustAcceptanceNative]::S02ClosePoint($Settings,$script:ProcessId) }
+    if ($Close -ceq 'TitlebarClose') {
+        $titlebarChecks.initial=[Collections.Generic.Dictionary[string,object]]::new()
+        $script:Report.operations+=@{name='S02 initial titlebar close-point check';modal=$Settings.ToInt64();native=$titlebarChecks.initial}
+        $closePoint=[MdliteRustAcceptanceNative]::S02ClosePoint($Settings,$script:ProcessId,$titlebarChecks.initial)
+    }
     }
     $shared=[hashtable]::Synchronized(@{
         ready=[Threading.ManualResetEvent]::new($false); stop=[Threading.ManualResetEvent]::new($false)
@@ -5675,7 +5960,12 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
             $entry.end_ms=$shared.clock.Elapsed.TotalMilliseconds
             if ($entry.sent -ne 2) { throw 'S02_DIRECT_ESCAPE_FAILED' }
         } elseif ($Close -ceq 'TitlebarClose') {
-            if (-not [MdliteRustAcceptanceNative]::VerifyS02ClosePoint($Settings,$script:ProcessId,$closePoint[0],$closePoint[1])) { throw 'S02_HTCLOSE_CHANGED' }
+            $titlebarChecks.recheck=[Collections.Generic.Dictionary[string,object]]::new()
+            $entry=[ordered]@{action='titlebar HTCLOSE recheck';start_ms=$shared.clock.Elapsed.TotalMilliseconds;end_ms=$null;point=$closePoint;guard=$titlebarChecks.recheck;sent=0}
+            $actions.Add($entry)
+            $closeVerified=[MdliteRustAcceptanceNative]::VerifyS02ClosePoint($Settings,$script:ProcessId,$closePoint[0],$closePoint[1],$titlebarChecks.recheck)
+            $entry.end_ms=$shared.clock.Elapsed.TotalMilliseconds
+            if (-not $closeVerified) { throw 'S02_HTCLOSE_CHANGED' }
             & $click $Settings $closePoint 'titlebar HTCLOSE=20'
         } else { & $click $Settings $cancelPoint 'Cancel' }
         $closeWait=1200
@@ -5822,6 +6112,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     }
     $rawEvidencePath=Join-Path $directory 'raw-evidence-before-metrics.json'
     $rawEvidence=[ordered]@{
+        titlebar_close_checks=$titlebarChecks
         path=$Close; mode=$Mode; startup_event=$startupEvent; startup_coverage=$startupCoverage; sampler_clock_origin_utc=$shared.clock_origin_utc; target=$TargetInfo; character_completed_ms=$characterCompleted; typed_samples_within_2s=$typedSamples; semantic_phase_error=$phaseError; crop=$Crop; frame_records=$frameRecords; actions=$actions.ToArray()
         sampler_error=$shared.error; actor_error=$actorError; worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
@@ -5854,7 +6145,7 @@ function Invoke-S02PassiveClose([string]$Close, [IntPtr]$Settings, [int[]]$Caret
     if($startup){$coverage=[bool]$startupCoverage}
     $rawEvidenceSha256=(Get-FileHash -LiteralPath $rawEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $receipt=[ordered]@{
-        path=$Close; mode=$Mode; startup_event=$startupEvent; startup_coverage=$startupCoverage; sampler_clock_origin_utc=$shared.clock_origin_utc; target=$TargetInfo; character_completed_ms=$characterCompleted; typed_samples_within_2s=$typedSamples; semantic_phase_error=$phaseError; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
+        path=$Close; mode=$Mode; titlebar_close_checks=$titlebarChecks; startup_event=$startupEvent; startup_coverage=$startupCoverage; sampler_clock_origin_utc=$shared.clock_origin_utc; target=$TargetInfo; character_completed_ms=$characterCompleted; typed_samples_within_2s=$typedSamples; semantic_phase_error=$phaseError; crop=$Crop; frames=$frameRecords; actions=$actions.ToArray(); sampler_error=$shared.error; actor_error=$actorError
         raw_evidence_path=$rawEvidencePath; raw_evidence_sha256=$rawEvidenceSha256; coverage_inputs=$coverageInputs; metric_error=$metricError
         worker_completion_confirmed=$workerCompleted
         native_focus_after_first_click=$firstClickFocus; native_focus_observed_ms=$focusObservedMs
@@ -5930,7 +6221,7 @@ function Test-Rev3MainOnlyPaintRemainder($Fence,[long]$MainHwnd) {
     } catch { return $false }
 }
 
-function Get-Rev3MainFrameState($SourceBefore,$Observed,[long]$MainHwnd) {
+function Get-Rev3MainFrameState($SourceBefore,$Observed,[long]$MainHwnd,$OwnedMainToCompact=$null) {
     try {
         if ($MainHwnd -le 0) { return 'OWNER_INVALID' }
         foreach ($stamp in @($SourceBefore,$Observed)) {
@@ -5942,6 +6233,24 @@ function Get-Rev3MainFrameState($SourceBefore,$Observed,[long]$MainHwnd) {
         }
         if ($SourceBefore.document_id -ne $Observed.document_id -or $SourceBefore.revision -ne $Observed.revision -or
             $SourceBefore.source_sha256 -cne $Observed.source_sha256) { return 'SOURCE_CHANGED' }
+        if($null -ne $OwnedMainToCompact) {
+            $main=$OwnedMainToCompact.main;$compact=$OwnedMainToCompact.compact
+            if($OwnedMainToCompact.expected_main -le 0 -or $OwnedMainToCompact.expected_pid -le 0 -or
+                [string]::IsNullOrWhiteSpace([string]$OwnedMainToCompact.expected_creation_utc) -or
+                [string]::IsNullOrWhiteSpace([string]$OwnedMainToCompact.expected_image_path) -or
+                $MainHwnd -eq [long]$OwnedMainToCompact.expected_main -or
+                $main.target_hwnd -ne $OwnedMainToCompact.expected_main -or $compact.target_hwnd -ne $MainHwnd -or
+                $main.target_pid -ne $OwnedMainToCompact.expected_pid -or $compact.target_pid -ne $OwnedMainToCompact.expected_pid -or
+                $main.target_thread -le 0 -or $compact.target_thread -ne $main.target_thread -or $compact.owner_hwnd -ne $main.target_hwnd -or
+                $main.window_class -cne 'MDLiteRustEditor' -or $compact.window_class -cne 'MDLiteRustEditor' -or
+                $main.target_creation_utc -cne $OwnedMainToCompact.expected_creation_utc -or $compact.target_creation_utc -cne $main.target_creation_utc -or
+                -not [string]::Equals($main.target_image_path,$OwnedMainToCompact.expected_image_path,[StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals($main.target_image_path,$compact.target_image_path,[StringComparison]::OrdinalIgnoreCase) -or
+                $compact.foreground_hwnd -ne $MainHwnd -or $main.foreground_hwnd -ne $MainHwnd -or
+                $compact.runner_session -ne $compact.target_session -or $main.target_session -ne $compact.target_session -or
+                $compact.runner_desktop -cne $compact.target_desktop -or $compact.input_desktop -cne $compact.target_desktop -or
+                $main.target_desktop -cne $compact.target_desktop) { return 'OWNED_TRANSITION_CHANGED' }
+        }
         $frame=$Observed.painted_frame
         if ($null -eq $frame) { return 'FRAME_PENDING' }
         foreach ($value in @($frame.hwnd,$frame.document_id,$frame.revision,$frame.sequence)) {
@@ -5949,7 +6258,12 @@ function Get-Rev3MainFrameState($SourceBefore,$Observed,[long]$MainHwnd) {
         }
         if ($null -eq $frame.hwnd -or [long]$frame.hwnd -le 0 -or $null -eq $frame.document_id -or [long]$frame.document_id -le 0 -or
             $null -eq $frame.revision -or [long]$frame.revision -lt 0 -or $null -eq $frame.sequence -or [long]$frame.sequence -le 0) { return 'FRAME_INVALID' }
-        if ([long]$frame.hwnd -ne $MainHwnd) { return 'FRAME_FOREIGN' }
+        if ([long]$frame.hwnd -ne $MainHwnd) {
+            if($null -ne $OwnedMainToCompact -and [long]$frame.hwnd -eq [long]$OwnedMainToCompact.expected_main -and
+                (Test-Rev3MainAfterFrameBinding $SourceBefore $SourceBefore ([long]$OwnedMainToCompact.expected_main)) -and
+                (Test-Rev3MainAfterFrameBinding $SourceBefore $Observed ([long]$OwnedMainToCompact.expected_main))) { return 'FRAME_PENDING' }
+            return 'FRAME_FOREIGN'
+        }
         if ($frame.document_id -eq $Observed.document_id -and $frame.revision -gt $Observed.revision) { return 'FRAME_INVALID' }
         # A prior successful frame can name an earlier source. It never admits
         # COPY; only the existing exact EndDraw binding predicate can do that.
@@ -5998,12 +6312,12 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
         visual_acceptance=if ($rev3MainObservation) { 'PENDING: inspect actual pixels together with semantic evidence.' } else { 'NOT_ASSERTED: inspect the actual captured pixels.' }
         observation_kind=if ($rev3MainObservation) { 'OWNED_NATURAL_PIXEL_OBSERVATION' } else { 'LEGACY_STRICT_PENDING_REGION_GATE' }
         quiescence=if ($rev3MainObservation) { 'UNCONFIRMED' } else { 'LEGACY_GATE' }
-        natural_pending_regions=@(); ownership_before_copy=$null; ownership_after_copy=$null
+        natural_pending_regions=@(); ownership_before_copy=$null; ownership_after_copy=$null;owned_main_to_compact_transition=$null
         binding_limitations='Main EndDraw/source identity does not prove layout or child-surface freshness.'
         pre_fence_frame_contract=if ($rev3MainObservation) { 'OBSERVED_UNASSERTED: may be missing/stale before the paint fence.' } else { 'LEGACY_BEHAVIOR' }
         copied_frame_contract=if ($rev3MainObservation) { 'AVAILABLE_UNCHANGED_SOURCE_ALL_THREE_STAMPS; MATCHING_MAIN_ENDDRAW_POST_FENCE_AND_POST_COPY' } else { 'LEGACY_BEHAVIOR' }
     }
-    $captureClock=$null
+    $captureClock=$null;$transition=$null
     try {
         Assert-UiOwnedWindow $Window
         if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) {
@@ -6021,7 +6335,12 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                 Assert-UiOwnedWindow $Window
                 if ([MdliteRustAcceptanceNative]::GetForegroundWindow() -ne $Window) { throw 'OWNERSHIP_GATE: passive Main lost foreground.' }
                 $readiness.after=Get-OwnedCaptureStamp
-                $readiness.frame_observation_state=Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64()
+                $transition=$null
+                if($Window -ne $script:WindowHandle -and $Window -eq $script:InputWindowHandle) {
+                    $transition=@{expected_main=$script:WindowHandle.ToInt64();expected_pid=$script:ProcessId;expected_creation_utc=$script:Process.StartTime.ToUniversalTime().ToString('o');expected_image_path=$ExecutablePath;main=(Get-OwnedActivationState $script:WindowHandle);compact=(Get-OwnedActivationState $Window)}
+                    $readiness.owned_main_to_compact_transition=$transition
+                }
+                $readiness.frame_observation_state=Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64() $transition
                 if ($readiness.frame_observation_state -cne 'FRAME_PENDING') { break }
                 [void][Threading.Thread]::Yield()
             } while ($captureClock.Elapsed.TotalMilliseconds -lt 7000)
@@ -6091,6 +6410,10 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
                 throw 'OWNERSHIP_GATE: Rev3 Main crop is not currently owned, opaque, fixed and unoccluded before COPY.'
             }
         }
+        if($null -ne $transition) {
+            $transition.main=Get-OwnedActivationState $script:WindowHandle;$transition.compact=Get-OwnedActivationState $Window
+            if((Get-Rev3MainFrameState $readiness.before $readiness.after $Window.ToInt64() $transition) -cne 'READY'){throw 'OWNERSHIP_GATE: Compact transition changed before COPY.'}
+        }
         if ($rev3MainObservation -and $captureClock.Elapsed.TotalMilliseconds -ge 7000) { throw 'OBSERVER_FAILURE: original capture budget expired before COPY.' }
         $readiness.copy_started_utc=[DateTime]::UtcNow.ToString('o')
         $graphics.CopyFromScreen(
@@ -6124,6 +6447,11 @@ function Capture-UiOwnedWindow([IntPtr]$Window, [string]$Path) {
         }
         if ($rev3MainObservation) {
             $readiness.after_copy=Get-OwnedCaptureStamp
+            if($null -ne $transition) {
+                $afterTransition=$transition.Clone();$afterTransition.main=Get-OwnedActivationState $script:WindowHandle;$afterTransition.compact=Get-OwnedActivationState $Window
+                $readiness['owned_transition_after_copy']=$afterTransition
+                if((Get-Rev3MainFrameState $readiness.before $readiness.after_copy $Window.ToInt64() $afterTransition) -cne 'READY'){throw 'OWNERSHIP_GATE: Compact transition changed during COPY; image discarded.'}
+            }
             if (-not (Test-Rev3MainAfterFrameBinding $readiness.after $readiness.after_copy $Window.ToInt64())) {
                 throw 'OBSERVER_FAILURE: Rev3 Main source/render binding changed during COPY; image discarded.'
             }
@@ -6184,7 +6512,7 @@ function New-UiParityFixture {
         $rev3SettingsPath=Join-Path $script:UiFixtureRoot '.mdlite/settings.toml'
         [IO.File]::WriteAllText($rev3SettingsPath,"schema_version = 1`nauto_save = false`n",[Text.UTF8Encoding]::new($false))
         $script:Report['rev3_workspace_settings']=@{ path=$rev3SettingsPath; configured_auto_save=$false; sha256=Get-UiSafeFileHash $rev3SettingsPath }
-        if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME')){
+        if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR')){
             $commonDir=Join-Path $script:UiLocalAppData 'MDLite';[void][IO.Directory]::CreateDirectory($commonDir)
             [IO.File]::WriteAllText((Join-Path $commonDir 'settings.toml'),"schema_version = 1`nauto_save = false`ntheme = `"dark`"`n",[Text.UTF8Encoding]::new($false))
         }
@@ -6201,7 +6529,7 @@ function New-UiParityFixture {
     $script:UiDocumentSources = @{}
     for ($index = 0; $index -lt 9; $index++) {
         $name = 'doc-{0:D2}.md' -f $index
-        if ($Rev3 -and $Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME') -and $index -eq 0) {
+        if ($Rev3 -and $Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR') -and $index -eq 0) {
             # Plain LF/ASCII lines keep byte T and native caret geometry unambiguous.
             $source=((0..119 | ForEach-Object { 'S02 plain line {0:D3} abcdefghijklmnopqrstuvwxyz' -f $_ }) -join "`n")+"`nS02 visible tail abcdef"
         } elseif ($index -eq 0) {
@@ -6506,7 +6834,7 @@ function Invoke-Rev4PanelDrag([string]$Name,[string]$PanelId,[switch]$Height) {
             [Math]::Abs($saved.panels.calendar.height-$weight*(1-$share)) -gt 0.1) { throw 'PRODUCT_ASSERTION: released internal ratio was not persisted.' }
     }
     $path=Join-Path $script:UiRunDirectory ('rev4-'+$Name+'-settled.png')
-    $script:Rev4PanelProof.drag+=@{name=$Name;before=$before.parent_root;after=$after.parent_root;saved=$saved;cleanup=$script:Report.drag_cleanup;capture=Capture-UiOwnedWindow $script:WindowHandle $path;path=$path}
+    $script:Rev4PanelProof.drag+=@{name=$Name;before=$before.parent_root;after=$after.parent_root;saved=$saved;cleanup=$script:Report.drag_cleanup;capture=Capture-UiOwnedWindow $script:WindowHandle $path;path=$path;post_release_observation='AFTER_RELEASE_AND_READ_DIAGNOSTIC_REFRESH; NOT_RELEASE_ONLY; initial held-frame defects remain evidence'}
 }
 
 function Invoke-Rev4PanelCompactRestart {
@@ -6606,22 +6934,47 @@ function Select-Rev5RightGroup([ValidateSet('Outline','Calendar')][string]$Repre
     $commands=@{Calendar=2;Outline=3};$labels=@{Calendar='カレンダー';Outline='アウトライン'}
     $before=Read-Diagnostic
     $left=ConvertTo-Json -InputObject @($before.parent_root.panel_groups | Where-Object side -ceq 'Left') -Depth 8 -Compress
+    $selectionObservation=@{name='Rev6 Right group selection state';representative=$Representative;expected_command=$commands[$Representative];before_utc=[DateTime]::UtcNow.ToString('o');before_parent_root=$before.parent_root;before_left_json=$left;after_utc=$null;after_parent_root=$null;after_left_json=$null;raw_left_equal=$null;left_semantic_deltas=@();expected_left_invariants=@('group sequence','representative','side','view order','stored width','active group','region visibility')}
+    $script:Report.operations+=$selectionObservation
     Set-OwnedForeground -Window $script:WindowHandle
     $button=Get-UiControlById $script:WindowHandle 109 'BUTTON' -RequireVisible -RequireEnabled
     $x=[int](($button.Rect[0]+$button.Rect[2])/2);$y=[int](($button.Rect[1]+$button.Rect[3])/2)
     if([MdliteRustAcceptanceNative]::U02RightClickOwnedAt($script:WindowHandle,$script:ProcessId,$button.Handle,$x,$y) -ne 2){throw 'INPUT_FAILURE: Right region menu click incomplete.'}
     $target=Wait-Rev4OwnedPopupItem -CommandId $commands[$Representative]
-    if($target.item.label -cne $labels[$Representative] -or $target.item.disabled){throw 'PRODUCT_ASSERTION: Right group menu command/label differs.'}
+    if($target.item.disabled -or ($target.item.label_readback -ceq 'NATIVE_STRING' -and $target.item.label -cne $labels[$Representative])){throw 'PRODUCT_ASSERTION: Right group menu command/label differs.'}
+    if($target.item.label_readback -cnotin @('NATIVE_STRING','OWNERDRAW_OR_NONSTRING_USE_ACTUAL_PIXELS')){throw 'OBSERVER_FAILURE: Right group menu label readback mode is unknown.'}
+    $labelObservation=@{name='Rev6 Right group label observation';command_id=$commands[$Representative];expected_label=$labels[$Representative];label=$target.item.label;label_readback=$target.item.label_readback;visible_label='PENDING_SAFE_ACTUAL_PIXEL_REVIEW';capture=$null}
+    $script:Report.operations+=$labelObservation
+    $labelObservation.capture=Capture-Rev4OwnedMenuComposite -Name ('rev6-right-'+$Representative.ToLowerInvariant()+'-'+$script:Report.operations.Count) -TooltipHandlesBeforeMenu @() -PopupItem $target.item
     $selected=$false
     for($step=0;$step -lt @($before.parent_root.panel_groups|Where-Object side -ceq 'Right').Count;$step++){
-        Send-Rev4OwnedMenuKey 0x28
+        Send-Rev4OwnedMenuKey 0x28 $target.item
         $highlight=Wait-Rev4OwnedPopupItem -Highlighted
-        if($highlight.item.command_id -eq $commands[$Representative]){Send-Rev4OwnedMenuKey 0x0D;$selected=$true;break}
+        if($highlight.item.popup -ne $target.item.popup -or $highlight.item.menu -ne $target.item.menu){throw 'OWNERSHIP_GATE: Right group popup/HMENU changed during keyboard traversal.'}
+        if($highlight.item.command_id -eq $commands[$Representative]){Send-Rev4OwnedMenuKey 0x0D $highlight.item;$selected=$true;break}
     }
     if(-not $selected){throw 'OBSERVER_FAILURE: Right group menu keyboard traversal did not reach expected command.'}
     Wait-UiWindowGone ([IntPtr][long]$target.item.popup) 1500
     $after=Wait-UiState {param($s) @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Right' -and $_.active -and $_.representative -ceq $Representative}).Count -eq 1} 'Right region menu selects expected representative'
-    if((ConvertTo-Json -InputObject @($after.parent_root.panel_groups|Where-Object side -ceq 'Left') -Depth 8 -Compress) -cne $left){throw 'PRODUCT_ASSERTION: Right group selection changed Left groups.'}
+    $leftBefore=@($before.parent_root.panel_groups|Where-Object side -ceq 'Left');$leftAfter=@($after.parent_root.panel_groups|Where-Object side -ceq 'Left')
+    $selectionObservation.after_utc=[DateTime]::UtcNow.ToString('o');$selectionObservation.after_parent_root=$after.parent_root
+    $selectionObservation.after_left_json=ConvertTo-Json -InputObject $leftAfter -Depth 8 -Compress
+    $selectionObservation.raw_left_equal=$selectionObservation.after_left_json -ceq $left
+    if($leftBefore.Count -ne $leftAfter.Count){$selectionObservation.left_semantic_deltas+=@{field='group_count';before=$leftBefore.Count;after=$leftAfter.Count}}
+    for($groupIndex=0;$groupIndex -lt [Math]::Min($leftBefore.Count,$leftAfter.Count);$groupIndex++) {
+        foreach($field in @('representative','side','views','width','active')) {
+            $oldValue=$leftBefore[$groupIndex].$field;$newValue=$leftAfter[$groupIndex].$field
+            $equal=switch($field) {
+                'views' {(@($oldValue) -join [char]31) -ceq (@($newValue) -join [char]31)}
+                'width' {[double]$oldValue -eq [double]$newValue}
+                'active' {[bool]$oldValue -eq [bool]$newValue}
+                default {[string]$oldValue -ceq [string]$newValue}
+            }
+            if(-not $equal){$selectionObservation.left_semantic_deltas+=@{group_index=$groupIndex;field=$field;before=$oldValue;after=$newValue}}
+        }
+    }
+    if([bool]$before.parent_root.left_region_visible -ne [bool]$after.parent_root.left_region_visible){$selectionObservation.left_semantic_deltas+=@{field='left_region_visible';before=$before.parent_root.left_region_visible;after=$after.parent_root.left_region_visible}}
+    if(-not $selectionObservation.raw_left_equal -or $selectionObservation.left_semantic_deltas.Count -ne 0){throw 'PRODUCT_ASSERTION: Right group selection changed Left groups or visibility.'}
     Assert-Rev4PanelDocument $after $before 'Right group menu selection'
     return $after
 }
@@ -6677,7 +7030,7 @@ function Invoke-Rev3PanelGroups {
             (& $getMembership $state 'Right') -ceq 'Outline:Outline,Git'
     } 'Git joins Outline on Right while Explorer and Search remain on Left'
     $right=ConvertTo-Json -InputObject @($arranged.parent_root.panel_groups | Where-Object side -ceq 'Right') -Depth 8 -Compress
-    $rounds=if($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')){1}else{3}
+    $rounds=if($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER','REV6_COMPACT_RESTART')){1}else{3}
     for ($round=0;$round -lt $rounds;$round++) {
         [void](Ensure-UiActivityPanel 111)
         $search=(Wait-Diagnostic { $true } 'fresh Rev3 snapshot')
@@ -6690,10 +7043,22 @@ function Invoke-Rev3PanelGroups {
         if (@(Get-UiOwnedChildren $script:WindowHandle | Where-Object { $_.Id -in @(112,113,114) -and $_.Visible }).Count) { throw 'PRODUCT_ASSERTION: grouped/right-only activity icons were duplicated.' }
         Assert-UiDiagnosticDragInvariants $restored $baseline 'group roundtrip'
     }
-    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')) {
+    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER','REV6_COMPACT_RESTART')) {
+        if($Rev3Case -cne 'REV6_COMPACT_RESTART') {
         Set-UiActivePanelFromHeader 131
         Invoke-UiPaletteCommand '右の独立グループへ'
-        $rightSwitch=Read-Diagnostic
+        # Palette closure precedes its queued command: establish the requested layout,
+        # not an arbitrary fresh snapshot, before recording the independence baseline.
+        $rightSwitch=Wait-UiState {
+            param($s)
+            (& $getMembership $s 'Left') -ceq 'Explorer:Explorer|Search:Search' -and
+                (& $getMembership $s 'Right') -ceq 'Calendar:Calendar|Outline:Outline,Git' -and
+                @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Right' -and $_.representative -ceq 'Calendar' -and $_.active}).Count -eq 1 -and
+                @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Left' -and $_.representative -ceq 'Explorer' -and $_.active}).Count -eq 1 -and
+                $s.parent_root.left_region_visible -and $s.parent_root.right_region_visible
+        } 'Calendar independent Right command committed before switching baseline'
+        Assert-Rev4PanelDocument $rightSwitch $restored 'Calendar independent Right setup'
+        $script:Report.operations+=@{name='Rev6 Right switching preparation committed';expected_left='Explorer:Explorer|Search:Search';expected_right='Calendar:Calendar|Outline:Outline,Git';expected_active_left='Explorer';expected_active_right='Calendar';parent_root=$rightSwitch.parent_root}
         $leftMembership=& $getMembership $rightSwitch 'Left'
         foreach($representative in @('Outline','Calendar','Outline')){
             [void](Select-Rev5RightGroup $representative)
@@ -6710,10 +7075,39 @@ function Invoke-Rev3PanelGroups {
         Invoke-Rev4PanelDrag 'rev5-both-left-width' 'explorer'
         Invoke-Rev4PanelDrag 'rev5-both-right-width' 'outline'
         Invoke-Rev4PanelDrag 'rev5-both-internal-height' 'explorer' -Height
+        } else {
+            $compactSetup=Wait-UiState {
+                param($s)
+                (& $getMembership $s 'Left') -ceq 'Explorer:Explorer,Calendar|Search:Search' -and
+                    (& $getMembership $s 'Right') -ceq 'Outline:Outline,Git' -and
+                    @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Left' -and $_.representative -ceq 'Explorer' -and $_.active}).Count -eq 1 -and
+                    @($s.parent_root.panel_groups|Where-Object {$_.side -ceq 'Right' -and $_.representative -ceq 'Outline' -and $_.active}).Count -eq 1 -and
+                    $s.parent_root.left_region_visible -and $s.parent_root.right_region_visible
+            } 'Rev6 independent Compact setup has expected arranged groups'
+            Assert-Rev4PanelDocument $compactSetup $baseline 'independent Compact setup'
+        }
+        $visibilityBaseline=Read-Diagnostic
+        if(-not $visibilityBaseline.parent_root.left_region_visible -or -not $visibilityBaseline.parent_root.right_region_visible){throw 'SETUP_FAILURE: four-state visibility starts with both regions visible.'}
+        $visibilityGroups=ConvertTo-Json (Get-Rev4PanelState $visibilityBaseline).groups -Depth 12 -Compress
+        $visibilityLayout=Get-Rev4SavedPanelState $visibilityBaseline
+        $visibilityFrames=@()
+        foreach($spec in @(@{id=108;left=$false;right=$true},@{id=109;left=$false;right=$false},@{id=108;left=$true;right=$false},@{id=109;left=$true;right=$true})) {
+            Invoke-UiControlById $script:WindowHandle $spec.id
+            $visible=Wait-UiState {param($s) [bool]$s.parent_root.left_region_visible -eq $spec.left -and [bool]$s.parent_root.right_region_visible -eq $spec.right} 'Rev6 explicit independent side visibility'
+            if((ConvertTo-Json (Get-Rev4PanelState $visible).groups -Depth 12 -Compress) -cne $visibilityGroups){throw 'PRODUCT_ASSERTION: side visibility changed panel group membership/order/width/active state.'}
+            Assert-Rev4PanelDocument $visible $visibilityBaseline 'four-state visibility'
+            $buttons=@(foreach($id in @(108,109)){Get-UiControlById $script:WindowHandle $id 'BUTTON' -RequireVisible -RequireEnabled})
+            $path=Join-Path $script:UiRunDirectory ('rev6-side-'+$visibilityFrames.Count+'.png')
+            $visibilityFrames+=@{expected=$spec;state=$visible.parent_root;buttons=$buttons;saved=Get-Rev4SavedPanelState $visible;capture=Capture-UiOwnedWindow $script:WindowHandle $path;path=$path}
+            $script:Report['rev6_side_visibility']=$visibilityFrames
+        }
+        if((Get-UiSafeFileHash $visibilityLayout.path) -cne $visibilityLayout.sha256){throw 'PRODUCT_ASSERTION: four-state roundtrip did not restore saved panel bytes.'}
+        $script:Rev4PanelProof['side_visibility']=$visibilityFrames
         $before=Read-Diagnostic
         $layout=Get-Rev4SavedPanelState $before
         $membership=ConvertTo-Json (Get-Rev4PanelState $before) -Depth 12 -Compress
         $source=[string]$before.source
+        $script:Report['rev6_before_compact']=@{parent_root=$before.parent_root;layout=$layout;membership=$membership;document_id=$before.document_id;revision=$before.revision;source_sha256=Get-UiTextSha256 $source;selection=$before.selection;dirty=$before.dirty;undo_count=$before.undo_count;redo_count=$before.redo_count}
         Invoke-UiPaletteCommand 'Compactへ移す'
         $compactDeadline=[DateTime]::UtcNow.AddMilliseconds(3000);$compact=[IntPtr]::Zero
         do {
@@ -6753,7 +7147,7 @@ function Invoke-Rev3PanelGroups {
         $saved=Get-Rev4SavedPanelState $fresh
         if((ConvertTo-Json (Get-Rev4PanelState $fresh) -Depth 12 -Compress) -cne $membership -or $saved.sha256 -cne $layout.sha256){throw 'PRODUCT_ASSERTION: Rev5 restart lost panel state.'}
         $capture=Capture-UiOwnedWindow $script:WindowHandle (Join-Path $script:UiRunDirectory 'rev5-restarted-panels.png')
-        return @{rounds=$rounds;arranged=$arranged.parent_root;drag=$script:Rev4PanelProof.drag;compact=$script:Rev4PanelProof.compact;restart=@{before=$identity;after=Get-OwnedActivationState $script:WindowHandle;layout=$saved;capture=$capture};visual_acceptance='PENDING_ROOT_PIXEL_REVIEW';four_states='NOT_RUN'}
+        return @{rounds=$rounds;arranged=$arranged.parent_root;drag=$script:Rev4PanelProof.drag;four_states=$visibilityFrames;compact=$script:Rev4PanelProof.compact;restart=@{before=$identity;after=Get-OwnedActivationState $script:WindowHandle;layout=$saved;capture=$capture};visual_acceptance='PENDING_ROOT_PIXEL_REVIEW'}
     }
     if ($Rev3Case -ceq 'P01_MIGRATION_RESTART_DRAG') { $baseline=Invoke-Rev4PanelCompactRestart }
     $frames=@()
@@ -7760,8 +8154,32 @@ function Read-Rev4OwnedMenuHelp([Parameter(Mandatory=$true)][AllowEmptyCollectio
     return $receipt
 }
 
-function Capture-Rev4OwnedMenuComposite([ValidatePattern('^[A-Za-z0-9-]+$')][string]$Name,[Parameter(Mandatory=$true)][AllowEmptyCollection()][long[]]$TooltipHandlesBeforeMenu) {
+function Capture-Rev4OwnedMenuComposite([ValidatePattern('^[A-Za-z0-9-]+$')][string]$Name,[Parameter(Mandatory=$true)][AllowEmptyCollection()][long[]]$TooltipHandlesBeforeMenu,$PopupItem=$null) {
     Assert-UiExecutableIdentity
+    if($null -ne $PopupItem) {
+        $popup=[IntPtr][long]$PopupItem.popup;$menu=[long]$PopupItem.menu;$crop=[int[]]$PopupItem.rect
+        $record=@{scope='EXACT_OWNED_POPUP_ITEM_ONLY';popup=$popup.ToInt64();menu=$menu;command_id=$PopupItem.command_id;crop=$crop;captured=$false;before=$null;after=$null;path=$null;visual_acceptance='PENDING_SAFE_ACTUAL_PIXEL_REVIEW';outside_crop='NOT_CAPTURED';paint_forced=$false}
+        $record.before=[MdliteRustAcceptanceNative]::ObserveU02PopupClient($popup,$script:WindowHandle,$script:ProcessId,$menu,$crop)
+        if(-not $record.before.safe){return $record}
+        $stampBefore=Get-OwnedCaptureStamp -IncludeState
+        Add-Type -AssemblyName System.Drawing
+        $bitmap=[Drawing.Bitmap]::new(($crop[2]-$crop[0]),($crop[3]-$crop[1]));$graphics=[Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $record['copy_started_utc']=[DateTime]::UtcNow.ToString('o')
+            $graphics.CopyFromScreen($crop[0],$crop[1],0,0,$bitmap.Size,[Drawing.CopyPixelOperation]::SourceCopy)
+            $record['copy_completed_utc']=[DateTime]::UtcNow.ToString('o')
+            $record.after=[MdliteRustAcceptanceNative]::ObserveU02PopupClient($popup,$script:WindowHandle,$script:ProcessId,$menu,$crop)
+            $stampAfter=Get-OwnedCaptureStamp -IncludeState
+            if(-not $record.after.safe -or -not $stampBefore.available -or -not $stampAfter.available){return $record}
+            foreach($key in @('document_id','revision','source_sha256','selection','dirty','undo_count','redo_count','scroll')) {
+                if((ConvertTo-Json $stampBefore[$key] -Compress) -cne (ConvertTo-Json $stampAfter[$key] -Compress)){throw ('OWNERSHIP_GATE: popup COPY source invariant changed: '+$key)}
+            }
+            $record.path=Join-Path $script:UiRunDirectory ('rev4-menu-'+$Name+'.png')
+            $bitmap.Save($record.path,[Drawing.Imaging.ImageFormat]::Png);$record.captured=$true
+            $record['stamp_before']=$stampBefore;$record['stamp_after']=$stampAfter
+            return $record
+        } finally {$graphics.Dispose();$bitmap.Dispose()}
+    }
     $crop=[int[]]$script:S02FixedMainBounds
     $surfaces=@(Get-UiThreadWindows -IncludeHidden | Where-Object {
         $_.Visible -and $_.Class -in @('#32768','tooltips_class32') -and
@@ -7827,18 +8245,56 @@ function Get-Rev4DensityReceipt([ValidateSet('git','calendar')][string]$PanelId,
         $_.Rect[1] -lt ($top+72*$dpi) -and $_.Rect[3] -gt $top -and
         ($PanelId -cne 'git' -or $_.Id -in @(6000,6003,6005,6006,6027))
     })
-    if ($buttons.Count -eq 0) {throw 'PRODUCT_ASSERTION: density toolbar has no visible owned controls.'}
+    $gitNarrow = $PanelId -ceq 'git' -and [bool]$RequireNarrow
+    if ($buttons.Count -eq 0 -and -not $gitNarrow) {throw 'PRODUCT_ASSERTION: density toolbar has no visible owned controls.'}
+    $clippedControls = @()
     foreach($button in $buttons) {
         if($button.Rect[0] -lt $bounds[0] -or $button.Rect[1] -lt $bounds[1] -or $button.Rect[2] -gt $bounds[2] -or
             $button.Rect[3] -gt $bounds[3] -or $button.Rect[2] -le $button.Rect[0] -or $button.Rect[3] -le $button.Rect[1]) {
-            throw 'PRODUCT_ASSERTION: toolbar control bounds are clipped/outside the diagnosed panel body.'
+            $clippedControls += $button
         }
     }
+    if ($clippedControls.Count -gt 0 -and -not $gitNarrow) {throw 'PRODUCT_ASSERTION: toolbar control bounds are clipped/outside the diagnosed panel body.'}
     $rowTops=@($buttons | ForEach-Object {$_.Rect[1]} | Sort-Object -Unique)
-    if ($PanelId -ceq 'git' -and ($rowTops.Count -ne 1 -or ($RequireNarrow -and
-        ($buttons.Count -ne 2 -or @($buttons | Where-Object {$_.Id -eq 6027 -and $_.Enabled}).Count -ne 1 -or
-        @($buttons | Where-Object {$_.Id -in @(6000,6003) -and $_.Enabled}).Count -ne 1)))) {
-        throw 'PRODUCT_ASSERTION: Git toolbar must be one row; narrow needs enabled primary and overflow only.'
+    if ($PanelId -ceq 'git') {
+        $untrustedIdle = $gitNarrow -and $Rev3Case -ceq 'U03_DENSITY_ONLY'
+        $primary = @($buttons | Where-Object { $_.Id -in @(6000,6003) })
+        $more = @($buttons | Where-Object { $_.Id -eq 6027 })
+        $fixture = @{ required = $untrustedIdle; passed = $true }
+        if ($untrustedIdle) {
+            $summaryText = ''
+            $summaryError = $null
+            try {
+                $summaryControl = Get-UiControlById $script:WindowHandle 6500 'EDIT' -RequireVisible
+                $summaryText = [MdliteRustAcceptanceNative]::OwnedControlText($summaryControl.Handle, $script:ProcessId)
+            } catch { $summaryError = $_.Exception.Message }
+            $busyProperty = $state.parent_root.PSObject.Properties['git_job_busy']
+            $busyValue = if ($null -ne $busyProperty -and $null -ne $busyProperty.Value) { [bool]$busyProperty.Value } else { $null }
+            $fixture = @{ required = $true; native_summary_text = $summaryText; summary_untrusted = ($summaryText -match 'Untrusted');
+                git_job_busy_present = ($null -ne $busyProperty -and $null -ne $busyProperty.Value); git_job_busy = $busyValue; expected_git_job_busy = $false;
+                summary_error = $summaryError; passed = ($null -eq $summaryError -and $summaryText -match 'Untrusted' -and $null -ne $busyProperty -and $null -ne $busyProperty.Value -and -not $busyValue) }
+        }
+        $expectedPrimary = if ($untrustedIdle) { '6000 disabled' } else { 'one primary enabled' }
+        $actualPrimary = @($primary | ForEach-Object { [ordered]@{ id = $_.Id; enabled = [bool]$_.Enabled } })
+        $unexpected = @($buttons | Where-Object { $gitNarrow -and $_.Id -notin @(6000,6003,6027) })
+        $conditions = @(@{ name = 'one visible row'; expected = 1; actual = $rowTops.Count })
+        if ($gitNarrow) {
+            $conditions += @(
+                @{ name = 'two visible actions'; expected = 2; actual = $buttons.Count },
+                @{ name = 'primary'; expected = $expectedPrimary; actual = $actualPrimary },
+                @{ name = 'MORE 6027 enabled'; expected = $true; actual = @($more | ForEach-Object { [bool]$_.Enabled }) },
+                @{ name = 'no extra actions'; expected = 0; actual = $unexpected.Count },
+                @{ name = 'controls inside panel'; expected = 0; actual = $clippedControls.Count }
+            )
+        }
+        $primaryValid = if ($untrustedIdle) { $primary.Count -eq 1 -and $primary[0].Id -eq 6000 -and -not $primary[0].Enabled } else { $primary.Count -eq 1 -and $primary[0].Enabled }
+        $toolbarFailure = $rowTops.Count -ne 1 -or ($gitNarrow -and ($buttons.Count -ne 2 -or $primary.Count -ne 1 -or -not $primaryValid -or $more.Count -ne 1 -or -not $more[0].Enabled -or $unexpected.Count -gt 0 -or $clippedControls.Count -gt 0))
+        $fixtureFailure = $untrustedIdle -and -not $fixture.passed
+        $script:Report.operations += @{ name = 'Git density toolbar'; panel = $PanelId; receipt = $Name; row_tops_px = $rowTops;
+            actual_controls = $buttons; fixture_precondition = $fixture; expected_named_conditions = $conditions;
+            status = if ($fixtureFailure) { 'FIXTURE_PRECONDITION_FAILURE' } elseif ($toolbarFailure) { 'ASSERTION_FAILURE' } else { 'PASS' } }
+        if ($fixtureFailure) { throw 'FIXTURE_PRECONDITION_FAILURE: U03 must be untrusted with git_job_busy=false.' }
+        if ($toolbarFailure) { throw 'PRODUCT_ASSERTION: Git density toolbar does not match the expected row/action state.' }
     }
     return @{panel=$PanelId;name=$Name;activation=$activation;body_dip=$body;body_screen=$bounds;toolbar_controls=$buttons;bounds_observation='POST_COPY_SAME_DIAGNOSTIC_BODY; child-pixel freshness NOT_INFERRED';row_tops_px=$rowTops;path=$path;capture=$capture;state=$state.parent_root;after=$after.parent_root;pixel_density='PENDING_ACTUAL_REVIEW';overflow_open_and_action_reach='NOT_RUN_BY_READONLY_RECEIPT';calendar_upper_gap='PENDING_ACTUAL_REVIEW';physical_input='NOT_ASSERTED'}
 }
@@ -7850,13 +8306,20 @@ function Wait-Rev4OwnedPopupItem([int]$CommandId=-1,[switch]$Highlighted,[switch
         $activation=Get-OwnedActivationState $script:WindowHandle
         if($activation.foreground_hwnd -ne $script:WindowHandle.ToInt64()){throw 'OWNERSHIP_GATE: Main lost foreground while awaiting its native menu; no refocus.'}
         if($activation.menu_owner_hwnd -eq $script:WindowHandle.ToInt64()) {
-            $items=@(foreach($window in @(Get-UiThreadWindows | Where-Object Class -ceq '#32768')) {
-                [MdliteRustAcceptanceNative]::U02ReadPopupItems($window.Handle,$script:WindowHandle,$script:ProcessId,[int[]]$script:S02FixedMainBounds)
+            $candidates=@(Get-UiThreadWindows | Where-Object Class -ceq '#32768')
+            $observation=@{name='Rev6 native popup read';observed_utc=[DateTime]::UtcNow.ToString('o');command_id=$CommandId;highlight_requested=[bool]$Highlighted;disabled_requested=[bool]$Disabled;activation=$activation;candidate_count=$candidates.Count;candidates=@($candidates|ForEach-Object {@{hwnd=$_.Handle.ToInt64();class=$_.Class}});readbacks=@();enumeration_scope='OWNED_MAIN_THREAD_VISIBLE_WINDOWS'}
+            $script:Report.operations+=$observation
+            if($candidates.Count -gt 1){throw 'OWNERSHIP_GATE: multiple visible native popups are ambiguous; no input.'}
+            $items=@(foreach($window in $candidates) {
+                $readback=[Collections.Generic.Dictionary[string,object]]::new()
+                $observation.readbacks+=,$readback
+                [MdliteRustAcceptanceNative]::U02ReadPopupItems($window.Handle,$script:WindowHandle,$script:ProcessId,[int[]]$script:S02FixedMainBounds,$readback)
             })
             $lastItems=$items
             $matches=@($items | Where-Object {($CommandId -lt 0 -or ($_.command_id -eq $CommandId -and $_.submenu -eq 0 -and $_.rect_inside_popup)) -and
                 (-not $Highlighted -or $_.highlighted) -and (-not $Disabled -or $_.disabled)})
-            if(($CommandId -lt 0 -and $matches.Count -gt 0) -or ($CommandId -ge 0 -and $matches.Count -eq 1)) {
+            if(($Highlighted -or $CommandId -ge 0) -and $matches.Count -gt 1){throw 'OWNERSHIP_GATE: native command/highlight is ambiguous; no input.'}
+            if(($CommandId -lt 0 -and -not $Highlighted -and $matches.Count -gt 0) -or (($Highlighted -or $CommandId -ge 0) -and $matches.Count -eq 1)) {
                 return @{item=$matches[0];all_items=$items;activation=$activation;elapsed_ms=$clock.Elapsed.TotalMilliseconds}
             }
         } elseif($activation.menu_owner_hwnd -ne 0){throw 'OWNERSHIP_GATE: a foreign menu owner replaced Main.'}
@@ -7866,12 +8329,17 @@ function Wait-Rev4OwnedPopupItem([int]$CommandId=-1,[switch]$Highlighted,[switch
     throw 'OBSERVER_FAILURE: expected owned native popup/item did not become observable.'
 }
 
-function Send-Rev4OwnedMenuKey([int]$Key) {
+function Send-Rev4OwnedMenuKey([int]$Key,$ExpectedItem=$null) {
     $active=Get-OwnedActivationState $script:WindowHandle
     if($active.foreground_hwnd -ne $script:WindowHandle.ToInt64() -or $active.menu_owner_hwnd -ne $script:WindowHandle.ToInt64()) {
         throw 'OWNERSHIP_GATE: native menu keyboard target changed; no refocus/input sent.'
     }
-    if([MdliteRustAcceptanceNative]::SendVirtualKey($script:WindowHandle,$script:ProcessId,[uint16]$Key,[uint16[]]@()) -ne 2){throw 'INPUT_FAILURE: native menu key delivery incomplete.'}
+    if($null -ne $ExpectedItem) {
+        $check=[Collections.Generic.Dictionary[string,object]]::new()
+        $script:Report.operations+=@{name='Rev6 immediate menu key validation';key=$Key;expected_item=$ExpectedItem;activation=$active;native=$check}
+        $sent=[MdliteRustAcceptanceNative]::U02SendPopupKey([IntPtr][long]$ExpectedItem.popup,$script:WindowHandle,$script:ProcessId,[int[]]$script:S02FixedMainBounds,[long]$ExpectedItem.menu,[uint32]$ExpectedItem.command_id,[uint16]$Key,$check)
+    } else {$sent=[MdliteRustAcceptanceNative]::SendVirtualKey($script:WindowHandle,$script:ProcessId,[uint16]$Key,[uint16[]]@())}
+    if($sent -ne 2){throw 'INPUT_FAILURE: native menu key delivery incomplete.'}
 }
 
 function Test-Rev4MenuFocusReturn($After,[long]$MainHwnd,[long]$ExpectedFocus) {
@@ -7954,7 +8422,8 @@ function Get-Rev4ObservedCalendarMonth($Cells) {
     return [DateTime]::new([int]$date.year,[int]$date.month,1)
 }
 
-function Invoke-Rev4U02U03Focused {
+function Invoke-Rev4U02U03Focused([switch]$DensityOnly) {
+    if($DensityOnly -and -not $Rev5Observation){throw 'REV6_DENSITY_REQUIRES_PASSIVE_OBSERVATION'}
     $proof=[ordered]@{menus=@();keyboard_before_open=@();density=@();width_gestures=@();calendar_roundtrip=$null;visual_acceptance='PENDING_ROOT_MENU_HELP_AND_DENSITY_PIXEL_REVIEW';typed_tooltip_text='OPTIONAL_READBACK_NOT_A_PIXEL_GATE';physical_input='NOT_ASSERTED'}
     $script:Report['rev4_u02_u03']=$proof
     # Observe an away/back transition; default Explorer alone cannot acknowledge the queued click.
@@ -7980,6 +8449,7 @@ function Invoke-Rev4U02U03Focused {
         if($fresh.selection.anchor -ne $baseline.selection.anchor -or $fresh.selection.head -ne $baseline.selection.head -or $fresh.scroll -ne $baseline.scroll){throw 'PRODUCT_ASSERTION: U02/U03 document position changed.'}
         Assert-S02DiskState $disk $phase
     }
+    if(-not $DensityOnly){
     foreach($spec in @(@{name='main-file-enabled-keyboard';key=0x46;id=1;help='新しい文書';disabled=$false},@{name='main-view-disabled-hover';key=0x56;id=103;help='Compactではありません';disabled=$true})) {
         $proof['phase']=$spec.name
         $oldTips=@(& $tips)
@@ -8034,6 +8504,8 @@ function Invoke-Rev4U02U03Focused {
     [void](Ensure-UiActivityPanel 113)
     $outlinePath=Join-Path $script:UiRunDirectory 'rev4-density-outline.png'
     $proof['outline']=@{capture=(Capture-UiOwnedWindow $script:WindowHandle $outlinePath);path=$outlinePath}
+    } # DensityOnly skips broad menu/help tour, retaining setup and actual narrow actions.
+    if($DensityOnly){$proof.visual_acceptance='PENDING_ROOT_DENSITY_PIXEL_REVIEW';$proof['scope']='GIT_CALENDAR_ORDINARY_NARROW_ACTIONS_ONLY';$proof['broad_menu_help']='NOT_RUN'}
     foreach($spec in @(@{panel='git';activity=114},@{panel='calendar';activity=112})) {
         [void](Ensure-UiActivityPanel $spec.activity)
         $ordinary=Get-Rev4DensityReceipt $spec.panel ($spec.panel+'-ordinary')
@@ -8093,17 +8565,88 @@ function Observe-Rev5StableSource([string]$Name,[string]$ExpectedSource) {
     return $record
 }
 
+function Invoke-Rev6SourceLiveEndpoints {
+    if(-not $Rev5Observation){throw 'REV6_SOURCE_LIVE_REQUIRES_PASSIVE_OBSERVATION'}
+    $source=[string]$script:UiDocumentSources['doc-08.md']
+    $baseline=Switch-UiSource $source 9
+    if($baseline.dirty -or $baseline.ime.active -or -not [string]::IsNullOrEmpty([string]$baseline.ime.preedit)){
+        throw 'SETUP_FAILURE: Source/Live display requires clean doc-08 without composition.'
+    }
+    $disk=Get-S02DiskState
+    $byteLength=[Text.Encoding]::UTF8.GetByteCount($source)
+    $frames=@()
+    $script:Report['rev5_stable_source_series']=@()
+    $proof=[ordered]@{document_id=$baseline.document_id;source_sha256=Get-UiTextSha256 $source;utf8_length=$byteLength;frames=@();visual_acceptance='PENDING_ROOT_PIXEL_REVIEW';front_matter='NOT_RUN: existing doc-08 contains no Front Matter';physical_input='NOT_ASSERTED'}
+    $script:Report['rev6_source_live']=$proof
+    # Begin in Source, return through Live, and preserve the original mode.
+    foreach($mode in @($true,$false)){
+        $before=Read-Diagnostic
+        if([bool]$before.raw -ne $mode){
+            Send-Key $script:WindowHandle 0x45 ([uint16[]]@(0x11))
+            $toggled=Wait-UiState {param($s) [bool]$s.raw -eq $mode} 'Rev6 Source/Live normal shortcut'
+            $expected=$before.PSObject.Copy();$expected.raw=$mode
+            Assert-UiDiagnosticDragInvariants $toggled $expected 'Rev6 Source/Live toggle'
+            if($toggled.selection.anchor -ne $before.selection.anchor -or $toggled.selection.head -ne $before.selection.head){throw 'PRODUCT_ASSERTION: Source/Live toggle changed exact source selection.'}
+        }
+        foreach($edge in @(@{name='bof';key=0x24;byte=0},@{name='eof';key=0x23;byte=$byteLength})){
+            Send-Key $script:WindowHandle $edge.key ([uint16[]]@(0x11))
+            $state=Wait-UiState {param($s) [bool]$s.raw -eq $mode -and [int]$s.selection.anchor -eq $edge.byte -and [int]$s.selection.head -eq $edge.byte} ('Rev6 exact '+$edge.name)
+            $expected=$baseline.PSObject.Copy();$expected.raw=$mode
+            Assert-UiDiagnosticDragInvariants $state $expected 'Rev6 Source/Live endpoint'
+            Assert-S02DiskState $disk 'Rev6 Source/Live before capture'
+            [void](Get-EditorRecoveryCaretDipPoint $state 'Rev6 endpoint actual caret')
+            $focus=[MdliteRustAcceptanceNative]::ObserveOwnedEditorFocus($script:WindowHandle,$script:WindowHandle,[IntPtr]::Zero,$script:ProcessId)
+            if(-not $focus.foreground_is_expected -or -not $focus.active_is_expected -or -not $focus.focus_is_expected -or -not $focus.caret_is_expected){throw 'OWNERSHIP_GATE: Source/Live endpoint lacks exact Main editor focus/caret.'}
+            $name='rev6-'+$(if($mode){'source'}else{'live'})+'-'+$edge.name
+            $path=Join-Path $script:UiRunDirectory ($name+'.png')
+            $capture=Capture-UiOwnedWindow $script:WindowHandle $path
+            $after=Read-Diagnostic
+            Assert-UiDiagnosticDragInvariants $after $state 'Rev6 endpoint capture'
+            if($after.selection.anchor -ne $edge.byte -or $after.selection.head -ne $edge.byte -or $after.scroll -ne $state.scroll){throw 'PRODUCT_ASSERTION: endpoint capture changed source position.'}
+            Assert-S02DiskState $disk 'Rev6 Source/Live after capture'
+            # Keep the immediate image; observe natural presentation with the existing unforced 2s sampler.
+            $series=Observe-Rev5StableSource ($name+'-endpoint') $source
+            foreach($sample in $series.passive.frames){
+                foreach($stamp in @($sample.stamp,$sample.stamp_after)){
+                    if($stamp.document_id -ne $state.document_id -or $stamp.revision -ne $state.revision -or
+                        $stamp.source_sha256 -cne $proof.source_sha256 -or
+                        $stamp.selection.anchor -ne $edge.byte -or $stamp.selection.head -ne $edge.byte){
+                        throw 'OBSERVER_FAILURE: endpoint passive frame stamp differs from exact source/revision/selection oracle.'
+                    }
+                }
+            }
+            $afterSeries=Read-Diagnostic
+            Assert-UiDiagnosticDragInvariants $afterSeries $state 'Rev6 passive endpoint series'
+            if($afterSeries.selection.anchor -ne $edge.byte -or $afterSeries.selection.head -ne $edge.byte -or $afterSeries.scroll -ne $state.scroll){throw 'PRODUCT_ASSERTION: passive endpoint series changed source position.'}
+            Assert-S02DiskState $disk 'Rev6 passive endpoint series disk'
+            $series['endpoint_binding']=@{expected_raw=$mode;expected_byte=$edge.byte;raw_before=[bool]$after.raw;raw_after=[bool]$afterSeries.raw;before=$after;after=$afterSeries;raw_scope='DIAGNOSTIC_BEFORE_AFTER_SERIES; per-frame raw not exposed; no input during series';pixel_endpoint='PENDING_ACTUAL_FRAME_REVIEW; stable source/selection stamps do not prove painted caret/status'}
+            $frames+=@{mode=$(if($mode){'Source'}else{'Live'});edge=$edge.name;expected_byte=$edge.byte;selection=$afterSeries.selection;scroll=$afterSeries.scroll;focus=$focus;path=$path;capture=$capture;passive_series=$series}
+            $proof.frames=$frames
+        }
+    }
+    $last=Read-Diagnostic
+    if([bool]$last.raw -ne [bool]$baseline.raw){
+        Send-Key $script:WindowHandle 0x45 ([uint16[]]@(0x11))
+        $last=Wait-UiState {param($s) [bool]$s.raw -eq [bool]$baseline.raw} 'Rev6 restores original Source/Live mode'
+    }
+    Assert-UiDiagnosticDragInvariants $last $baseline 'Rev6 Source/Live final original mode'
+    if($last.selection.anchor -ne $byteLength -or $last.selection.head -ne $byteLength){throw 'PRODUCT_ASSERTION: Source/Live final mode restore lost EOF.'}
+    Assert-S02DiskState $disk 'Rev6 Source/Live final disk'
+    $proof['source_history_disk_unchanged']=$true
+    return $proof
+}
+
 function Invoke-Rev3FocusedCases($StartupState) {
     $script:Report['native_editor_focus_checks']=@()
     $script:Report['rev3_acceptance']='PARTIAL: case PASS means observed assertions only; visual review, actual DPI matrix and physical IME remain separate.'
     $script:Report['rev3_selected_case']=if ([string]::IsNullOrWhiteSpace($Rev3Case)) { 'ALL' } else { $Rev3Case }
-    if($Rev3Case -ceq 'REV5_PANEL_REMAINDER'){
+    if($Rev3Case -cin @('REV5_PANEL_REMAINDER','REV6_COMPACT_RESTART')){
         if(-not $Rev5Observation){throw 'REV5_CASE_REQUIRES_PASSIVE_OBSERVATION'}
         $script:Rev4PanelProof=[ordered]@{drag=@();disk_before=[ordered]@{}}
         $script:Report['held_drag_waypoints']=@()
         foreach($path in $script:UiInitialDocPaths){$script:Rev4PanelProof.disk_before[$path]=Get-UiSafeFileHash $path}
         $script:Report['rev5_panel_proof']=$script:Rev4PanelProof
-        [void](Invoke-UiParityCase 'REV5_PANEL_REMAINDER' {Invoke-Rev3PanelGroups})
+        [void](Invoke-UiParityCase $Rev3Case {Invoke-Rev3PanelGroups})
     } elseif($Rev3Case -ceq 'REV5_STARTUP_EDIT_PANELS'){
         if(-not $Rev5Observation){throw 'REV5_CASE_REQUIRES_PASSIVE_OBSERVATION'}
         [void](Invoke-UiParityCase 'REV5_STARTUP_EDIT_PANELS' {
@@ -8138,6 +8681,9 @@ function Invoke-Rev3FocusedCases($StartupState) {
             $script:Report['rev5_panel_proof']=$script:Rev4PanelProof
             @{edit_capture=$editCapture;undo_capture=$undoCapture;edit_series=$editSeries;undo_series=$undoSeries;undo_redo_steps=$budget;restored_disk_sha256=$disk;input='Unicode SendInput; physical/IME NOT_ASSERTED';panels=Invoke-Rev3PanelGroups}
         })
+    } elseif($Rev3Case -ceq 'REV6_SOURCE_LIVE_ENDPOINTS'){
+        $passed=Invoke-UiParityCase 'REV6_SOURCE_LIVE_ENDPOINTS' {Invoke-Rev6SourceLiveEndpoints}
+        if(-not $passed){throw 'REV6_SOURCE_LIVE_STOPPED_PROCESS_RETAINED'}
     } elseif($Rev3Case -cin @('STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')){
         Invoke-StartupFenceComparison $StartupState
         foreach($id in @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS')){Add-UiParityCase $id 'NOT_RUN' 'DIAGNOSTIC_ONLY_NO_ACCEPTANCE' $null}
@@ -8470,7 +9016,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
         if ($Rev3Case -ceq 'S01_FIELDS_COLOR' -and -not $s01CasePassed) {throw 'S01_FIELDS_COLOR_STOPPED_PROCESS_RETAINED'}
     }
     $s02CasePassed=Invoke-UiParityCase 'S01_S02_FORM_CLOSE' {
-        if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME')){return (Invoke-S02ReturnProof)}
+        if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR')){return (Invoke-S02ReturnProof)}
         $paths=@(); $finalFrames=@()
         $closeNames=@('Cancel')
         if ($Rev3Case -cne 'S02_CANCEL_ONLY') { $closeNames+=@('Escape','TitlebarClose','ApplyThenCancel') }
@@ -8552,9 +9098,9 @@ function Invoke-Rev3FocusedCases($StartupState) {
         }
         @{ settings_layout='COMPACT_INITIAL_FORM_REPRESENTATIVE'; settings_scroll='NOT_RUN'; close_paths=$paths; close_path_scope=if ($Rev3Case -ceq 'S02_CANCEL_ONLY') { 'CANCEL_ONLY; Escape/TitlebarClose/ApplyThenCancel NOT_RUN' } else { 'FOUR_COMPACT_INITIAL_FORM_PATHS; layers/theme/scroll remain separate' }; final_owned_snapshots=$finalFrames; apply_conflicts='NOT_RUN'; changed_value_apply='NOT_RUN'; all_layers='NOT_RUN'; continuous_close_frames='CAPTURED_PENDING_VISUAL_REVIEW'; physical_input='NOT_ASSERTED' }
     }
-    if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME') -and -not $s02CasePassed){throw 'S02_RETURN_PROOF_STOPPED_PROCESS_RETAINED'}
+    if($Rev3Case -cin @('S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR') -and -not $s02CasePassed){throw 'S02_RETURN_PROOF_STOPPED_PROCESS_RETAINED'}
     $u02CasePassed=Invoke-UiParityCase 'U02_U03_VISUAL_RECEIPTS' {
-        if($Rev3Case -ceq 'U02_U03_FOCUSED'){return (Invoke-Rev4U02U03Focused)}
+        if($Rev3Case -cin @('U02_U03_FOCUSED','U03_DENSITY_ONLY')){return (Invoke-Rev4U02U03Focused -DensityOnly:($Rev3Case -ceq 'U03_DENSITY_ONLY'))}
         $frames=@()
         foreach ($activity in @(112,114)) {
             [void](Ensure-UiActivityPanel $activity)
@@ -8563,7 +9109,7 @@ function Invoke-Rev3FocusedCases($StartupState) {
         }
         @{ frames=$frames; visual_acceptance='PENDING: toolbar rows, Calendar gap, font density'; menu_keyboard_help='NOT_RUN'; compact_overflow='NOT_RUN' }
     }
-    if($Rev3Case -ceq 'U02_U03_FOCUSED' -and -not $u02CasePassed){throw 'U02_U03_FOCUSED_STOPPED_PROCESS_RETAINED'}
+    if($Rev3Case -cin @('U02_U03_FOCUSED','U03_DENSITY_ONLY') -and -not $u02CasePassed){throw 'U02_U03_FOCUSED_STOPPED_PROCESS_RETAINED'}
     }
     Invoke-Rev3QualifiedNormalClose
     $closeRecord=$script:Report.normal_close_details
@@ -8663,7 +9209,7 @@ function Invoke-UiParitySuite {
     )
     if ($Rev3) { $caseIds = @('P01_P04_GROUPS','E01_E04_DIRECT_LIVE','U01_QUERY_BOUNDARY','S01_S02_FORM_CLOSE','U02_U03_VISUAL_RECEIPTS'); if ($Rev3PanelTargetProbe) { $caseIds = @('PANEL_TARGET_PROBE') + $caseIds }; if ($Rev3Case -ceq 'PAINT_DEPENDENCY_PROBE') { $caseIds = @('PAINT_DEPENDENCY_PROBE') + $caseIds } }
     if ($Rev3 -and $Rev3Case -ceq 'SETTINGS_ENUMERATION_PROBE') { $caseIds = @('SETTINGS_ENUMERATION_PROBE') + $caseIds }
-    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER')) { $caseIds=@($Rev3Case) }
+    if ($Rev3Case -cin @('REV5_STARTUP_EDIT_PANELS','REV5_PANEL_REMAINDER','REV6_COMPACT_RESTART','REV6_SOURCE_LIVE_ENDPOINTS')) { $caseIds=@($Rev3Case) }
     if ($Rev3 -and $Rev3Case -cin @('S01_FORM_FIELDS','S01_FIELDS_COLOR')) { $caseIds = @('S01_FORM_FIELDS') + $caseIds }
     if($Rev3 -and $Rev3Case -cin @('STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')){$caseIds=@('STARTUP_FENCE_COMPARISON')+$caseIds}
     if ($StartupSmoke) {
@@ -8690,7 +9236,7 @@ function Invoke-UiParitySuite {
         $script:Report.active_input_profile = $initial.active_input_profile
         if($Rev5Observation -and $script:Report.dpi -ne 96){throw 'REV5_REQUIRES_100_PERCENT_DPI'}
         $script:UiCapturePath = Join-Path $script:UiRunDirectory 'initial-window.png'
-        if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S01_FORM_FIELDS','S01_FIELDS_COLOR','U02_U03_FOCUSED','STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT')) {
+        if ($Rev3 -and $Rev3Case -cin @('S02_CANCEL_ONLY','S02_RETURN_PROOF','S02_APPLY_RETURN_PROOF','S02_APPLY_IME','S01_FORM_FIELDS','S01_FIELDS_COLOR','U02_U03_FOCUSED','STARTUP_FENCE_CONTROL','STARTUP_FENCE_TREATMENT','S02_MISSING_CLICKCHAR','S02_TITLEBAR_CLICKCHAR','U03_DENSITY_ONLY','REV6_SOURCE_LIVE_ENDPOINTS')) {
             Assert-OwnedWindow $script:WindowHandle
             if ([MdliteRustAcceptanceNative]::WindowClass($script:WindowHandle) -cne 'MDLiteRustEditor') {
                 throw 'OWNERSHIP_GATE: S02 geometry-only startup requires the exact owned Main instance.'
@@ -9442,6 +9988,9 @@ function Invoke-UiParitySuite {
         $script:Report.status = 'FAIL'
         $script:Report.failure_case_id = $script:CurrentUiCaseId
         $script:Report['failure_message'] = $_.Exception.Message
+        $script:Report['failure_exception'] = $_.Exception.ToString()
+        $script:Report['failure_base_exception_type'] = $_.Exception.GetBaseException().GetType().FullName
+        $script:Report['failure_base_exception_message'] = $_.Exception.GetBaseException().Message
         $script:Report['failure_script_stack_trace'] = $_.ScriptStackTrace
         $script:Report['failure_invocation_info'] = [ordered]@{
             script_name = $_.InvocationInfo.ScriptName
@@ -9451,10 +10000,10 @@ function Invoke-UiParitySuite {
             position_message = $_.InvocationInfo.PositionMessage
             invocation_name = $_.InvocationInfo.InvocationName
         }
-        $script:Report.failure_code = if ($_.Exception.Message -match '^[A-Z0-9_]+$') {
-            $_.Exception.Message
+        $script:Report.failure_code = if ($_.Exception.GetBaseException().Message -match '^([A-Z][A-Z0-9_]+)(?::|$)') {
+            $Matches[1]
         } else {
-            $_.Exception.GetType().Name.ToUpperInvariant()
+            $_.Exception.GetBaseException().GetType().Name.ToUpperInvariant()
         }
         Complete-UiParityCaseList $caseIds
     } finally {

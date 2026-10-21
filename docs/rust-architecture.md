@@ -18,6 +18,29 @@ Markdown原文を永続正本とし、表示は派生データとする。
 
 ## 選定
 
+2026年10月22日の描画負荷調査では、同じEXE・同じ所有windowで
+`WS_EX_COMPOSITED`だけを解除すると、静止時の連続paintが止まることを確認した。
+DCへ描く現在のDirect2D経路にMain/Compact全体の合成styleを重ねず、
+既存の子control固有bufferとdamage/caret/IME処理を維持する。
+既存経路の局所修正で原因を除けるため、新しい描画libraryやbufferは追加しない。
+依存・memory・互換性の負担を増やさずに済む。
+この局所選択はVMでの原因比較に基づくもので、別GPU/端末の性能保証ではない。
+最終buildの測定値と表示回帰は[受入記録](rust-acceptance.md)に対応付ける。
+
+Settingsの親背景消去は`WS_CLIPCHILDREN`で可視の子control領域を除外する。
+借用中も安定したtheme/brush snapshotで色通知を処理し、親の背景で子controlを上書きしない。
+同じSettings HWNDのstyleだけを変えた比較で、child中心が親DCから除外され、
+開閉途中のblank frameが消えることを確認した。追加bufferや強制再描画で覆い隠さない。
+
+今回のShell/status、Features、Settings helpのTooltip登録には、使用中のcommon-controlsが
+受理する`TTTOOLINFOW` sizeを渡す。
+このno-manifest native環境ではfull size 72の登録が失敗し、`lpReserved`の手前までの
+V2 size 64で登録・Unicode全文・矩形の読戻しが成立した。sizeはABIのfield offsetから求め、
+manifestやcontrol frameworkを切り替えない。
+[`TTM_ADDTOOL`](https://learn.microsoft.com/en-us/windows/win32/controls/ttm-addtool)の戻り値と、
+[`TTTOOLINFOW`](https://learn.microsoft.com/en-us/windows/win32/api/commctrl/ns-commctrl-tttoolinfow)の
+text buffer契約を守る。調査時のmanual size比較と、production登録経路の回帰確認を区別する。
+
 Win32とDirectWrite/Direct2Dを選ぶ。OSの文字整形と同じlayoutを描画、
 hit test、selection、IME候補位置に使い、独自の文字幅推測を避ける。
 `windows` 0.62.2のライセンスはMIT/Apache-2.0、MSRVは1.82。

@@ -1837,6 +1837,15 @@ impl App {
         true
     }
     pub(super) fn git_branch_label(&self) -> String {
+        if self.git_ui.workspace.is_none() {
+            return "Workspace未設定".into();
+        }
+        if !self.git_ui.trusted {
+            return "Trust未確認".into();
+        }
+        if self.git_ui.worker.is_some() {
+            return "状態を更新中".into();
+        }
         let Some(status) = &self.git_ui.status else {
             return "未確認".into();
         };
@@ -1844,13 +1853,26 @@ impl App {
             GitState::NoGit => "Gitなし".into(),
             GitState::NoRepository => "repoなし".into(),
             _ => {
-                if status.detached {
+                let branch = if status.detached {
                     "detached".into()
                 } else if status.unborn {
                     format!("{} (unborn)", status.branch)
                 } else {
                     status.branch.clone()
-                }
+                };
+                let changes = if status.files.iter().any(|file| file.conflicted) {
+                    "競合あり".into()
+                } else if status.files.is_empty() {
+                    "local変更なし".into()
+                } else {
+                    format!("変更{}件", status.files.len())
+                };
+                let remote = if status.state == GitState::NoRemote {
+                    "remoteなし"
+                } else {
+                    "remoteあり"
+                };
+                format!("{branch} · {changes} · {remote}")
             }
         }
     }
@@ -2315,6 +2337,37 @@ fn selection_after_source_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_label_distinguishes_unchecked_trust_and_local_repository_states() {
+        let mut app = super::super::tests::composing_test_app("note");
+        assert_eq!(app.git_branch_label(), "Workspace未設定");
+        app.git_ui.workspace = Some(WorkspaceIdentity::read(&std::env::temp_dir()).unwrap());
+        assert_eq!(app.git_branch_label(), "Trust未確認");
+        app.git_ui.trusted = true;
+        assert_eq!(app.git_branch_label(), "未確認");
+        app.git_ui.status = Some(GitStatus {
+            state: GitState::NoRepository,
+            ..Default::default()
+        });
+        assert_eq!(app.git_branch_label(), "repoなし");
+        app.git_ui.status = Some(GitStatus {
+            state: GitState::NoRemote,
+            branch: "main".into(),
+            ..Default::default()
+        });
+        assert_eq!(app.git_branch_label(), "main · local変更なし · remoteなし");
+        app.git_ui.status.as_mut().unwrap().files.push(FileStatus {
+            path: "note.md".into(),
+            original_path: None,
+            index: b'.',
+            worktree: b'M',
+            untracked: false,
+            conflicted: false,
+        });
+        assert_eq!(app.git_branch_label(), "main · 変更1件 · remoteなし");
+        app.git_ui.status.as_mut().unwrap().files[0].conflicted = true;
+        assert!(app.git_branch_label().contains("競合あり"));
+    }
     #[test]
     fn git_diff_text_normalizes_native_crlf_without_changing_stdout() {
         let diff = GitDiff {

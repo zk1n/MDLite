@@ -8,11 +8,53 @@ use mdlite::{
 use std::ops::Range;
 
 const STATUS_MAX_CHARS: usize = 260;
-const STATUS_NAME_CHARS: usize = 32;
 const MAX_INLINE_CODE_RECTS: usize = 128;
 const LINE_HEIGHT_EM: f32 = 1.6;
 const LINE_BASELINE_EM: f32 = 1.25;
 const HEADING_GAP_EM: f32 = 0.12;
+
+pub(super) struct StatusField {
+    pub text: String,
+    pub width: f32,
+    priority: u8,
+}
+
+/// Fixed information owns its own cell; optional cells disappear before the
+/// caret and save state. Positions never depend on a transient message length.
+fn status_cells(fields: &[StatusField], width: f32) -> Vec<(usize, f32, f32)> {
+    let mut remaining = width.max(0.0);
+    let mut included = vec![false; fields.len()];
+    for priority in 0..=7 {
+        for (index, field) in fields.iter().enumerate() {
+            if field.priority == priority && field.width <= remaining {
+                included[index] = true;
+                remaining -= field.width;
+            }
+        }
+    }
+    let mut right = width.max(0.0);
+    let mut cells = Vec::new();
+    for (index, field) in fields
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(index, _)| *index >= 2)
+    {
+        if included[index] {
+            right -= field.width;
+            cells.push((index, right, field.width));
+        }
+    }
+    cells.reverse();
+    let mut left = 0.;
+    for (index, field) in fields.iter().take(2).enumerate() {
+        if included[index] {
+            cells.insert(index.min(cells.len()), (index, left, field.width));
+            left += field.width;
+        }
+    }
+    cells
+}
 
 pub(super) fn line_height(size: f32) -> f32 {
     size * LINE_HEIGHT_EM
@@ -375,7 +417,7 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn editor_status_text(&mut self) -> String {
+    pub(super) fn editor_status_fields(&mut self) -> Vec<StatusField> {
         let document_id = self.doc().id();
         let revision = self.doc().revision();
         let cache_matches =
@@ -403,7 +445,7 @@ impl App {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
             })
-            .unwrap_or_else(|| "—".to_owned());
+            .unwrap_or_else(|| "未設定".to_owned());
         let branch = self.git_branch_label();
         let eol = &self.shell.status_eol_cache.as_ref().unwrap().2;
         let (line, column) = line_column(&tab.doc, eol);
@@ -422,19 +464,133 @@ impl App {
         } else {
             "Plain text"
         };
-        let text = format!(
-            "Workspace {} · Git {} · {} · {} · Ln {}, Col {} · {} · {} · {}",
-            clipped(&workspace, STATUS_NAME_CHARS),
-            clipped(&branch, STATUS_NAME_CHARS),
-            save,
-            external,
-            line,
-            column,
-            format_encoding(encoding),
-            clipped(&eol.summary, 48),
-            document_type,
-        );
-        clipped(&text, STATUS_MAX_CHARS)
+        let mode = if tab.raw { "Source" } else { "Live" };
+        vec![
+            StatusField {
+                text: format!("Workspace {workspace}"),
+                width: 180.,
+                priority: 2,
+            },
+            StatusField {
+                text: format!("Git {branch}"),
+                width: 150.,
+                priority: 3,
+            },
+            StatusField {
+                text: format!("Ln {line}, Col {column}"),
+                width: 112.,
+                priority: 0,
+            },
+            StatusField {
+                text: format_encoding(encoding).into(),
+                width: 76.,
+                priority: 4,
+            },
+            StatusField {
+                text: eol.summary.clone(),
+                width: 126.,
+                priority: 6,
+            },
+            StatusField {
+                text: format!("{mode} · {document_type}"),
+                width: 132.,
+                priority: 5,
+            },
+            StatusField {
+                text: save.into(),
+                width: 76.,
+                priority: 1,
+            },
+            StatusField {
+                text: external.into(),
+                width: 112.,
+                priority: 7,
+            },
+        ]
+    }
+
+    #[cfg(test)]
+    pub(super) fn editor_status_text(&mut self) -> String {
+        self.editor_status_fields()
+            .into_iter()
+            .map(|field| field.text)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    pub(super) unsafe fn draw_editor_status(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        top: f32,
+        foreground: &ID2D1SolidColorBrush,
+        border: &ID2D1SolidColorBrush,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let fields = self.editor_status_fields();
+            let left = if self.shell.enabled && self.hwnd == self.shell.main_window {
+                52.
+            } else {
+                8.
+            };
+            let available = (self.width - left - 8.).max(0.);
+            let cells = status_cells(&fields, available);
+            let tooltip = fields
+                .iter()
+                .map(|field| field.text.as_str())
+                .chain(std::iter::once(self.status.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.status_tooltip(&tooltip, left, top + 2., available);
+            for &(index, offset, width) in &cells {
+                let x = left + offset;
+                target.DrawLine(point(x, top + 7.), point(x, top + 23.), border, 1., None);
+                let layout =
+                    self.ui_text_layout(&fields[index].text, (width - 16.).max(1.), 12.)?;
+                layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                let ellipsis = self.graphics.write.CreateEllipsisTrimmingSign(&layout)?;
+                layout.SetTrimming(
+                    &DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        ..Default::default()
+                    },
+                    &ellipsis,
+                )?;
+                target.DrawTextLayout(
+                    point(x + 8., top + 5.),
+                    &layout,
+                    foreground,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
+            // The fixed cells stay in place while a message uses the spare
+            // space at the left. Its full value remains in the tooltip.
+            let left_end = cells
+                .iter()
+                .filter(|(index, _, _)| *index < 2)
+                .map(|(_, x, width)| x + width)
+                .fold(0., f32::max);
+            let right_start = cells
+                .iter()
+                .filter(|(index, _, _)| *index >= 2)
+                .map(|(_, x, _)| *x)
+                .fold(available, f32::min);
+            let message_width = right_start - left_end;
+            if !self.status.is_empty() && message_width >= 60. {
+                let layout = self.ui_text_layout(
+                    &clipped(&self.status, STATUS_MAX_CHARS),
+                    (message_width - 12.).max(1.),
+                    12.,
+                )?;
+                layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                target.DrawTextLayout(
+                    point(left + left_end + 6., top + 5.),
+                    &layout,
+                    foreground,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
+            Ok(())
+        }
     }
 
     pub(super) fn mark_external_change(&mut self, document_id: u64) {
@@ -649,6 +805,39 @@ mod tests {
         assert!(status.contains("Ln 3, Col 3"));
         assert!(status.contains("LF:1 CRLF:1 CR:1"));
         assert!(status.contains("Markdown"));
+    }
+
+    #[test]
+    fn status_cells_keep_caret_and_save_at_narrow_width_without_overlap() {
+        let mut app = super::super::tests::composing_test_app("line\n");
+        let fields = app.editor_status_fields();
+        for width in [0., 80., 188., 300., 640., 1024., 1600.] {
+            let mut cells = status_cells(&fields, width);
+            cells.sort_by(|a, b| a.1.total_cmp(&b.1));
+            for &(_, x, cell_width) in &cells {
+                assert!(x >= 0. && x + cell_width <= width);
+            }
+            assert!(
+                cells
+                    .windows(2)
+                    .all(|pair| pair[0].1 + pair[0].2 <= pair[1].1)
+            );
+            if width >= 188. {
+                assert!(cells.iter().any(|(index, _, _)| *index == 2));
+                assert!(cells.iter().any(|(index, _, _)| *index == 6));
+            }
+        }
+        let cells = status_cells(&fields, 1024.);
+        assert_eq!(
+            cells.iter().find(|(index, _, _)| *index == 0).unwrap().1,
+            0.
+        );
+        assert_eq!(
+            cells.iter().find(|(index, _, _)| *index == 1).unwrap().1,
+            180.
+        );
+        assert!(fields[0].text.contains("未設定"));
+        assert!(fields[1].text.contains("Workspace未設定"));
     }
 
     #[test]

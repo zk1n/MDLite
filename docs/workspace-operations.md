@@ -36,14 +36,18 @@ Ctrl+Kまたは上部のqueryへ直接入力し、直下に候補だけを表示
 pointer起動は描画したquery矩形内だけで、左右余白や他buttonへ広げない。
 Main／Compactともqueryを別popupへ複製しない。menuは短いlabelと独立shortcut列を使い、
 説明・disabled理由はhover／keyboard選択時の補助表示へ分離する。
-実効keybindingをヒントに使う。設定は共通/Workspaceの層を選び、空欄は継承する。
+実効keybindingをヒントに使う。設定の対象は「すべてのワークスペース（ユーザー共通）」と
+「このワークスペース」。優先順位は初期設定→ユーザー共通→Workspaceで、現在の有効値と適用元、
+編集する値、未適用の変更を区別する。
 Applyは開始時snapshotと照合し、外部変更・不明schema・書込み失敗ではフォームを保持する。
 詳細編集では未知の行を保持する。変更可能bindingと固定Editor/表/パネル操作の衝突を拒否する。
 Rev3候補の設定は一般／保存、表示／テーマ、カスタム色、キー割当の折りたたみカテゴリを持つ。
-実装済みregistryの色とcommandを個別に列挙し、短い日本語名、key、実効値とこの層の指定を区別する。
-hoverとkeyboard focusの補助説明から許容範囲・継承を確認できる。
-継承へ戻す操作、空pathの明示指定、shortcutの解除を分け、false・0・空文字を継承へ暗黙変換しない。
-折りたたみや層切替では未適用draftを保持し、適用は既存snapshot照合とSettingsPatchの検証を通す。
+実装済みregistryの色とcommandを個別に列挙し、短い日本語名、key、現在の有効値と編集する値を区別する。
+hoverとkeyboard focusの補助説明から許容範囲と解除後の適用値を確認できる。
+Workspaceの「共通設定を使う」とユーザー共通の「初期設定に戻す」は、対象の指定を消す下書き操作とする。
+空pathの明示指定、shortcutの解除を分け、false・0・空文字を未指定へ暗黙変換しない。
+折りたたみや対象切替では未適用draftを保持し、一括resetもApply前の下書きに留める。
+適用は既存snapshot照合とSettingsPatchの検証を通し、Cancelは未適用の変更を破棄する。
 
 Ctrl+Pは相対path/filenameでQuick Openを絞る。表示は200件までで、queryは走査対象全体へ
 適用する。候補の続きと走査未完了を表示する。Explorerのcopy/pasteは選択file一覧を

@@ -24,6 +24,16 @@ scrollは通常6 DIP程度、hover/dragで8〜10 DIP程度の灰色thumbを基�
 ヒット領域と標準wheel/keyboard操作は維持し、表の横scrollは表内に限定する。
 native実装を使い、WebViewやJavaScript実行基盤を追加しない。
 
+静止中の同じ状態を同期するだけで、全frameの再描画・再layout・子control再配置を
+継続しない。caret/IME、必要なanimation、外部変更の更新は保ち、再描画は変更面へ限定する。
+設定カテゴリ開閉は途中の再配置中もテーマを保ち、白化を最終画面のdark描画で隠さない。
+測定は対象EXEと環境を固定し、process CPU、GPU engine、paint/layoutを区別する。
+
+ステータスバーは単一の長文ではなく項目ごとに配置する。左のWorkspaceとGit branch/状態、
+右の行・桁、encoding、改行コード、表示mode、保存/外部変更状態を識別できるようにする。
+狭幅では優先順位を付けて省略し、説明から全文を確認できる。一時messageで固定情報を押し流さない。
+Git未確認をclean/同期済みと表示せず、caret移動・paintごとのGit subprocessや通信は追加しない。
+
 2026年10月18日の作業候補では、DWrite描画と主要child controlのUI fontを`Yu Gothic UI`へ共通化し、
 本文の設定fontとcodeのmonospaceは分離する。本文／入力欄、操作対象、splitter、
 背景でpointerを分ける。Calendarは土曜を青、日曜・祝休日を赤とし、重複時は赤を優先する。

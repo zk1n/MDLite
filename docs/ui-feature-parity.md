@@ -1,5 +1,15 @@
 # Rust UI・周辺機能の実装記録
 
+## 2026年10月22日・Live編集と描画負荷（今回範囲のMachine確認済み）
+
+今回のLive編集契約は[Editor操作](editor-operations.md)に従う。
+明示改行を維持し、Front Matter/fenceはcaretが来た区切り行を編集表示する。
+以下のRev3等にある全区切り常時表示は各時点の履歴であり、今回の正本ではない。
+描画の自律paint反復とSettingsの親eraseによるcontrol消失をWin32 styleの局所修正で解消し、
+設定の対象/有効値/適用元、項目別statusと全文tooltipを確認した。
+描画、設定、statusの最終対象と受入は[受入記録](rust-acceptance.md)へ対応付ける。
+物理IME・別端末・Human受入や正式Releaseの完了は意味しない。
+
 ## 2026年10月19日・Rev3候補（作業中・未統合）
 
 左右独立のpanel group、単独Search、schema1配置の互換移行、代表icon、右local切替を実装した。

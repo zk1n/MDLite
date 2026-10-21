@@ -104,12 +104,25 @@ pub struct DisplayProjection {
     pub editable_source_positions: Vec<usize>,
     source_boundary_bits: Vec<u64>,
     source_spans: Vec<SourceProjectionSpan>,
+    source_delimiter_lines: Vec<SourceDelimiterLine>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceProjectionSpan {
     source: Range<usize>,
     display_utf16: Range<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceDelimiterLine {
+    source: Range<usize>,
+    includes_eof: bool,
+}
+
+struct PendingFencedCode {
+    kind: BlockKind,
+    source: Range<usize>,
+    body_text_ranges: Vec<Range<usize>>,
 }
 
 struct PendingText<'a> {
@@ -182,6 +195,22 @@ impl DisplayProjection {
             builder.process(Event::Text(pending.text), pending.range);
         }
         builder.finish()
+    }
+
+    /// Return the complete source line for a Front Matter or fenced-code
+    /// delimiter containing this source byte position.
+    ///
+    /// The range includes its LF/CRLF ending when present. An unterminated
+    /// delimiter on the final source line also owns the EOF caret position.
+    pub fn source_delimiter_line_at(&self, source_byte: usize) -> Option<Range<usize>> {
+        self.source_delimiter_lines
+            .iter()
+            .find(|line| {
+                line.source.start <= source_byte
+                    && (source_byte < line.source.end
+                        || (source_byte == self.source_len && line.includes_eof))
+            })
+            .map(|line| line.source.clone())
     }
 
     /// Convert a display UTF-16 boundary to its nearest source byte boundary.
@@ -318,6 +347,8 @@ struct ProjectionBuilder<'a> {
     blocks: Vec<ProjectionBlock>,
     runs: Vec<ProjectionRun>,
     source_spans: Vec<SourceProjectionSpan>,
+    source_delimiter_lines: Vec<Range<usize>>,
+    pending_fenced_code: Option<PendingFencedCode>,
     open_blocks: Vec<OpenBlock>,
     inline_stack: Vec<InlineKind>,
     table_rows: usize,
@@ -339,6 +370,8 @@ impl<'a> ProjectionBuilder<'a> {
             blocks: Vec::new(),
             runs: Vec::new(),
             source_spans: Vec::new(),
+            source_delimiter_lines: Vec::new(),
+            pending_fenced_code: None,
             open_blocks: Vec::new(),
             inline_stack: Vec::new(),
             table_rows: 0,
@@ -352,12 +385,19 @@ impl<'a> ProjectionBuilder<'a> {
             Event::Start(tag) => self.start_tag(&tag, range),
             Event::End(tag) => self.end_tag(&tag, range),
             Event::Text(value) => {
-                // Metadata and fenced code own their complete source range at
-                // Start, including delimiters. Body events must not project it twice.
-                if self.open_blocks.iter().any(|block| {
-                    block.end_tag == EndTag::FrontMatter
-                        || matches!(block.kind, BlockKind::Code { fenced: true, .. })
-                }) {
+                if let Some(block) = &mut self.pending_fenced_code {
+                    // The parser's body spans distinguish literal fence-like
+                    // text from the actual closing delimiter.
+                    block.body_text_ranges.push(range);
+                    return;
+                }
+                // Metadata bodies are projected from source at Start; parser
+                // body events must not project the same source twice.
+                if self
+                    .open_blocks
+                    .iter()
+                    .any(|block| block.end_tag == EndTag::FrontMatter)
+                {
                     return;
                 }
                 let kinds = self.current_kinds();
@@ -392,10 +432,13 @@ impl<'a> ProjectionBuilder<'a> {
                 self.append_visible(&label, range, kinds);
             }
             Event::SoftBreak => {
-                self.append_visible(" ", range, vec![InlineKind::Break]);
+                // Live editing preserves each source line as a separate row.
+                // Literal tokenization maps a CRLF pair to one display newline
+                // while keeping both source bytes in the same boundary span.
+                self.append_literal("\n", range, vec![InlineKind::Break], '\n');
             }
             Event::HardBreak => {
-                self.append_visible("\n", range, vec![InlineKind::Break]);
+                self.append_literal("\n", range, vec![InlineKind::Break], '\n');
             }
             Event::Rule => {
                 let display_start = self.display_utf16;
@@ -444,19 +487,27 @@ impl<'a> ProjectionBuilder<'a> {
             Tag::BlockQuote(_) => self.open_block(BlockKind::Quote, EndTag::Quote, &range),
             Tag::CodeBlock(kind) => {
                 let (fenced, language) = code_block_info(kind);
-                self.open_block(BlockKind::Code { fenced, language }, EndTag::Code, &range);
+                let block_kind = BlockKind::Code { fenced, language };
+                self.open_block(block_kind.clone(), EndTag::Code, &range);
                 self.inline_stack.push(InlineKind::Code);
                 if fenced {
-                    let raw = self.source.get(range.clone()).unwrap_or_default();
-                    let visible = raw.replace("\r\n", "\n").replace('\r', "\n");
-                    self.append_literal(&visible, range, vec![InlineKind::Code], '\n');
+                    self.pending_fenced_code = Some(PendingFencedCode {
+                        kind: block_kind,
+                        source: range,
+                        body_text_ranges: Vec::new(),
+                    });
                 }
             }
             Tag::MetadataBlock(_) => {
-                self.open_block(BlockKind::FrontMatter, EndTag::FrontMatter, &range);
-                let raw = self.source.get(range.clone()).unwrap_or_default();
+                let block_kind = BlockKind::FrontMatter;
+                self.open_block(block_kind.clone(), EndTag::FrontMatter, &range);
+                let delimiters = source_delimiter_ranges(self.source, &block_kind, &range, &[]);
+                self.source_delimiter_lines
+                    .extend(delimiters.iter().cloned());
+                let body = body_range_without_delimiters(&range, &delimiters);
+                let raw = self.source.get(body.clone()).unwrap_or_default();
                 let visible = raw.replace("\r\n", "\n").replace('\r', "\n");
-                self.append_literal(&visible, range, vec![InlineKind::Text], '\n');
+                self.append_literal(&visible, body, vec![InlineKind::Text], '\n');
             }
             Tag::Table(_) => {
                 self.in_table = true;
@@ -514,6 +565,20 @@ impl<'a> ProjectionBuilder<'a> {
                 self.close_block(&EndTag::Image, &range);
             }
             TagEnd::CodeBlock => {
+                if let Some(pending) = self.pending_fenced_code.take() {
+                    let delimiters = source_delimiter_ranges(
+                        self.source,
+                        &pending.kind,
+                        &pending.source,
+                        &pending.body_text_ranges,
+                    );
+                    self.source_delimiter_lines
+                        .extend(delimiters.iter().cloned());
+                    let body = body_range_without_delimiters(&pending.source, &delimiters);
+                    let raw = self.source.get(body.clone()).unwrap_or_default();
+                    let visible = raw.replace("\r\n", "\n").replace('\r', "\n");
+                    self.append_literal(&visible, body, vec![InlineKind::Code], '\n');
+                }
                 self.pop_inline(&InlineKind::Code, &range);
                 self.close_block(&EndTag::Code, &range);
             }
@@ -961,6 +1026,18 @@ impl<'a> ProjectionBuilder<'a> {
                 .then_with(|| right.source.end.cmp(&left.source.end))
         });
         let editable_source_positions = editable_source_positions(self.source, &self.blocks);
+        self.source_delimiter_lines.sort_by_key(|line| line.start);
+        self.source_delimiter_lines.dedup();
+        let source_delimiter_lines = self
+            .source_delimiter_lines
+            .into_iter()
+            .map(|source| SourceDelimiterLine {
+                includes_eof: source.end == self.source.len()
+                    && !self.source[source.clone()].ends_with('\r')
+                    && !self.source[source.clone()].ends_with('\n'),
+                source,
+            })
+            .collect();
         DisplayProjection {
             text: self.text,
             blocks: self.blocks,
@@ -970,6 +1047,7 @@ impl<'a> ProjectionBuilder<'a> {
             editable_source_positions,
             source_boundary_bits: source_boundary_bits(self.source),
             source_spans: self.source_spans,
+            source_delimiter_lines,
         }
     }
 }
@@ -1010,6 +1088,115 @@ fn editable_source_positions(source: &str, blocks: &[ProjectionBlock]) -> Vec<us
     positions.sort_unstable();
     positions.dedup();
     positions
+}
+
+fn source_delimiter_ranges(
+    source: &str,
+    block_kind: &BlockKind,
+    block_source: &Range<usize>,
+    body_text_ranges: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    if block_source.start >= block_source.end || block_source.end > source.len() {
+        return Vec::new();
+    }
+    let lines = physical_lines_in_range(source, block_source);
+    let Some(opening) = lines.first().cloned() else {
+        return Vec::new();
+    };
+
+    match block_kind {
+        BlockKind::FrontMatter => {
+            let marker = match source_line_content(source, &opening).trim_end() {
+                "---" => "yaml",
+                "+++" => "toml",
+                _ => return Vec::new(),
+            };
+            let closing = lines.iter().skip(1).rev().find(|line| {
+                let content = source_line_content(source, line).trim_end();
+                if marker == "yaml" {
+                    matches!(content, "---" | "...")
+                } else {
+                    content == "+++"
+                }
+            });
+            closing.map_or_else(Vec::new, |closing| vec![opening, closing.clone()])
+        }
+        BlockKind::Code { fenced: true, .. } => {
+            let closing = lines
+                .iter()
+                .skip(1)
+                .rev()
+                .find(|line| !source_line_content(source, line).trim().is_empty());
+            let closing = closing.filter(|line| {
+                !body_text_ranges
+                    .iter()
+                    .any(|body| body.start < line.end && line.start < body.end)
+            });
+            match closing {
+                Some(closing) => vec![opening, closing.clone()],
+                None => vec![opening],
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn body_range_without_delimiters(
+    block_source: &Range<usize>,
+    delimiter_lines: &[Range<usize>],
+) -> Range<usize> {
+    let Some(opening) = delimiter_lines.first() else {
+        return block_source.clone();
+    };
+    let start = opening.end.min(block_source.end).max(block_source.start);
+    let end = delimiter_lines
+        .get(1)
+        .map_or(block_source.end, |closing| {
+            closing.start.min(block_source.end)
+        })
+        .max(start);
+    start..end
+}
+
+fn physical_lines_in_range(source: &str, range: &Range<usize>) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut position = range.start;
+    while position < range.end {
+        let line = physical_line_range_at(source, position);
+        if line.start >= range.end {
+            break;
+        }
+        let next = line.end;
+        lines.push(line);
+        if next <= position || next >= source.len() {
+            break;
+        }
+        position = next;
+    }
+    lines
+}
+
+fn physical_line_range_at(source: &str, position: usize) -> Range<usize> {
+    let position = position.min(source.len());
+    let start = source[..position]
+        .rfind(['\r', '\n'])
+        .map_or(0, |offset| offset + 1);
+    let content_end = source[start..]
+        .find(['\r', '\n'])
+        .map_or(source.len(), |offset| start + offset);
+    let end = match source.as_bytes().get(content_end) {
+        Some(&b'\r') if source.as_bytes().get(content_end + 1) == Some(&b'\n') => content_end + 2,
+        Some(&b'\r') | Some(&b'\n') => content_end + 1,
+        _ => content_end,
+    };
+    start..end
+}
+
+fn source_line_content<'a>(source: &'a str, line: &Range<usize>) -> &'a str {
+    source
+        .get(line.clone())
+        .unwrap_or_default()
+        .trim_end_matches(['\r', '\n'])
 }
 
 fn end_tag_for_block(tag: &TagEnd) -> Option<EndTag> {
@@ -1414,7 +1601,7 @@ mod tests {
 
         let first_break_end = source.find("\r\n").unwrap() + 2;
         assert!(positions.contains(&first_break_end));
-        assert!(projection.text.contains("before second"));
+        assert!(projection.text.contains("before\nsecond"));
         let code = projection
             .blocks
             .iter()
@@ -1424,6 +1611,44 @@ mod tests {
         assert!(positions.contains(&code.source.end));
         assert!(positions.contains(&source.len()));
         assert_eq!(projection.source_len, source.len());
+    }
+
+    #[test]
+    fn soft_and_hard_breaks_keep_lf_and_crlf_source_lines_separate() {
+        let second = "日本語 👩‍💻 é";
+        for newline in ["\n", "\r\n"] {
+            let display_break_start = "first".encode_utf16().count();
+            let display_second_start = display_break_start + 1;
+            for prefix in ["first", "first  "] {
+                let source = format!("{prefix}{newline}{second}");
+                let projection = DisplayProjection::parse(&source);
+                assert_eq!(projection.text, format!("first\n{second}"));
+
+                let source_break_start = "first".len();
+                let second_line_start = prefix.len() + newline.len();
+                assert!(
+                    projection
+                        .editable_source_positions
+                        .contains(&second_line_start)
+                );
+                if prefix == "first" {
+                    assert_eq!(
+                        projection
+                            .source_byte_at_utf16(display_break_start, BoundaryAffinity::Before),
+                        Some(source_break_start)
+                    );
+                }
+                assert_eq!(
+                    projection.source_byte_at_utf16(display_second_start, BoundaryAffinity::After),
+                    Some(second_line_start)
+                );
+                assert_eq!(
+                    projection.utf16_at_source_byte(second_line_start, BoundaryAffinity::After),
+                    Some(display_second_start)
+                );
+                assert_eq!(projection.text.lines().count(), 2);
+            }
+        }
     }
 
     #[test]
@@ -1515,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_exposes_delimiters_info_blank_lines_and_literal_scalar_mapping_once() {
+    fn fenced_code_hides_delimiters_and_maps_body_lines_without_losing_source_ranges() {
         for eol in ["\n", "\r\n"] {
             for (open, close) in [("```", "```"), ("````", "`````"), ("~~~", "~~~~")] {
                 for info in ["", "rust", "unknown-language extra"] {
@@ -1544,39 +1769,60 @@ mod tests {
                                     matches!(block.kind, BlockKind::Code { fenced: true, .. })
                                 })
                                 .unwrap();
+                            assert!(matches!(
+                                &block.kind,
+                                BlockKind::Code { language, .. }
+                                    if language.as_deref() == info.split_whitespace().next()
+                            ));
+                            let opening = format!("{open}{info}{eol}");
+                            let body_source = body.replace('\n', eol);
+                            let closing = closed.then(|| format!("{close}{eol}"));
                             let display: Vec<_> = projection.text.encode_utf16().collect();
                             assert_eq!(
                                 String::from_utf16_lossy(&display[block.display_utf16.clone()]),
-                                source[block.source.clone()].replace("\r\n", "\n"),
+                                body_source.replace("\r\n", "\n"),
                                 "{source:?}"
                             );
+                            assert_eq!(block.source.start, 0);
+                            assert!(block.source.end >= opening.len() + body_source.len());
+                            let opening_range = 0..opening.len();
+                            assert_eq!(projection.source_delimiter_line_at(0), Some(opening_range));
+                            if let Some(closing) = &closing {
+                                let closing_start = opening.len() + body_source.len();
+                                assert_eq!(
+                                    projection.source_delimiter_line_at(closing_start),
+                                    Some(closing_start..closing_start + closing.len())
+                                );
+                            }
                             assert!(
                                 projection.blocks.iter().all(|other| other == block
                                     || other.source.start >= block.source.end)
                             );
-                            for (byte, _) in source[block.source.clone()].char_indices() {
-                                let byte = block.source.start + byte;
+                            for (byte, _) in body_source.char_indices() {
                                 if byte > 0
-                                    && source.as_bytes()[byte] == b'\n'
-                                    && source.as_bytes()[byte - 1] == b'\r'
+                                    && body_source.as_bytes()[byte] == b'\n'
+                                    && body_source.as_bytes()[byte - 1] == b'\r'
                                 {
                                     continue;
                                 }
-                                let expected =
-                                    source[..byte].replace("\r\n", "\n").encode_utf16().count();
-                                for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After]
-                                {
-                                    assert_eq!(
-                                        projection.utf16_at_source_byte(byte, affinity),
-                                        Some(expected),
-                                        "{source:?} byte={byte}"
-                                    );
-                                    assert_eq!(
-                                        projection.source_byte_at_utf16(expected, affinity),
-                                        Some(byte),
-                                        "{source:?} byte={byte}"
-                                    );
-                                }
+                                let expected = block.display_utf16.start
+                                    + body_source[..byte]
+                                        .replace("\r\n", "\n")
+                                        .encode_utf16()
+                                        .count();
+                                let source_byte = opening.len() + byte;
+                                assert_eq!(
+                                    projection
+                                        .utf16_at_source_byte(source_byte, BoundaryAffinity::After),
+                                    Some(expected),
+                                    "{source:?} byte={source_byte}"
+                                );
+                                assert_eq!(
+                                    projection
+                                        .source_byte_at_utf16(expected, BoundaryAffinity::After),
+                                    Some(source_byte),
+                                    "{source:?} at display={expected}"
+                                );
                             }
                             assert!(
                                 projection
@@ -1588,6 +1834,77 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn unclosed_fences_keep_quote_and_list_looking_body_lines_visible() {
+        for eol in ["\n", "\r\n"] {
+            for fake_fence in ["> ```", "- ```", "1. ```"] {
+                for source in [
+                    format!("```{eol}{fake_fence}"),
+                    format!("```{eol}{fake_fence}{eol}"),
+                    format!("```{eol}{fake_fence}{eol}tail"),
+                    format!("```{eol}{fake_fence}{eol}{eol}tail"),
+                ] {
+                    let projection = DisplayProjection::parse(&source);
+                    let block = projection
+                        .blocks
+                        .iter()
+                        .find(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+                        .expect("unclosed fence remains a code block");
+                    let opening_end = 3 + eol.len();
+                    let display: Vec<_> = projection.text.encode_utf16().collect();
+                    assert_eq!(
+                        String::from_utf16_lossy(&display[block.display_utf16.clone()]),
+                        source[opening_end..].replace("\r\n", "\n"),
+                        "{source:?}"
+                    );
+                    let fake_fence_start = source.find(fake_fence).unwrap();
+                    assert_eq!(
+                        projection.source_delimiter_line_at(fake_fence_start),
+                        None,
+                        "{source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_quote_and_list_fences_keep_real_closers_source_mapped() {
+        for eol in ["\n", "\r\n"] {
+            for (source, body) in [
+                (
+                    format!("> ```rust{eol}> body{eol}> ```{eol}"),
+                    format!("> body{eol}"),
+                ),
+                (
+                    format!("- ```rust{eol}  body{eol}  ```{eol}"),
+                    format!("  body{eol}"),
+                ),
+                (
+                    format!("1. ```rust{eol}   body{eol}   ```{eol}"),
+                    format!("   body{eol}"),
+                ),
+            ] {
+                let projection = DisplayProjection::parse(&source);
+                let block = projection
+                    .blocks
+                    .iter()
+                    .find(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+                    .expect("nested fenced code block");
+                let display: Vec<_> = projection.text.encode_utf16().collect();
+                assert_eq!(
+                    String::from_utf16_lossy(&display[block.display_utf16.clone()]),
+                    body.replace("\r\n", "\n"),
+                    "{source:?}"
+                );
+                let opening_start = source.find("```").unwrap();
+                let closing_start = source.rfind("```").unwrap();
+                assert!(projection.source_delimiter_line_at(opening_start).is_some());
+                assert!(projection.source_delimiter_line_at(closing_start).is_some());
             }
         }
     }
@@ -2053,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn front_matter_exposes_every_raw_line_and_scalar_boundary() {
+    fn front_matter_hides_delimiters_but_keeps_body_and_source_line_mapping() {
         for eol in ["\n", "\r\n"] {
             for body in [
                 "",
@@ -2080,35 +2397,51 @@ mod tests {
                         0..raw.trim_end_matches(['\r', '\n']).len(),
                         "{source:?}"
                     );
+                    let opening = format!("---{eol}");
+                    let body_source = if body.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{eol}", body.replace('\n', eol))
+                    };
+                    let closing_start = opening.len() + body_source.len();
+                    let closing_line = format!("{closing}{eol}");
                     let display: Vec<_> = projection.text.encode_utf16().collect();
                     assert_eq!(
                         String::from_utf16(&display[block.display_utf16.clone()]).unwrap(),
-                        source[block.source.clone()].replace("\r\n", "\n")
+                        body_source.replace("\r\n", "\n"),
+                        "{source:?}"
                     );
-                    for (byte, _) in raw.char_indices() {
-                        if byte >= block.source.end {
-                            break;
-                        }
-                        // CRLF is one display break and one editor movement.
+                    assert_eq!(
+                        projection.source_delimiter_line_at(0),
+                        Some(0..opening.len())
+                    );
+                    assert_eq!(
+                        projection.source_delimiter_line_at(closing_start),
+                        Some(closing_start..closing_start + closing_line.len())
+                    );
+                    for (byte, _) in body_source.char_indices() {
                         if byte > 0
-                            && raw.as_bytes()[byte] == b'\n'
-                            && raw.as_bytes()[byte - 1] == b'\r'
+                            && body_source.as_bytes()[byte] == b'\n'
+                            && body_source.as_bytes()[byte - 1] == b'\r'
                         {
                             continue;
                         }
-                        let expected = raw[..byte].replace("\r\n", "\n").encode_utf16().count();
-                        for affinity in [BoundaryAffinity::Before, BoundaryAffinity::After] {
-                            assert_eq!(
-                                projection.utf16_at_source_byte(byte, affinity),
-                                Some(expected),
-                                "{source:?} at {byte}"
-                            );
-                            assert_eq!(
-                                projection.source_byte_at_utf16(expected, affinity),
-                                Some(byte),
-                                "{source:?} at {byte}"
-                            );
-                        }
+                        let expected = block.display_utf16.start
+                            + body_source[..byte]
+                                .replace("\r\n", "\n")
+                                .encode_utf16()
+                                .count();
+                        let source_byte = opening.len() + byte;
+                        assert_eq!(
+                            projection.utf16_at_source_byte(source_byte, BoundaryAffinity::After),
+                            Some(expected),
+                            "{source:?} at {source_byte}"
+                        );
+                        assert_eq!(
+                            projection.source_byte_at_utf16(expected, BoundaryAffinity::After),
+                            Some(source_byte),
+                            "{source:?} at display {expected}"
+                        );
                     }
                     // Every physical front matter line has its own mapped
                     // display start, which the native gutter and hit-test use.
@@ -2120,6 +2453,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn delimiter_line_lookup_owns_line_endings_and_unterminated_eof() {
+        for newline in ["\n", "\r\n"] {
+            let source = format!("---{newline}title: value{newline}---");
+            let projection = DisplayProjection::parse(&source);
+            let opening = 0..3 + newline.len();
+            let closing_start = source.rfind("---").unwrap();
+            let closing = closing_start..source.len();
+            assert_eq!(
+                projection.source_delimiter_line_at(0),
+                Some(opening.clone())
+            );
+            assert_eq!(
+                projection.source_delimiter_line_at(opening.end - 1),
+                Some(opening.clone())
+            );
+            assert_eq!(projection.source_delimiter_line_at(opening.end), None);
+            assert_eq!(
+                projection.source_delimiter_line_at(closing_start),
+                Some(closing.clone())
+            );
+            assert_eq!(
+                projection.source_delimiter_line_at(source.len()),
+                Some(closing)
+            );
+
+            let terminated = format!("---{newline}title: value{newline}---{newline}");
+            let projection = DisplayProjection::parse(&terminated);
+            let closing_start = terminated.rfind("---").unwrap();
+            assert!(projection.source_delimiter_line_at(closing_start).is_some());
+            assert_eq!(projection.source_delimiter_line_at(terminated.len()), None);
+        }
+
+        let unclosed_fence = "```rust\nbody";
+        let projection = DisplayProjection::parse(unclosed_fence);
+        let block = projection
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Code { fenced: true, .. }))
+            .expect("unclosed fenced block remains a source-backed block");
+        assert_eq!(block.source, 0..unclosed_fence.len());
+        assert_eq!(projection.source_delimiter_line_at(0), Some(0..8));
+        assert_eq!(
+            projection.source_delimiter_line_at(unclosed_fence.len()),
+            None
+        );
+
+        let unterminated_opener = "```";
+        let projection = DisplayProjection::parse(unterminated_opener);
+        assert_eq!(
+            projection.source_delimiter_line_at(unterminated_opener.len()),
+            Some(0..unterminated_opener.len())
+        );
     }
 
     #[test]
@@ -2138,6 +2526,8 @@ mod tests {
                 doc.set_selection(selection.anchor, selection.head).unwrap();
                 let revision = doc.revision();
                 let before = DisplayProjection::parse(doc.source());
+                assert!(before.source_delimiter_line_at(0).is_some());
+                assert!(before.source_delimiter_line_at(closing).is_some());
                 assert_eq!(doc.source(), source);
                 assert_eq!(doc.revision(), revision);
                 assert!(!doc.is_dirty());
@@ -2154,16 +2544,26 @@ mod tests {
                 );
                 assert!(doc.source().ends_with("# surviving body"));
                 assert!(after.text.contains("surviving body"));
+                assert_eq!(after.source_delimiter_line_at(0), None);
                 assert_eq!(doc.undo_count(), 1);
                 assert!(doc.undo());
                 assert_eq!(doc.source(), source);
                 assert_eq!(doc.selection(), selection);
                 assert!(!doc.is_dirty());
                 assert_eq!(DisplayProjection::parse(doc.source()), before);
+                assert!(
+                    DisplayProjection::parse(doc.source())
+                        .source_delimiter_line_at(closing)
+                        .is_some()
+                );
                 assert!(doc.redo());
                 assert_eq!(doc.source(), edited);
                 assert_eq!(doc.selection(), after_selection);
                 assert_eq!(DisplayProjection::parse(doc.source()), after);
+                assert_eq!(
+                    DisplayProjection::parse(doc.source()).source_delimiter_line_at(0),
+                    None
+                );
             }
         }
     }

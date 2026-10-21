@@ -869,7 +869,7 @@ impl FeaturePanes {
                     let text_ptr = PWSTR(text.as_mut_ptr());
                     self.controls.tooltip_text.push(text);
                     let mut tool = TTTOOLINFOW {
-                        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                        cbSize: shell::TOOLTIP_INFO_SIZE,
                         uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                         hwnd: owner,
                         uId: hwnd.0 as usize,

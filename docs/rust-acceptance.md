@@ -1094,3 +1094,11 @@ Rootがruntime_layout_after_restartをlast preclose drag.afterとid別に比較�
 同値move gateは実変更時の既存presentation_changedを保持し、共有renderer・input/caret・Markdown/source/history処理を変えていないため、旧端点機能/Ω比較/Settings/save/history成功を一括失効させない。最新2harness差分はCompact内部loop/receiptだけで専用helddrag経路不変、9537の最終drag証拠は4b05にも有効。独立静的reviewの必要指摘は全解消、Ponytail自己確認と区別。最終integrity/Git Closure判断後、通常history-preserving統合/配送を行う。
 
 Jev Closure `rev8-complete-closure` はRESOLVED/git_delivery（confidence0.94）。現Taskの必須engineering/受入と独立review完了に基づく通常Git配送判断であり、配送済みの証拠ではない。finaldiffcheck PASS、開始TaskHEADa8b70b1/develop902dfd1と両remoteの対応、delivery worktree cleanをfresh確認。4対象pathだけをcommitし、通常no-ff統合後は同treeを確認してから既存origin/githubへ通常push/OID読戻しする。
+
+### Rev8 配送結果の記録
+
+製品/受入記録commit `5e58a8e2df6853e5eb7e586caa7de203a7c1b2e4` を通常merge `c3779b48dceceb6416e19ac470bc0f81c804dfc5` でdevelopへ統合した。task/develop両tree `cab22e4f97a43c68415214d75454167cc08d6036` 一致により統合で製品/build条件は変わらず、再build/GUI再実行を追加しない。origin/github両方へtaskbranch/developを通常pushし、両remoteで同OIDを読戻した。main/archive/tag/Releaseは対象外で不変。
+
+登録generatorでHANDOFFを生成しRev8入力をarchive、登録uploaderの初回private Drive保存と3filesのダウンロードSHA-256読戻しを完了した（status complete）。必要なGitBook差分は既存CR7の3ページへ追補し、exact markdown/旧suffix保持を読戻し、draftを維持した。配送URI/詳細receipt/原証拠はlocal HANDOFFに保管し、private Task入力やlocal evidence自体はGitへ追跡しない。
+
+本追記は配送実結果を閉じる文書だけの更新で、検証済み製品source47 fed94d3c…・EXE9a89bc48…・harness4b057495…は不変。最終文書配送のOID/最終HANDOFF読戻しは同HANDOFFのdelivery receiptを正本とする。Task Inbox整理は最終Drive保存/readback後だけ実行する。全製品/物理IME/Human受入や稼働中の通常実行体更新を配送成功へ含めない。

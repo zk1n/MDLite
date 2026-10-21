@@ -2024,13 +2024,16 @@ impl FeaturePanes {
                         );
                     }
                 }
-                draw_feature_text(
+                draw_feature_text_single_line(
                     app,
                     target,
                     &file.relative_path.display().to_string(),
-                    body.x + 8.,
-                    y + 1.,
-                    body.width - 16.,
+                    Rect {
+                        x: body.x + 8.,
+                        y: y + 1.,
+                        width: body.width - 16.,
+                        height: CALENDAR_ROW_HEIGHT - 1.,
+                    },
                     10.,
                     foreground,
                 )?;

@@ -960,3 +960,137 @@ Taskの局所修理・既存代替経路を試した結果として **GROUNDED_I
 Titlebar視覚auditは `rev6-titlebar-visual.md/json`。44PNGを11hash群へ照合し5実画像を直接表示。modal消滅観測675.041msより前の012以降はclean Mainで、採取したpostmodal ghostはない。入力終了824.6467ms、Ωなしの032COPY末尾1502.7164ms（+678.0697）、Ωあり033COPY開始1524.009ms（+699.3623）。最終15c3にも次文字の画面更新遅れが残る。機能PASS、描画遅れ、正確な提示時刻UNKNOWNを分ける。
 
 Closure wrapper初回は `GateKind Closure` の大文字をCLIが拒否しERROR。既存wrapperの小文字 `closure` に訂正した同判断ID `rev6-grounded-checkpoint-closure` は `RESOLVED / git_delivery`。未完了checkpoint配送の判断であり、develop統合／GUI受入の合格ではない。
+
+### Rev8 開始時の証拠採否と担当
+
+Rev8を登録Downloaderで取得・検証した（Task `20261018-mdlite-live-navigation-ui-git-polish`、receipt `720e86b0…`）。旧snapshot `aa494060…` はpreservedへ検証保存。Root session `01a15d45-5c50-7200-a7e6-baf27bd3f99c` / turn `01a15d45-8388-7de1-aa8f-af21050d5cb0` はexact runtimeのVERIFIED_ROOT、gpt-6.1-sol / medium。実効permissionはunrestricted、承認はneverであり、設定変更・権限昇格は行わない。
+
+開始時worktreeはclean、HEADは `a8b70b10f7b7ed0e507eb58ab975004c224fb4e1`。local/origin/githubのtask branchは同OID、developはすべて `902dfd17754d45d782508c137c63950b2bc495c4`。登録Release EXEのraw SHA256 `15c3e041ff0102e38c51158e06c2507ee128a7291fbb220bdd975d3acfef0e94`、tools harnessのraw SHA256 `05957f223d35f4d19f6de300dfd4c12a39326cbe8f8fd11c1d70893e24edceae` は保存値と一致。担当変更のみのrebuild・全suite再実行はしない。
+
+Rev8 reference REVIEW/EVIDENCE_MAP/REFERENCE_INDEXを採用し、Git owner-draw native RED/GREEN・限定glyph、右menu5切替と左右独立、原文/保存/履歴・Source/Live・Settings入力Undoは記録された範囲でREUSED。親title/Outline欠落を機能stateやdamage replayでPASSにしない。Ωの既存値はCOPY区間による観測であり設定後固有の製品不具合とは未確定。旧ghost/both-hidden blankの訂正を維持する。
+
+Jev Initial `rev8-initial` はRESOLVED / sol_medium_specialist。親paint/layout/child/DC clipの限定調査はSol Medium、既存harnessの4状態受動採取・Ω少数対照・Compact/menu停止条件の準備はLuna Max、GUI/process/windowsはRootが直列所有する。最初の判別は同じ4表示操作の前・直後・追加入力なし後続画面を比較し、Read-Diagnosticのrefresh介入と分離する。必要修正後の残対象は左右幅/内部高さdrag、Compact入力Undo/Main復帰、通常restart配置、Calendar密度/代表操作、関連query/端点の不足画素。完了条件はRev8第6章のまま、現時点は未完了・develop未統合。
+
+開始source47も47ファイル・`efed05695df9375e843006fdfbea111784ac772a74178408fd15576f7b87a909` で一致。限定診断buildはsource47 `3eae033170c7c502e7db398db8fa2cf45ef29b7c0cd7d053ceb19ce9af612467`、登録pathのEXE `fff7fcb67cf33c82ddd244e9b96f93f8ceb52f77ccf9d7f17d7c4297c5d1d315`。担当のcargo check/fmt/Release build PASSを採用し重複実行しない（`rev8-parent-paint/instrumentation-receipt.json`）。製品動作修正ではなく既存phases.jsonlへの限定観測追加。実geometry、BeginPaint damage/DC clip、title/Outline領域と重なる可視child、EndPaint後の結果を記録し、Outline/Git同時表示から最大32件・同geometry3件に限る。実画面受入は未実行。
+
+Rev6 density停止の限定読取では、先行記録のmenu owner/captureはMainから0へ変わっていたが、throwした同じ呼出しのactivation記録は無く、原因UNKNOWN。次はguard判定に使った値と期待値をthrow前に保存するだけでguardを維持する。既存densityはGit→Calendarの連結なので、Calendarだけを同じ準備・判定で選択する局所経路が必要。旧runの後段NOT_RUNは保持する。
+
+専用selector `REV8_TITLE_FOUR_STATE`（harness raw `d4ebc91d…`）は構文・既存前面限定の正負helper・selector順序/Compact前return確認がPASS。Rootの実run `20261021T072318Z-cbd73f64fb854880ba3bdc341cf3269f` は最初の配置reset palette入口で `PALETTE_CONTROLS_UNAVAILABLE` / BLOCKED。4状態も新probe対象配置も未到達。EXE/source/harness不変、final_proof_valid=trueはこの入口までの識別であって受入PASSではない。WM_CLOSE607ms＋exit待機61ms、exit0、process_retained=false。元resultを保持する。新selectorがCtrl+K経路を継承していたため、次は既にCompact生成に到達したowned query EDIT150クリックの既存経路を同selectorへ適用し、入口の差を判別する。guard/待機条件は維持し、同目的の試行をリセットしない。
+
+query150既存経路を同selectorへ適用したharness `a88d9440…` は限定route正負チェック/Powershell構文/diff PASS（`rev8-harness-check/palette-entry-route-check.json`）。run `20261021T072556Z-1f0d71ce60a3458398359f2857e9387f` はpaletteより前の初期COPY guardでENV_BLOCKED。Main foreground HWND29757622、PID1972、client `[242,265,1326,1026]` に対し、別Qt HWND590410/PID15888のrect `[1318,111,1913,1142]` が8px重なりUNEXPECTED_OVERLAP。source/frame READYでもCOPY未送出。failure_message/stackとreadiness原記録を保持。WM_CLOSE830ms＋待機91ms、exit0、残processなし。製品FAILへ分類しない。新受入はまだ進んでいないため同位置での反復を止め、既存のowned window移動でclear領域へ置けるかへ方法を見直す。Jev Difficulty `rev8-occlusion-method` はRESOLVED / sol_medium_specialist、同Medium担当が既存移動手段と最小局所修理を限定判断。別window操作・guard緩和・全画面captureは行わない。
+
+同Mediumの判断では既存ClickOwnedCaptionはcaption取得不能時だけ一時移動し最後に元位置へ戻すため、既にforegroundのMainの撮影重複を解消しない。RootはRev8 selectorだけの初回COPY前setupとして、同monitor work-area内へ同サイズの所有Mainを一度移動する局所helper拡張を採用。既存SetWindowPos/所有確認/有限矩形待ちを再利用し、NOACTIVATE/NOZORDER/NOSIZE、同PID/thread/HWND/class/creation/EXE・session/desktop・96DPIと前後矩形を要求する。入力やmodal/menu/captureがある場合・領域不足・移動不成立は停止。移動後も元の撮影重複guardを使い、別windowを動かさない。これは観測前のsetup介入であり、欠落の自然回復や受入の証拠ではない。
+
+配置helperのfull inline C#compile、無効HWNDでmove_attempted=false、領域不足/正の矩形例、PS parse/Rev8限定経路はPASS。checkerのhere-string抽出とliteral照合の2エラーはchecker-onlyとしてreceiptへ保持し、成功済みcompile等を再実行せず不足照合だけ回収した（`rev8-harness-check/rev8-owned-placement-check.json`）。harness `b8f4beda…` の実run `20261021T074404Z-b3b82e72bc8344499cd86d655d0d1516` は所有Main `[104,104,1204,904]`→`[16,16,1116,816]` を546msで確認、同monitor work `[0,0,1920,1032]`・同一性/96DPI不変。初期client COPY `[24,47,1108,808]` が安全に成立した。配置の実動作証拠のみで製品受入へ加算しない。
+
+同runはquery150クリック（owned child6491738、x612/y65、2events）後も最初のreset-command待機でPALETTE_CONTROLS_UNAVAILABLE。終了前のRead-Diagnosticを伴う別snapshotでは同childにfocus/caretがあり候補151はvisible/enabled/class=ListBoxだった。query_control_count=0は診断側のcase-sensitive `EDIT`比較であり、制御lookupのcase-insensitive比較とは違うためquery欠落の根拠にしない。4状態/probe対象には未到達、document/history不変、通常終了731ms＋待機50ms・exit0・残processなし。Jev Finding `rev8-palette-readiness` round1はREFINE_REQUIRED / gather_facts。同じ2500ms待機のどのpredicateが拒否したか、元lookupのexpected/actual/control/timeをrefresh前に保存する局所観測へ限定する。timeout延長・guard緩和・同一条件反復へは進まない。
+
+lookupの元1回の列挙からexpected/actualを例外へ添付し、paletteは最初/最後の失敗だけ保存する変更（harness `73bd278a…`）を実施。PS parseと意味的な正負lookup/count・単一列挙確認はPASS。source文字列に依存したmatcherは検査器の誤りでERROR_NOT_ADOPTEDとし、文字列matcher修理を打切り、Rootが実差分のpredicate/budget/throw不変を確認した。C#再compileや旧試験の反復はしていない。証拠 `rev8-harness-check/palette-readiness-evidence-check.json`。
+
+run `20261021T075225Z-d1962fc4e10046faa6c38454a83a470a` は選択した4状態caseの操作・原文/履歴/配置不変がPASS、通常終了exit0・残processなし・source/EXE/harness不変。最初のresetでresults151は520〜1665msに候補0件、その後1955msで自然にready。他のsetup commandは382〜930msでready、diagnostic refreshやbudget/input変更なし。過去の断続的palette停止原因は未確定のまま。Jev同Finding round2初回はunknownsを落としたpacketをERROR/facts_dropped_during_refinementとして保持し、元packet全項目を維持して追加factのみでround2へ進めた（REFINE_REQUIRED/gather_facts）。round3 NoMoreFactsはRESOLVED/investigate_root_cause。既存codeと今回同時点データから製品欠陥を裏付けられるか、Mediumへread-only限定判断を依頼し、追加反復で失敗を探さない。
+
+4状態の画素は `rev8-parent-paint/four-state-correlation.md/json` を採用。追加入力/refresh前の受動204frameで、各状態は正しい見出し・Outline内容/関連child・本文へ自然追従した。click完了から最後の旧/混在COPY末尾→最初の正しいCOPY開始は、right-only 463.2→480.0ms、both-hidden 245.2→273.8ms、left-only 476.9→501.5ms、both-shown 477.1→496.6ms。処理/提示の厳密時間ではない。state3 frame005〜010は新childと旧親画素が混在し、011〜050は同hash `cbb1049aee2667316c4ffec32ef6dd32b9adeb804d1f3d7893c75131d7056794` の正しい両側表示。Rootの当初のまとめ表示の読違いによる「frame050も欠落」は単独ファイル表示/hashで訂正し、不採用とした。原画像/結果は不変。
+
+23 probeはpaint成功・全面damage/clip bounding box、対象に重なる可視childなし。state3 sequence143〜145の実editor/Outline/Git矩形は正しく、非ゼロtitle/Outline行のRectVisible=true（全域可視の保証ではない）。mixed frame010→correct011は同sequence143で、EndDrawは画素提示を保証しないという旧限界を実証した。今回は2秒内の自然表示を確認したが、旧Rev6単一画像の同原因/持続時間、一般性能/全GUIの合格は断定しない。現時点ではtitleの製品patchを裏付けず、一時probeを除去し元の製品動作の最終buildへ戻して、Ωの少数対照と残drag/Compact/restart/Calendarを続ける。
+
+一時probe151行だけを撤去しsrc/native.rs差分はゼロ、source47は元の `efed05695df9375e843006fdfbea111784ac772a74178408fd15576f7b87a909`。登録Releaseの再buildで実EXEは `2612e93d3ff9e406b5ffedc58007d7c97d9bc95287d4ef757f6b1c50fda3c18a`（旧15c3とは別の実hash）。fmt/check/build/hash読戻しは担当証拠を採用（`rev8-parent-paint/final-uninstrumented/`）、GUIはこの実hashをpinする。Mediumのpalette原因確認では、同期focus→host/list生成の実装と今回の自然readyを確認したが、旧失敗時点の実lookup不足からborrowed WM_COMMAND経路等への因果帰属はできず、追加修理/traceの根拠なし。titleのJev Finding `rev8-title-observation` はround1 REFINE_REQUIRED/gather_facts、最終buildの残確認とΩ対照の事実を得て同IDへ戻す。
+
+最終buildの4状態試行 `20261021T080318Z-1ef1d7a0e8924b129fd936402e6ec614` はstartup captionの再hit-testが完了せずACTIVATION_POINT_CHANGED、caption入力0・capture0・case未到達。guardを維持して停止。PID12936/creation08:03:19.7548995Z/EXE2612をfresh照合した既存有限activation回復はMain foregroundを回復し、clean再確認から通常closeを呼んだ。helperはREV3_NORMAL_CLOSE_UNCERTAIN（send delivery未確認）のため正常close PASSにしない。同helperのこの例外はexit確認/exitcode0の後だけの分岐であり、fresh PID不在も確認、残processなし。send/wait個別値は旧cleanup wrapperがthrow後にexportしなかったためUNKNOWN。元result/cleanupは不変、別 `rev8-harness-check/final-target-activation-collection.json` に終了確認とWM_CLOSE送達不確実を分けて保存した。再close/強制終了はしていない。Ω selectorの独立準備を継続する。
+
+### Rev8 最終buildのΩ少数対照
+
+既存ClickChar actor/2秒samplerを共有し、Normalはmodal作成/終了だけ省略、TitlebarCloseは設定を変更しない終了とした。共通light-theme setupは1回、順序N/C・C/N・N/C、各rowで同source/caret/dirty/history/raw/diskを要求（revision増分は記録）。6証拠directoryは独立し既存pathがあれば停止する。checker側のmock出力収集とbyte期待値の誤りは別記し、orchestrationの成立部分と実source/selection/history oracleの正負PASSだけ採用。最後のdirectory guard後のPS parseはRootが不足範囲として実施。Rootが発見したselector→S01_S02とexpected-caseIDの不整合は1行修正し、旧S02のNOT_SELECTED集計へ戻してfinal parse PASS（harness `0f976040…`）。GUIはこれを固定した。
+
+run `20261021T081709Z-7cdb580cfbe6449fbaf397e15647e8d0` はEXE2612・final_proof_valid=true、選択S01_S02_FORM_CLOSEの全6rowが機能PASS。suite INCOMPLETEは他4件NOT_SELECTEDによる。全rowの正位置Ω入力/原文・選択・disk保全とUndo2回による元source/clean/Undo0/Redo2を確認、通常終了exit0・残processなし。旧redo分岐はtypingで意図的に切られ、元branch完全保存とは主張しない。
+
+`rev8-parent-paint/omega-comparison.md/json` に6条件の原文/時刻/COPY/画像/Undoを対応付けた。Unicode SendInput終了から最終no-Ω COPY末尾→最初Ω COPY開始は、pair1 Normal629.7→645.7ms/Close581.9→610.7ms、pair2 Normal498.2→517.9ms/Close386.7→406.2ms、pair3 Normal637.1→660.9ms/Close375.9→406.1ms。全6の最終画像は同hash `60fd2650aa4648e56e8a598269f5efcc190a3744d622bdd88cfaf86ef71b6aa9`、light Mainの`abcdefΩX`を直接確認（Rootも単独代表画像を確認）。最終no-Ωでも既にtyped source/選択5545/Undo2と同EndDraw番号があり、共通するsource→提示/採取の隔たりが残る。COPY費用約9〜31ms・最大開始gap約53〜68ms・16ms予定の欠落78〜82slot、host VM負荷はUNKNOWN。これらは採取境界であり処理時間ではない。
+
+3組で設定終了後固有の追加停滞、入力消失、追加入力を要する回復、保存/Undo破損は再現せず、今回このための設定終了専用patchを裏付けない。一般入力性能や共通製品経路が無欠陥/原因は環境と確定したとは言わない。新しい閾値/全閉鎖matrix/大規模benchmarkは追加せず、この範囲のΩ確認を採用し残drag/Compact/restart/Calendar/Git対象操作へ進む。
+
+### Rev8 残確認の独立経路とdrag停止
+
+harness `22e0ca2306b392fa7b7fa8c9d1767855d857647ad09ff352ab955431fc1003ec` で3方向drag・Compact/restart・Calendar/Git密度の独立selectorを準備。最終raw copyを同hashで `rev8-harness-check/Invoke-RustGuiAcceptance-22e0…ps1` に保存。PS parse・case/Panel選択・same-call menu-owner拒否時のno-key正負確認を採用。Ω本体4関数はこのbatchで変更していない。実行時0f976のraw全体snapshotは未保存で、既存check領域にも無いため再構成せず、元run/hash・保存済み証拠とfunction範囲の変更履歴で採否を判断する。以後のfrozen rawは保存する。
+
+run `20261021T083456Z-c2a249103ed740f0a896fd7d91843404` は最初のLeft幅dragの2番目waypoint（x304/y81）でOBSERVER_FAILURE、source/EXE/harness不変、通常終了exit0・残processなし。幅256/editor500には到達したがgesture全体PASSではない。拒否条件はsequenceのみ（要求65/実64）、doc/revision/source/selection/dirty/UndoRedo/scroll/geometry/self-frameは一致、COPY未開始。Medium調査でfloorはmax(pre-MOVE64+1,reached frame)、fresh診断fileのwrite08:36:08.2859833/read08:36:08.3120221も新geometry＋64。単純off-by-oneや古いfile読みと断定できず、traceのMain paint完了は約7.6245秒途切れていた。失敗時の実画素が無いので表示停滞か記録との乖離か未確定。元resultは不変。
+
+同じ要求の失敗履歴を通算し、同方法の再実行やfloor削除は行わない。Jev Finding `rev8-held-frame` はround1 REFINE_REQUIRED/gather_facts。次の最小判別はsequenceだけ拒否された時に既存held所有/入力/crop guardを維持して診断専用COPYを保存する案であり、受入対象外・鮮度UNKNOWNと明示して元throw/PASS条件を維持する。実画素の旧/新で次の描画経路/記録経路調査を分けられる場合だけ実施する。Calendar/Git・Compact機能は独立経路で継続し、非default寸法restartはCompact機能の後の実resizeと保存値で確認する。
+
+### Rev8 Calendar/Git・Compactとheld dragの原因絞込み
+
+Calendar固定18DIP行はwrap可能な本文描画を使い、100DIP幅で長いfilenameが次行へ重なった。既存single-line描画へcallerだけ変更（features.rs、font/文字列/操作維持）。fmt/check/strict Clippy/登録Release PASSを担当receiptから採用。source47 `1c958fb1bd5d051f98d825e35cad62c090ffd14b8a542da29c66936c72e63310`、EXE `fea119e8f780417aa1e7e9d6c9dea6939a246e504a4b4c4576b804a99d42a250`。run `091027Z-3c2610c183de466a934c76282ddfb2f2` の240/100DIP実PNGで重なり解消、月往復/原文/履歴を確認した。結果収集のPSCustomObject追加property例外は別修正。既保存のcoherent原/終bytesとclean preclose診断からexact config復元 `c99d76c8…` を回収し `calendar-collection-recovery.json` に記録。原FAILをPASSへ書換えず複合証拠として採用、通常終了exit0。
+
+Git run `091513Z-e953be4f563d4288a9603b1c29df78d7` はEXEfea/harness1a4、選択U02/U03 PASS（他NOT_SELECTED、suite INCOMPLETE）。通常240/狭幅100DIP画素、代表overflow表示/Escape1、config exact復元、原文/履歴を確認。same-call menu expected/actual owner=8785700、終了後owner0・focus12259392、通常close0。旧menu停止の原因確定やguard回避ではない。
+
+Compact run `091824Z-0b4962089b2d4dd5aed38117ed72541a` はEXEfea/harness1a4。4状態受動画素/原文/配置に加え、実Compact X入力→Undo→Main復帰と配置維持が `rev5_panel_proof.compact` に保存された。その後非default配置用の最初のLeft resizeで要求frame183/実182のみ拒否、restart未到達。新しい診断専用COPYは受入不可/鮮度UNKNOWNのまま、他11条件とheld所有/cropを維持して保存した。実親divider287/288/editor開始308は旧幅240、model幅248/editor開始316と異なる。frame182が約7.4秒維持され、trace7.631558秒に252diagnosticと248layout.rebuild、全thread停止ではない。4状態終端の読違いは単独path/hashで訂正し正しい表示を採用、原画像不変。通常終了exit0。
+
+一時probeは既存phase channelにheld moveの変更/不変累計を限定記録。read-only GetUpdateRect(FALSE)を失敗COPY直前/後へ追加し、floor/guard/throwを維持。source47 `f74e78eadeadf6bd2c2615f12a1aa994f4579c8f89e2c8c2c741001ed301e899`、probe EXE `7eb02e41bfbceb83d6b193b2ef86bc1e4b53606b9b3810b448ef86725266c739`。先行run093428はpalette151未生成が2975msまで続きdrag未到達。新Rev5の2独立selectorだけ既存TimeoutMs=7000のcontrols readinessへ揃え、focus/text/入力/判定は維持（最終harness `138e01b0c37ec8aae49f44a3b8661f483e70a1965d52e65713027c342f5c5222`）。
+
+run `093855Z-c13da5385b6344758373163bdf0d9a99` は同probe/harness138。最初の幅248で同frame拒否、phaseにmove128/changed1/unchanged127、同x296/y81を記録。09:40:00.152/00.179のCOPY直前/後ともMain full1084x761のpending update=true。damage消失より、同寸法moveが継続する間の低優先paint dispatch停滞へ絞れた。通常終了exit0、残owned processなし。実behavior修正はまだなし。Jev Difficulty `rev8-held-producer` round2はREFINE_REQUIRED/sol_medium_specialist、Mediumがsame-dimension refreshとnative子配置の関係を限定読取中。暫定probeは最終製品へ残さない。未達は全方向/内部height dragと非default9-doc restartであり、develop未統合。
+
+Jev held-producer round3初回はRefinedPacketとNoMoreFactsを同時指定しsemantic_round_plan_mismatch ERROR。既存round2 packetにNoMoreFactsだけで同ID/round3を正しく再提出し、RESOLVED/sol_medium_specialistを得た。API semantic roundの新設や上限迂回なし。Mediumに実stored値の差分だけでrefreshを予約するwidth/height局所修正・既存native fixture・登録Release buildを一括委譲した。RootはGUIを占有せず、最終EXEで残drag/restartを直列実行する。
+
+Query/candidateの不足画素は091824の `rev8-compact-palette-initial.png` をRootが単独直接表示して補完した。query `Compactへ移す` と候補2行が読め、選択済み先頭行と別候補が区別できる。これは関連palette/Compact場面の表示確認で、Workspace検索全体の再試験ではない。旧033154のBOF Source44/Live53受動frameも限定確認し、保存caret_rect内にblink差分がなく代表画像でもglyphを確信できないためUNKNOWNを維持する。今回のsplitter同値更新gateは編集caret生成/表示・Source/Live切替を変更せず、旧端点の機能/原文/history/diskはその条件でREUSED。BOF glyphをstatus値だけでPASSへ変更せず、旧全IDを今回完了gateへ復活させない。
+
+最終製品修正はshell_mouse_moveで実stored幅／上下2height weightsを比較し、実変更時だけpresentation_changedを呼ぶ。active splitterの同値moveは従来通り消費済みtrue、hover/capture/enddrag/saveを保持。一時計測は撤去しnative.rs差分ゼロ。既存splitter native fixtureに実COM layoutの変更/保持（同座標・100/600幅clamp・heightclamp）とsource/revision/dirty/UndoRedo/selection/capture不変を追加しPASS、変更heightで実layout再構築も要求する。fmt/check/strictClippy/Release PASSとPonytail自己確認を担当receiptから採用し再実行しない。`rev8-held-fix/fix-receipt.json`、source47 `fed94d3c5dddf5b1dd5e370b5d1fb3ea15c13472d86f61667a430ee341b6ee14`、登録最終EXE `9a89bc48b64f43313661dd409c143d6b287b67a087961ee38c8075bbd17bd9bf`。build JSONのfmt/clippy/test NOT_RUNはVerify=falseによるもので、別の直接実行log/receiptを根拠にする。実画面の停滞解消はまだ未確認。
+
+Jev Review `rev8-final-review` はRESOLVED/sol61_high。独立Sol Highへ実装・native assertion・harness判定/安全性の最終静的reviewを依頼した。実効shared roleは書込可能だが依頼をread-onlyに限定し、reviewerはtest/build/GUIを実行しない。Rootだけが最終9a89/ハーネス138でdrag→Compact/restartを直列確認する。
+
+最終drag `095047Z-ece6d64afad34549b7163b54bd4f2eb6` は機能PASS/final_proof_valid/normalclose0だが、実画素全点PASSではない。Mediumの14画像単独監査 `rev8-held-fix/drag-pixel-audit.md/json` で、即時width/height点は前waypoint寸法、Rightには部分child混在を確認。既存2秒held repeatのLeft256/Right232は追加入力/refreshなしで正しい寸法へ追従し、旧7.7秒frame停止は再現しない。高さも押下中に進むが最後のheld端点は未採取、settled264/216/374はrelease後ReadDiagnostic refreshあり。原resultと画像を保持し、機能成功と自然終端表示の不足を分離する。
+
+独立reviewの必須P2は2件。Panel省略時にstring nullが空文字へ束縛されるのにnull判定したdensity filterをIsNullOrWhiteSpaceへ修正し、実束縛/選択3条件PASS。restart高さは保存TOML hashだけでなくruntime panel_rects比較と実画面を要求する。旧BOF glyph UNKNOWNをPASSへ変えない。他に製品差分/安全性findingなし。reviewer自身の実行はゼロ。別に実観測されたrectangle arrayのcomma演算優先順位エラーも各差分を括弧で修正、実RHS4座標条件/PS parse PASS。最終harness `04636c59cac2def056a6f01ab984f0e495a09a4bd52b158005ee7284fdea2590` のraw/receipt保存。
+
+Compact run `095239Z-b70c0d63d03e486a99b23d29f29bd5fc` は実X/Undo/Main、非default3dimension実resize、freshprocess9tabsまで到達したが、上記arrayエラーで残9文書照合/復元画像に未到達。再試行 `095618Z-b8c3329cc32348eb9107abb62db64617` は最初のresizeCOPY中にframe176→177、source/geometry/history/所有不変でも同frame条件により画像破棄・停止した。両方normalcloseexit0/sourceEXE/harness不変、原FAIL保持。同じ要求で2 correction roundを通算し、同じ即時COPYの盲目的再試行を打切り、観測方法を再評価した。Rootは既存2秒held待機をCOPY前へ適用する最小案をMediumへ限定判断依頼し、自然追従/持続停滞を判別できる場合だけ続ける。製品patchやfloor削除・captureguard緩和は追加しない。
+
+Jev held-frame round3はRESOLVED/investigate_root_cause。producer-discriminatorでdamage保持/同値move反復を突き止めたMedium laneを継続し、残る提示/採取の時差を既存観測で分ける。担当変更・helper改名による試行履歴リセットなし。
+
+Mediumは撮影方法の再評価で、新Rev8の2selectorだけgeometry/floor成立後・元copyDeadline内に2秒の受動held待機を置く案を妥当と判断した。毎周の既存held所有/capture/button検査、元deadline超過停止、元Captureのframe/source/history/geometry/crop guardを保持し、入力・refocus・ReadDiagnostic・paint要求・deadline更新・retryを追加しない。2秒経過を合格とはせず、待機後の実PNGが期待寸法かを確認する。旧追加2秒repeatは新2caseだけ抑制し重複4秒待機を避ける。旧rawは保持。既存restart-only入口はなく、失敗fixtureからbaselineを再構築する方が大きいため採用しない。
+
+Lowが同変更を実施し、PS parseと実AST predicate20条件をPASS、raw一致を保存。最終ハーネス `fa0a6fc08cf04ed441b83335ae2290bd7504e1531307c1a6645601005d6af08d`、receipt `rev8-harness-check/passive-held-before-copy-fa0…json`。同じ独立reviewerへこの安定差分だけread-only再確認を依頼し、全reviewや試験を繰り返さない。実最終buildの必要drag/restartはこの観測修理で不足だけを続ける。
+
+同じ独立SolHighの安定harness fa0限定追認は追加blockerなし。priorPanel P2修正、array括弧、元deadlineと全held/COPYguard維持を静的確認。実行なし。restart runtimeheight比較は未解消のままRootが担当する。
+
+最終9a89の4状態は095239の各受動終端が既存091824と同hash（right-only a0489245、both-hidden72a8449b、left-only377a2f98、both-shown ea087ad8）。Lunaのboth-hidden blank判定はRootが exact State1/frame049 を単独original表示し、UI heading A/Bとalpha/beta本文の可視を確認して訂正した。原画像/hash不変、当該判定は不採用。left-onlyにOutline行があるとの記載も状態契約に反するため採用しない。最終Compactのquery/candidate可読とX実glyphを確認、Undo/Main復帰の機能receiptと対応付ける。撮影系の単独表示で訂正した視覚誤判定を製品findingへ昇格しない。
+
+2秒受動hold後のrun `100249Z-63fa27e13a784f06942f34b83a6323cc`（9a89/fa0）は最初のLeft width248でCOPY中frame74→75となり、画像破棄・元throwでFAIL。source/geometry/history/所有は同一、実hold2004ms、normalcloseexit0/final_proof_valid/sourceEXEハーネス不変。これで2秒経過を表示/同frame保証へ読み替えられないことが実証された。同じ待機条件の再実行はしない。Mediumへpaint cadence/observerの有無をraw traceで限定判別する判断を返し、独立restartは既存no-HeldWaypointsの実ドラッグ経路で非default設定準備だけを行えるか分けて検討する。held実画素の不足は残し、restart達成で黙って全dragをPASSにしない。
+
+Mediumの100249 raw分析ではpaint完了は約148〜277ms間隔で続き、該当区間にlayout.rebuildはない。今回COPY14msとbeforestamp読出しの間に74→75が進んだ。観測helperはfile読取/GetUpdateRect(FALSE)/metadata確認で、明示的paint/refresh呼出しなし。周期producerはtraceにmessage種別がなくUNKNOWN。旧7.7秒のlayout連打とは分け、根拠のない製品patchを追加しない。
+
+次は同じ待機条件の反復ではなく、既存heldCOPY内の限定再観測をLunaMaxへ委譲した。新2Rev8selectorだけ、両stampがbaseline/source/doc/revision/selection/history/scroll/reachedgeometry/floor/Mainを個別に満たし、held/crop所有が前後safeで、唯一の差が同Mainのsequence単調増加の場合だけfailedbitmapを破棄し元deadline内で次COPYを観測する。欠落/退行/foreign/source/geometry/history/所有など他差分は元FAILへ直行し、frame不一致の画像は採用しない。採用には従来の同frame条件とRoot実PNG確認が必要。元期限を延ばす・catch-all retry・入力・refocus・ReadDiagnostic・強制paintは禁止。
+
+独立restartのため、Compactの非default準備だけは既存no-HeldWaypointsの実down/endpointmove/upを使い、文書/反対側/最終geometry/保存bytes/capture解放のoracleを維持する案も同batchで実装する。setupをSEMANTIC_PERSISTENCE_ONLYと明示し、専用dragの3waypoint実画面要件は維持。新resume loaderや設定ファイル直書きは使わない。独立restartが成功しても未達held視覚をPASSへ混ぜない。変更後は独立reviewerの限定静的確認を経て不足GUIだけを実行する。
+
+Title Finding `rev8-title-observation` はfinal9a89の自然4状態画素・Compact次入力と6Ω対照を追加してround2 REFINE_REQUIRED/gather_facts、同packet NoMoreFactsのround3はRESOLVED/defer。defer対象は再現/原因根拠のない追加title renderer patchと旧単一snapshotの原因追究であり、必須の現在4状態実画素確認を延期/免除した意味ではない。現在の自然追従は原証拠/最終build画素の有効範囲で採用し、歴史的瞬間の原因・持続時間はUNKNOWNとして保持する。
+
+LunaMaxは限定再観測とCompact setup分離の差分を保存したが、初回checkerを旧Windows PowerShell5で起動して実行policy拒否を受け、迂回せずRootへ返した。Rootが通常taskホストのPowerShell7.6.7/existing RemoteSignedをread-only確認し、設定変更/Bypassなしで同checkerを通常実行した。PS parse PASSだがstrict sequence-advance正例がfalseとなりFAIL（c954173b…、native/GUI/build実行なし）。旧hostの拒否とpure predicate正例失敗を別に記録。Rootは具体的な型/shapeまたは実装原因の判別と狭い修理だけをSolLowへ委譲し、失敗checkerを回し続けたりadmissionを緩めたりしない。製品source/EXEはfed94/9a89で不変。
+
+SolLowは正例FAILを新実装のownership membership判定へ特定した。nativeとmockのGeneric.DictionaryはIDictionaryを実装するが、PowerShellからの `.Contains('safe')` は1引数overloadを持たず、catchがfalseを返していた。self/waypoint/baseline/sequence orderは正例で成立。Dictionary Keysのcase-sensitive membershipへ局所修正し、missing/ownership等の拒否を維持してcheckerを確認する。期待値をfalseへ変えて合わせない。
+
+有限再観測のfinal harnessは `abf29edd7ecb7c63d3e78ea264b452f35ee13445dc9aa489a40b3bfdb056fd70`。新2selectorだけ、frame単調増加のdiscard後1回再観測（元期限内、fresh-before即一致/順序検査）。採用は元の同frame条件のみ、失敗bitmap保存なし。他変化/欠落/所有不一致は即FAIL。Compactの3setup呼出しだけ既存zero-held actorを使用しSEMANTIC_PERSISTENCE_ONLYと記録、専用dragのheld要件不変。
+
+通常PowerShell7のfocused checkerはparse、21 unique admission正負、18 actor、1 selectorをPASS。Dictionary membershipの実装不具合を局所修正した後、mockのif出力が単一boolへunwrapされ `.Count` を失うchecker不具合も発見・明示修正した（HeldWaypoints defaultは実装と同じ@()で正しかった）。元2FAIL・c954/abf29 rawを保持。期待値の緩和やGUI/native/build実行なし。deadline/bitmap保存経路は静的review範囲とし、同独立reviewerへ安定新差分だけ確認依頼した。
+
+新helperの独立静的reviewはdeadlineの必須P2を1件指摘した。COPY開始前だけの検査では、post-observationが元期限を超えて同frame保存を許すため、最終held所有確認の後・保存採用の直前に単一admission UTCを取得し、元Deadline以上ならDEADLINE_EXHAUSTED_AFTER_COPY/元OBSERVER_FAILUREで未保存・非eligibleとして破棄する。valid時はadmission/deadline UTCを記録。予算はnativeCOPY＋post-observation/admissionまでで、確定bitmapのPNG永続化はその観測window外と明示した。元deadline/retry回数/floorに変更なし。
+
+最終harness `95372d0204ae7f55d81ec065e5ee3189b095cc1f706cd04a6034b173a81704b3`、actual AST期限guardのpast/future正負とPSparse PASS、wholecapturebody未実行を明記。別SolHighの同patch限定確認でP2解消・追加blockerなし。全review/test再実行なし。Rootは独立restartを先に、次に専用helddragを同9a89/9537で直列実行し、欠けているruntime高さ/画素だけを確認する。
+
+### Rev8 最終held drag受入
+
+`103214Z-7d462feaed08427e9d718436ebcf380a` は9a89/9537で選択case PASS、final_proof_valid=true、通常closeexit0、source/EXE/harness不変。Rootのadmission回収 `rev8-held-fix/final-held-admission-collection.json` は全9点の採用1件/元deadline内admission/eligible=trueと、破棄3件のpath=null/eligible=falseを確認。Right4/Height7/8はframeだけ増加した最初のbitmapを未保存で破棄し、2回目は元の同frame/source/history/geometry/所有条件を満たした。期限延長や進行frameの採用はない。
+
+Mediumが9held＋3settledの実PNGを個別表示して独立要求geometryと照合しPASS（`final-drag-pixel-audit.md/json`）。実Left248/256/264、Right232/224/216、Explorerheight358/366/374・Calendarheader394/402/410が一致。見出し/Outline A+B/本文/反対側/native buttonsは保全、旧Git partial glyph residueなし。Rootも最終height8の正しい374/header410を単独original画像で直接確認した。全before/after条件・floor・所有・COPY終端/後stampも元期限内。これは2秒受動hold後の疎な押下中表示の確認で、即時表示/全frame/連続drag性能保証とはしない。原095047の一時的な前geometry/混在や旧7.7秒FAILは保持する。
+
+独立Compact/restart `102907Z-9911f0ddb6bd4daaab369582bddea724` はSEMANTIC_PERSISTENCE_ONLYの実3寸法変更・通常close・fresh9tabs/placementに到達後、全UiDocumentSources.Keys（9初期＋205QuickOpen用file）を9tabs内で探す既存loop誤りによりSYNTHETIC_TAB_NOT_FOUND。初期9文書が正本なのでUiInitialDocPathsだけを照合する局所修理を行い、214mapから9unique expected source・MaxTabs9/clean-historyを保つactualAST fixture PASS。restart runtime geometryはclose後のrawdiagでparent_root=null、precloseSnapshotはsource/history subsetだけであり、回収だけではP2を閉じられなかった。新run用に既存membership/config assert後のfresh.parent_rootをruntime_layout_after_restartへ保持する1fieldを追加した。新expected値を製品出力から作っていない。
+
+最終harness `4b057495c8886e5628c5c204df0169489d9f9d857fb44c790b640ea5ca5140dc` の2局所変更を同独立Highが静的確認し追加blockerなし。専用drag経路は9537から不変なので上記proofは有効。Rootは同9a89/4b05でCompact/restart最終確認を実行中、runtime高さ比較・画像はその結果で判断する。
+
+### Rev8 通常9文書restart・範囲完了判断
+
+`103524Z-cada814c999e4476b28e69abab69b156` は9a89/4b05で選択REV8_COMPACT_RESTART PASS、final_proof_valid=true/sourceEXEハーネス不変、通常closeexit0。Compact実X→Undo→Main保全から、実非default3寸法setup、clean確認・通常close、fresh process（10:35:26.2975624Z→10:36:27.1152354Z）で9tabs起動、全9expected source/clean Undo0Redo0、左右membership/config hashの照合を完了。setupの非held経路をheld視覚受入へ代用していない（専用103214で別証明）。
+
+Rootがruntime_layout_after_restartをlast preclose drag.afterとid別に比較し、同client1084×761/96DPI、editor/active_editor矩形、左右表示、group順序・所属・active・width、panel flagsとbody/rectの全x/y/width/heightがexact一致。Left264/Right216、Explorer374/Calendar327・header410の非default高さ復元をsavedTOMLだけでなく実runtimeで確認。最終通常close後も9文書bytesとlayout hash25fb50e8…が前値と一致。`rev8-harness-check/restart-runtime-geometry-collection.json` PASS。Rootが `rev5-restarted-panels.png` を単独original表示し同寸法・見出し/Outline A+B/本文/native controlsの正常表示を確認した。独立reviewのruntime-height evidence P2をこの複合証拠で解消した。
+
+必須残件は現在対象へのPASSまたはTask許可の有効REUSEDがそろった。Calendar固定行label/同値splitter連打を局所修正、最終4状態/次入力/全3方向held画素/Compact/通常9文書非default復元/Calendar・Git密度操作/Ω少数比較を採用する。旧source/保存/history/右menu/Source-Live等は変更影響条件で再利用する。BOF glyph/物理IME/Human/旧起動白画面等の無関係な歴史的不足は残し、今回変更はそれらの生成/描画経路を変えていない。全製品/全DPI/全frame/一般応答時間の合格とはしない。
+
+同値move gateは実変更時の既存presentation_changedを保持し、共有renderer・input/caret・Markdown/source/history処理を変えていないため、旧端点機能/Ω比較/Settings/save/history成功を一括失効させない。最新2harness差分はCompact内部loop/receiptだけで専用helddrag経路不変、9537の最終drag証拠は4b05にも有効。独立静的reviewの必要指摘は全解消、Ponytail自己確認と区別。最終integrity/Git Closure判断後、通常history-preserving統合/配送を行う。
+
+Jev Closure `rev8-complete-closure` はRESOLVED/git_delivery（confidence0.94）。現Taskの必須engineering/受入と独立review完了に基づく通常Git配送判断であり、配送済みの証拠ではない。finaldiffcheck PASS、開始TaskHEADa8b70b1/develop902dfd1と両remoteの対応、delivery worktree cleanをfresh確認。4対象pathだけをcommitし、通常no-ff統合後は同treeを確認してから既存origin/githubへ通常push/OID読戻しする。

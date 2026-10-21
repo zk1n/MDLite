@@ -3362,11 +3362,13 @@ impl App {
         };
         let x = (lp.0 as u16 as i16) as f32 / self.dpi;
         let y = ((lp.0 >> 16) as u16 as i16) as f32 / self.dpi;
-        match splitter {
+        let changed = match splitter {
             Splitter::Width(id) => {
+                let before = self.shell.layout.group(id).width;
                 let left = self.shell.layout.side(id) == Side::Left;
                 let width = if left { x - 48. } else { self.width - x };
                 self.shell.layout.set_width(id, width.clamp(100., 600.));
+                before != self.shell.layout.group(id).width
             }
             Splitter::Height(id) => {
                 let views = self.shell.layout.group(id).views.clone();
@@ -3376,6 +3378,10 @@ impl App {
                     .skip_while(|v| *v != id)
                     .skip(1)
                     .find(|v| !self.shell.layout.get(*v).hidden);
+                let before = [
+                    self.shell.layout.get(id).height,
+                    next.map_or(0., |next| self.shell.layout.get(next).height),
+                ];
                 if let Some(next) = next {
                     let upper = self.shell.panels[id as usize].1;
                     let lower = self.shell.panels[next as usize].1;
@@ -3389,9 +3395,19 @@ impl App {
                             (weight * (1. - share)).clamp(1., 4096.);
                     }
                 }
+                before
+                    != [
+                        self.shell.layout.get(id).height,
+                        next.map_or(0., |next| self.shell.layout.get(next).height),
+                    ]
             }
+        };
+        // Captured pointer messages can repeat at the same position. Consume
+        // them without rebuilding the same layout and
+        // competing with the pending parent paint.
+        if changed {
+            self.presentation_changed();
         }
-        self.presentation_changed();
         true
     }
     pub(super) fn finish_splitter(&mut self) {
@@ -4214,6 +4230,17 @@ mod tests {
                 doc.selection(),
             )
         };
+        // Retain the COM objects so a rebuild cannot reuse their addresses.
+        let layouts = || {
+            fixture
+                .state
+                .app
+                .borrow()
+                .views
+                .iter()
+                .map(|view| view.layout.clone())
+                .collect::<Vec<_>>()
+        };
         unsafe {
             SetWindowPos(
                 fixture.hwnd,
@@ -4270,7 +4297,24 @@ mod tests {
                     .borrow_mut()
                     .features_finish_outline_drag(true)
             );
-            for (x, width) in [(852, 232.), (860, 224.), (868, 216.)] {
+            for (x, width) in [
+                (852, 232.),
+                (860, 224.),
+                (868, 216.),
+                (984, 100.),
+                (1000, 100.),
+                (0, 600.),
+                (8, 600.),
+            ] {
+                let previous_width = fixture
+                    .state
+                    .app
+                    .borrow()
+                    .shell
+                    .layout
+                    .group(PanelId::Outline)
+                    .width;
+                let retained = layouts();
                 SendMessageW(
                     fixture.hwnd,
                     WM_MOUSEMOVE,
@@ -4288,6 +4332,20 @@ mod tests {
                         .width,
                     width
                 );
+                assert_eq!(layouts() == retained, previous_width == width);
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, 81)),
+                );
+                assert_eq!(
+                    layouts(),
+                    retained,
+                    "same or clamped width must retain layout"
+                );
+                assert_eq!(GetCapture(), fixture.hwnd);
                 assert_eq!(source_state(), before);
             }
             SendMessageW(
@@ -4351,6 +4409,7 @@ mod tests {
             let (x, y, heights) = {
                 let mut app = fixture.state.app.borrow_mut();
                 app.shell.layout.get_mut(PanelId::Search).collapsed = false;
+                app.shell.layout.get_mut(PanelId::Git).hidden = true;
                 app.layout_key = None;
                 app.ensure_layout().unwrap();
                 let upper = app.shell.panels[PanelId::Outline as usize].1;
@@ -4382,16 +4441,59 @@ mod tests {
                     .borrow_mut()
                     .features_finish_outline_drag(true)
             );
+            let retained = layouts();
             SendMessageW(
                 fixture.hwnd,
                 WM_MOUSEMOVE,
                 Some(WPARAM(0)),
                 Some(position(x, y - 24)),
             );
+            assert_ne!(layouts(), retained, "changed paired heights rebuild layout");
             {
                 let app = fixture.state.app.borrow();
                 assert!(app.shell.layout.get(PanelId::Outline).height < heights.0);
                 assert!(app.shell.layout.get(PanelId::Search).height > heights.1);
+            }
+            for target_y in [0, 760] {
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, target_y)),
+                );
+                assert_ne!(layouts(), retained, "new clamped heights rebuild layout");
+                let weights = {
+                    let app = fixture.state.app.borrow();
+                    (
+                        app.shell.layout.get(PanelId::Outline).height,
+                        app.shell.layout.get(PanelId::Search).height,
+                    )
+                };
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, target_y)),
+                );
+                let app = fixture.state.app.borrow();
+                assert_eq!(
+                    (
+                        app.shell.layout.get(PanelId::Outline).height,
+                        app.shell.layout.get(PanelId::Search).height,
+                    ),
+                    weights,
+                    "repeating the clamped height retains both stored weights"
+                );
+                drop(app);
+                assert_eq!(
+                    layouts(),
+                    retained,
+                    "same paired heights must retain layout"
+                );
+                assert_eq!(GetCapture(), fixture.hwnd);
+                assert_eq!(source_state(), before);
             }
             SendMessageW(
                 fixture.hwnd,

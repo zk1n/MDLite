@@ -33,6 +33,11 @@ ranges so the native editor can map display positions back to the exact source
 spelling. Formatting and navigation metadata do not rewrite Markdown, line
 endings, encoding, dirty state, or history.
 
+Live is an editing surface: explicit source line breaks remain separate editing
+lines even when CommonMark would allow a soft break to render as a space. This
+display contract does not add hard-break syntax or normalize LF/CRLF. Table-cell
+compression retains its separate source mapping.
+
 Native list bullets and ordered numbers are drawn in a gutter from the
 projection's source-ranged `List` and `ListItem` blocks; ordered markers honor
 the list start and item order, including nesting. Block quotes get a gutter

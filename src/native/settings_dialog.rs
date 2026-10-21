@@ -3,7 +3,7 @@ use super::*;
 use mdlite::settings::{
     CapturedSettings, EffectiveSettings, SettingValue, SettingsPatch, ThemeMode,
 };
-use std::{fs, io, ops::Range};
+use std::{fs, io, ops::Range, rc::Rc};
 use windows::Win32::UI::Controls::*;
 const APPLY: usize = 210;
 const CANCEL: usize = 211;
@@ -20,6 +20,10 @@ const COMPLETION_ISSUED: PCWSTR = w!("MDLite.Settings.Completion.Issued.v1");
 const COMPLETION_TARGET: PCWSTR = w!("MDLite.Settings.Completion.Target.v1");
 const COMPLETION_READY: PCWSTR = w!("MDLite.Settings.Completion.Ready.v1");
 const COMPLETION_ROOT: PCWSTR = w!("MDLite.Settings.Completion.Root.v1");
+
+fn settings_window_style() -> WINDOW_STYLE {
+    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL | WS_CLIPCHILDREN
+}
 
 // Diagnostic-only, owner-produced receipt. Odd serial means work is in flight;
 // an even serial is published last, after the matching focus ENSURE has finished.
@@ -297,15 +301,76 @@ struct FormWindow {
     tooltip_text: Vec<Vec<u16>>,
     detail: Option<PathBuf>,
     tokens: shell::Tokens,
-    brush: HBRUSH,
     hwnd: HWND,
     scroll: i32,
     wheel_delta: i32,
     dpi: u32,
 }
+struct FormPaint {
+    tokens: shell::Tokens,
+    brush: HBRUSH,
+}
+impl FormPaint {
+    fn new(tokens: shell::Tokens) -> Self {
+        Self {
+            tokens,
+            brush: unsafe { CreateSolidBrush(shell::rgb(tokens.panel)) },
+        }
+    }
+    unsafe fn message(&self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        unsafe {
+            match msg {
+                WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
+                    let dc = HDC(wp.0 as *mut _);
+                    SetTextColor(dc, shell::rgb(self.tokens.foreground));
+                    SetBkColor(dc, shell::rgb(self.tokens.panel));
+                    Some(LRESULT(self.brush.0 as isize))
+                }
+                WM_ERASEBKGND => {
+                    let mut r = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut r);
+                    FillRect(HDC(wp.0 as *mut _), &r, self.brush);
+                    Some(LRESULT(1))
+                }
+                WM_DRAWITEM if lp.0 != 0 => {
+                    let item = &*(lp.0 as *const DRAWITEMSTRUCT);
+                    FillRect(item.hDC, &item.rcItem, self.brush);
+                    SetTextColor(item.hDC, shell::rgb(self.tokens.foreground));
+                    let _ = SetBkMode(item.hDC, TRANSPARENT);
+                    let mut r = item.rcItem;
+                    draw_gdi_text(
+                        item.hDC,
+                        &shell::text_of(item.hwndItem),
+                        &mut r,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    let border = CreateSolidBrush(shell::rgb(self.tokens.border));
+                    FrameRect(item.hDC, &r, border);
+                    let _ = DeleteObject(border.into());
+                    if item.itemState.0 & ODS_FOCUS.0 != 0 {
+                        let _ = DrawFocusRect(item.hDC, &r);
+                    }
+                    Some(LRESULT(1))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+impl Drop for FormPaint {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.brush.into());
+        }
+    }
+}
 struct Window {
     completion: Completion,
     form: RefCell<FormWindow>,
+    // Color notifications can reenter while a layout command owns `form`.
+    // Keep the matching tokens and brush in a separate snapshot whose lifetime
+    // is retired at WM_NCDESTROY.
+    control_paint: RefCell<Option<Rc<FormPaint>>>,
     font: RefCell<Option<control_style::UiFont>>,
     font_updating: Cell<bool>,
     font_pending: Cell<bool>,
@@ -424,42 +489,42 @@ fn field_specs() -> Vec<Field> {
         Field {
             key: "auto_save".into(),
             label: "自動保存".into(),
-            help: "文書の変更を自動で保存します。有効／無効を指定できます。未指定なら下の設定層を継承します。".into(),
+            help: "文書の変更を自動で保存します。この対象で有効／無効を指定できます。指定しない場合は、上部の適用順で直前に有効な値を使います。".into(),
             kind: FieldKind::Boolean,
             category: Category::General,
         },
         Field {
             key: "auto_save_delay_ms".into(),
             label: "自動保存までの待機時間".into(),
-            help: "入力後、自動保存を始めるまでの時間です。単位は ms、範囲は 100～60000 です。空欄は継承です。".into(),
+            help: "入力後、自動保存を始めるまでの時間です。単位は ms、範囲は 100～60000 です。指定しない場合は上部の適用順で直前の値を使います。".into(),
             kind: FieldKind::Integer,
             category: Category::General,
         },
         Field {
             key: "default_memo_workspace".into(),
             label: "既定のメモWorkspace".into(),
-            help: "既定で開くメモWorkspaceの絶対パスです。空欄は継承、「空を指定」はこの層の既定先を消します。".into(),
+            help: "既定で開くメモWorkspaceの絶対パスです。右の解除ボタンはこの対象の指定を消し、上部の適用順で直前の値を使います。「空を指定」は空文字を明示的に保存します。".into(),
             kind: FieldKind::Path,
             category: Category::General,
         },
         Field {
             key: "theme".into(),
             label: "テーマ".into(),
-            help: "画面の配色です。システム／ライト／ダーク／カスタムから選べます。空欄は継承です。".into(),
+            help: "画面の配色です。システム／ライト／ダーク／カスタムから選べます。指定なしでは上部の適用順で直前の値を使います。".into(),
             kind: FieldKind::Theme,
             category: Category::Appearance,
         },
         Field {
             key: "font_face".into(),
             label: "フォント名".into(),
-            help: "アプリの表示に使うフォント名です。空欄は継承です。".into(),
+            help: "アプリの表示に使うフォント名です。指定なしでは上部の適用順で直前の値を使います。".into(),
             kind: FieldKind::Text,
             category: Category::Appearance,
         },
         Field {
             key: "font_size_pt".into(),
             label: "文字サイズ".into(),
-            help: "アプリ表示の文字サイズです。単位は pt、範囲は 6～96 です。0 は有効値にならず、空欄は継承です。".into(),
+            help: "アプリ表示の文字サイズです。単位は pt、範囲は 6～96 です。0 は有効値になりません。指定なしでは上部の適用順で直前の値を使います。".into(),
             kind: FieldKind::Integer,
             category: Category::Appearance,
         },
@@ -477,8 +542,8 @@ fn field_specs() -> Vec<Field> {
         };
         fields.push(Field {
             key: format!("color.{name}"),
-            label: format!("{label}  [color.{name}]"),
-            help: format!("{label}の色です。#RRGGBB の6桁16進数で指定します。カスタムテーマで使われ、空欄または継承ボタンで下の層へ戻ります。"),
+            label: label.to_owned(),
+            help: format!("{label}の色です。#RRGGBB の6桁16進数で指定します。カスタムテーマで使われます。右の解除ボタンを押すと、この対象の色指定を消します。"),
             kind: FieldKind::Color,
             category: Category::Colors,
         });
@@ -489,8 +554,8 @@ fn field_specs() -> Vec<Field> {
         }
         fields.push(Field {
             key: format!("bind.{command}"),
-            label: format!("{label}  [bind.{command}]"),
-            help: format!("{label}のキー割当です。Ctrl／Shift／Alt と A～Z、0～9、F1～F24を指定します。空欄／継承は下の層を使い、「解除」は割当なしにします。予約キーや他の項目との重複はApply時に拒否します。"),
+            label: label.to_owned(),
+            help: format!("{label}のキー割当です。Ctrl／Shift／Alt と A～Z、0～9、F1～F24を指定します。指定なしでは上部の適用順で直前の値を使い、「解除」は割当なしを指定します。予約キーや他の項目との重複は適用時に拒否します。"),
             kind: FieldKind::Shortcut,
             category: Category::Keys,
         });
@@ -579,12 +644,64 @@ fn form_patch(
     Ok(patch)
 }
 
-fn merged_settings(forms: &[Form]) -> EffectiveSettings {
-    let mut settings = EffectiveSettings::default();
-    for form in forms {
-        settings.overlay(&form.file.parsed().layer);
+fn parsed_forms(forms: &[Form]) -> Vec<mdlite::settings::ParsedSettings> {
+    forms.iter().map(|form| form.file.parsed()).collect()
+}
+
+fn effective_settings(
+    parsed: &[mdlite::settings::ParsedSettings],
+) -> mdlite::settings::SettingsResolution {
+    mdlite::settings::resolve_settings(parsed.first(), parsed.get(1))
+}
+
+fn effective_source(
+    field: &Field,
+    fields: &[Field],
+    parsed: &[mdlite::settings::ParsedSettings],
+    settings: &EffectiveSettings,
+    binding_conflict: bool,
+) -> &'static str {
+    if field.kind == FieldKind::Shortcut && binding_conflict {
+        return "初期設定";
     }
-    settings
+    let source_field = if field.kind == FieldKind::Color && settings.theme != ThemeMode::Custom {
+        fields
+            .iter()
+            .find(|field| field.key == "theme")
+            .unwrap_or(field)
+    } else {
+        field
+    };
+    if parsed
+        .get(1)
+        .is_some_and(|file| value_for_field(source_field, &file.layer).is_some())
+    {
+        "Workspace"
+    } else if parsed
+        .first()
+        .is_some_and(|file| value_for_field(source_field, &file.layer).is_some())
+    {
+        "ユーザー共通"
+    } else {
+        "初期設定"
+    }
+}
+
+fn effective_summary(
+    field: &Field,
+    settings: &EffectiveSettings,
+    source: &str,
+    tokens: shell::Tokens,
+) -> String {
+    let value = if field.key == "default_memo_workspace"
+        && settings.default_memo_workspace.as_os_str().is_empty()
+        && source != "初期設定"
+    {
+        "空".to_owned()
+    } else {
+        effective_value(field, settings, tokens)
+    };
+    format!("{value}（{source}）")
 }
 
 fn theme_label(theme: ThemeMode) -> &'static str {
@@ -675,20 +792,20 @@ fn effective_value(field: &Field, settings: &EffectiveSettings, tokens: shell::T
 
 fn draft_state(field: &Field, value: Option<&str>) -> &'static str {
     match value {
-        None => "継承",
+        None => "指定なし",
         Some("") if field.kind == FieldKind::Path => "空を指定",
         Some(value) if field.kind == FieldKind::Shortcut && value.eq_ignore_ascii_case("none") => {
-            "解除"
+            "割当なし"
         }
-        Some(_) => "上書き",
+        Some(_) => "指定値",
     }
 }
 
 fn combo_options(kind: FieldKind) -> &'static [(&'static str, &'static str)] {
     match kind {
-        FieldKind::Boolean => &[("継承", ""), ("有効", "true"), ("無効", "false")],
+        FieldKind::Boolean => &[("指定しない", ""), ("有効", "true"), ("無効", "false")],
         FieldKind::Theme => &[
-            ("継承", ""),
+            ("指定しない", ""),
             ("システム", "system"),
             ("ライト", "light"),
             ("ダーク", "dark"),
@@ -833,18 +950,52 @@ impl FormWindow {
                         SetWindowTextW(row.input, PCWSTR(wide(value.unwrap_or_default()).as_ptr()));
                 }
             }
+            self.update_target_labels();
             self.update_row_summaries();
         }
     }
     unsafe fn update_row_summaries(&self) {
         unsafe {
-            let effective = merged_settings(&self.forms);
+            let parsed = parsed_forms(&self.forms);
+            let resolution = effective_settings(&parsed);
+            let effective = &resolution.settings;
+            let binding_conflict = resolution.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == mdlite::settings::DiagnosticKind::BindingConflict
+            });
+            let pending = self.forms[self.selected].draft != self.forms[self.selected].baseline;
+            let header = if pending {
+                "この対象の入力値（未適用あり）"
+            } else {
+                "この対象の入力値"
+            };
+            let _ = SetWindowTextW(self.headers[2], PCWSTR(wide(header).as_ptr()));
             for (index, (field, row)) in self.fields.iter().zip(&self.rows).enumerate() {
-                let value = effective_value(field, &effective, self.tokens);
+                let source =
+                    effective_source(field, &self.fields, &parsed, effective, binding_conflict);
+                let value = effective_summary(field, effective, source, self.tokens);
                 let state = draft_state(field, self.forms[self.selected].draft[index].as_deref());
-                let text = format!("{value} / {state}");
+                let text = format!("{value}\n適用元：{source} / 入力：{state}");
                 let _ = SetWindowTextW(row.effective, PCWSTR(wide(&text).as_ptr()));
             }
+        }
+    }
+    unsafe fn update_target_labels(&self) {
+        unsafe {
+            let common = self.selected == 0;
+            for row in &self.rows {
+                let label = if common {
+                    "初期設定に戻す"
+                } else {
+                    "共通設定を使う"
+                };
+                let _ = SetWindowTextW(row.inherit, PCWSTR(wide(label).as_ptr()));
+            }
+            let reset = if common {
+                "ユーザー共通をリセット"
+            } else {
+                "Workspaceをリセット"
+            };
+            let _ = SetWindowTextW(self.buttons[2], PCWSTR(wide(reset).as_ptr()));
         }
     }
     unsafe fn update_help(&self, control: HWND) {
@@ -866,7 +1017,7 @@ impl FormWindow {
                 })
                 .or_else(|| {
                     (control == self.scope).then_some(
-                        "編集対象の層を選びます。ユーザー共通の下書きはWorkspaceへ切り替えても保持されます。",
+                        "すべてのワークスペース共通、または現在のWorkspaceを選びます。切り替えても各対象の下書きは保持されます。",
                     )
                 })
                 .unwrap_or("設定の項目へTabで移動すると、ここに補足を表示します。hoverでも同じ説明を確認できます。");
@@ -1003,7 +1154,7 @@ impl FormWindow {
             self.tooltip_text.push(wide(text));
             let text = self.tooltip_text.last_mut().unwrap();
             let mut tool = TTTOOLINFOW {
-                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                cbSize: shell::TOOLTIP_INFO_SIZE,
                 uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                 hwnd: self.hwnd,
                 uId: control.0 as usize,
@@ -1046,26 +1197,26 @@ impl FormWindow {
             let _ = GetClientRect(self.hwnd, &mut client);
             let scale = self.dpi as f32 / 96.;
             let width = (client.right as f32 / scale).round() as i32;
-            self.place(self.scope, 128, 12, 220, 28, true);
-            self.place(self.note, 366, 10, (width - 382).max(180), 38, true);
+            self.place(self.scope, 128, 12, 330, 28, true);
+            self.place(self.note, 470, 10, (width - 486).max(180), 38, true);
             self.place(self.help, 16, 48, (width - 32).max(220), 34, true);
-            self.place(self.headers[0], 16, 84, 280, 22, true);
-            self.place(self.headers[1], 304, 84, 190, 22, true);
+            self.place(self.headers[0], 16, 84, 200, 22, true);
+            self.place(self.headers[1], 224, 84, 270, 22, true);
             self.place(self.headers[2], 502, 84, (width - 534).max(220), 22, true);
 
             let right = width - 16;
-            let inherit_x = right - 72;
+            let inherit_x = right - 116;
             let action_x = inherit_x - 80;
             let mut y = 112;
-            let row_height = shell::UI_ROW_HEIGHT.round() as i32 + 10;
+            let row_height = shell::UI_ROW_HEIGHT.round() as i32 + 20;
             for category in &self.categories {
                 self.place(category.button, 16, y, (width - 32).max(240), 28, true);
                 y += 34;
                 for index in category.fields.clone() {
                     let row = &self.rows[index];
                     let visible = category.expanded;
-                    self.place(row.label, 16, y, 280, row_height, visible);
-                    self.place(row.effective, 304, y, 190, row_height, visible);
+                    self.place(row.label, 16, y, 200, row_height, visible);
+                    self.place(row.effective, 224, y, 270, row_height, visible);
                     let has_action = row.action.is_some();
                     let input_right = if has_action {
                         action_x - 8
@@ -1075,14 +1226,14 @@ impl FormWindow {
                     self.place(
                         row.input,
                         502,
-                        y + 2,
+                        y + 6,
                         (input_right - 502).max(80),
-                        row_height - 4,
+                        row_height - 12,
                         visible,
                     );
-                    self.place(row.inherit, inherit_x, y + 2, 72, row_height - 4, visible);
+                    self.place(row.inherit, inherit_x, y + 4, 116, row_height - 8, visible);
                     if let Some(action) = row.action {
-                        self.place(action, action_x, y + 2, 72, row_height - 4, visible);
+                        self.place(action, action_x, y + 4, 72, row_height - 8, visible);
                     }
                     y += row_height;
                 }
@@ -1108,18 +1259,21 @@ impl FormWindow {
         unsafe {
             self.dpi = GetDpiForWindow(self.hwnd).max(96);
             let scope_label =
-                shell::control(self.hwnd, w!("STATIC"), "編集する層", 0, WINDOW_STYLE(0));
+                shell::control(self.hwnd, w!("STATIC"), "設定の対象", 0, WINDOW_STYLE(0));
             self.place(scope_label, 16, 12, 104, 28, true);
             self.scope = shell::control(
                 self.hwnd,
                 w!("COMBOBOX"),
-                "設定の編集対象",
+                "設定の対象",
                 200,
                 WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_VSCROLL,
             );
-            for name in ["ユーザー共通", "Workspace"]
-                .into_iter()
-                .take(self.forms.len())
+            for name in [
+                "すべてのワークスペース（ユーザー共通）",
+                "このワークスペース",
+            ]
+            .into_iter()
+            .take(self.forms.len())
             {
                 shell::send(
                     self.scope,
@@ -1132,39 +1286,39 @@ impl FormWindow {
             self.note = shell::control(
                 self.hwnd,
                 w!("STATIC"),
-                "共通設定の後にWorkspace設定が適用されます。列は実効値／この層の下書きです。空欄は継承、falseや0は指定値です。",
+                "適用順：初期設定 → ユーザー共通 → Workspace",
                 0,
                 WINDOW_STYLE(0),
             );
             self.help = shell::control(
                 self.hwnd,
                 w!("STATIC"),
-                "項目へTabで移動すると補足を表示します。hoverでも同じ説明を確認できます。",
+                "入力欄はこの対象に保存する下書きです。適用で検証・保存し、キャンセルでは未適用分を破棄します。指定しない場合は直前の適用元を使います。false／0／空文字は空欄と区別し、既存の検証を通します。",
                 0,
                 WINDOW_STYLE(0),
             );
             self.headers = [
+                shell::control(self.hwnd, w!("STATIC"), "設定項目", 0, WINDOW_STYLE(0)),
                 shell::control(
                     self.hwnd,
                     w!("STATIC"),
-                    "項目 / 識別キー",
+                    "現在の有効値（適用元）",
                     0,
                     WINDOW_STYLE(0),
                 ),
                 shell::control(
                     self.hwnd,
                     w!("STATIC"),
-                    "実効値 / この層の下書き",
+                    "この対象の入力値（下書き）",
                     0,
                     WINDOW_STYLE(0),
                 ),
-                shell::control(self.hwnd, w!("STATIC"), "この層の値", 0, WINDOW_STYLE(0)),
             ];
             let category_specs = [
                 (
                     Category::General,
                     "一般／保存",
-                    "保存待機や既定Workspaceを設定します。共通設定の後にWorkspace設定が優先されます。",
+                    "保存待機や既定のメモWorkspaceを設定します。共通設定は、すべてのワークスペースで使われます。",
                     true,
                 ),
                 (
@@ -1182,7 +1336,7 @@ impl FormWindow {
                 (
                     Category::Keys,
                     "キー割当",
-                    "登録済みcommandだけを編集します。解除は下の層の割当を継承せず、割当なしを指定します。",
+                    "登録済み操作のキー割当を編集します。「解除」は次の設定元を使わず、割当なしを指定します。",
                     false,
                 ),
             ];
@@ -1247,7 +1401,7 @@ impl FormWindow {
                 let inherit = shell::control(
                     self.hwnd,
                     w!("BUTTON"),
-                    "継承",
+                    "初期設定に戻す",
                     INHERIT_BASE + index,
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
                 );
@@ -1282,10 +1436,10 @@ impl FormWindow {
                 if let Some(action) = action {
                     let help = match field.kind {
                         FieldKind::Path => {
-                            "この層の既定Workspaceを空にします。継承ボタンで下の層へ戻ります。"
+                            "この対象の既定Workspaceを空文字にします。保存後、実効値は未指定になります。"
                         }
                         FieldKind::Shortcut => {
-                            "このcommandのショートカットを解除します。下の層から継承したい場合は継承ボタンを使います。"
+                            "この操作のショートカットを割当なしにします。次の設定元の値を使うには右の解除ボタンを使います。"
                         }
                         _ => "",
                     };
@@ -1295,7 +1449,7 @@ impl FormWindow {
             for (index, (id, label)) in [
                 (APPLY, "適用"),
                 (CANCEL, "閉じる（キャンセル）"),
-                (RESET, "この層をリセット"),
+                (RESET, "ユーザー共通をリセット"),
                 (DETAIL, "詳細編集…"),
             ]
             .into_iter()
@@ -1309,14 +1463,17 @@ impl FormWindow {
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
                 );
             }
-            self.add_tooltip(self.buttons[0], "この層の変更を検証し、安全に保存します。競合や不正値がある場合は入力を保持します。");
+            self.add_tooltip(self.buttons[0], "選択した対象の変更を検証し、その設定ファイルへ安全に保存します。競合や不正値がある場合は下書きを保持します。");
             self.add_tooltip(
                 self.buttons[1],
                 "未適用の下書きを保存せず閉じます。すでに適用した設定は残ります。",
             );
-            self.add_tooltip(self.buttons[2], "この層の管理項目を下書きで継承へ戻します。保存するには「適用」を押してください。未知の設定は保持します。");
+            self.add_tooltip(self.buttons[2], "選択した対象の管理項目をすべて未指定にする下書きです。ユーザー共通では初期設定、Workspaceではユーザー共通の値が使われます。保存には「適用」を押してください。未知の設定は保持します。");
             self.add_tooltip(self.buttons[3], "現在の設定ファイルを詳細編集で開きます。普段の色やキー割当には各項目のフォームを使ってください。");
-            self.add_tooltip(self.scope, "編集対象の層を選びます。ユーザー共通の下書きはWorkspaceへ切り替えても保持されます。");
+            self.add_tooltip(
+                self.scope,
+                "設定の対象を選びます。対象を切り替えても各対象の下書きは保持されます。",
+            );
             self.layout_controls();
             self.show_draft();
             for child in children(self.hwnd) {
@@ -1561,6 +1718,29 @@ unsafe fn close_window(hwnd: HWND, state: &Window) {
         let _ = DestroyWindow(hwnd);
     }
 }
+
+fn refresh_form_paint(state: &Window) {
+    let Some(tokens) = state.form.try_borrow().ok().map(|form| form.tokens) else {
+        return;
+    };
+    let changed = state
+        .control_paint
+        .try_borrow()
+        .ok()
+        .and_then(|paint| paint.as_ref().map(|paint| paint.tokens))
+        .is_none_or(|current| {
+            shell::rgb(current.panel) != shell::rgb(tokens.panel)
+                || shell::rgb(current.foreground) != shell::rgb(tokens.foreground)
+                || shell::rgb(current.border) != shell::rgb(tokens.border)
+        });
+    if changed {
+        let retired = state
+            .control_paint
+            .replace(Some(Rc::new(FormPaint::new(tokens))));
+        drop(retired);
+    }
+}
+
 unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
@@ -1577,8 +1757,11 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         if msg == WM_NCDESTROY {
             (*pointer).completion.retire();
             (*pointer).closed.set(true);
+            let retired_paint = (*pointer).control_paint.replace(None);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            return DefWindowProcW(hwnd, msg, wp, lp);
+            let result = DefWindowProcW(hwnd, msg, wp, lp);
+            drop(retired_paint);
+            return result;
         }
         let _work = CompletionWork::begin(&*pointer);
         if msg == WM_DESTROY {
@@ -1599,6 +1782,7 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             (*pointer)
                 .high_contrast
                 .set(scrollbar_style::high_contrast());
+            refresh_form_paint(&*pointer);
             let position = { (*pointer).form.try_borrow().ok().map(|form| form.scroll) };
             if let Some(position) = position {
                 scroll_window(&*pointer, position);
@@ -1611,6 +1795,16 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 rail.cancel();
             }
             return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        let paint = (*pointer)
+            .control_paint
+            .try_borrow()
+            .ok()
+            .and_then(|paint| paint.as_ref().cloned());
+        if let Some(paint) = paint
+            && let Some(result) = paint.message(hwnd, msg, wp, lp)
+        {
+            return result;
         }
         let Ok(mut form) = (*pointer).form.try_borrow_mut() else {
             if msg == ENSURE_VISIBLE && (*pointer).completion.enabled {
@@ -1862,38 +2056,6 @@ unsafe extern "system" fn form_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 scroll_window(&*pointer, pending.unwrap_or(position));
                 LRESULT(0)
             }
-            WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
-                let dc = HDC(wp.0 as *mut _);
-                SetTextColor(dc, shell::rgb(form.tokens.foreground));
-                SetBkColor(dc, shell::rgb(form.tokens.panel));
-                LRESULT(form.brush.0 as isize)
-            }
-            WM_ERASEBKGND => {
-                let mut r = RECT::default();
-                let _ = GetClientRect(hwnd, &mut r);
-                FillRect(HDC(wp.0 as *mut _), &r, form.brush);
-                LRESULT(1)
-            }
-            WM_DRAWITEM => {
-                let item = &*(lp.0 as *const DRAWITEMSTRUCT);
-                FillRect(item.hDC, &item.rcItem, form.brush);
-                SetTextColor(item.hDC, shell::rgb(form.tokens.foreground));
-                let _ = SetBkMode(item.hDC, TRANSPARENT);
-                let mut r = item.rcItem;
-                draw_gdi_text(
-                    item.hDC,
-                    &shell::text_of(item.hwndItem),
-                    &mut r,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
-                let border = CreateSolidBrush(shell::rgb(form.tokens.border));
-                FrameRect(item.hDC, &r, border);
-                let _ = DeleteObject(border.into());
-                if item.itemState.0 & ODS_FOCUS.0 != 0 {
-                    let _ = DrawFocusRect(item.hDC, &r);
-                }
-                LRESULT(1)
-            }
             _ => {
                 // Default processing can synchronously send WM_CLOSE/WM_SIZE
                 // or enter native scrollbar tracking. Those callbacks must
@@ -1975,7 +2137,7 @@ impl App {
                     baseline,
                 });
             }
-            let brush = CreateSolidBrush(shell::rgb(self.shell.tokens.panel));
+            let paint = Rc::new(FormPaint::new(self.shell.tokens));
             let state = Box::new(Window {
                 completion: Completion::new(self.diagnostic.is_some()),
                 font: RefCell::new(None),
@@ -1983,6 +2145,7 @@ impl App {
                 font_pending: Cell::new(false),
                 rail: RefCell::new(None),
                 high_contrast: Cell::new(scrollbar_style::high_contrast()),
+                control_paint: RefCell::new(Some(paint)),
                 form: RefCell::new(FormWindow {
                     forms,
                     selected: 0,
@@ -1999,7 +2162,6 @@ impl App {
                     tooltip_text: Vec::new(),
                     detail: None,
                     tokens: self.shell.tokens,
-                    brush,
                     hwnd: HWND::default(),
                     scroll: 0,
                     wheel_delta: 0,
@@ -2019,7 +2181,7 @@ impl App {
                 WS_EX_DLGMODALFRAME,
                 w!("MDLiteSettings"),
                 w!("MDLite 設定"),
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL,
+                settings_window_style(),
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 (960. * self.dpi) as i32,
@@ -2030,7 +2192,6 @@ impl App {
                 Some((&*state as *const Window).cast()),
             );
             let Ok(hwnd) = hwnd else {
-                let _ = DeleteObject(brush.into());
                 self.status = "設定windowを作成できません".into();
                 return None;
             };
@@ -2143,7 +2304,6 @@ impl PreparedSettings {
             }
             let _ = SetFocus(Some(owner));
             let detail = state.form.borrow_mut().detail.take();
-            let _ = DeleteObject(state.form.borrow().brush.into());
             SettingsOutcome { detail, quit }
         }
     }
@@ -3001,6 +3161,9 @@ mod tests {
     }
     impl FormFixture {
         fn new() -> Self {
+            Self::with_tokens(shell::Tokens::default())
+        }
+        fn with_tokens(tokens: shell::Tokens) -> Self {
             unsafe {
                 let state = Box::new(Window {
                     completion: Completion::new(true),
@@ -3009,6 +3172,7 @@ mod tests {
                     font_pending: Cell::new(false),
                     rail: RefCell::new(None),
                     high_contrast: Cell::new(true),
+                    control_paint: RefCell::new(Some(Rc::new(FormPaint::new(tokens)))),
                     form: RefCell::new(FormWindow {
                         forms: Vec::new(),
                         selected: 0,
@@ -3024,8 +3188,7 @@ mod tests {
                         tooltip: HWND::default(),
                         tooltip_text: Vec::new(),
                         detail: None,
-                        tokens: shell::Tokens::default(),
-                        brush: CreateSolidBrush(COLORREF(0)),
+                        tokens,
                         hwnd: HWND::default(),
                         scroll: 0,
                         wheel_delta: 0,
@@ -3044,7 +3207,7 @@ mod tests {
                     WINDOW_EX_STYLE(0),
                     w!("MDLiteSettingsReentryTest"),
                     w!("Settings test"),
-                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VSCROLL,
+                    settings_window_style(),
                     0,
                     0,
                     680,
@@ -3096,8 +3259,218 @@ mod tests {
                 if IsWindow(Some(self.hwnd)).as_bool() {
                     let _ = DestroyWindow(self.hwnd);
                 }
-                let _ = DeleteObject(self.state.form.borrow().brush.into());
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive visible native GUI lease"]
+    fn settings_parent_dc_clips_visible_child_but_keeps_exposed_area() {
+        let fixture = FormFixture::new();
+        unsafe {
+            let child = shell::control(
+                fixture.hwnd,
+                w!("STATIC"),
+                "visible child",
+                903,
+                WINDOW_STYLE(0),
+            );
+            SetWindowPos(
+                child,
+                None,
+                80,
+                80,
+                120,
+                40,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .unwrap();
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            assert!(IsWindowVisible(fixture.hwnd).as_bool());
+            assert!(IsWindowVisible(child).as_bool());
+
+            let dc = GetDC(Some(fixture.hwnd));
+            let mut child_rect = RECT::default();
+            GetWindowRect(child, &mut child_rect).unwrap();
+            let mut child_center = POINT {
+                x: (child_rect.left + child_rect.right) / 2,
+                y: (child_rect.top + child_rect.bottom) / 2,
+            };
+            ScreenToClient(fixture.hwnd, &mut child_center).unwrap();
+            let exposed = POINT { x: 10, y: 10 };
+            let child_center_visible = PtVisible(dc, child_center.x, child_center.y).as_bool();
+            let exposed_point_visible = PtVisible(dc, exposed.x, exposed.y).as_bool();
+            let _ = ReleaseDC(Some(fixture.hwnd), dc);
+            let _ = ShowWindow(fixture.hwnd, SW_HIDE);
+
+            assert!(
+                !child_center_visible,
+                "the visible child center must be clipped from the parent DC"
+            );
+            assert!(
+                exposed_point_visible,
+                "the parent DC must still include exposed client area"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_paint_snapshot_handles_reentry_theme_refresh_and_window_retirement() {
+        let dark = shell::Tokens::default();
+        let light = shell::Tokens {
+            panel: color(0.94, 0.95, 0.96),
+            foreground: color(0.12, 0.15, 0.19),
+            border: color(0.76, 0.79, 0.82),
+            ..dark
+        };
+        let fixture = FormFixture::with_tokens(dark);
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 80,
+                    biHeight: -48,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap =
+                CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let previous = SelectObject(dc, bitmap.into());
+            let static_control =
+                shell::control(fixture.hwnd, w!("STATIC"), "reentry", 901, WINDOW_STYLE(0));
+            let button = shell::control(
+                fixture.hwnd,
+                w!("BUTTON"),
+                "custom",
+                902,
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+            );
+            let old_paint = fixture
+                .state
+                .control_paint
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone();
+            let old_weak = Rc::downgrade(&old_paint);
+            let sentinel = COLORREF(0x005a2bc3);
+            SetTextColor(dc, sentinel);
+            SetBkColor(dc, sentinel);
+
+            // Match the reentrant paint messages issued while category layout
+            // owns the mutable form borrow.
+            let form = fixture.state.form.borrow_mut();
+            let color_result = SendMessageW(
+                fixture.hwnd,
+                WM_CTLCOLORSTATIC,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(static_control.0 as isize)),
+            );
+            assert_eq!(color_result.0, old_paint.brush.0 as isize);
+            assert_eq!(GetTextColor(dc), shell::rgb(dark.foreground));
+            assert_eq!(GetBkColor(dc), shell::rgb(dark.panel));
+
+            let bounds = RECT {
+                left: 0,
+                top: 0,
+                right: 80,
+                bottom: 48,
+            };
+            let sentinel_brush = CreateSolidBrush(sentinel);
+            FillRect(dc, &bounds, sentinel_brush);
+            let _ = DeleteObject(sentinel_brush.into());
+            assert_eq!(
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_ERASEBKGND,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0)),
+                )
+                .0,
+                1
+            );
+            assert_eq!(GetPixel(dc, 0, 0), shell::rgb(dark.panel));
+
+            let item = DRAWITEMSTRUCT {
+                CtlType: ODT_BUTTON,
+                CtlID: 902,
+                hwndItem: button,
+                hDC: dc,
+                rcItem: RECT {
+                    left: 2,
+                    top: 2,
+                    right: 48,
+                    bottom: 22,
+                },
+                ..Default::default()
+            };
+            let sentinel_brush = CreateSolidBrush(sentinel);
+            FillRect(dc, &bounds, sentinel_brush);
+            let _ = DeleteObject(sentinel_brush.into());
+            assert_eq!(
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_DRAWITEM,
+                    Some(WPARAM(902)),
+                    Some(LPARAM((&item as *const DRAWITEMSTRUCT) as isize)),
+                )
+                .0,
+                1
+            );
+            assert_eq!(GetPixel(dc, 4, 4), shell::rgb(dark.panel));
+            drop(form);
+
+            // A theme snapshot replacement takes effect on the existing HWND;
+            // a callback clone keeps the old brush alive until it is released.
+            fixture.state.form.borrow_mut().tokens = light;
+            SendMessageW(
+                fixture.hwnd,
+                WM_THEMECHANGED,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
+            let light_paint = fixture
+                .state
+                .control_paint
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert!(!Rc::ptr_eq(&old_paint, &light_paint));
+            assert_eq!(light_paint.tokens.panel, light.panel);
+            assert!(old_weak.upgrade().is_some());
+
+            let form = fixture.state.form.borrow_mut();
+            SetTextColor(dc, sentinel);
+            SetBkColor(dc, sentinel);
+            let color_result = SendMessageW(
+                fixture.hwnd,
+                WM_CTLCOLOREDIT,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(static_control.0 as isize)),
+            );
+            assert_eq!(color_result.0, light_paint.brush.0 as isize);
+            assert_eq!(GetTextColor(dc), shell::rgb(light.foreground));
+            assert_eq!(GetBkColor(dc), shell::rgb(light.panel));
+            drop(form);
+
+            drop(old_paint);
+            assert!(old_weak.upgrade().is_none());
+            let light_weak = Rc::downgrade(&light_paint);
+            drop(light_paint);
+            assert!(DestroyWindow(fixture.hwnd).is_ok());
+            assert!(fixture.state.control_paint.borrow().is_none());
+            assert!(light_weak.upgrade().is_none());
+
+            let _ = SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
         }
     }
 
@@ -4028,12 +4401,93 @@ mod tests {
             fields
                 .iter()
                 .filter(|field| field.kind == FieldKind::Color || field.kind == FieldKind::Shortcut)
-                .all(|field| field.label.contains('[') && !field.help.is_empty())
+                .all(|field| !field.label.contains('[') && !field.help.is_empty())
         );
+        assert_eq!(combo_options(FieldKind::Boolean)[0], ("指定しない", ""));
+        assert_eq!(combo_options(FieldKind::Theme)[0], ("指定しない", ""));
     }
 
     #[test]
-    fn settings_form_keeps_false_zero_empty_and_unbind_separate_from_inherit() {
+    fn settings_form_summary_reports_effective_value_source_and_explicit_empty() {
+        let fields = field_specs();
+        let index = |key: &str| fields.iter().position(|field| field.key == key).unwrap();
+        let common = mdlite::settings::parse_settings(
+            "schema_version = 1\nauto_save = false\ntheme = \"custom\"\ncolor.background = \"#112233\"\nbind.file.save = \"Ctrl+Alt+S\"\n",
+        );
+        let workspace = mdlite::settings::parse_settings(
+            "schema_version = 1\ndefault_memo_workspace = \"\"\nauto_save_delay_ms = 1500\n",
+        );
+        let parsed = [common, workspace];
+        let resolution = effective_settings(&parsed);
+        let binding_conflict = resolution
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == mdlite::settings::DiagnosticKind::BindingConflict);
+        let settings = &resolution.settings;
+
+        let auto_save = &fields[index("auto_save")];
+        assert_eq!(
+            effective_source(auto_save, &fields, &parsed, settings, binding_conflict),
+            "ユーザー共通"
+        );
+        assert_eq!(
+            effective_value(auto_save, settings, shell::Tokens::default()),
+            "無効"
+        );
+        let delay = &fields[index("auto_save_delay_ms")];
+        assert_eq!(
+            effective_source(delay, &fields, &parsed, settings, binding_conflict),
+            "Workspace"
+        );
+        assert_eq!(
+            effective_value(delay, settings, shell::Tokens::default()),
+            "1500 ms"
+        );
+
+        let path = &fields[index("default_memo_workspace")];
+        assert_eq!(
+            effective_source(path, &fields, &parsed, settings, binding_conflict),
+            "Workspace"
+        );
+        assert_eq!(
+            effective_summary(path, settings, "Workspace", shell::Tokens::default()),
+            "空（Workspace）"
+        );
+
+        let color = &fields[index("color.background")];
+        assert_eq!(
+            effective_source(color, &fields, &parsed, settings, binding_conflict),
+            "ユーザー共通"
+        );
+        assert_eq!(
+            effective_value(color, settings, shell::Tokens::default()),
+            "#112233"
+        );
+        let unused_color = &fields[index("color.link")];
+        assert_eq!(
+            effective_source(unused_color, &fields, &parsed, settings, binding_conflict),
+            "初期設定"
+        );
+
+        let default_binding = &fields[index("bind.file.open")];
+        assert_eq!(
+            effective_source(
+                default_binding,
+                &fields,
+                &parsed,
+                settings,
+                binding_conflict
+            ),
+            "初期設定"
+        );
+        assert_eq!(draft_state(path, None), "指定なし");
+        assert_eq!(draft_state(path, Some("")), "空を指定");
+        assert_eq!(draft_state(default_binding, Some("NONE")), "割当なし");
+        assert_eq!(draft_state(auto_save, Some("false")), "指定値");
+    }
+
+    #[test]
+    fn settings_form_keeps_false_zero_empty_and_unbind_separate_from_unspecified() {
         let fields = field_specs();
         let index = |key: &str| fields.iter().position(|field| field.key == key).unwrap();
         let before = vec![None; fields.len()];
@@ -4065,7 +4519,7 @@ mod tests {
         );
         assert_eq!(
             draft_state(&fields[index("bind.file.save")], Some("NONE")),
-            "解除"
+            "割当なし"
         );
     }
 
@@ -4152,6 +4606,12 @@ mod tests {
             }
             let (baselines, expected, other_draft, reset, cancel, font_edit) = {
                 let form = fixture.state.form.borrow();
+                assert_eq!(shell::text_of(form.buttons[2]), "Workspaceをリセット");
+                assert!(
+                    form.rows
+                        .iter()
+                        .all(|row| shell::text_of(row.inherit) == "共通設定を使う")
+                );
                 (
                     form.forms
                         .iter()
@@ -4217,6 +4677,10 @@ mod tests {
             {
                 let form = fixture.state.form.borrow();
                 assert_eq!(form.selected, 1);
+                assert_eq!(
+                    shell::text_of(form.headers[2]),
+                    "この対象の入力値（未適用あり）"
+                );
                 assert!(form.forms[1].draft.iter().all(Option::is_none));
                 assert_eq!(form.forms[0].draft, other_draft);
                 for (index, layer) in form.forms.iter().enumerate() {
@@ -4233,7 +4697,7 @@ mod tests {
                     } else {
                         assert_eq!(shell::text_of(row.input), "");
                     }
-                    assert!(shell::text_of(row.effective).ends_with(" / 継承"));
+                    assert!(shell::text_of(row.effective).contains("入力：指定なし"));
                 }
             }
             assert_eq!(fs::read(&common_path).unwrap(), common_bytes);
@@ -4284,6 +4748,19 @@ mod tests {
                 ];
                 form.create_controls();
             }
+            let scope = fixture.state.form.borrow().scope;
+            assert_eq!(
+                shell::text_of(scope),
+                "すべてのワークスペース（ユーザー共通）"
+            );
+            assert_eq!(
+                shell::text_of(fixture.state.form.borrow().buttons[2]),
+                "ユーザー共通をリセット"
+            );
+            assert_eq!(
+                shell::text_of(fixture.state.form.borrow().headers[2]),
+                "この対象の入力値"
+            );
             let font_index = fields
                 .iter()
                 .position(|field| field.key == "font_face")
@@ -4316,7 +4793,6 @@ mod tests {
             );
             assert_eq!(shell::text_of(font_edit), "Meiryo");
 
-            let scope = fixture.state.form.borrow().scope;
             shell::send(scope, CB_SETCURSEL, WPARAM(1), LPARAM(0));
             SendMessageW(
                 fixture.hwnd,
@@ -4325,6 +4801,24 @@ mod tests {
                 Some(LPARAM(scope.0 as isize)),
             );
             assert_eq!(fixture.state.form.borrow().selected, 1);
+            assert_eq!(
+                shell::text_of(fixture.state.form.borrow().headers[2]),
+                "この対象の入力値"
+            );
+            assert_eq!(shell::text_of(scope), "このワークスペース");
+            assert_eq!(
+                shell::text_of(fixture.state.form.borrow().buttons[2]),
+                "Workspaceをリセット"
+            );
+            assert!(
+                fixture
+                    .state
+                    .form
+                    .borrow()
+                    .rows
+                    .iter()
+                    .all(|row| shell::text_of(row.inherit) == "共通設定を使う")
+            );
             assert_eq!(shell::text_of(font_edit), "");
             SetWindowTextW(font_edit, PCWSTR(wide("Yu Gothic").as_ptr())).unwrap();
             fixture.state.form.borrow_mut().capture_draft();
@@ -4337,6 +4831,19 @@ mod tests {
                 Some(LPARAM(scope.0 as isize)),
             );
             assert_eq!(shell::text_of(font_edit), "Meiryo");
+            assert_eq!(
+                shell::text_of(scope),
+                "すべてのワークスペース（ユーザー共通）"
+            );
+            assert!(
+                fixture
+                    .state
+                    .form
+                    .borrow()
+                    .rows
+                    .iter()
+                    .all(|row| shell::text_of(row.inherit) == "初期設定に戻す")
+            );
 
             SetWindowTextW(font_edit, PCWSTR(wide("Meiryo Pro").as_ptr())).unwrap();
             fixture.state.form.borrow_mut().capture_draft();

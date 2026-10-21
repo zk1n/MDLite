@@ -17,6 +17,10 @@ pub(super) const EDITOR_TOP: f32 = 80.;
 pub(super) const UI_FONT_FAMILY: &str = "Yu Gothic UI";
 pub(super) const UI_FONT_SIZE: f32 = 12.;
 pub(super) const UI_ROW_HEIGHT: f32 = 24.;
+// The classic ComCtl32 tooltip ABI ends at lParam. Including lpReserved in
+// cbSize makes ADDTOOL fail without a v6 activation context; this V2 prefix is
+// also accepted by v6 and contains every field used by these native tools.
+pub(super) const TOOLTIP_INFO_SIZE: u32 = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
 const NAV_BACK: usize = 168;
 const NAV_FORWARD: usize = 169;
 const SETTINGS: usize = 101;
@@ -606,6 +610,7 @@ pub(super) struct NativeShell {
     region_buttons: [HWND; 2],
     region_focus: [HWND; 2],
     tooltip: HWND,
+    status_tools: [StatusTool; 2],
     drawer: Option<PanelId>,
     splitter: Option<Splitter>,
     palette: Option<PaletteState>,
@@ -624,6 +629,13 @@ pub(super) struct NativeShell {
     nav_forward: Vec<NavigationPoint>,
     navigating: bool,
 }
+#[derive(Default)]
+struct StatusTool {
+    hwnd: HWND,
+    bounds: [i32; 4],
+    text: Vec<u16>,
+}
+
 impl Default for NativeShell {
     fn default() -> Self {
         Self {
@@ -651,6 +663,7 @@ impl Default for NativeShell {
             region_buttons: [HWND::default(); 2],
             region_focus: [HWND::default(); 2],
             tooltip: HWND::default(),
+            status_tools: Default::default(),
             drawer: None,
             splitter: None,
             palette: None,
@@ -1556,7 +1569,7 @@ impl App {
             {
                 self.shell.tooltip_text.push(wide(&text_of(*h)));
                 let mut tool = TTTOOLINFOW {
-                    cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                    cbSize: TOOLTIP_INFO_SIZE,
                     uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                     hwnd: self.hwnd,
                     uId: h.0 as usize,
@@ -2000,6 +2013,59 @@ impl App {
             }
         }
     }
+    pub(super) unsafe fn status_tooltip(&mut self, text: &str, x: f32, y: f32, width: f32) {
+        unsafe {
+            let tooltip = self.shell.tooltip;
+            if tooltip == HWND::default() {
+                return;
+            }
+            let index = usize::from(self.hwnd == self.shell.compact_window);
+            let cached = &mut self.shell.status_tools[index];
+            let bounds = [
+                (x * self.dpi) as i32,
+                (y * self.dpi) as i32,
+                ((x + width) * self.dpi) as i32,
+                ((y + 24.) * self.dpi) as i32,
+            ];
+            let text = wide(text);
+            if cached.hwnd == self.hwnd && cached.bounds == bounds && cached.text == text {
+                return;
+            }
+            let new_tool = cached.hwnd != self.hwnd;
+            cached.hwnd = self.hwnd;
+            cached.bounds = bounds;
+            // The backing allocation remains owned until the next explicit
+            // tooltip update, including across nested tooltip callbacks.
+            let retired = std::mem::replace(&mut cached.text, text);
+            let mut tool = TTTOOLINFOW {
+                cbSize: TOOLTIP_INFO_SIZE,
+                uFlags: TTF_SUBCLASS,
+                hwnd: self.hwnd,
+                uId: 9001,
+                rect: RECT {
+                    left: bounds[0],
+                    top: bounds[1],
+                    right: bounds[2],
+                    bottom: bounds[3],
+                },
+                lpszText: PWSTR(cached.text.as_mut_ptr()),
+                ..Default::default()
+            };
+            send(
+                tooltip,
+                if new_tool {
+                    TTM_ADDTOOLW
+                } else {
+                    TTM_SETTOOLINFOW
+                },
+                WPARAM(0),
+                LPARAM((&mut tool as *mut TTTOOLINFOW) as isize),
+            );
+            send(tooltip, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(700));
+            drop(retired);
+        }
+    }
+
     pub(super) fn update_shell_geometry(&mut self, height: f32) {
         if !self.shell.enabled {
             return;
@@ -3951,7 +4017,7 @@ impl App {
             let title = wide(&format!("{} — Compact", self.tab_display_name(self.active)));
             let placement = self.tabs[self.active].persistence.placement.clone();
             let compact = CreateWindowExW(
-                WS_EX_COMPOSITED,
+                WINDOW_EX_STYLE::default(),
                 w!("MDLiteRustEditor"),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -4207,6 +4273,116 @@ pub(super) unsafe fn track_control_ime(hwnd: HWND) -> Box<Cell<bool>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_tooltip_registers_updates_and_round_trips_full_text_and_hit_region() {
+        use super::*;
+        unsafe {
+            let mut app = super::super::tests::composing_test_app("body");
+            app.clear_composition();
+            let owner = super::super::tests::hidden_test_window_size(640, 480);
+            app.hwnd = owner;
+            app.shell.main_window = owner;
+            let tooltip = CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                None,
+                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP),
+                0,
+                0,
+                0,
+                0,
+                Some(owner),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            app.shell.tooltip = tooltip;
+            for (text, x, y, width) in [
+                (
+                    "Workspace 日本語 full name\nGit acceptance (unborn) · remoteなし\nUTF-8 · CRLF · Live · 保存済み",
+                    0.,
+                    450.,
+                    640.,
+                ),
+                (
+                    "Workspace updated long name\nGit local · 変更3件 · remoteなし\nLn 8, Col 1 · CP932 · Source · 未保存",
+                    50.,
+                    400.,
+                    400.,
+                ),
+            ] {
+                app.status_tooltip(text, x, y, width);
+                app.status_tooltip(text, x, y, width);
+                assert_eq!(send(tooltip, TTM_GETTOOLCOUNT, WPARAM(0), LPARAM(0)).0, 1);
+                let mut output = vec![0u16; 2048];
+                let mut query = TTTOOLINFOW {
+                    cbSize: TOOLTIP_INFO_SIZE,
+                    hwnd: owner,
+                    uId: 9001,
+                    lpszText: PWSTR(output.as_mut_ptr()),
+                    ..Default::default()
+                };
+                assert_ne!(
+                    send(
+                        tooltip,
+                        TTM_GETTOOLINFOW,
+                        WPARAM(0),
+                        LPARAM((&mut query as *mut TTTOOLINFOW) as isize)
+                    )
+                    .0,
+                    0
+                );
+                assert_eq!(
+                    query.rect,
+                    RECT {
+                        left: x as i32,
+                        top: y as i32,
+                        right: (x + width) as i32,
+                        bottom: (y + 24.) as i32
+                    }
+                );
+                let end = output.iter().position(|&unit| unit == 0).unwrap();
+                assert_eq!(String::from_utf16_lossy(&output[..end]), text);
+                let mut hit = TTHITTESTINFOW {
+                    hwnd: owner,
+                    pt: POINT {
+                        x: x as i32 + 5,
+                        y: y as i32 + 5,
+                    },
+                    ti: TTTOOLINFOW {
+                        cbSize: TOOLTIP_INFO_SIZE,
+                        lpszText: PWSTR(output.as_mut_ptr()),
+                        ..Default::default()
+                    },
+                };
+                assert_ne!(
+                    send(
+                        tooltip,
+                        TTM_HITTESTW,
+                        WPARAM(0),
+                        LPARAM((&mut hit as *mut TTHITTESTINFOW) as isize)
+                    )
+                    .0,
+                    0
+                );
+                assert_eq!(hit.ti.uId, 9001);
+                hit.pt.y = y as i32 - 1;
+                assert_eq!(
+                    send(
+                        tooltip,
+                        TTM_HITTESTW,
+                        WPARAM(0),
+                        LPARAM((&mut hit as *mut TTHITTESTINFOW) as isize)
+                    )
+                    .0,
+                    0
+                );
+            }
+            DestroyWindow(tooltip).unwrap();
+            DestroyWindow(owner).unwrap();
+        }
+    }
     use super::*;
 
     #[test]

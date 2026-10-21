@@ -5,6 +5,31 @@
 操作契約は[Workspace操作](workspace-operations.md)、実施結果は
 [実装・検証表](ui-feature-parity.md)と[受入記録](rust-acceptance.md)を正本とする。
 
+## 2026年10月22日・描画負荷とLive編集の追補差分
+
+Task `20261022-mdlite-rendering-live-editing-repair` Revision 1。
+Liveは原文の明示改行をcaret位置によらず別の編集行として保つ。
+Front Matterとfenceの区切りはcaretが来た原文行を編集表示し、旧Rev3の全区切り常時表示を置き換える。
+区切りの再入力／Undoで再構成した後も終端を再編集できることを確認する。
+原文・encoding・LF/CRLF・dirty・履歴を表示のために変更せず、表のcell圧縮は別の規則を保つ。
+
+設定は対象、有効値と適用元、下書きを区別し、優先順位を初期設定→ユーザー共通→Workspaceと説明する。
+解除・resetは対象を明示する下書き操作とし、明示的な空・false・0の保存契約を維持する。
+statusはWorkspace/Gitと文書情報を項目別に配置し、未確認のGit状態をcleanと表示しない。
+静止時の不要なpaint/control同期と設定再配置途中の白化は、対象EXEを固定して原因・修正前後を確認する。
+最終196b4b82…のRelease候補でLF/CRLF、Main/Compact caret、dark/light設定遷移と保存、
+実local/noRemote Gitのstatus全文popupを確認した。VMの診断off・操作後idle CPUは
+1コア換算76.15%→0.78%。全frame/持続GPU/他端末/物理IME/Human受入とは区別する。
+詳細な対象・条件・raw commandの失敗分類は[受入記録](rust-acceptance.md)に従う。
+
+開始時にGitBook CR7 `fkQ2xRsXyzfbDP89y6SX` と公開版を照合したところ、CR7は既にmergedで、
+編集・設定・構成の3ページ本文は公開版と同一だった。過去の「draftのまま」は当時の記録として保持する。
+今回の更新先は後継CR8 `K0pAzsgY5hINhqfbNZMj`（draft）。公開版とmerged CR7を保持する。
+この差分ファイル自体を外部書込の証明とせず、実更新/読戻しは最終HANDOFFの記録を参照する。
+CR8の製品概要・編集・設定・構成の4ページへ追補し、既存suffix全文保持を読戻した。
+新規節は編集ページでexact一致、他3ページはunderscoreのMarkdown escapeだけの正規化と確認した。
+4ページの公開版は旧本文と一致し、CR8はdraftのまま、publish操作は行っていない。
+
 ## Rev6候補：Git button描画の借用中処理漏れ（2026年10月21日）
 
 Git hostから転送されるowner-draw要求が、App借用中かつenabled状態不変の場合に未処理となる経路を、

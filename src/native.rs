@@ -432,7 +432,6 @@ struct App {
     gutter_rows: Vec<GutterRow>,
     gutter_width: f32,
     visible_tokens: Vec<VisibleToken>,
-    literal_blocks: Vec<Range<usize>>,
     tables: Vec<TableView>,
     images: Vec<ImageView>,
     image_cache: HashMap<PathBuf, CachedImage>,
@@ -1071,8 +1070,8 @@ fn caret_intersects_damage(caret: (f32, f32, f32), damage: D2D_RECT_F) -> bool {
         && damage.top <= caret.1 + caret.2
         && damage.bottom >= caret.1
 }
-fn caret_in_editor(caret: (f32, f32, f32), right: f32, bottom: f32) -> bool {
-    caret.0 >= LEFT && caret.0 + 2.0 <= right && caret.1 >= TOP && caret.1 + caret.2 <= bottom
+fn caret_in_editor(caret: (f32, f32, f32), left: f32, top: f32, right: f32, bottom: f32) -> bool {
+    caret.0 >= left && caret.0 + 2.0 <= right && caret.1 >= top && caret.1 + caret.2 <= bottom
 }
 fn visible_table_offset(current: f32, caret_x: f32, viewport: f32, content: f32) -> f32 {
     let margin = 6.0_f32.min(viewport / 2.0);
@@ -1103,7 +1102,6 @@ fn startup_window_state(
         gutter_rows: Vec::new(),
         gutter_width: 0.0,
         visible_tokens: Vec::new(),
-        literal_blocks: Vec::new(),
         tables: Vec::new(),
         images: Vec::new(),
         image_cache: HashMap::new(),
@@ -1207,7 +1205,10 @@ pub fn run() -> windows::core::Result<()> {
         let mut app = Box::new(startup_window_state(graphics, diagnostic, paths));
         let pointer = (&*app as *const WindowState).cast();
         let hwnd = CreateWindowExW(
-            WS_EX_COMPOSITED,
+            // Direct2D presents through the paint DC. Ancestor compositing
+            // repeatedly invalidates that surface after present; native child
+            // controls retain their own existing local paint buffers.
+            WINDOW_EX_STYLE::default(),
             w!("MDLiteRustEditor"),
             w!("MDLite — Rust 編集基盤"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2761,14 +2762,8 @@ impl App {
             .iter()
             .map(|table| table.table.range.clone())
             .collect();
-        let token_target = live_horizontal_step(
-            self.doc().source(),
-            &self.visible_tokens,
-            &tables,
-            &self.literal_blocks,
-            p,
-            back,
-        );
+        let token_target =
+            live_horizontal_step(self.doc().source(), &self.visible_tokens, &tables, p, back);
         let markers = self
             .views
             .iter()
@@ -3534,16 +3529,10 @@ impl App {
                             .collect();
                         if let Some(plan) = line_ending_delete(
                             self.doc().source(),
-                            &self.visible_tokens,
                             if self.tabs[self.active].raw {
                                 &[]
                             } else {
                                 &table_ranges
-                            },
-                            if self.tabs[self.active].raw {
-                                &[]
-                            } else {
-                                &self.literal_blocks
                             },
                             p,
                             key == 0x08,
@@ -3839,6 +3828,14 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            let same_document_view = self.layout_key.is_some_and(|(id, revision, _, raw)| {
+                (id, revision, raw)
+                    == (
+                        self.doc().id(),
+                        self.doc().revision(),
+                        self.tabs[self.active].raw,
+                    )
+            });
             let _ = self.ensure_layout();
             let p = self.doc().selection().head;
             if let Some(table) = self
@@ -3871,7 +3868,7 @@ impl App {
             } else if y + height > max {
                 self.scroll(y + height - max);
             }
-            self.refresh();
+            self.refresh_damage(same_document_view);
         }
     }
     unsafe fn copy(&mut self, cut: bool) {
@@ -4628,19 +4625,23 @@ impl App {
             } else {
                 let projection = self.cached_projection();
                 let head = self.doc().selection().head;
-                projection
-                    .blocks
-                    .iter()
-                    .filter(|block| {
-                        matches!(
-                            block.kind,
-                            BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem
-                        ) && block.source.start <= head
-                            && (head < block.source.end
-                                || (head == self.doc().byte_len() && block.source.end == head))
-                    })
-                    .min_by_key(|block| block.source.len())
-                    .map(|block| block.source.clone())
+                projection.source_delimiter_line_at(head).or_else(|| {
+                    projection
+                        .blocks
+                        .iter()
+                        .filter(|block| {
+                            matches!(
+                                block.kind,
+                                BlockKind::Paragraph
+                                    | BlockKind::Heading { .. }
+                                    | BlockKind::ListItem
+                            ) && block.source.start <= head
+                                && (head < block.source.end
+                                    || (head == self.doc().byte_len() && block.source.end == head))
+                        })
+                        .min_by_key(|block| block.source.len())
+                        .map(|block| block.source.clone())
+                })
             };
             let reveal = if self.tabs[self.active].raw {
                 None
@@ -4655,7 +4656,6 @@ impl App {
             self.revealed_source = reveal;
             self.views.clear();
             self.visible_tokens.clear();
-            self.literal_blocks.clear();
             self.tables.clear();
             self.images.clear();
             let source = self.doc().source_shared();
@@ -4692,17 +4692,6 @@ impl App {
                 }
             } else {
                 let projection = self.cached_projection();
-                self.literal_blocks = projection
-                    .blocks
-                    .iter()
-                    .filter(|block| {
-                        matches!(
-                            block.kind,
-                            BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
-                        )
-                    })
-                    .map(|block| block.source.clone())
-                    .collect();
                 let mut handled_images = std::collections::HashSet::new();
                 let retained_paths: std::collections::HashSet<_> = projection
                     .blocks
@@ -4916,14 +4905,23 @@ impl App {
                     // boundary, not an extra DirectWrite row before the next
                     // physical line. Internal blank lines remain in the layout.
                     let mut display_range = block.display_utf16.clone();
-                    if matches!(block.kind, BlockKind::Code { fenced: true, .. })
-                        && display_range.end > display_range.start
+                    if matches!(
+                        block.kind,
+                        BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
+                    ) && display_range.end > display_range.start
                         && utf16[display_range.end - 1] == b'\n' as u16
                     {
                         display_range.end -= 1;
                     }
                     let text = String::from_utf16_lossy(&utf16[display_range.clone()]);
-                    let (map, before) = if display_range.is_empty()
+                    let literal = matches!(
+                        block.kind,
+                        BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
+                    );
+                    if literal && text.is_empty() {
+                        continue;
+                    }
+                    let (mut map, mut before) = if display_range.is_empty()
                         && matches!(block.kind, BlockKind::Heading { .. })
                     {
                         // Empty headings share a display boundary with the next
@@ -4954,10 +4952,37 @@ impl App {
                     };
                     let indent = (block.depth.saturating_sub(1) as f32 * 12.0)
                         .max(marker.as_ref().map_or(0.0, |(_, width)| width + 8.0));
+                    // Delimiter rows have their own source anchors. The body
+                    // view must not claim their bytes or pull the closing
+                    // delimiter's caret back into the body after a rebuild.
+                    let view_source = if literal {
+                        let start = projection
+                            .source_delimiter_line_at(block.source.start)
+                            .map_or(block.source.start, |line| line.end);
+                        let end = projection
+                            .source_delimiter_line_at(block.source.end.saturating_sub(1))
+                            .filter(|line| line.start >= start)
+                            .map_or(block.source.end, |line| line.start);
+                        let body = &source[start..end];
+                        let content = body
+                            .strip_suffix("\r\n")
+                            .or_else(|| body.strip_suffix(['\r', '\n']))
+                            .unwrap_or(body);
+                        let end = start + content.len();
+                        // Hidden delimiters share global display boundaries
+                        // with following blocks. A literal body's terminal
+                        // insertion point remains before its own physical EOL.
+                        for byte in map.iter_mut().chain(before.iter_mut()) {
+                            *byte = (*byte).clamp(start, end);
+                        }
+                        start..end
+                    } else {
+                        block.source.clone()
+                    };
                     let height = self.push_view(
                         &text,
                         (map, before),
-                        block.source.clone(),
+                        view_source,
                         (self.content_left() + indent, y, width - indent),
                         size,
                         None,
@@ -5182,18 +5207,12 @@ impl App {
                     .filter(|gap| !gap.is_empty() && gap.trim().is_empty())
                     .map(|_| (p, false))
             }));
-            markers.extend(
-                self.literal_blocks
-                    .iter()
-                    .flat_map(|range| [(range.start, true), (range.end, false)])
-                    .filter(|(p, _)| {
-                        source.is_char_boundary(*p)
-                            && !self
-                                .views
-                                .iter()
-                                .any(|view| view.map.binary_search(p).is_ok())
-                    }),
-            );
+            let projection = self.cached_projection();
+            markers.extend(line_starts.iter().filter_map(|&start| {
+                projection
+                    .source_delimiter_line_at(start)
+                    .map(|line| (line.start, true))
+            }));
             markers.sort_by_key(|(p, _)| *p);
             let mut unique_markers: Vec<(usize, bool)> = Vec::with_capacity(markers.len());
             for (position, takes_row) in markers {
@@ -5206,12 +5225,14 @@ impl App {
                 }
             }
             let mut row_positions = Vec::new();
+            let mut row_heights = Vec::new();
             let mut reused_row_anchors = Vec::new();
             let row_height = presentation::line_height(self.font_size());
             for (p, takes_row) in unique_markers {
                 if empty_anchor_positions.binary_search(&p).is_ok() {
                     if takes_row {
                         row_positions.push(p);
+                        row_heights.push(row_height);
                         reused_row_anchors.push(p);
                     }
                     continue;
@@ -5233,14 +5254,29 @@ impl App {
                         .or(next_y)
                         .unwrap_or(bottom)
                 };
-                self.push_view(
-                    "",
-                    (vec![p], vec![p]),
-                    p..p,
+                let revealed_line = self.revealed_source.as_ref().filter(|line| {
+                    line.start == p
+                        && projection.source_delimiter_line_at(p).as_ref() == Some(*line)
+                });
+                let text = revealed_line.map_or("", |line| {
+                    source[line.clone()].trim_end_matches(['\r', '\n'])
+                });
+                let map = byte_map(text, p);
+                let height = self.push_view(
+                    text,
+                    (map.clone(), map),
+                    revealed_line.cloned().unwrap_or(p..p),
                     (self.content_left(), y, width),
                     self.font_size(),
                     None,
                 )?;
+                if takes_row {
+                    row_heights.push(height);
+                }
+            }
+            let mut row_offsets = vec![0.];
+            for height in row_heights {
+                row_offsets.push(row_offsets.last().copied().unwrap() + height);
             }
             for (index, view) in self.views.iter_mut().enumerate() {
                 let reused_row_anchor = index < existing_view_count
@@ -5252,12 +5288,12 @@ impl App {
                     view.source.start,
                     include_equal,
                 );
-                view.y += shifts as f32 * row_height;
+                view.y += row_offsets[shifts];
             }
             for image in &mut self.images {
                 let shifts =
                     presentation::source_row_shift_count(&row_positions, image.source.start, true);
-                image.y += shifts as f32 * row_height;
+                image.y += row_offsets[shifts];
             }
             for table in &mut self.tables {
                 let shifts = presentation::source_row_shift_count(
@@ -5265,7 +5301,7 @@ impl App {
                     table.table.range.start,
                     true,
                 );
-                table.y += shifts as f32 * row_height;
+                table.y += row_offsets[shifts];
             }
             let blank_row_y: HashMap<_, _> = self
                 .views
@@ -5301,7 +5337,7 @@ impl App {
                     view.y = y;
                 }
             }
-            bottom += row_positions.len() as f32 * row_height;
+            bottom += row_offsets.last().copied().unwrap();
             let p = self.doc().selection().head;
             if !self
                 .tables
@@ -5388,7 +5424,13 @@ impl App {
                 };
                 let represented_row = if view.source.is_empty() || view.text.is_empty() {
                     presentation::is_source_line_start(&self.source_line_starts, byte)
-                        && source_line_is_blank(source, byte)
+                        && (source_line_is_blank(source, byte)
+                            || self
+                                .projection_cache
+                                .as_ref()
+                                .is_some_and(|(_, _, projection)| {
+                                    projection.source_delimiter_line_at(byte).is_some()
+                                }))
                 } else {
                     !(line.length == 0 && position >= view.text.len())
                 };
@@ -6613,37 +6655,7 @@ impl App {
             self.draw_shell(&t)?;
             self.features_draw(&t)?;
             self.git_draw(&t)?;
-            let metrics = self.editor_status_text();
-            let message = self.status.chars().take(100).collect::<String>();
-            let status = if message.is_empty() {
-                metrics
-            } else {
-                format!("{message} · {metrics}")
-            };
-            let status_x = if self.shell.enabled && self.hwnd == self.shell.main_window {
-                60.
-            } else {
-                16.
-            };
-            let layout =
-                self.ui_text_layout(&status, (self.width - status_x - 16.).max(1.), 11.)?;
-            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            frame.push_clip(
-                &rect(
-                    status_x,
-                    viewport + 2.,
-                    (self.width - status_x - 8.).max(1.),
-                    24.,
-                ),
-                D2D1_ANTIALIAS_MODE_ALIASED,
-            );
-            t.DrawTextLayout(
-                point(status_x, viewport + 5.),
-                &layout,
-                &muted,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            );
-            frame.pop_clip();
+            self.draw_editor_status(&t, viewport, &muted, &border)?;
             frame.pop_clip();
             let draw_result = {
                 let _phase = PhaseSpan::new(&self.phase_trace, "paint.frame_finish");
@@ -6823,9 +6835,13 @@ impl App {
                 } else {
                     self.editor_right()
                 };
-                let visible = caret_in_editor((x, y, height), right, self.animation_viewport())
-                    && x >= self.content_left()
-                    && y >= self.editor_top();
+                let visible = caret_in_editor(
+                    (x, y, height),
+                    self.content_left(),
+                    self.editor_top(),
+                    right,
+                    self.animation_viewport(),
+                );
                 if self.native_caret.size.is_some() && visible != self.native_caret.visible {
                     let result = if visible {
                         ShowCaret(Some(self.hwnd))
@@ -7022,6 +7038,9 @@ impl App {
         }
     }
     unsafe fn refresh(&mut self) {
+        unsafe { self.refresh_damage(false) }
+    }
+    unsafe fn refresh_damage(&mut self, editor_only: bool) {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -7045,7 +7064,27 @@ impl App {
             // Native caret coordinates and visibility must use that final
             // viewport, rather than retaining a pre-clamp offscreen position.
             self.update_caret();
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
+            if editor_only && !self.full_paint {
+                let left = if self.shell.enabled {
+                    self.shell.editor.x
+                } else {
+                    0.
+                };
+                let editor = RECT {
+                    left: (left * self.dpi).floor() as i32,
+                    top: (self.editor_top() * self.dpi).floor() as i32,
+                    right: (self.editor_right() * self.dpi).ceil() as i32,
+                    bottom: (self.editor_bottom() * self.dpi).ceil() as i32,
+                };
+                let status = RECT {
+                    top: (self.editor_bottom() * self.dpi).floor() as i32,
+                    ..r
+                };
+                let _ = InvalidateRect(Some(self.hwnd), Some(&editor), false);
+                let _ = InvalidateRect(Some(self.hwnd), Some(&status), false);
+            } else {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
             self.sync_animations();
             self.diagnostic();
         }
@@ -7931,42 +7970,16 @@ fn adjacent_line_ending(source: &str, p: usize, back: bool) -> Option<Range<usiz
 }
 fn line_ending_delete(
     source: &str,
-    tokens: &[VisibleToken],
     tables: &[Range<usize>],
-    literal_blocks: &[Range<usize>],
     p: usize,
     back: bool,
 ) -> Option<LiveEdit> {
     let range = adjacent_line_ending(source, p, back)?;
     // One adjacent physical line ending is one join operation. A protected
     // boundary returns a no-op plan so deletion cannot fall through to a glyph.
-    let mut protected = tables
+    let protected = tables
         .iter()
         .any(|table| range.start <= table.end && range.end >= table.start);
-    for block in literal_blocks {
-        let spans: Vec<_> = tokens
-            .iter()
-            .flat_map(|token| token.spans.iter())
-            .filter(|span| span.start >= block.start && span.end <= block.end)
-            .collect();
-        let first = spans.iter().map(|span| span.start).min();
-        let last = spans.iter().map(|span| span.end).max();
-        let opening = first.and_then(|first| adjacent_line_ending(source, first, true));
-        let closing = last
-            .filter(|&last| {
-                last < block.end
-                    && source
-                        .get(last..block.end)
-                        .is_some_and(|tail| !tail.trim().is_empty())
-            })
-            .and_then(|last| adjacent_line_ending(source, last, true));
-        if opening.as_ref() == Some(&range)
-            || closing.as_ref() == Some(&range)
-            || (spans.is_empty() && range.start >= block.start && range.end <= block.end)
-        {
-            protected = true;
-        }
-    }
     Some(if protected {
         LiveEdit {
             range: p..p,
@@ -7985,24 +7998,15 @@ fn live_horizontal_step(
     source: &str,
     tokens: &[VisibleToken],
     tables: &[Range<usize>],
-    literal_blocks: &[Range<usize>],
     p: usize,
     back: bool,
 ) -> usize {
-    // Navigation is independent of editing protection: a protected fence EOL
-    // must not turn a movement key into a no-op.
+    // A physical line ending is a navigation boundary even when the previous
+    // delimiter line is currently decorated rather than raw.
     if let Some(range) = adjacent_line_ending(source, p, back)
         && !tables
             .iter()
             .any(|table| range.start >= table.start && range.end <= table.end)
-        && !literal_blocks.iter().any(|block| {
-            range.start >= block.start
-                && range.end <= block.end
-                && !tokens
-                    .iter()
-                    .flat_map(|token| token.spans.iter())
-                    .any(|span| span.start <= range.start && span.end >= range.end)
-        })
     {
         return if back { range.start } else { range.end };
     }
@@ -9969,7 +9973,7 @@ mod tests {
             })
             .expect("the full fenced source must remain directly editable");
         let displayed = String::from_utf16(&fence.text).unwrap();
-        assert_eq!(displayed, format!("{opening}\nx\n```"));
+        assert_eq!(displayed, opening, "only the active delimiter line is raw");
         assert_eq!(
             source[fence.source.clone()].trim_end_matches(['\r', '\n']),
             displayed
@@ -12336,6 +12340,121 @@ mod tests {
         assert_vertical_sequence(&source.replace('\n', "\r\n"));
     }
     #[test]
+    fn live_delimiter_reveal_follows_caret_and_reconstructed_block_revision() {
+        for eol in ["\n", "\r\n"] {
+            for (opening, body, closing) in [
+                ("---", "title: value", "---"),
+                ("```rust", "let value = 1;", "```"),
+                ("```", "body 👩‍💻 é", "```"),
+            ] {
+                let source = format!("{opening}{eol}{body}{eol}{closing}{eol}{eol}tail");
+                let mut app = composing_test_app(&source);
+                app.clear_composition();
+                app.hwnd = hidden_test_window_size(640, 480);
+                let end = source.rfind(closing).unwrap();
+                let before = document_state(app.doc());
+                for position in [0, opening.len() + eol.len(), end, source.len(), end] {
+                    app.doc_mut().set_selection(position, position).unwrap();
+                    unsafe { app.ensure_layout().unwrap() };
+                    let active = app.cached_projection().source_delimiter_line_at(position);
+                    if let Some(line) = active {
+                        assert_eq!(app.revealed_source.as_ref(), Some(&line));
+                        let view = app.views.iter().find(|view| view.source == line).unwrap();
+                        assert_eq!(
+                            String::from_utf16_lossy(&view.text),
+                            source[line].trim_end_matches(['\r', '\n'])
+                        );
+                        let (x, y, height) = app.caret_location();
+                        assert_eq!(app.hit(x + 0.1, y + height * 0.5), position);
+                    }
+                }
+                assert_eq!(app.doc().revision(), before.2);
+                assert_eq!(app.doc().undo_count(), before.4);
+                assert!(!app.doc().is_dirty());
+                app.edit_range(end..end + closing.len(), "");
+                unsafe { app.ensure_layout().unwrap() };
+                assert!(app.doc_mut().undo());
+                app.doc_mut().set_selection(end + 1, end + 1).unwrap();
+                unsafe { app.ensure_layout().unwrap() };
+                app.edit("X");
+                let mut expected = source.clone();
+                expected.insert(end + 1, 'X');
+                assert_eq!(app.doc().source(), expected);
+                assert!(app.doc_mut().undo());
+                assert_eq!(app.doc().source(), source);
+                unsafe { DestroyWindow(app.hwnd).unwrap() };
+            }
+        }
+    }
+    #[test]
+    fn unclosed_fence_keeps_quote_and_list_looking_body_lines_and_tail_visible() {
+        for body in ["> ```\ntail", "- ```\ntail", "  - ```\ntail"] {
+            let source = format!("```\n{body}");
+            let mut app = composing_test_app(&source);
+            app.clear_composition();
+            let tail = source.find("tail").unwrap();
+            app.doc_mut().set_selection(tail, tail).unwrap();
+            app.hwnd = hidden_test_window_size(640, 480);
+            let before = document_state(app.doc());
+            unsafe { app.ensure_layout().unwrap() };
+            assert!(
+                app.views
+                    .iter()
+                    .any(|view| String::from_utf16_lossy(&view.text) == body),
+                "literal body was truncated: {source:?}"
+            );
+            let (x, y, height) = app.caret_location();
+            assert_eq!(app.hit(x + 0.1, y + height * 0.5), tail);
+            assert_eq!(document_state(app.doc()), before);
+            unsafe { DestroyWindow(app.hwnd).unwrap() };
+        }
+    }
+    #[test]
+    fn front_matter_body_has_one_row_and_terminal_mapping_before_its_own_eol() {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("---{eol}title: value{eol}---{eol}{eol}following");
+            let mut app = composing_test_app(&source);
+            app.clear_composition();
+            app.hwnd = hidden_test_window_size(640, 480);
+            let before = document_state(app.doc());
+            unsafe { app.ensure_layout().unwrap() };
+            let start = 3 + eol.len();
+            let end = start + "title: value".len();
+            let body = app
+                .views
+                .iter()
+                .find(|view| String::from_utf16_lossy(&view.text) == "title: value")
+                .unwrap();
+            assert_eq!(body.source, start..end);
+            assert!(
+                body.map
+                    .iter()
+                    .chain(&body.before)
+                    .all(|&byte| (start..=end).contains(&byte))
+            );
+            assert_eq!(body.map.last(), Some(&end));
+            assert_eq!(body.before.last(), Some(&end));
+            assert!((body.height - presentation::line_height(app.font_size())).abs() < 0.1);
+            let closing = end + eol.len();
+            let row_height = presentation::line_height(app.font_size());
+            let opening_y = app
+                .source_view_at(0, Some(BoundaryAffinity::After))
+                .unwrap()
+                .y;
+            let closing_y = app
+                .source_view_at(closing, Some(BoundaryAffinity::After))
+                .unwrap()
+                .y;
+            assert!((closing_y - opening_y - 2. * row_height).abs() < 0.1);
+            for byte in start..=end {
+                let (x, y, height) = app.caret_location_at(byte, BoundaryAffinity::After);
+                assert_eq!(app.hit(x + 0.1, y + height * 0.5), byte);
+            }
+            assert_eq!(document_state(app.doc()), before);
+            unsafe { DestroyWindow(app.hwnd).unwrap() };
+        }
+    }
+    #[test]
     fn editor_live_front_matter_delimiters_edit_and_undo_through_native_input() {
         for eol in ["\n", "\r\n"] {
             let source = format!("---{eol}title: 日本語 👩‍💻{eol}---{eol}{eol}# body{eol}");
@@ -12785,19 +12904,6 @@ mod tests {
         }
         assert_eq!(app.doc().selection_affinity(), BoundaryAffinity::After);
 
-        let shortest_boundary_view = app
-            .views
-            .iter()
-            .filter(|view| {
-                !view.source.is_empty()
-                    && (view.map.contains(&boundary) || view.before.contains(&boundary))
-            })
-            .min_by_key(|view| view.source.len())
-            .unwrap();
-        let previous_source = shortest_boundary_view.source.clone();
-        let previous_y = shortest_boundary_view.y;
-        assert_eq!(previous_source, 77..93);
-
         let following_index = app
             .views
             .iter()
@@ -12807,8 +12913,16 @@ mod tests {
         let following_y = app.views[following_index].y;
         assert_eq!(following_source, boundary..SOURCE.len());
         assert_eq!(following_source.len(), 30);
-        assert!(following_source.len() > previous_source.len());
-        assert_ne!(following_y, previous_y);
+        let body = app
+            .views
+            .iter()
+            .find(|view| String::from_utf16_lossy(&view.text) == "code")
+            .unwrap();
+        assert!(
+            body.source.end < boundary,
+            "hidden closing delimiter must not alias the following paragraph"
+        );
+        assert!(following_y >= body.y + body.height);
 
         let before_candidate = app
             .views
@@ -13345,7 +13459,6 @@ mod tests {
             gutter_rows: Vec::new(),
             gutter_width: 0.0,
             visible_tokens: Vec::new(),
-            literal_blocks: Vec::new(),
             tables: Vec::new(),
             images: Vec::new(),
             image_cache: HashMap::new(),
@@ -14249,8 +14362,8 @@ mod tests {
         }
         assert_eq!(
             lines.len(),
-            3,
-            "opening fence, body, and closing fence each occupy one physical row"
+            1,
+            "the decorated body view owns its own physical row"
         );
         let following = app
             .views
@@ -14258,8 +14371,8 @@ mod tests {
             .find(|view| String::from_utf16_lossy(&view.text).contains("following"))
             .unwrap();
         assert!(
-            (following.y - code.y - code.height - lines[0].height).abs() <= 1.0,
-            "the literal trailing row and one physical blank row should each occupy one baseline"
+            (following.y - code.y - code.height - 2.0 * lines[0].height).abs() <= 1.0,
+            "the hidden closing delimiter row and physical blank row retain separate baselines"
         );
         assert!(
             (source_row_y(&app, 13) - source_row_y(&app, 0) - 2.0 * lines[0].height).abs() <= 1.0
@@ -14515,9 +14628,19 @@ mod tests {
                     assert!(app.doc_mut().undo());
                 }
                 let opening_info = 4..4 + info.len();
+                // Native input refreshes the active source line before editing.
+                // The idle projection intentionally hides this info string.
+                app.doc_mut()
+                    .set_selection(opening_info.start, opening_info.end)
+                    .unwrap();
+                unsafe { app.ensure_layout().unwrap() };
                 app.edit_range(opening_info.clone(), "python");
                 assert_eq!(&app.doc().source()[4..10], "python");
                 assert!(app.doc_mut().undo());
+                app.doc_mut()
+                    .set_selection(opening_info.start, opening_info.end)
+                    .unwrap();
+                unsafe { app.ensure_layout().unwrap() };
                 app.edit_range(opening_info, "");
                 assert!(app.doc().source().starts_with(&format!("````{eol}")));
                 if !info.is_empty() {
@@ -14526,6 +14649,7 @@ mod tests {
                 assert_eq!(app.doc().source(), source);
                 let closing = source.find(&format!("````{eol}{eol}")).unwrap();
                 app.doc_mut().set_selection(closing, closing + 4).unwrap();
+                unsafe { app.ensure_layout().unwrap() };
                 app.edit("");
                 assert!(!app.doc().source().contains(&format!("````{eol}{eol}")));
                 unsafe { app.ensure_layout().unwrap() };
@@ -14653,14 +14777,13 @@ mod tests {
             }));
             let geometry = (rule_views[0].y, rule_views[0].height);
             assert_eq!(
-                live_horizontal_step(&source, &app.visible_tokens, &[], &[], rule_start, false,),
+                live_horizontal_step(&source, &app.visible_tokens, &[], rule_start, false,),
                 rule_start + 1
             );
             assert_eq!(
                 live_horizontal_step(
                     &source,
                     &app.visible_tokens,
-                    &[],
                     &[],
                     rule_start + syntax.len(),
                     true,
@@ -14757,11 +14880,11 @@ mod tests {
                 0
             );
             assert_eq!(app.tables.len(), 1, "final EOL {ending:?}");
-            assert!(
-                app.literal_blocks
-                    .iter()
-                    .any(|range| { source[range.clone()].starts_with("---\ntitle") })
-            );
+            assert!(app.cached_projection().blocks.iter().any(|block| matches!(
+                block.kind,
+                BlockKind::FrontMatter
+            )
+                && source[block.source.clone()].starts_with("---\ntitle")));
             assert_eq!(
                 app.tables[0].table.range.end,
                 source.len() - ending.len(),
@@ -16107,18 +16230,45 @@ mod tests {
         assert_eq!(visible_table_offset(0.0, 90.0, 200.0, 100.0), 0.0);
         assert!(caret_in_editor(
             (LEFT + 192.0, TOP, 27.0),
+            LEFT,
+            TOP,
             LEFT + 200.0,
             600.0
         ));
         assert!(!caret_in_editor(
             (LEFT - 10.0, TOP, 27.0),
+            LEFT,
+            TOP,
             LEFT + 200.0,
             600.0
         ));
         assert!(!caret_in_editor(
             (LEFT + 210.0, TOP, 27.0),
+            LEFT,
+            TOP,
             LEFT + 200.0,
             600.0
+        ));
+        assert!(caret_in_editor(
+            (335.8, 82.5, 23.5),
+            335.8,
+            shell::EDITOR_TOP,
+            1084.,
+            735.
+        ));
+        assert!(caret_in_editor(
+            (24., 82.5, 23.5),
+            24.,
+            shell::EDITOR_TOP,
+            776.,
+            650.
+        ));
+        assert!(!caret_in_editor(
+            (335.8, 79., 23.5),
+            335.8,
+            shell::EDITOR_TOP,
+            1084.,
+            735.
         ));
     }
     fn dispatch_table_key(
@@ -16431,37 +16581,27 @@ mod tests {
             let source = format!("hello{eol}");
             let tokens = projected_tokens(&source);
             assert_eq!(
-                live_horizontal_step(&source, &tokens, &[], &[], source.len(), true),
+                live_horizontal_step(&source, &tokens, &[], source.len(), true),
                 5
             );
             assert_eq!(
-                live_horizontal_step(&source, &tokens, &[], &[], 5, false),
+                live_horizontal_step(&source, &tokens, &[], 5, false),
                 source.len()
             );
             let source = format!("a{eol}{eol}b");
             let tokens = projected_tokens(&source);
             assert_eq!(
-                live_horizontal_step(&source, &tokens, &[], &[], 1 + 2 * eol.len(), true),
+                live_horizontal_step(&source, &tokens, &[], 1 + 2 * eol.len(), true),
                 1 + eol.len()
             );
             assert_eq!(
-                live_horizontal_step(&source, &tokens, &[], &[], 1, false),
+                live_horizontal_step(&source, &tokens, &[], 1, false),
                 1 + eol.len()
             );
         }
         let source = "---\ntitle: T\n---\n";
-        let projection = DisplayProjection::parse(source);
         let tokens = projected_tokens(source);
-        let blocks: Vec<_> = projection
-            .blocks
-            .iter()
-            .filter(|block| matches!(block.kind, BlockKind::FrontMatter))
-            .map(|block| block.source.clone())
-            .collect();
-        assert_eq!(
-            live_horizontal_step(source, &tokens, &[], &blocks, 4, true),
-            3
-        );
+        assert_eq!(live_horizontal_step(source, &tokens, &[], 4, true), 3);
     }
     fn apply_plan(doc: &mut Document, plan: LiveEdit) {
         doc.replace_range_with_selection(
@@ -16484,10 +16624,8 @@ mod tests {
             apply_plan(&mut doc, enter);
             assert_eq!(doc.source(), format!("hello{eol}"));
             let after_enter = doc.selection();
-            let tokens = projected_tokens(doc.source());
             let deletion =
-                line_ending_delete(doc.source(), &tokens, &[], &[], doc.selection().head, true)
-                    .unwrap();
+                line_ending_delete(doc.source(), &[], doc.selection().head, true).unwrap();
             assert_eq!(deletion.range, 5..5 + eol.len());
             apply_plan(&mut doc, deletion);
             assert_eq!(doc.source(), "hello");
@@ -16508,8 +16646,7 @@ mod tests {
             for (back, p) in [(true, 1 + eol.len() * 2), (false, 1)] {
                 let mut doc = Document::new(32, source.clone());
                 doc.set_selection(p, p).unwrap();
-                let tokens = projected_tokens(&source);
-                let plan = line_ending_delete(&source, &tokens, &[], &[], p, back).unwrap();
+                let plan = line_ending_delete(&source, &[], p, back).unwrap();
                 apply_plan(&mut doc, plan);
                 assert_eq!(doc.source(), format!("a{eol}b"));
                 assert_eq!(doc.undo_count(), 1);
@@ -16530,7 +16667,6 @@ mod tests {
         for rows in ["", "| A | B |\n"] {
             let source = format!("before\n\n| H | J |\n| --- | --- |\n{rows}\nafter\n");
             let table = mdlite::table::find_tables(&source).remove(0);
-            let tokens = projected_tokens(&source);
             for (p, back) in [
                 (table.range.start, true),
                 (table.range.start - 1, false),
@@ -16539,15 +16675,8 @@ mod tests {
             ] {
                 let mut doc = Document::new(33, source.clone());
                 doc.set_selection(p, p).unwrap();
-                let plan = line_ending_delete(
-                    &source,
-                    &tokens,
-                    std::slice::from_ref(&table.range),
-                    &[],
-                    p,
-                    back,
-                )
-                .unwrap();
+                let plan = line_ending_delete(&source, std::slice::from_ref(&table.range), p, back)
+                    .unwrap();
                 assert!(plan.range.is_empty());
                 apply_plan(&mut doc, plan);
                 assert_eq!(doc.source(), source);
@@ -16560,23 +16689,10 @@ mod tests {
     #[test]
     fn first_fence_text_backspace_edits_visible_opening_line_ending_and_undo_restores_it() {
         let source = "```\nfirst\n```\n";
-        let projection = DisplayProjection::parse(source);
-        let tokens = projected_tokens(source);
-        let blocks: Vec<_> = projection
-            .blocks
-            .iter()
-            .filter(|block| {
-                matches!(
-                    block.kind,
-                    BlockKind::FrontMatter | BlockKind::Code { fenced: true, .. }
-                )
-            })
-            .map(|block| block.source.clone())
-            .collect();
         let first = source.find("first").unwrap();
         let mut doc = Document::new(34, source.into());
         doc.set_selection(first, first).unwrap();
-        let plan = line_ending_delete(source, &tokens, &[], &blocks, first, true).unwrap();
+        let plan = line_ending_delete(source, &[], first, true).unwrap();
         assert_eq!(plan.range, 3..4);
         apply_plan(&mut doc, plan);
         assert_eq!(doc.source(), "```first\n```\n");
@@ -16621,10 +16737,8 @@ mod tests {
     }
     #[test]
     fn initial_live_insertion_respects_visible_frontmatter_and_hidden_heading_prefix() {
-        for (source, expected, first) in [
-            ("# ab", "# Xab", 2),
-            ("---\ntitle: T\n---\n", "X---\ntitle: T\n---\n", 0),
-        ] {
+        {
+            let (source, expected, first) = ("# ab", "# Xab", 2);
             let tokens = projected_tokens(source);
             let point = live_caret_boundary(&tokens, 0, &[]);
             assert_eq!(point, first);
@@ -16653,6 +16767,19 @@ mod tests {
             );
             assert!(!doc.is_dirty());
         }
+    }
+    #[test]
+    fn initial_front_matter_native_input_reveals_and_edits_the_opening_line() {
+        let source = "---\ntitle: T\n---\n";
+        let fixture = EditorFixture::new(source, false);
+        fixture.message(WM_CHAR, 'X' as usize);
+        let mut app = fixture.state.app.borrow_mut();
+        assert_eq!(app.doc().source(), "X---\ntitle: T\n---\n");
+        assert_eq!(app.doc().selection(), Selection::caret(1));
+        assert!(app.doc_mut().undo());
+        assert_eq!(app.doc().source(), source);
+        assert_eq!(app.doc().selection(), Selection::caret(0));
+        assert!(!app.doc().is_dirty());
     }
     #[test]
     fn hidden_closing_boundary_and_atomic_spelling_resolve_to_visible_insertions() {

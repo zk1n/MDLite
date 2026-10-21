@@ -1,5 +1,83 @@
 # Rust Editor受入記録
 
+## 描画負荷・Live編集修正（2026年10月22日 JST、今回範囲のMachine確認済み）
+
+Task `20261022-mdlite-rendering-live-editing-repair` Revision 1。開始developは
+`ff0328b8d42531aaf788f0e25ef3c93259a27c80`。以下の旧Rev節は各固定時点の履歴として保持する。
+Git統合・配送のOIDとHANDOFF保存結果は最終HANDOFFを正本とする。正式Release・全製品・Human受入ではない。
+
+### 最終対象と原因修正
+
+登録Release buildのsource aggregateは`c49de271395fc2eaeade31725196d7a4f1446870459a6e8e139345beade82377`、
+EXE SHA-256は`196b4b827becc9decc7f8c7ab93139bffb01cea5194dbaf064935441cca73f00`。
+対象は`D:/codex_work/MDLite/.codex-runtime/rendering-live-editing-repair/target/release/mdlite.exe`、
+Rust1.99.1、VM/QEMU Q35、16logical processors、96 DPI、通常client1084×761。
+最終source/EXEは登録build receiptと一致した。通常`target/release/mdlite.exe`の既存PID19464は未変更で、
+そのEXE SHA-256は`81b30d4669aecca7166b8b378d71e4e0f788800a6040967ce6c7933054f23be6`。
+通常起動先を検証版へ自動置換したという意味ではない。
+
+- SoftBreakを空白にする表示を改め、Liveでも明示改行を保持。HardBreakのCRLF対応も維持する。
+- Front Matter/fenceはcaretの原文区切り行だけを編集表示する。parser本文spanで未閉鎖code内の偽区切りを保ち、
+  再構成後の境界移動/削除、wrap高さ、Front Matter終端mappingと実編集領域に基づくcaret判定を修正した。
+- 同一EXEのstyle比較でMainの`WS_EX_COMPOSITED`をpaint反復の原因に分離し、同じ方式のCompactからも除去した。
+  同一Settings HWNDの比較では親eraseが子controlを上書きすることを確認し、`WS_CLIPCHILDREN`で除外した。
+- Settingsの借用中もtheme/brush snapshotで色・erase・owner-drawを処理する。対象/有効値/適用元/下書きと解除を明示した。
+- statusを項目別に配置し、既存Git cacheの未確認/Trust/branch/変更/remote有無を区別する。
+  対象tooltip登録のclassic ABI sizeを修正し、狭幅で省略した情報を含む全文popupを実確認した。
+  新しいlibrary、bufferの重ね増し、固定FPS、強制paint、manifest/framework変更は採用していない。
+
+### 今回の受入と有効範囲
+
+| 対象 | 採用した確認 |
+|---|---|
+| A/B | LF/CRLFの2行とDown先空行、原文/revision/dirty/履歴不変、Source切替/保存bytes、区切り解除→Undo→終端再編集をb644候補で確認。関連mapping code不変の最終196候補でもMain最上段glyph・2行移動・Compact最上段/入力/Undo/Main復帰を確認。 |
+| C | 同一EXEのstyle比較で原因分離、最終196の診断on/off・Down/操作後・最小化/復帰・button・Settings/Main非focusをquiet条件で比較。 |
+| D | 最終196のdark/light各4burstで開閉途中も文字/controlを保持。false/明示空Apply読戻し、draft Cancel/reset Cancel hash保持、Workspace指定解除Apply、有効値/適用元表示を確認。 |
+| E | Workspaceなし/Trust未確認と独立fieldの通常/狭幅表示、TEMP内の実local Git root・acceptance(unborn)・remotes[]を照合。実hoverで所有popup全文を確認し、encoding/EOL/mode/保存/外部変更を含む。 |
+| R | 変更範囲のnative/source/selection/IME境界/Undo/保存/caret/scroll/resize/復帰をfocused testsと実画面で確認。物理IME・他DPI/端末は別記未確認。 |
+
+独立Sol High reviewerはP1（偽fence終端）/P2（Front Matter余分な行/終端map）を指摘し、修正後の
+assertionとsourceを再確認した。後続のSettings clipping/tooltip ABI・buffer寿命も同reviewerが静的clear。
+reviewer自身の試験実行はない。Ponytail complexity self-checkは別に実施した。
+
+### 負荷比較
+
+単位はprocess CPU時間÷経過時間の1コア換算。通常約4秒、小さな同一合成文書、記録撮影/buildと分離。
+
+| 条件 | 修正前 | 最終196 |
+|---|---:|---:|
+| 診断on：idle | 83.91% | 5.84% |
+| 診断on：10 Down / 操作後idle | 81.07% / 80.83% | 8.12% / 2.73% |
+| 診断on：最小化 / 復帰後idle | 3.90% / 75.74% | 3.51% / 2.73% |
+| Source button / 操作後 | 72.25% / 81.57% | 4.22% / 1.56% |
+| Settings作成＋4秒 / 閉じた後 | 55.29% / 75.98% | 16.83% / 6.92% |
+| 診断off：idle / 10 Down / 操作後idle | 69.77% / 69.21% / 76.15% | 7.02% / 5.44% / 0.78% |
+| 診断off：最小化 / 復帰後idle | 3.89% / 75.71% | 2.73% / 3.12% |
+
+Settings openは作成を含む7347ms→7149msの区間で、純粋な4秒idle値ではない。
+診断onのpaint増分は5区間で67/65/74/1/68→2/2/1/1/1。診断読取り自体がrefreshを要求するため、
+残る境界frameを自然な連続描画と混同しない。`layout_count`はview数であり、14で安定してもrebuild数ではない。
+実traceのlayout.rebuildは起動/Down/復帰時に14件、補助runは起動/button時3件で2.31秒以降25.09秒まで増加なし。
+今回のサンプルで不要な自律paint反復を解消した。全frame・長時間・全hardwareの保証ではない。
+
+GPU17 engine別の最終endpoint値は取得可でmax0だったが、継続GPU総量やmain PC改善の証明にはしない。
+DWM CPUはnull propertiesによりUNAVAILABLE。旧empty sum由来0は測定0として採用しない。
+診断offはdisk不変のみ確認し、memory/historyはNOT_OBSERVED。ホスト側負荷は未知。
+
+### 自動確認の扱いと残る境界
+
+fmt、明示all-target Release check、strict Clippy、登録Release build、diff-checkは成功。
+Build receiptのtest/fmt/clippy欄はそのbuildコマンド内の実行有無であり、別logの成功を示す欄ではない。
+projection22、native focused20、Settings clip実DC1件とsettings group34件、production tooltip1件を確認した。
+新しいvisible clip試験は実GUI leaseで成功後、default並列では実行しないignore属性だけを追加した。
+広いRelease commandの生結果はlib154pass、native319pass/6fail/10explicitGUIignored。
+同じsource/oracleのexact6をfresh processで実行すると全件成功し、foreground/wheel共有fixture干渉に分類した。
+元command全体をPASSと書き換えず、不要な広い再実行もしない。最終の限定followupは影響範囲だけ実行した。
+
+GitUI/menu_styleの未変更tooltip size不整合は今回のstatus/Settings対象外としてdeferした。
+物理IME、別DPI/端末、持続GPU総量、本人の最終主観的受入は未確認。
+private入力・原証拠・合成fixture・確認用EXEはGitへ追跡せず、Project内HANDOFFへまとめる。
+
 ## Rev2方向修正のcheckpoint（2026年10月19日 JST、未完了）
 
 製品source local commit: `7847b04688b57a9216a9c402d7ef88fac65f6cd5`。

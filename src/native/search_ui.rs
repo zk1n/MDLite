@@ -2696,7 +2696,7 @@ impl SearchPane {
     unsafe fn highlight_view(
         &self,
         app: &App,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         view: &TextView,
         x: f32,
         y: f32,
@@ -3120,7 +3120,7 @@ impl App {
 
     pub(super) unsafe fn search_highlight_view(
         &self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         view: &TextView,
         x: f32,
         y: f32,

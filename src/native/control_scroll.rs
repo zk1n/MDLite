@@ -1208,10 +1208,46 @@ mod tests {
                 (120, 8),
                 (-120, 8),
             ] {
+                let mut chars = 0u32;
+                SystemParametersInfoW(
+                    SPI_GETWHEELSCROLLCHARS,
+                    0,
+                    Some((&mut chars as *mut u32).cast()),
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                )
+                .unwrap();
+                let state = f.state();
+                let horizontal = state.horizontal.get().unwrap();
+                let mut native = scrollbar_style::scroll_info(scrollbar_style::Range::default());
+                GetScrollInfo(f.native, SB_HORZ, &mut native).unwrap();
+                let mut native_client = RECT::default();
+                let mut adapted_client = RECT::default();
+                GetClientRect(f.native, &mut native_client).unwrap();
+                GetClientRect(f.adapted, &mut adapted_client).unwrap();
+                let native_unit = horizontal_unit(f.native);
+                let adapted_unit = horizontal_unit(f.adapted);
+                eprintln!(
+                    "H_WHEEL before delta={delta} flags={flags} native_font={:#x} adapted_font={:#x} native_unit={native_unit} adapted_unit={adapted_unit} native_width={} adapted_width={} chars={chars} effective_chars={} remainder={} custom={} native={}",
+                    SendMessageW(f.native, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0,
+                    SendMessageW(f.adapted, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0,
+                    native_client.right,
+                    adapted_client.right,
+                    chars.min((adapted_client.right / adapted_unit).max(1) as u32),
+                    horizontal.wheel.get(),
+                    horizontal.offset.get(),
+                    native.nPos
+                );
                 f.send_both(
                     WM_MOUSEHWHEEL,
                     WPARAM(((delta as u16 as usize) << 16) | flags),
                     LPARAM(0),
+                );
+                GetScrollInfo(f.native, SB_HORZ, &mut native).unwrap();
+                eprintln!(
+                    "H_WHEEL after delta={delta} flags={flags} remainder={} custom={} native={}",
+                    horizontal.wheel.get(),
+                    horizontal.offset.get(),
+                    native.nPos
                 );
                 check(&format!("horizontal wheel delta={delta} flags={flags}"));
             }
@@ -1525,6 +1561,45 @@ mod tests {
                 damage().is_some(),
                 "identical refresh must preserve independently pending damage"
             );
+
+            clean();
+            let _ = ShowWindow(fixture.adapted, SW_HIDE);
+            assert!(!IsWindowVisible(rail).as_bool());
+            for native_policy in [false, true] {
+                state.sync(96, native_policy);
+                // Paint the fixture's existing damage with the real rail
+                // renderer; do not validate/discard pending regions by hand.
+                SendMessageW(rail, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+                assert!(damage().is_none());
+                let hidden_range = state.range(fixture.adapted);
+                let hidden_bounds = bounds();
+                for (message, wp, lp) in [
+                    (LB_SETSEL, WPARAM(0), LPARAM(-1)),
+                    (
+                        LB_SETTOPINDEX,
+                        WPARAM(hidden_range.position as usize),
+                        LPARAM(0),
+                    ),
+                ] {
+                    SendMessageW(fixture.adapted, message, Some(wp), Some(lp));
+                    assert!(state.range(fixture.adapted) == hidden_range);
+                    assert_eq!(bounds(), hidden_bounds);
+                    assert!(
+                        damage().is_none(),
+                        "unchanged hidden/native rail must stay clean"
+                    );
+                }
+                state.sync(96, native_policy);
+                assert!(damage().is_none(), "identical hidden/native sync");
+            }
+            state.sync(96, false);
+            let _ = ShowWindow(fixture.adapted, SW_SHOWNA);
+            assert!(IsWindowVisible(rail).as_bool());
+            assert!(
+                damage().is_some(),
+                "showing the rail must retain its visibility repaint"
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
 
             clean();
             SendMessageW(

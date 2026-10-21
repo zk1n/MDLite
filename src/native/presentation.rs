@@ -289,7 +289,7 @@ impl App {
     /// Fills the source-mapped inline-code glyph bounds with the caller's cached brush.
     pub(super) unsafe fn paint_inline_code_backgrounds(
         &self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         view: &TextView,
         x: f32,
         y: f32,

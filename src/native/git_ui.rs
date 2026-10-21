@@ -635,7 +635,56 @@ impl App {
         }
         self.git_sync();
     }
+    pub(super) fn git_button_paint(&self) -> Option<Rc<Vec<shell::OwnerButtonPaint>>> {
+        let controls = self.git_ui.controls.as_ref()?;
+        if unsafe {
+            !IsWindow(Some(controls.host)).as_bool()
+                || GetParent(controls.host).ok() != Some(self.shell.main_window)
+                || GetDlgCtrlID(controls.host) as usize != GIT_PANE_HOST
+        } {
+            return None;
+        }
+        Some(Rc::new(
+            controls
+                .buttons
+                .iter()
+                .copied()
+                .chain([
+                    (EXECUTE, controls.execute),
+                    (INPUT_CANCEL, controls.input_cancel),
+                ])
+                .map(|(id, child)| shell::OwnerButtonPaint {
+                    recipient: self.shell.main_window,
+                    parent: controls.host,
+                    parent_id: Some(GIT_PANE_HOST),
+                    child,
+                    id,
+                    tokens: self.shell.tokens,
+                    label: shell::text_of(child),
+                })
+                .collect(),
+        ))
+    }
+    fn publish_git_button_paint(&self) {
+        if self.defer_theme_updates {
+            return;
+        }
+        unsafe {
+            let pointer =
+                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(self.shell.main_window)
+            {
+                let paints = self.git_button_paint();
+                let retired = state.git_button_paint.replace(paints);
+                drop(retired);
+            }
+        }
+    }
     pub(super) fn git_sync(&mut self) {
+        // Show/position can synchronously draw any descendant before an enable
+        // transition. Publish all registered Git buttons before that reentry.
+        self.publish_git_button_paint();
         let identity = self
             .persistence
             .workspace_root()
@@ -939,10 +988,7 @@ impl App {
         }
         self.git_ui.list_dirty = false;
     }
-    pub(super) unsafe fn git_draw(
-        &self,
-        target: &ID2D1HwndRenderTarget,
-    ) -> windows::core::Result<()> {
+    pub(super) unsafe fn git_draw(&self, target: &ID2D1RenderTarget) -> windows::core::Result<()> {
         unsafe {
             if self.git_ui.controls.is_none()
                 && let Some(r) = self.feature_panel_rect(PanelId::Git)
@@ -2139,6 +2185,21 @@ unsafe extern "system" fn pane_proc(
 ) -> LRESULT {
     unsafe {
         if msg == WM_NCDESTROY {
+            let main = HWND(data as *mut _);
+            let pointer = GetWindowLongPtrW(main, GWLP_USERDATA) as *const WindowState;
+            if id == GIT_PANE_HOST
+                && let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(main)
+            {
+                let matches = state
+                    .git_button_paint
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|paints| paints.iter().any(|paint| paint.parent == hwnd));
+                if matches {
+                    state.git_button_paint.borrow_mut().take();
+                }
+            }
             let _ = RemoveWindowSubclass(hwnd, Some(pane_proc), id);
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
@@ -2887,6 +2948,385 @@ mod tests {
             ReleaseDC(Some(window.0), dc);
         }
     }
+    #[test]
+    fn git_owner_draw_reentrant_host_keeps_registered_disabled_icon() {
+        use windows::Win32::Graphics::Gdi::*;
+
+        let mut app = super::super::tests::composing_test_app("unchanged Git paint source😀");
+        app.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(app);
+        fixture.state.main_window.set(fixture.hwnd);
+        let (host, button, tokens) = {
+            let mut app = fixture.state.app.borrow_mut();
+            app.shell.main_window = fixture.hwnd;
+            app.shell.enabled = true;
+            app.shell.panels[PanelId::Git as usize].1 = Rect {
+                x: 600.,
+                y: 350.,
+                width: 260.,
+                height: 300.,
+            };
+            app.git_init();
+            let controls = app.git_ui.controls.as_ref().unwrap();
+            let button = controls
+                .buttons
+                .iter()
+                .find(|(id, _)| *id == REFRESH)
+                .unwrap()
+                .1;
+            (controls.host, button, app.shell.tokens)
+        };
+        struct Pixels {
+            dc: HDC,
+            bitmap: HBITMAP,
+            old: HGDIOBJ,
+        }
+        impl Drop for Pixels {
+            fn drop(&mut self) {
+                unsafe {
+                    SelectObject(self.dc, self.old);
+                    let _ = DeleteObject(self.bitmap.into());
+                    let _ = DeleteDC(self.dc);
+                }
+            }
+        }
+        unsafe {
+            let source_dc = GetDC(Some(fixture.hwnd));
+            let bitmap = CreateCompatibleBitmap(source_dc, 100, 24);
+            let dc = CreateCompatibleDC(Some(source_dc));
+            ReleaseDC(Some(fixture.hwnd), source_dc);
+            assert!(!bitmap.0.is_null() && !dc.0.is_null());
+            let pixels = Pixels {
+                dc,
+                bitmap,
+                old: SelectObject(dc, bitmap.into()),
+            };
+            let mut item = DRAWITEMSTRUCT {
+                CtlType: ODT_BUTTON,
+                CtlID: REFRESH as u32,
+                itemID: u32::MAX,
+                hwndItem: button,
+                hDC: pixels.dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 24,
+                },
+                ..Default::default()
+            };
+            let fill_white = || {
+                let white = CreateSolidBrush(COLORREF(0x00ffffff));
+                FillRect(pixels.dc, &item.rcItem, white);
+                let _ = DeleteObject(white.into());
+            };
+            // Registered host/child/id/type are an independent prerequisite.
+            {
+                let app = fixture.state.app.borrow();
+                assert!(
+                    app.git_ui
+                        .owner_draw_button(fixture.hwnd, REFRESH, &item)
+                        .is_some()
+                );
+                assert!(
+                    app.git_ui
+                        .owner_draw_button(fixture.hwnd, STAGE, &item)
+                        .is_none()
+                );
+                item.CtlType = ODT_LISTBOX;
+                assert!(
+                    app.git_ui
+                        .owner_draw_button(fixture.hwnd, REFRESH, &item)
+                        .is_none()
+                );
+                item.CtlType = ODT_BUTTON;
+                item.hwndItem = fixture.hwnd;
+                assert!(
+                    app.git_ui
+                        .owner_draw_button(fixture.hwnd, REFRESH, &item)
+                        .is_none()
+                );
+                item.hwndItem = button;
+            }
+            let before = {
+                let app = fixture.state.app.borrow();
+                (
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().selection(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                )
+            };
+            fill_white();
+            let normal = shell::send(
+                host,
+                WM_DRAWITEM,
+                WPARAM(REFRESH),
+                LPARAM((&item as *const DRAWITEMSTRUCT) as isize),
+            );
+            let expected_background = shell::rgb(tokens.panel);
+            assert_eq!(
+                normal,
+                LRESULT(1),
+                "normal registered Git host forwarding prerequisite"
+            );
+            assert_eq!(GetPixel(pixels.dc, 2, 2), expected_background);
+            let normal_icon_pixels = (4..20)
+                .flat_map(|y| (35..65).map(move |x| (x, y)))
+                .filter(|(x, y)| {
+                    let color = GetPixel(pixels.dc, *x, *y);
+                    color != expected_background && color != COLORREF(0x00ffffff)
+                })
+                .count();
+            assert!(
+                normal_icon_pixels > 0,
+                "ordinary registered route must paint its icon before the borrowed-route check"
+            );
+            let enabled = IsWindowEnabled(button).as_bool();
+            assert!(
+                !enabled,
+                "untrusted/no-Workspace Refresh must be disabled in this fixture"
+            );
+            fill_white();
+            fixture.state.deferred_control_redraw.set(false);
+            let (borrowed, background, icon_pixels, deferred) = {
+                let mut app = fixture.state.app.borrow_mut();
+                app.git_sync();
+                assert_eq!(
+                    IsWindowEnabled(button).as_bool(),
+                    enabled,
+                    "no enable transition"
+                );
+                assert!(
+                    fixture.state.button_paint.borrow().is_none(),
+                    "no temporary EnableWindow paint scope"
+                );
+                let result = shell::send(
+                    host,
+                    WM_DRAWITEM,
+                    WPARAM(REFRESH),
+                    LPARAM((&item as *const DRAWITEMSTRUCT) as isize),
+                );
+                let icon_pixels = (4..20)
+                    .flat_map(|y| (35..65).map(move |x| (x, y)))
+                    .filter(|(x, y)| {
+                        let color = GetPixel(pixels.dc, *x, *y);
+                        color != expected_background && color != COLORREF(0x00ffffff)
+                    })
+                    .count();
+                assert_eq!(
+                    (
+                        app.doc().source().to_owned(),
+                        app.doc().revision(),
+                        app.doc().selection(),
+                        app.doc().is_dirty(),
+                        app.doc().undo_count(),
+                        app.doc().redo_count()
+                    ),
+                    before
+                );
+                (
+                    result,
+                    GetPixel(pixels.dc, 2, 2),
+                    icon_pixels,
+                    fixture.state.deferred_control_redraw.get(),
+                )
+            };
+            eprintln!(
+                "Git registered host draw: enabled={enabled}; normal={normal:?}; borrowed={borrowed:?}; background={background:?}; expected={expected_background:?}; interior_icon_pixels={icon_pixels}; deferred={deferred}"
+            );
+            assert_eq!(
+                borrowed,
+                LRESULT(1),
+                "registered Git WM_DRAWITEM must render while App is borrowed even without an EnableWindow transition"
+            );
+            assert_eq!(
+                background, expected_background,
+                "disabled Git button keeps themed background"
+            );
+            assert!(icon_pixels > 0, "disabled Git button keeps its muted icon");
+            assert!(
+                !deferred,
+                "handled Git draw does not request default-paint recovery"
+            );
+
+            struct PositionDraw {
+                button: HWND,
+                dc: HDC,
+                calls: Cell<u32>,
+                handled: Cell<isize>,
+            }
+            unsafe extern "system" fn draw_during_position(
+                hwnd: HWND,
+                msg: u32,
+                wp: WPARAM,
+                lp: LPARAM,
+                _: usize,
+                data: usize,
+            ) -> LRESULT {
+                unsafe {
+                    if msg == WM_WINDOWPOSCHANGED {
+                        let draw = &*(data as *const PositionDraw);
+                        let item = DRAWITEMSTRUCT {
+                            CtlType: ODT_BUTTON,
+                            CtlID: REFRESH as u32,
+                            hwndItem: draw.button,
+                            hDC: draw.dc,
+                            rcItem: RECT {
+                                left: 0,
+                                top: 0,
+                                right: 100,
+                                bottom: 24,
+                            },
+                            ..Default::default()
+                        };
+                        draw.calls.set(draw.calls.get() + 1);
+                        draw.handled.set(
+                            shell::send(
+                                hwnd,
+                                WM_DRAWITEM,
+                                WPARAM(REFRESH),
+                                LPARAM((&item as *const DRAWITEMSTRUCT) as isize),
+                            )
+                            .0,
+                        );
+                    }
+                    DefSubclassProc(hwnd, msg, wp, lp)
+                }
+            }
+            let position_draw = PositionDraw {
+                button,
+                dc: pixels.dc,
+                calls: Cell::new(0),
+                handled: Cell::new(0),
+            };
+            assert!(
+                SetWindowSubclass(
+                    host,
+                    Some(draw_during_position),
+                    0xF20,
+                    (&position_draw as *const PositionDraw) as usize
+                )
+                .as_bool()
+            );
+            fixture.state.git_button_paint.borrow_mut().take();
+            fill_white();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.panels[PanelId::Git as usize].1.width -= 12.;
+                app.git_sync();
+                assert_eq!(IsWindowEnabled(button).as_bool(), enabled);
+                assert_eq!(
+                    (
+                        app.doc().source().to_owned(),
+                        app.doc().revision(),
+                        app.doc().selection(),
+                        app.doc().is_dirty(),
+                        app.doc().undo_count(),
+                        app.doc().redo_count()
+                    ),
+                    before
+                );
+            }
+            let _ = RemoveWindowSubclass(host, Some(draw_during_position), 0xF20);
+            assert!(
+                position_draw.calls.get() > 0,
+                "actual SetWindowPos reentry must run"
+            );
+            assert_eq!(
+                position_draw.handled.get(),
+                1,
+                "Git cache must precede native host positioning"
+            );
+            assert_eq!(GetPixel(pixels.dc, 2, 2), expected_background);
+        }
+    }
+    #[test]
+    fn git_owner_draw_snapshot_keeps_seven_identities_staged_theme_and_host_lifetime() {
+        let mut seed = super::super::tests::composing_test_app("retained theme source");
+        seed.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        fixture.state.main_window.set(fixture.hwnd);
+        let mut app = fixture.state.app.borrow_mut();
+        app.shell.main_window = fixture.hwnd;
+        app.shell.enabled = true;
+        app.git_init();
+        let old = fixture.state.git_button_paint.borrow().clone().unwrap();
+        assert_eq!(old.len(), 7);
+        let expected = [
+            (REFRESH, "更新"),
+            (STAGE, "Stage"),
+            (UNSTAGE, "Unstage"),
+            (CANCEL, "取消"),
+            (MORE, "その他のGit操作"),
+            (EXECUTE, "確認へ"),
+            (INPUT_CANCEL, "入力取消"),
+        ];
+        for (id, label) in expected {
+            let paint = old.iter().find(|paint| paint.id == id).unwrap();
+            let mut item = DRAWITEMSTRUCT {
+                CtlType: ODT_BUTTON,
+                CtlID: id as u32,
+                hwndItem: paint.child,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe { paint.state(fixture.hwnd, id, &item) }
+                    .unwrap()
+                    .label,
+                label
+            );
+            assert!(
+                unsafe { paint.state(paint.parent, id, &item) }.is_none(),
+                "wrong recipient"
+            );
+            assert!(
+                unsafe { paint.state(fixture.hwnd, id + 100, &item) }.is_none(),
+                "wrong message ID"
+            );
+            item.CtlType = ODT_LISTBOX;
+            assert!(unsafe { paint.state(fixture.hwnd, id, &item) }.is_none());
+            item.CtlType = ODT_BUTTON;
+            item.hwndItem = fixture.hwnd;
+            assert!(unsafe { paint.state(fixture.hwnd, id, &item) }.is_none());
+        }
+        let source = app.doc().source().to_owned();
+        app.defer_theme_updates = true;
+        let mut settings = app.shell.settings.clone();
+        settings.theme = mdlite::settings::ThemeMode::Light;
+        unsafe { app.apply_shell_settings(settings) };
+        app.git_sync();
+        assert!(
+            Rc::ptr_eq(
+                &old,
+                fixture.state.git_button_paint.borrow().as_ref().unwrap()
+            ),
+            "prepared theme remains unpublished"
+        );
+        app.defer_theme_updates = false;
+        app.publish_prepared_theme_paint();
+        let published = fixture.state.git_button_paint.borrow().clone().unwrap();
+        assert!(!Rc::ptr_eq(&old, &published));
+        assert!(
+            published
+                .iter()
+                .all(|paint| shell::rgb(paint.tokens.panel) == shell::rgb(app.shell.tokens.panel))
+        );
+        assert_eq!(app.doc().source(), source);
+        let host = app.git_ui.controls.as_ref().unwrap().host;
+        unsafe { DestroyWindow(host).unwrap() };
+        assert!(
+            fixture.state.git_button_paint.borrow().is_none(),
+            "destroyed Git host retires cached HWNDs"
+        );
+        assert!(
+            app.git_button_paint().is_none(),
+            "dead host cannot be republished"
+        );
+    }
+
     #[test]
     fn native_git_explicit_worker_fixture_selected_literal_diff_and_untrusted() {
         assert!(!COMMANDS.iter().any(|c| c.0 == 6007));

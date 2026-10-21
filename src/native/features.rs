@@ -789,6 +789,13 @@ impl FeaturePanes {
                 EXPLORER_LIST,
                 WINDOW_STYLE(0x0001 | 0x0010 | 0x0040 | 0x0100 | 0x0800),
             );
+            if let Err(error) =
+                super::explorer_icons::buffer_client_paint(self.controls.explorer_list, owner)
+            {
+                self.status = Some(format!(
+                    "Explorer 描画バッファの初期化に失敗しました: {error}"
+                ));
+            }
             let _ = shell::send(
                 self.controls.explorer_list,
                 LB_SETITEMHEIGHT,
@@ -1594,7 +1601,7 @@ impl FeaturePanes {
         }
     }
 
-    fn draw(&self, app: &App, target: &ID2D1HwndRenderTarget) -> windows::core::Result<()> {
+    fn draw(&self, app: &App, target: &ID2D1RenderTarget) -> windows::core::Result<()> {
         if !app.shell.enabled || app.hwnd != app.shell.main_window {
             return Ok(());
         }
@@ -1681,7 +1688,7 @@ impl FeaturePanes {
     fn draw_explorer(
         &self,
         app: &App,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         body: Rect,
         foreground: &ID2D1SolidColorBrush,
     ) -> windows::core::Result<()> {
@@ -1733,7 +1740,7 @@ impl FeaturePanes {
     fn draw_calendar(
         &self,
         app: &App,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         body: Rect,
         foreground: &ID2D1SolidColorBrush,
         muted: &ID2D1SolidColorBrush,
@@ -2017,13 +2024,16 @@ impl FeaturePanes {
                         );
                     }
                 }
-                draw_feature_text(
+                draw_feature_text_single_line(
                     app,
                     target,
                     &file.relative_path.display().to_string(),
-                    body.x + 8.,
-                    y + 1.,
-                    body.width - 16.,
+                    Rect {
+                        x: body.x + 8.,
+                        y: y + 1.,
+                        width: body.width - 16.,
+                        height: CALENDAR_ROW_HEIGHT - 1.,
+                    },
                     10.,
                     foreground,
                 )?;
@@ -2036,7 +2046,7 @@ impl FeaturePanes {
     fn draw_outline(
         &self,
         app: &App,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
         body: Rect,
         foreground: &ID2D1SolidColorBrush,
         muted: &ID2D1SolidColorBrush,
@@ -2600,7 +2610,7 @@ impl FeaturePanes {
 #[allow(clippy::too_many_arguments)] // Direct text draw primitive, with explicit position and brush.
 fn draw_feature_text(
     app: &App,
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     text: &str,
     x: f32,
     y: f32,
@@ -2622,7 +2632,7 @@ fn draw_feature_text(
 
 fn draw_feature_text_single_line(
     app: &App,
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     text: &str,
     bounds: Rect,
     size: f32,
@@ -2937,8 +2947,7 @@ impl App {
         let list = self.features.controls.explorer_list;
         if list == HWND::default() || !unsafe { IsWindow(Some(list)).as_bool() } {
             self.features.explorer_paint_key = None;
-            let retired = self.features.explorer_paint.replace(None);
-            drop(retired);
+            self.publish_explorer_paint(None);
             return;
         }
         let tokens = self.shell.tokens;
@@ -2969,11 +2978,19 @@ impl App {
         self.features.explorer_paint_key = next.as_ref().map(|_| key);
         // Retiring font/icon handles can make native calls. Never drop them
         // while the publication slot is borrowed by a synchronous callback.
-        let retired = self.features.explorer_paint.replace(next);
-        drop(retired);
+        self.publish_explorer_paint(next);
         // Native H geometry changes can synchronously request painting.
         if geometry_changed && let Some(extent) = self.explorer_icons.measure_extent(list) {
             let _ = unsafe { super::control_scroll::set_horizontal_extent(list, extent) };
+        }
+    }
+
+    fn publish_explorer_paint(&mut self, next: Option<Rc<super::explorer_icons::ExplorerPaint>>) {
+        if self.defer_theme_updates {
+            self.staged_explorer_paint = Some(next);
+        } else {
+            let retired = self.features.explorer_paint.replace(next);
+            drop(retired);
         }
     }
 
@@ -2988,7 +3005,7 @@ impl App {
 
     pub(super) unsafe fn features_draw(
         &self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1RenderTarget,
     ) -> windows::core::Result<()> {
         self.features.draw(self, target)
     }
@@ -6108,6 +6125,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn theme_publishes_explorer_before_native_rail_reentry_without_repopulating_rows() {
+        struct Probe {
+            slot: ExplorerPaintSlot,
+            original: Rc<super::super::explorer_icons::ExplorerPaint>,
+            changed_at_count: Cell<bool>,
+            seen: Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _: usize,
+            data: usize,
+        ) -> LRESULT {
+            unsafe {
+                let probe = &*(data as *const Probe);
+                if msg == LB_GETCOUNT {
+                    probe.seen.set(true);
+                    let current = probe.slot.borrow().clone();
+                    probe.changed_at_count.set(
+                        probe.changed_at_count.get()
+                            && current
+                                .as_ref()
+                                .is_some_and(|next| !Rc::ptr_eq(next, &probe.original)),
+                    );
+                }
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+        }
+        let fixture = ExplorerPaintFixture::new();
+        let probe = Probe {
+            slot: Rc::clone(&fixture.main.state.explorer_paint),
+            original: fixture.main.state.explorer_paint.borrow().clone().unwrap(),
+            changed_at_count: Cell::new(true),
+            seen: Cell::new(false),
+        };
+        unsafe {
+            let count = shell::send(fixture.list, LB_GETCOUNT, WPARAM(0), LPARAM(0));
+            let before = {
+                let app = fixture.main.state.app.borrow();
+                (
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().selection(),
+                )
+            };
+            SetWindowSubclass(
+                fixture.list,
+                Some(observe),
+                777,
+                (&probe as *const Probe) as usize,
+            )
+            .unwrap();
+            {
+                let mut app = fixture.main.state.app.borrow_mut();
+                let mut settings = app.shell.settings.clone();
+                settings.theme = mdlite::settings::ThemeMode::Light;
+                app.apply_shell_settings(settings);
+            }
+            windows::Win32::UI::Shell::RemoveWindowSubclass(fixture.list, Some(observe), 777)
+                .unwrap();
+            assert!(probe.seen.get(), "exercise actual native rail callbacks");
+            assert!(
+                probe.changed_at_count.get(),
+                "rail callbacks must see the newly published Explorer theme"
+            );
+            assert_eq!(
+                shell::send(fixture.list, LB_GETCOUNT, WPARAM(0), LPARAM(0)),
+                count
+            );
+            let app = fixture.main.state.app.borrow();
+            assert_eq!(
+                (
+                    app.doc().source().to_owned(),
+                    app.doc().revision(),
+                    app.doc().is_dirty(),
+                    app.doc().undo_count(),
+                    app.doc().redo_count(),
+                    app.doc().selection()
+                ),
+                before
+            );
+        }
+    }
     #[test]
     fn explorer_runtime_snapshot_refreshes_content_cache_theme_and_font() {
         let fixture = ExplorerPaintFixture::new();

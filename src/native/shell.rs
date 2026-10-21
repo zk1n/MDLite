@@ -100,6 +100,79 @@ impl OwnerButtonPaint {
         }
     }
 }
+// Owned shell inputs remain available during synchronous child drawing while
+// layout or a theme update holds App. No document or App references are retained.
+pub(super) struct ShellButtonPaint {
+    owner: HWND,
+    tokens: Tokens,
+    buttons: Vec<(usize, HWND, bool)>,
+}
+impl ShellButtonPaint {
+    pub(super) unsafe fn draw(
+        &self,
+        recipient: HWND,
+        message_id: usize,
+        item: &DRAWITEMSTRUCT,
+    ) -> bool {
+        unsafe {
+            if recipient != self.owner
+                || recipient == HWND::default()
+                || item.CtlType != ODT_BUTTON
+                || item.CtlID as usize != message_id
+                || GetParent(item.hwndItem).ok() != Some(recipient)
+                || GetDlgCtrlID(item.hwndItem) as usize != message_id
+            {
+                return false;
+            }
+            let Some((_, _, active)) = self.buttons.iter().find(|(id, child, _)| {
+                *id == message_id && *child == item.hwndItem && *child != HWND::default()
+            }) else {
+                return false;
+            };
+            draw_shell_button(self.tokens, *active, item);
+            true
+        }
+    }
+}
+unsafe fn valid_shell_erase_button(child: HWND, owner: HWND, id: usize) -> bool {
+    unsafe {
+        let mut process = 0;
+        let thread = GetWindowThreadProcessId(child, Some(&mut process));
+        let mut owner_process = 0;
+        let owner_thread = GetWindowThreadProcessId(owner, Some(&mut owner_process));
+        let mut class = [0u16; 32];
+        let length = GetClassNameW(child, &mut class);
+        thread == windows_sys::Win32::System::Threading::GetCurrentThreadId()
+            && owner_thread == thread
+            && process == std::process::id()
+            && owner_process == process
+            && GetParent(child).ok() == Some(owner)
+            && GetDlgCtrlID(child) as usize == id
+            && GetWindowLongW(child, GWL_STYLE) as u32 & 0xf == BS_OWNERDRAW as u32
+            && length > 0
+            && String::from_utf16_lossy(&class[..length as usize]).eq_ignore_ascii_case("Button")
+    }
+}
+unsafe extern "system" fn shell_erase_proc(
+    child: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    owner: usize,
+) -> LRESULT {
+    unsafe {
+        if msg == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(child, Some(shell_erase_proc), id);
+        } else if msg == WM_ERASEBKGND && valid_shell_erase_button(child, HWND(owner as *mut _), id)
+        {
+            // Only registered full-rectangle shell owner painters use this
+            // subclass. Keep old pixels until their real WM_DRAWITEM completes.
+            return LRESULT(1);
+        }
+        DefSubclassProc(child, msg, wp, lp)
+    }
+}
 pub(super) unsafe fn owner_draw_state(label: String, item: &DRAWITEMSTRUCT) -> OwnerDrawState {
     OwnerDrawState {
         label,
@@ -543,8 +616,8 @@ pub(super) struct NativeShell {
     pub(super) scroll_hover: bool,
     pub(super) status_eol_cache: Option<(u64, u64, super::presentation::StatusEolSummary)>,
     pub(super) external_change_docs: std::collections::HashSet<u64>,
-    main_target: Option<ID2D1HwndRenderTarget>,
-    compact_target: Option<ID2D1HwndRenderTarget>,
+    main_target: Option<ID2D1DCRenderTarget>,
+    compact_target: Option<ID2D1DCRenderTarget>,
     colors: Rc<ControlColors>,
     tooltip_text: Vec<Vec<u16>>,
     nav_back: Vec<NavigationPoint>,
@@ -1447,6 +1520,14 @@ impl App {
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
                 ));
             }
+            for (id, child, _) in self.shell_button_paint().buttons {
+                if !valid_shell_erase_button(child, self.hwnd, id)
+                    || !SetWindowSubclass(child, Some(shell_erase_proc), id, self.hwnd.0 as usize)
+                        .as_bool()
+                {
+                    self.status = "Shell描画の初期化に失敗しました".into();
+                }
+            }
             self.shell.tooltip = CreateWindowExW(
                 WS_EX_TOPMOST,
                 TOOLTIPS_CLASSW,
@@ -1585,7 +1666,11 @@ impl App {
             };
             let attached = GetMenu(owner);
             if attached != HMENU::default() {
-                let _ = SetMenu(owner, None);
+                // Only an attached native bar changed. Popup-menu replacement
+                // must not synchronously erase all child surfaces before paint.
+                if SetMenu(owner, None).is_ok() {
+                    let _ = DrawMenuBar(owner);
+                }
                 if attached != self.shell.menu {
                     let _ = DestroyMenu(attached);
                 }
@@ -1596,7 +1681,6 @@ impl App {
             self.shell.menu = menu;
             self.shell.menu_groups = [file, view, workspace, search, git, editor, navigation];
             self.shell.menu_routes = routes;
-            let _ = DrawMenuBar(owner);
         }
     }
     unsafe fn open_shell_menu(&mut self, group: Option<usize>) {
@@ -1818,6 +1902,104 @@ impl App {
             _ => true,
         }
     }
+    fn shell_button_paint(&self) -> ShellButtonPaint {
+        let mut buttons = vec![
+            (SHELL_MENU, self.shell.menu_button, false),
+            (
+                REGION_LEFT,
+                self.shell.region_buttons[0],
+                self.shell.layout.left_visible,
+            ),
+            (
+                REGION_RIGHT,
+                self.shell.region_buttons[1],
+                self.shell.layout.right_visible,
+            ),
+        ];
+        buttons.extend(
+            [CMD_NEW, CMD_SAVE, NAV_BACK, NAV_FORWARD]
+                .into_iter()
+                .zip(self.shell.top_actions.iter().copied())
+                .map(|(id, child)| (id, child, false)),
+        );
+        buttons.extend(
+            self.shell
+                .activity
+                .iter()
+                .enumerate()
+                .map(|(i, child)| (ACTIVITY + i, *child, self.activity_button_active(i))),
+        );
+        buttons.extend(
+            self.shell
+                .headers
+                .iter()
+                .enumerate()
+                .map(|(i, child)| (HEADER + i, *child, false)),
+        );
+        ShellButtonPaint {
+            owner: self.shell.main_window,
+            tokens: self.shell.tokens,
+            buttons,
+        }
+    }
+    fn publish_shell_button_paint(&self) {
+        if self.defer_theme_updates {
+            return;
+        }
+        unsafe {
+            let pointer =
+                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(self.shell.main_window)
+            {
+                let retired = state
+                    .shell_button_paint
+                    .replace(Some(Rc::new(self.shell_button_paint())));
+                drop(retired);
+            }
+        }
+    }
+    fn publish_shell_control_colors(&self) {
+        if self.defer_theme_updates {
+            return;
+        }
+        unsafe {
+            let pointer =
+                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(self.shell.main_window)
+            {
+                let retired = state
+                    .control_colors
+                    .replace(Some(Rc::clone(&self.shell.colors)));
+                drop(retired);
+            }
+        }
+    }
+    pub(super) fn publish_prepared_theme_paint(&mut self) {
+        unsafe {
+            let pointer =
+                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
+            if let Some(state) = pointer.as_ref()
+                && state.owns_paint_surface(self.shell.main_window)
+            {
+                let buttons = Rc::new(self.shell_button_paint());
+                let git_buttons = self.git_button_paint();
+                // Replace every ready slot before dropping any retired GDI
+                // resource. No RefCell guard spans a native callback.
+                let colors = state
+                    .control_colors
+                    .replace(Some(Rc::clone(&self.shell.colors)));
+                let buttons = state.shell_button_paint.replace(Some(buttons));
+                let git_buttons = state.git_button_paint.replace(git_buttons);
+                let explorer = self
+                    .staged_explorer_paint
+                    .take()
+                    .map(|next| state.explorer_paint.replace(next));
+                drop((colors, buttons, git_buttons, explorer));
+            }
+        }
+    }
     pub(super) fn update_shell_geometry(&mut self, height: f32) {
         if !self.shell.enabled {
             return;
@@ -1838,6 +2020,7 @@ impl App {
         };
         self.shell.editor = editor;
         self.shell.panels = panels;
+        self.publish_shell_button_paint();
         if compact {
             unsafe {
                 let query = self.ensure_toolbar_query(self.hwnd);
@@ -1970,6 +2153,11 @@ impl App {
         unsafe {
             use mdlite::settings::ThemeMode;
             self.shell.settings = settings;
+            if self.defer_theme_updates {
+                // New settings/tokens prepare layout now; independent native
+                // paint resources stay on the presented theme until completion.
+                self.theme_update_pending = true;
+            }
             let light = match self.shell.settings.theme {
                 ThemeMode::Light => true,
                 ThemeMode::System => system_light(),
@@ -2030,6 +2218,25 @@ impl App {
                 tokens.high_contrast = true;
             }
             self.shell.tokens = tokens;
+            self.shell.colors = Rc::new(ControlColors::new(tokens));
+            self.publish_shell_control_colors();
+            self.publish_shell_button_paint();
+            self.features_refresh_explorer_paint(false);
+            self.layout_key = None;
+            self.shell.controls_dirty = true;
+            if !self.defer_theme_updates {
+                self.apply_shell_native_theme();
+            }
+        }
+    }
+    pub(super) unsafe fn apply_shell_native_theme(&mut self) {
+        unsafe {
+            let tokens = self.shell.tokens;
+            let light = match self.shell.settings.theme {
+                mdlite::settings::ThemeMode::Light => true,
+                mdlite::settings::ThemeMode::System => system_light(),
+                _ => false,
+            };
             self.diagnostics.refresh_theme(tokens);
             for surface in [self.shell.main_window, self.shell.compact_window] {
                 if surface != HWND::default()
@@ -2038,12 +2245,6 @@ impl App {
                     self.status = format!("スクロール表示の更新に失敗しました: {error}");
                 }
             }
-            self.shell.colors = Rc::new(ControlColors::new(tokens));
-            let pointer =
-                GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
-            if !pointer.is_null() && (&*pointer).owns_paint_surface(self.shell.main_window) {
-                *(&*pointer).control_colors.borrow_mut() = Some(Rc::clone(&self.shell.colors));
-            }
             let dark = windows::core::BOOL(i32::from(!light));
             let _ = DwmSetWindowAttribute(
                 self.shell.main_window,
@@ -2051,9 +2252,14 @@ impl App {
                 (&dark as *const windows::core::BOOL).cast(),
                 std::mem::size_of_val(&dark) as u32,
             );
-            self.layout_key = None;
-            self.shell.controls_dirty = true;
-            let _ = InvalidateRect(Some(self.hwnd), None, true);
+            // Theme changes affect every child, including controls whose bounds
+            // and enabled state are unchanged by the following layout pass.
+            for surface in [self.shell.main_window, self.shell.compact_window] {
+                if surface != HWND::default() {
+                    let _ =
+                        RedrawWindow(Some(surface), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+                }
+            }
         }
     }
     pub(super) unsafe fn load_panel_layout(&mut self) {
@@ -2122,7 +2328,7 @@ impl App {
             self.status = format!("パネル配置保存失敗 — 原本保持: {e}");
         }
     }
-    pub(super) unsafe fn draw_shell(&self, t: &ID2D1HwndRenderTarget) -> windows::core::Result<()> {
+    pub(super) unsafe fn draw_shell(&self, t: &ID2D1RenderTarget) -> windows::core::Result<()> {
         unsafe {
             if !self.shell.enabled {
                 return Ok(());
@@ -2180,90 +2386,87 @@ impl App {
             Ok(())
         }
     }
-    pub(super) unsafe fn draw_shell_button(&self, item: &DRAWITEMSTRUCT) {
-        unsafe {
-            let control_dpi = (GetDpiForWindow(item.hwndItem) as f32 / 96.).max(1.);
-            let id = item.CtlID as usize;
-            let activity = id
-                .checked_sub(ACTIVITY)
-                .filter(|index| *index < ACTIVITY_COUNT);
-            let action = match id {
-                CMD_NEW => Some(0),
-                CMD_SAVE => Some(1),
-                NAV_BACK => Some(2),
-                NAV_FORWARD => Some(3),
-                _ => None,
+}
+unsafe fn draw_shell_button(tokens: Tokens, active: bool, item: &DRAWITEMSTRUCT) {
+    unsafe {
+        let control_dpi = (GetDpiForWindow(item.hwndItem) as f32 / 96.).max(1.);
+        let id = item.CtlID as usize;
+        let activity = id
+            .checked_sub(ACTIVITY)
+            .filter(|index| *index < ACTIVITY_COUNT);
+        let action = match id {
+            CMD_NEW => Some(0),
+            CMD_SAVE => Some(1),
+            NAV_BACK => Some(2),
+            NAV_FORWARD => Some(3),
+            _ => None,
+        };
+        let bg = if item.itemState.0 & ODS_SELECTED.0 != 0 || active {
+            tokens.selected
+        } else {
+            tokens.panel
+        };
+        let brush = CreateSolidBrush(rgb(bg));
+        FillRect(item.hDC, &item.rcItem, brush);
+        let _ = DeleteObject(brush.into());
+        if active {
+            let brush = CreateSolidBrush(rgb(tokens.accent));
+            let stripe = RECT {
+                left: item.rcItem.left,
+                top: item.rcItem.bottom - (3. * control_dpi).round() as i32,
+                right: item.rcItem.right,
+                bottom: item.rcItem.bottom,
             };
-            let active = activity.is_some_and(|index| self.activity_button_active(index))
-                || (id == REGION_LEFT && self.shell.layout.left_visible)
-                || (id == REGION_RIGHT && self.shell.layout.right_visible);
-            let bg = if item.itemState.0 & ODS_SELECTED.0 != 0 || active {
-                self.shell.tokens.selected
-            } else {
-                self.shell.tokens.panel
-            };
-            let brush = CreateSolidBrush(rgb(bg));
-            FillRect(item.hDC, &item.rcItem, brush);
+            FillRect(item.hDC, &stripe, brush);
             let _ = DeleteObject(brush.into());
-            if active {
-                let brush = CreateSolidBrush(rgb(self.shell.tokens.accent));
-                let stripe = RECT {
-                    left: item.rcItem.left,
-                    top: item.rcItem.bottom - (3. * control_dpi).round() as i32,
-                    right: item.rcItem.right,
-                    bottom: item.rcItem.bottom,
-                };
-                FillRect(item.hDC, &stripe, brush);
-                let _ = DeleteObject(brush.into());
-            }
-            let icon = if id == SHELL_MENU {
-                Some(HAMBURGER_ICON)
-            } else if id == REGION_LEFT || id == REGION_RIGHT {
-                Some(REGION_ICONS[usize::from(id == REGION_RIGHT)])
-            } else if (HEADER..HEADER + IDS.len()).contains(&id) {
-                Some(MENU_ICON)
-            } else if let Some(index) = action {
-                Some(TOP_ACTION_ICONS[index])
+        }
+        let icon = if id == SHELL_MENU {
+            Some(HAMBURGER_ICON)
+        } else if id == REGION_LEFT || id == REGION_RIGHT {
+            Some(REGION_ICONS[usize::from(id == REGION_RIGHT)])
+        } else if (HEADER..HEADER + IDS.len()).contains(&id) {
+            Some(MENU_ICON)
+        } else if let Some(index) = action {
+            Some(TOP_ACTION_ICONS[index])
+        } else {
+            activity.map(|index| ACTIVITY_ICONS[index])
+        };
+        if let Some(icon) = icon {
+            draw_icon(
+                item.hDC,
+                &item.rcItem,
+                icon,
+                control_dpi,
+                tokens.foreground,
+                bg,
+            );
+        } else {
+            let text = text_of(item.hwndItem);
+            let mut area = item.rcItem;
+            let font = HGDIOBJ(send(item.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let previous = if font != HGDIOBJ::default() {
+                Some(SelectObject(item.hDC, font))
             } else {
-                activity.map(|index| ACTIVITY_ICONS[index])
+                None
             };
-            if let Some(icon) = icon {
-                draw_icon(
-                    item.hDC,
-                    &item.rcItem,
-                    icon,
-                    control_dpi,
-                    self.shell.tokens.foreground,
-                    bg,
-                );
-            } else {
-                let text = text_of(item.hwndItem);
-                let mut area = item.rcItem;
-                let font =
-                    HGDIOBJ(send(item.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as *mut _);
-                let previous = if font != HGDIOBJ::default() {
-                    Some(SelectObject(item.hDC, font))
-                } else {
-                    None
-                };
-                let _ = SetBkMode(item.hDC, TRANSPARENT);
-                SetTextColor(item.hDC, rgb(self.shell.tokens.foreground));
-                draw_gdi_text(
-                    item.hDC,
-                    &text,
-                    &mut area,
-                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
-                );
-                if let Some(previous) = previous {
-                    let _ = SelectObject(item.hDC, previous);
-                }
+            let _ = SetBkMode(item.hDC, TRANSPARENT);
+            SetTextColor(item.hDC, rgb(tokens.foreground));
+            draw_gdi_text(
+                item.hDC,
+                &text,
+                &mut area,
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            if let Some(previous) = previous {
+                let _ = SelectObject(item.hDC, previous);
             }
-            if item.itemState.0 & ODS_FOCUS.0 != 0 {
-                control_style::draw_focus(self.shell.tokens, item, &item.rcItem, true);
-            }
+        }
+        if item.itemState.0 & ODS_FOCUS.0 != 0 {
+            control_style::draw_focus(tokens, item, &item.rcItem, true);
         }
     }
 }
+
 fn owner_button_icon(label: &str) -> Option<&'static str> {
     Some(match label {
         "新しいファイル" => include_str!("../../assets/ui/icons/file-plus.svg"),
@@ -2405,7 +2608,6 @@ impl App {
                         return None;
                     }
                     let item = &*(lp.0 as *const DRAWITEMSTRUCT);
-                    let id = item.CtlID as usize;
                     if (hwnd == self.shell.main_window || hwnd == self.shell.compact_window)
                         && self.shell.colors.draw_container(hwnd, wp.0, item)
                     {
@@ -2438,18 +2640,9 @@ impl App {
                         draw_owner_button(self.shell.tokens, item, &state);
                         return Some(LRESULT(1));
                     }
-                    if id != PALETTE
-                        && id != SHELL_MENU
-                        && id != REGION_LEFT
-                        && id != REGION_RIGHT
-                        && ![CMD_NEW, CMD_OPEN, CMD_SAVE, NAV_BACK, NAV_FORWARD].contains(&id)
-                        && !(ACTIVITY..ACTIVITY + ACTIVITY_COUNT).contains(&id)
-                        && !(HEADER..HEADER + IDS.len()).contains(&id)
-                    {
-                        return None;
-                    }
-                    self.draw_shell_button(item);
-                    Some(LRESULT(1))
+                    self.shell_button_paint()
+                        .draw(hwnd, wp.0, item)
+                        .then_some(LRESULT(1))
                 }
                 WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN
                     if (hwnd == self.shell.main_window || hwnd == self.shell.compact_window)
@@ -2995,6 +3188,22 @@ impl App {
         }
         None
     }
+    pub(super) unsafe fn begin_shell_splitter(&mut self, x: f32, y: f32) -> bool {
+        if !self.shell.enabled
+            || self.hwnd != self.shell.main_window
+            || self.shell.compact_window != HWND::default()
+            || self.composing
+            || self.background_mutation_busy()
+        {
+            return false;
+        }
+        let Some(splitter) = self.splitter_at(x, y) else {
+            return false;
+        };
+        self.shell.splitter = Some(splitter);
+        unsafe { SetCapture(self.hwnd) };
+        true
+    }
     pub(super) fn surface_cursor_at(&self, x: f32, y: f32) -> PCWSTR {
         if !self.shell.enabled {
             return if y < 74. {
@@ -3068,9 +3277,7 @@ impl App {
             if self.shell.compact_window != HWND::default() && self.hwnd == self.shell.main_window {
                 return;
             }
-            if let Some(splitter) = self.splitter_at(x, y) {
-                self.shell.splitter = Some(splitter);
-                SetCapture(self.hwnd);
+            if self.begin_shell_splitter(x, y) {
                 return;
             }
             for (id, r) in self.shell.panels {
@@ -3155,11 +3362,13 @@ impl App {
         };
         let x = (lp.0 as u16 as i16) as f32 / self.dpi;
         let y = ((lp.0 >> 16) as u16 as i16) as f32 / self.dpi;
-        match splitter {
+        let changed = match splitter {
             Splitter::Width(id) => {
+                let before = self.shell.layout.group(id).width;
                 let left = self.shell.layout.side(id) == Side::Left;
                 let width = if left { x - 48. } else { self.width - x };
                 self.shell.layout.set_width(id, width.clamp(100., 600.));
+                before != self.shell.layout.group(id).width
             }
             Splitter::Height(id) => {
                 let views = self.shell.layout.group(id).views.clone();
@@ -3169,6 +3378,10 @@ impl App {
                     .skip_while(|v| *v != id)
                     .skip(1)
                     .find(|v| !self.shell.layout.get(*v).hidden);
+                let before = [
+                    self.shell.layout.get(id).height,
+                    next.map_or(0., |next| self.shell.layout.get(next).height),
+                ];
                 if let Some(next) = next {
                     let upper = self.shell.panels[id as usize].1;
                     let lower = self.shell.panels[next as usize].1;
@@ -3182,9 +3395,19 @@ impl App {
                             (weight * (1. - share)).clamp(1., 4096.);
                     }
                 }
+                before
+                    != [
+                        self.shell.layout.get(id).height,
+                        next.map_or(0., |next| self.shell.layout.get(next).height),
+                    ]
             }
+        };
+        // Captured pointer messages can repeat at the same position. Consume
+        // them without rebuilding the same layout and
+        // competing with the pending parent paint.
+        if changed {
+            self.presentation_changed();
         }
-        self.presentation_changed();
         true
     }
     pub(super) fn finish_splitter(&mut self) {
@@ -3728,7 +3951,7 @@ impl App {
             let title = wide(&format!("{} — Compact", self.tab_display_name(self.active)));
             let placement = self.tabs[self.active].persistence.placement.clone();
             let compact = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                WS_EX_COMPOSITED,
                 w!("MDLiteRustEditor"),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -3985,6 +4208,321 @@ pub(super) unsafe fn track_control_ime(hwnd: HWND) -> Box<Cell<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitter_native_down_precedes_outline_at_painted_border_and_height_edge() {
+        use super::super::{
+            GetCapture, IDC_SIZENS, IDC_SIZEWE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        let mut seed = super::super::tests::composing_test_app("# A\nbody\n# B\nother\n");
+        seed.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        let position = |x: i32, y: i32| LPARAM(((y as u32) << 16 | x as u32) as isize);
+        let source_state = || {
+            let app = fixture.state.app.borrow();
+            let doc = app.doc();
+            (
+                doc.source().to_owned(),
+                doc.revision(),
+                doc.is_dirty(),
+                doc.undo_count(),
+                doc.redo_count(),
+                doc.selection(),
+            )
+        };
+        // Retain the COM objects so a rebuild cannot reuse their addresses.
+        let layouts = || {
+            fixture
+                .state
+                .app
+                .borrow()
+                .views
+                .iter()
+                .map(|view| view.layout.clone())
+                .collect::<Vec<_>>()
+        };
+        unsafe {
+            SetWindowPos(
+                fixture.hwnd,
+                None,
+                0,
+                0,
+                1084,
+                761,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.start_shell();
+                app.features_init();
+                app.shell.layout = mdlite::panel::PanelLayout::default();
+                app.shell
+                    .layout
+                    .move_group(PanelId::Outline, mdlite::panel::Side::Right);
+                app.shell.layout.join(PanelId::Search, PanelId::Outline);
+                app.shell.layout.join(PanelId::Git, PanelId::Outline);
+                app.shell.layout.join(PanelId::Calendar, PanelId::Explorer);
+                app.shell.layout.select(PanelId::Explorer);
+                app.shell.layout.select(PanelId::Outline);
+                app.layout_key = None;
+                app.ensure_layout().unwrap();
+                let body = app.feature_panel_rect(PanelId::Outline).unwrap();
+                assert_eq!((body.x, body.y), (844., 66.));
+                for (x, splitter) in [
+                    (839., false),
+                    (840., true),
+                    (844., true),
+                    (848., true),
+                    (849., false),
+                ] {
+                    assert_eq!(
+                        app.surface_cursor_at(x, 81.).as_ptr() == IDC_SIZEWE.as_ptr(),
+                        splitter
+                    );
+                }
+            }
+            let before = source_state();
+            SendMessageW(
+                fixture.hwnd,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(position(844, 81)),
+            );
+            assert_eq!(GetCapture(), fixture.hwnd);
+            assert!(
+                !fixture
+                    .state
+                    .app
+                    .borrow_mut()
+                    .features_finish_outline_drag(true)
+            );
+            for (x, width) in [
+                (852, 232.),
+                (860, 224.),
+                (868, 216.),
+                (984, 100.),
+                (1000, 100.),
+                (0, 600.),
+                (8, 600.),
+            ] {
+                let previous_width = fixture
+                    .state
+                    .app
+                    .borrow()
+                    .shell
+                    .layout
+                    .group(PanelId::Outline)
+                    .width;
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, 81)),
+                );
+                assert_eq!(
+                    fixture
+                        .state
+                        .app
+                        .borrow()
+                        .shell
+                        .layout
+                        .group(PanelId::Outline)
+                        .width,
+                    width
+                );
+                assert_eq!(layouts() == retained, previous_width == width);
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, 81)),
+                );
+                assert_eq!(
+                    layouts(),
+                    retained,
+                    "same or clamped width must retain layout"
+                );
+                assert_eq!(GetCapture(), fixture.hwnd);
+                assert_eq!(source_state(), before);
+            }
+            SendMessageW(
+                fixture.hwnd,
+                WM_LBUTTONUP,
+                Some(WPARAM(0)),
+                Some(position(868, 81)),
+            );
+            assert_eq!(GetCapture(), HWND::default());
+            assert!(
+                !fixture
+                    .state
+                    .app
+                    .borrow_mut()
+                    .features_finish_outline_drag(true)
+            );
+            assert_eq!(source_state(), before);
+
+            // Five DIP into Outline is outside splitter slop and must retain
+            // its existing feature selection/drag route.
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.layout.set_width(PanelId::Outline, 240.);
+                app.layout_key = None;
+                app.ensure_layout().unwrap();
+            }
+            SendMessageW(
+                fixture.hwnd,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(position(849, 81)),
+            );
+            assert!(
+                fixture
+                    .state
+                    .app
+                    .borrow_mut()
+                    .features_finish_outline_drag(true)
+            );
+            assert_eq!(
+                fixture
+                    .state
+                    .app
+                    .borrow()
+                    .shell
+                    .layout
+                    .group(PanelId::Outline)
+                    .width,
+                240.
+            );
+            SendMessageW(fixture.hwnd, WM_LBUTTONUP, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(
+                !fixture
+                    .state
+                    .app
+                    .borrow_mut()
+                    .features_finish_outline_drag(true)
+            );
+            assert_eq!(source_state(), before);
+
+            let (x, y, heights) = {
+                let mut app = fixture.state.app.borrow_mut();
+                app.shell.layout.get_mut(PanelId::Search).collapsed = false;
+                app.shell.layout.get_mut(PanelId::Git).hidden = true;
+                app.layout_key = None;
+                app.ensure_layout().unwrap();
+                let upper = app.shell.panels[PanelId::Outline as usize].1;
+                let x = (upper.x + 24.) as i32;
+                let y = (upper.y + upper.height).round() as i32 - 1;
+                assert_eq!(
+                    app.surface_cursor_at(x as f32, y as f32).as_ptr(),
+                    IDC_SIZENS.as_ptr()
+                );
+                (
+                    x,
+                    y,
+                    (
+                        app.shell.layout.get(PanelId::Outline).height,
+                        app.shell.layout.get(PanelId::Search).height,
+                    ),
+                )
+            };
+            SendMessageW(
+                fixture.hwnd,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(position(x, y)),
+            );
+            assert!(
+                !fixture
+                    .state
+                    .app
+                    .borrow_mut()
+                    .features_finish_outline_drag(true)
+            );
+            let retained = layouts();
+            SendMessageW(
+                fixture.hwnd,
+                WM_MOUSEMOVE,
+                Some(WPARAM(0)),
+                Some(position(x, y - 24)),
+            );
+            assert_ne!(layouts(), retained, "changed paired heights rebuild layout");
+            {
+                let app = fixture.state.app.borrow();
+                assert!(app.shell.layout.get(PanelId::Outline).height < heights.0);
+                assert!(app.shell.layout.get(PanelId::Search).height > heights.1);
+            }
+            for target_y in [0, 760] {
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, target_y)),
+                );
+                assert_ne!(layouts(), retained, "new clamped heights rebuild layout");
+                let weights = {
+                    let app = fixture.state.app.borrow();
+                    (
+                        app.shell.layout.get(PanelId::Outline).height,
+                        app.shell.layout.get(PanelId::Search).height,
+                    )
+                };
+                let retained = layouts();
+                SendMessageW(
+                    fixture.hwnd,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(position(x, target_y)),
+                );
+                let app = fixture.state.app.borrow();
+                assert_eq!(
+                    (
+                        app.shell.layout.get(PanelId::Outline).height,
+                        app.shell.layout.get(PanelId::Search).height,
+                    ),
+                    weights,
+                    "repeating the clamped height retains both stored weights"
+                );
+                drop(app);
+                assert_eq!(
+                    layouts(),
+                    retained,
+                    "same paired heights must retain layout"
+                );
+                assert_eq!(GetCapture(), fixture.hwnd);
+                assert_eq!(source_state(), before);
+            }
+            SendMessageW(
+                fixture.hwnd,
+                WM_LBUTTONUP,
+                Some(WPARAM(0)),
+                Some(position(x, y - 24)),
+            );
+            assert_eq!(GetCapture(), HWND::default());
+            assert_eq!(source_state(), before);
+            assert!(!IsWindowVisible(fixture.hwnd).as_bool());
+
+            let foreign = super::super::tests::hidden_test_window_size(100, 100);
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                app.hwnd = foreign;
+                assert!(!app.begin_shell_splitter(844., 81.));
+                app.hwnd = fixture.hwnd;
+                app.composing = true;
+                assert!(!app.begin_shell_splitter(844., 81.));
+                app.composing = false;
+                app.shell.compact_window = foreign;
+                assert!(!app.begin_shell_splitter(844., 81.));
+                app.shell.compact_window = HWND::default();
+            }
+            DestroyWindow(foreign).unwrap();
+            assert_eq!(GetCapture(), HWND::default());
+            assert_eq!(source_state(), before);
+        }
+    }
 
     #[test]
     #[ignore = "visible NOACTIVATE resize fixture; requires exclusive GUI lease"]
@@ -4766,6 +5304,61 @@ mod tests {
         assert!(app.command_enabled(Command::Return));
     }
     #[test]
+    fn shell_owned_button_erase_keeps_private_pixels_and_rejects_foreign_identity() {
+        let mut seed = super::super::tests::composing_test_app("button source");
+        seed.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        unsafe {
+            fixture.state.app.borrow_mut().start_shell();
+            let source = GetDC(Some(fixture.hwnd));
+            let dc = CreateCompatibleDC(Some(source));
+            let bitmap = CreateCompatibleBitmap(source, 32, 32);
+            ReleaseDC(Some(fixture.hwnd), source);
+            let old = SelectObject(dc, bitmap.into());
+            let sentinel = COLORREF(0x0012_8931);
+            SetPixel(dc, 4, 4, sentinel);
+            let button = GetDlgItem(Some(fixture.hwnd), SHELL_MENU as i32).unwrap();
+            assert!(valid_shell_erase_button(button, fixture.hwnd, SHELL_MENU));
+            assert_eq!(
+                SendMessageW(
+                    button,
+                    WM_ERASEBKGND,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0))
+                ),
+                LRESULT(1)
+            );
+            assert_eq!(
+                GetPixel(dc, 4, 4),
+                sentinel,
+                "standalone erase cannot clear a registered full-rect owner button"
+            );
+            assert!(!valid_shell_erase_button(
+                button,
+                HWND::default(),
+                SHELL_MENU
+            ));
+            assert!(!valid_shell_erase_button(
+                button,
+                fixture.hwnd,
+                SHELL_MENU + 1
+            ));
+            let foreign = {
+                // Native EDIT initialization can synchronously notify ID107.
+                // Match real startup's borrow boundary so this negative paint
+                // fixture cannot execute a menu command while it is created.
+                let _app = fixture.state.app.borrow_mut();
+                control(fixture.hwnd, w!("EDIT"), "", SHELL_MENU, WINDOW_STYLE(0))
+            };
+            assert!(!valid_shell_erase_button(foreign, fixture.hwnd, SHELL_MENU));
+            assert!(!IsWindowVisible(fixture.hwnd).as_bool());
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
     fn shell_binding_dispatch_respects_remapping_and_reserved_commands() {
         let mut app = super::super::tests::composing_test_app("source");
         app.composing = false;
@@ -4782,6 +5375,45 @@ mod tests {
         app.composing = true;
         assert!(!app.command_enabled(Command::Source));
         assert!(!app.command_enabled(Command::Palette));
+    }
+    #[test]
+    fn shell_staged_theme_keeps_new_binding_in_rebuilt_native_menu() {
+        let mut seed = super::super::tests::composing_test_app("unchanged 日本語");
+        seed.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        unsafe {
+            let mut app = fixture.state.app.borrow_mut();
+            app.start_shell();
+            let old = fixture.state.control_colors.borrow().clone().unwrap();
+            let previous = app.shell.settings.clone();
+            app.defer_theme_updates = true;
+            let mut next = previous.clone();
+            next.theme = mdlite::settings::ThemeMode::Light;
+            next.keybindings
+                .insert("file.save".into(), "Ctrl+Alt+S".into());
+            app.apply_shell_settings(next);
+            assert_ne!(
+                app.shell.settings, previous,
+                "completion must notice changed metadata"
+            );
+            app.install_shell_menu();
+            let menu = app.shell.menu_routes[&CMD_SAVE];
+            let mut label = [0u16; 128];
+            let length = GetMenuStringW(menu, CMD_SAVE as u32, Some(&mut label), MF_BYCOMMAND);
+            assert_eq!(
+                String::from_utf16_lossy(&label[..length as usize]),
+                "保存\tCtrl+Alt+S"
+            );
+            assert!(Rc::ptr_eq(
+                &old,
+                fixture.state.control_colors.borrow().as_ref().unwrap()
+            ));
+            assert_eq!(
+                GetMenu(fixture.hwnd),
+                HMENU::default(),
+                "popup resources do not create a native menu bar"
+            );
+        }
     }
     #[test]
     fn shell_palette_single_candidate_keeps_a_full_native_list_row() {
@@ -5026,8 +5658,17 @@ mod tests {
             item.CtlType = ODT_BUTTON;
             item.CtlID = PALETTE as u32;
             let parameter = LPARAM((&item as *const DRAWITEMSTRUCT) as isize);
+            // A claimed button ID cannot turn the Main HWND into an owned child.
             assert_eq!(
                 app.shell_window_message(window, WM_DRAWITEM, WPARAM(PALETTE), parameter),
+                None
+            );
+            app.start_shell();
+            item.CtlID = SHELL_MENU as u32;
+            item.hwndItem = app.shell.menu_button;
+            let parameter = LPARAM((&item as *const DRAWITEMSTRUCT) as isize);
+            assert_eq!(
+                app.shell_window_message(window, WM_DRAWITEM, WPARAM(SHELL_MENU), parameter),
                 Some(LRESULT(1))
             );
             ReleaseDC(Some(window), dc);

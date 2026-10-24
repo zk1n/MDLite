@@ -1024,6 +1024,7 @@ const FIXED_SHORTCUTS: &[(&str, &str)] = &[
     ("CTRL+SHIFT+TAB", "tab.previous"),
     ("CTRL+SHIFT+T", "table.source"),
     ("CTRL+ALT+T", "table.toolbar"),
+    ("CTRL+ALT+L", "code.language"),
     ("CTRL+ALT+UP", "panel.resize.grow"),
     ("CTRL+ALT+DOWN", "panel.resize.shrink"),
     ("CTRL+ALT+1", "panel.move.left_top"),
@@ -1386,7 +1387,7 @@ mod tests {
         assert!(!resolution.is_valid());
         assert_eq!(resolution.settings.keybindings["file.save"], "Ctrl+S");
 
-        for binding in ["Ctrl+Alt+T", "Ctrl+Alt+Up", "Ctrl+Alt+Down"] {
+        for binding in ["Ctrl+Alt+T", "Ctrl+Alt+L", "Ctrl+Alt+Up", "Ctrl+Alt+Down"] {
             let parsed = parse_settings(&format!(
                 "schema_version = 1\nbind.file.save = \"{binding}\"\n"
             ));

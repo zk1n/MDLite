@@ -6,6 +6,132 @@ use windows::Win32::UI::Controls::{SetScrollInfo, ShowScrollBar, WM_MOUSELEAVE};
 const CLASS: PCWSTR = w!("MDLiteVerticalRail");
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
+pub(super) const RAIL_WIDTH_DIP: f32 = 10.0;
+pub(super) const THUMB_IDLE_WIDTH_DIP: f32 = 6.0;
+pub(super) const THUMB_ACTIVE_WIDTH_DIP: f32 = 10.0;
+pub(super) const MIN_THUMB_DIP: f32 = 18.0;
+
+pub(super) fn rail_width(dpi: u32) -> i32 {
+    (RAIL_WIDTH_DIP * dpi.max(1) as f32 / 96.0).round().max(1.0) as i32
+}
+
+pub(super) fn thumb_width(dpi: u32, active: bool) -> i32 {
+    let width = if active {
+        THUMB_ACTIVE_WIDTH_DIP
+    } else {
+        THUMB_IDLE_WIDTH_DIP
+    };
+    (width * dpi.max(1) as f32 / 96.0).round().max(1.0) as i32
+}
+
+pub(super) fn thumb_width_dip(active: bool) -> f32 {
+    if active {
+        THUMB_ACTIVE_WIDTH_DIP
+    } else {
+        THUMB_IDLE_WIDTH_DIP
+    }
+}
+
+/// Proportional scrollbar geometry in one coordinate system. Editor drawing,
+/// hit testing, track jumps, and thumb drags all use this same calculation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Geometry {
+    track_start: f32,
+    track_length: f32,
+    content: f32,
+    page: f32,
+    position: f32,
+    min_thumb: f32,
+}
+
+impl Geometry {
+    pub(super) fn new(
+        track_start: f32,
+        track_length: f32,
+        content: f32,
+        page: f32,
+        position: f32,
+        min_thumb: f32,
+    ) -> Self {
+        let finite_nonnegative = |value: f32| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            track_start: if track_start.is_finite() {
+                track_start
+            } else {
+                0.0
+            },
+            track_length: finite_nonnegative(track_length),
+            content: finite_nonnegative(content),
+            page: finite_nonnegative(page),
+            position: finite_nonnegative(position),
+            min_thumb: finite_nonnegative(min_thumb),
+        }
+    }
+
+    pub(super) fn max_scroll(self) -> f32 {
+        (self.content - self.page).max(0.0)
+    }
+
+    pub(super) fn with_position(mut self, position: f32) -> Self {
+        self.position = if position.is_finite() {
+            position.max(0.0)
+        } else {
+            0.0
+        };
+        self
+    }
+
+    pub(super) fn thumb(self) -> Option<(f32, f32)> {
+        let maximum = self.max_scroll();
+        if maximum <= 0.0 || self.track_length <= 0.0 {
+            return None;
+        }
+        let size = (self.track_length * (self.page / self.content).clamp(0.0, 1.0))
+            .max(self.min_thumb)
+            .min(self.track_length);
+        let travel = (self.track_length - size).max(0.0);
+        let top = self.track_start + travel * (self.position.clamp(0.0, maximum) / maximum);
+        Some((top, size))
+    }
+
+    pub(super) fn thumb_offset_at(self, pointer: f32) -> Option<f32> {
+        let (top, size) = self.thumb()?;
+        (pointer >= top && pointer < top + size).then_some((pointer - top).clamp(0.0, size))
+    }
+
+    pub(super) fn position_for_pointer(self, pointer: f32, offset: f32) -> f32 {
+        let Some((_, size)) = self.thumb() else {
+            return 0.0;
+        };
+        self.position_for_thumb_top(pointer - offset.clamp(0.0, size))
+    }
+
+    pub(super) fn position_for_track_click(self, pointer: f32) -> f32 {
+        let Some((_, size)) = self.thumb() else {
+            return 0.0;
+        };
+        self.position_for_pointer(pointer, size / 2.0)
+    }
+
+    fn position_for_thumb_top(self, top: f32) -> f32 {
+        let maximum = self.max_scroll();
+        let Some((_, size)) = self.thumb() else {
+            return 0.0;
+        };
+        let travel = (self.track_length - size).max(0.0);
+        if maximum <= 0.0 || travel <= 0.0 {
+            return 0.0;
+        }
+        ((top - self.track_start).clamp(0.0, travel) / travel) * maximum
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Range {
     pub content: i32,
@@ -13,7 +139,7 @@ pub(super) struct Range {
     pub position: i32,
 }
 impl Range {
-    fn maximum(self) -> i32 {
+    pub(super) fn maximum(self) -> i32 {
         self.content.saturating_sub(self.page.max(1)).max(0)
     }
     fn thumb(self, length: i32, dpi: u32) -> (i32, i32) {
@@ -21,7 +147,7 @@ impl Range {
         if self.maximum() == 0 || length == 0 {
             return (0, length);
         }
-        let minimum = (18_i64 * dpi as i64 / 96).max(1);
+        let minimum = (MIN_THUMB_DIP as i64 * dpi as i64 / 96).max(1);
         let size = (length as i64 * self.page.max(0) as i64 / self.content.max(1) as i64)
             .max(minimum)
             .min(length as i64) as i32;
@@ -35,6 +161,11 @@ impl Range {
             return 0;
         }
         (pixel.clamp(0, travel) as i64 * self.maximum() as i64 / travel as i64) as i32
+    }
+
+    fn at_pointer(self, pixel: i32, length: i32, dpi: u32) -> i32 {
+        let thumb = self.thumb(length, dpi).1;
+        self.at(pixel.saturating_sub(thumb / 2), length, dpi)
     }
 }
 
@@ -236,7 +367,7 @@ impl VerticalRail {
                 }
             } else {
                 let mut client = RECT::default();
-                let width = (10. * dpi as f32 / 96.).round().max(1.) as i32;
+                let width = rail_width(dpi);
                 // Prove child layout first. A failed setup leaves native scrolling usable.
                 let ready = GetClientRect(s.owner, &mut client).is_ok()
                     && SetWindowPos(
@@ -458,8 +589,12 @@ impl State {
             {
                 return;
             }
-            self.pending
-                .set(Some(position.clamp(0, self.range.get().maximum())));
+            let position = position.clamp(0, self.range.get().maximum());
+            let current = self.pending.get().unwrap_or(self.range.get().position);
+            if position == current {
+                return;
+            }
+            self.pending.set(Some(position));
             let _ = InvalidateRect(Some(hwnd), None, false);
             let _ = PostMessageW(
                 Some(self.owner),
@@ -514,35 +649,16 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 range.position = state.pending.get().unwrap_or(range.position);
                 let length = state.length(client);
                 let (top, height) = range.thumb(length, state.dpi.get());
-                let width = ((if state.hover.get() || state.drag_offset.get().is_some() {
-                    10.
-                } else {
-                    6.
-                }) * state.dpi.get() as f32
-                    / 96.)
-                    .round()
-                    .max(1.) as i32;
+                let width = thumb_width(
+                    state.dpi.get(),
+                    state.hover.get() || state.drag_offset.get().is_some(),
+                );
                 let cross = if state.horizontal {
                     client.bottom
                 } else {
                     client.right
                 };
                 let left = (cross - width) / 2;
-                let track = if state.horizontal {
-                    RECT {
-                        left: 0,
-                        top: left,
-                        right: length,
-                        bottom: left + width,
-                    }
-                } else {
-                    RECT {
-                        left,
-                        top: 0,
-                        right: left + width,
-                        bottom: length,
-                    }
-                };
                 let thumb = if state.horizontal {
                     RECT {
                         left: top,
@@ -558,7 +674,6 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         bottom: top + height,
                     }
                 };
-                fill(&track, tokens.border);
                 fill(&thumb, tokens.muted);
                 if msg == WM_PAINT {
                     let _ = EndPaint(hwnd, &ps);
@@ -569,7 +684,8 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_LBUTTONDOWN if !state.native.get() && state.range.get().maximum() > 0 => {
                 let mut client = RECT::default();
                 let _ = GetClientRect(hwnd, &mut client);
-                let range = state.range.get();
+                let mut range = state.range.get();
+                range.position = state.pending.get().unwrap_or(range.position);
                 let length = state.length(client);
                 if y >= length {
                     return LRESULT(0);
@@ -582,17 +698,7 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         state.cancel();
                     }
                 } else {
-                    let position = state.pending.get().unwrap_or(range.position);
-                    let page = if state.horizontal {
-                        (range.page / 3 * 2).max(1)
-                    } else {
-                        range.page
-                    };
-                    state.request(if y < top {
-                        position.saturating_sub(page)
-                    } else {
-                        position.saturating_add(page)
-                    });
+                    state.request(range.at_pointer(y, length, state.dpi.get()));
                 }
                 LRESULT(0)
             }
@@ -666,6 +772,42 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 mod tests {
     use super::*;
     const REQUEST: u32 = WM_APP + 319;
+
+    #[test]
+    fn proportional_geometry_preserves_grab_offset_and_clamps_track_clicks() {
+        let geometry = Geometry::new(80.0, 500.0, 2_000.0, 500.0, 675.0, 18.0);
+        let (top, size) = geometry.thumb().unwrap();
+        for fraction in [0.0, 0.5, 0.95] {
+            let pointer = top + size * fraction;
+            let offset = geometry.thumb_offset_at(pointer).unwrap();
+            let unchanged = geometry.position_for_pointer(pointer, offset);
+            assert!((unchanged - 675.0).abs() < 0.01, "{fraction}: {unchanged}");
+
+            let moved = geometry.position_for_pointer(pointer + 25.0, offset);
+            let moved_geometry = Geometry::new(80.0, 500.0, 2_000.0, 500.0, moved, 18.0);
+            let (moved_top, _) = moved_geometry.thumb().unwrap();
+            assert!((moved_top - (top + 25.0)).abs() < 0.01);
+        }
+
+        let click = 250.0;
+        let target = geometry.position_for_track_click(click);
+        let jumped = Geometry::new(80.0, 500.0, 2_000.0, 500.0, target, 18.0);
+        let (jumped_top, jumped_size) = jumped.thumb().unwrap();
+        assert!((jumped_top + jumped_size / 2.0 - click).abs() < 0.01);
+
+        let end = Geometry::new(80.0, 500.0, 2_000.0, 500.0, f32::MAX, 18.0);
+        let (end_top, end_size) = end.thumb().unwrap();
+        assert!((end_top + end_size - 580.0).abs() < 0.01);
+        let small = Geometry::new(80.0, 8.0, 2_000.0, 8.0, 1_000.0, 18.0);
+        assert_eq!(small.thumb(), Some((80.0, 8.0)));
+        assert_eq!(small.position_for_track_click(84.0), 0.0);
+        assert!(
+            Geometry::new(80.0, 500.0, 500.0, 500.0, 0.0, 18.0)
+                .thumb()
+                .is_none()
+        );
+    }
+
     struct Owner {
         rail: RefCell<Option<VerticalRail>>,
         position: Cell<i32>,
@@ -824,6 +966,64 @@ mod tests {
             assert_eq!(rail.take_request(rail.0.token, hwnd), None);
         }
     }
+
+    #[test]
+    fn settings_rail_track_click_maps_to_clicked_position_without_capture() {
+        let fixture = Fixture::new();
+        let rail = &fixture.rail;
+        let hwnd = rail.hwnd();
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(hwnd, &mut client).unwrap();
+            let click = client.bottom * 3 / 4;
+            pointer(hwnd, WM_LBUTTONDOWN, click);
+            let target = rail.0.pending.get().expect("track click request");
+            assert!(target > rail.0.range.get().maximum() / 2);
+            assert_eq!(rail.0.drag_offset.get(), None);
+            assert_ne!(
+                GetCapture(),
+                hwnd,
+                "track click does not begin a thumb drag"
+            );
+            fixture.dispatch_requests();
+        }
+        assert_eq!(fixture.owner.position.get(), rail.0.range.get().position);
+        assert!(fixture.owner.position.get() > rail.0.range.get().maximum() / 2);
+    }
+
+    #[test]
+    fn settings_rail_unchanged_requests_do_not_queue_owner_refreshes() {
+        let fixture = Fixture::new();
+        let rail = &fixture.rail;
+        unsafe {
+            rail.0.request(rail.0.range.get().position);
+            assert!(!rail.has_pending());
+            rail.0.request(1);
+            rail.0.request(1);
+            let mut message = MSG::default();
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(fixture.parent),
+                    REQUEST,
+                    REQUEST,
+                    PM_REMOVE
+                )
+                .as_bool()
+            );
+            assert!(
+                !PeekMessageW(
+                    &mut message,
+                    Some(fixture.parent),
+                    REQUEST,
+                    REQUEST,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            );
+        }
+    }
+
     #[test]
     fn settings_rail_identical_hidden_native_updates_are_idempotent() {
         let fixture = Fixture::new();

@@ -113,6 +113,22 @@ enum ViewSemantic {
 }
 
 fn semantic_for_source(projection: &DisplayProjection, source: &Range<usize>) -> ViewSemantic {
+    // Delimiter views own their physical EOL too. Parser block ranges can end
+    // before that EOL; use the recognized delimiter's owner rather than pulling
+    // a following paragraph into the literal background.
+    if let Some(line) = projection.source_delimiter_line_at(source.start)
+        && source.start == line.start
+        && source.end <= line.end
+        && projection.blocks.iter().any(|block| {
+            matches!(
+                block.kind,
+                BlockKind::Code { fenced: true, .. } | BlockKind::FrontMatter
+            ) && block.source.start < line.end
+                && line.start < block.source.end
+        })
+    {
+        return ViewSemantic::Code;
+    }
     let end = projection
         .blocks
         .partition_point(|block| block.source.start <= source.start);
@@ -605,6 +621,39 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognized_delimiter_physical_rows_keep_literal_background_only_within_block() {
+        for eol in ["\n", "\r\n"] {
+            for (opening, closing) in [("```rust", "```"), ("~~~~", "~~~~"), ("---", "---")] {
+                for ending in ["", eol] {
+                    let source = format!("{opening}{eol}body{eol}{closing}{ending}");
+                    let projection = DisplayProjection::parse(&source);
+                    let start = opening.len() + eol.len() + 4 + eol.len();
+                    let line = projection.source_delimiter_line_at(start).unwrap();
+                    assert_eq!(semantic_for_source(&projection, &line), ViewSemantic::Code);
+                    assert_eq!(
+                        semantic_for_source(&projection, &(start..start)),
+                        ViewSemantic::Code
+                    );
+                    if !ending.is_empty() {
+                        let followed = format!("{source}plain paragraph{eol}");
+                        let projection = DisplayProjection::parse(&followed);
+                        assert_eq!(
+                            semantic_for_source(&projection, &(source.len()..followed.len())),
+                            ViewSemantic::Plain
+                        );
+                    }
+                }
+            }
+        }
+        let source = "text\n---\n\nparagraph\n";
+        let projection = DisplayProjection::parse(source);
+        assert_ne!(
+            semantic_for_source(&projection, &(5..9)),
+            ViewSemantic::Code
+        );
+    }
 
     #[test]
     fn eol_summary_counts_lf_crlf_and_cr_without_materializing_source() {

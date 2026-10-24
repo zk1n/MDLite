@@ -1,17 +1,20 @@
 //! Canonical Markdown editing core for the native MDLite editor.
 pub mod assets;
 pub mod calendar;
+pub mod code_fence;
 pub mod coordinates;
 pub mod document;
 pub mod git;
 pub mod image_reference;
 pub mod instance;
+pub mod link_preview;
 pub mod markdown;
 pub mod navigation;
 pub mod panel;
 pub mod process;
 pub mod profiles;
 pub mod projection;
+pub mod properties;
 pub mod recovery;
 pub mod replace;
 pub mod search;

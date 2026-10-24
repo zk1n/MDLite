@@ -106,6 +106,99 @@ unsafe fn native_bar(hwnd: HWND, horizontal: bool) -> Option<SCROLLBARINFO> {
     }
 }
 
+fn track_click_position(
+    info: SCROLLINFO,
+    length: i32,
+    thumb_start: i32,
+    thumb_end: i32,
+    pointer: i32,
+) -> Option<i32> {
+    let page = info.nPage.saturating_sub(1).min(i32::MAX as u32) as i32;
+    let minimum = info.nMin;
+    let maximum = info.nMax.saturating_sub(page).max(minimum);
+    let thumb = thumb_end.saturating_sub(thumb_start).max(0);
+    let travel = length.saturating_sub(thumb).max(0);
+    if maximum <= minimum || travel == 0 {
+        return None;
+    }
+    let top = pointer.saturating_sub(thumb / 2).clamp(0, travel) as i64;
+    let range = i64::from(maximum) - i64::from(minimum);
+    let position = i64::from(minimum) + top * range / i64::from(travel);
+    Some(position.clamp(i64::from(minimum), i64::from(maximum)) as i32)
+}
+
+fn horizontal_char_delta(pixel_delta: i32, average_char_width: i32) -> i32 {
+    let width = i64::from(average_char_width.max(1));
+    let delta = i64::from(pixel_delta);
+    let rounded = if delta >= 0 {
+        delta + width / 2
+    } else {
+        delta - width / 2
+    };
+    (rounded / width).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+unsafe fn scroll_to_track_point(hwnd: HWND, horizontal: bool, screen_coordinate: i32) -> bool {
+    unsafe {
+        let Some(bar) = native_bar(hwnd, horizontal) else {
+            return false;
+        };
+        let (axis, start, length) = if horizontal {
+            (
+                SB_HORZ,
+                bar.rcScrollBar.left,
+                bar.rcScrollBar.right - bar.rcScrollBar.left,
+            )
+        } else {
+            (
+                SB_VERT,
+                bar.rcScrollBar.top,
+                bar.rcScrollBar.bottom - bar.rcScrollBar.top,
+            )
+        };
+        let mut info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            ..Default::default()
+        };
+        if GetScrollInfo(hwnd, axis, &mut info).is_err() {
+            return false;
+        }
+        let Some(target) = track_click_position(
+            info,
+            length,
+            bar.xyThumbTop,
+            bar.xyThumbBottom,
+            screen_coordinate - start,
+        ) else {
+            return false;
+        };
+        let delta = target.saturating_sub(info.nPos);
+        if delta != 0 {
+            if horizontal {
+                let characters =
+                    horizontal_char_delta(delta, super::control_scroll::horizontal_unit(hwnd));
+                if characters != 0 {
+                    SendMessageW(
+                        hwnd,
+                        EM_LINESCROLL,
+                        Some(WPARAM(characters as isize as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+            } else {
+                SendMessageW(
+                    hwnd,
+                    EM_LINESCROLL,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(delta as isize)),
+                );
+            }
+        }
+        true
+    }
+}
+
 /// Attach only to an owned native multiline EDIT. Parent, ID, style, format rect,
 /// selection and history remain native. Attach failure attempts native restoration;
 /// a failed restoration is reported separately rather than claiming usable fallback.
@@ -559,25 +652,16 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 FillRect(dc, &client, background);
                 let _ = DeleteObject(background.into());
                 if let Some(bar) = native_bar(state.hwnd, rail.horizontal) {
-                    let thickness = ((if rail.hover.get() || GetCapture() == state.hwnd {
-                        10.
-                    } else {
-                        6.
-                    }) * GetDpiForWindow(hwnd).max(1) as f32
-                        / 96.)
-                        .round()
-                        .max(1.) as i32;
+                    let thickness = scrollbar_style::thumb_width(
+                        GetDpiForWindow(hwnd).max(1),
+                        rail.hover.get() || GetCapture() == state.hwnd,
+                    );
                     let cross = if rail.horizontal {
                         client.bottom
                     } else {
                         client.right
                     };
                     let start = (cross - thickness) / 2;
-                    let length = if rail.horizontal {
-                        client.right
-                    } else {
-                        client.bottom
-                    };
                     let rect = |a, b| {
                         if rail.horizontal {
                             RECT {
@@ -595,14 +679,10 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             }
                         }
                     };
-                    for (r, color) in [
-                        (rect(0, length), tokens.border),
-                        (rect(bar.xyThumbTop, bar.xyThumbBottom), tokens.muted),
-                    ] {
-                        let brush = CreateSolidBrush(shell::rgb(color));
-                        FillRect(dc, &r, brush);
-                        let _ = DeleteObject(brush.into());
-                    }
+                    let thumb = rect(bar.xyThumbTop, bar.xyThumbBottom);
+                    let brush = CreateSolidBrush(shell::rgb(tokens.muted));
+                    FillRect(dc, &thumb, brush);
+                    let _ = DeleteObject(brush.into());
                 }
                 let _ = EndPaint(hwnd, &paint);
                 LRESULT(0)
@@ -629,6 +709,20 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             && point.y < bar.rcScrollBar.bottom
                     })
                 {
+                    let Some(bar) = native_bar(state.hwnd, rail.horizontal) else {
+                        return LRESULT(0);
+                    };
+                    let (coordinate, start) = if rail.horizontal {
+                        (point.x, bar.rcScrollBar.left)
+                    } else {
+                        (point.y, bar.rcScrollBar.top)
+                    };
+                    if coordinate < start + bar.xyThumbTop
+                        || coordinate >= start + bar.xyThumbBottom
+                    {
+                        let _ = scroll_to_track_point(state.hwnd, rail.horizontal, coordinate);
+                        return LRESULT(0);
+                    }
                     let packed = ((point.y as u16 as u32) << 16) | point.x as u16 as u32;
                     SendMessageW(
                         state.hwnd,
@@ -644,20 +738,22 @@ unsafe extern "system" fn rail_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                rail.hover.set(true);
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    ..Default::default()
-                };
-                let _ = TrackMouseEvent(&mut track);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                if !rail.hover.replace(true) {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        ..Default::default()
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                rail.hover.set(false);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                if rail.hover.replace(false) {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_CANCELMODE => {
@@ -1088,6 +1184,151 @@ mod tests {
             moved.client,
             excluded.len()
         );
+    }
+
+    #[test]
+    fn edit_track_click_maps_both_native_axes_without_changing_text_state() {
+        let pair = Pair::new();
+        let before = semantics(pair.clipped);
+        unsafe {
+            for (horizontal, axis) in [(false, SB_VERT), (true, SB_HORZ)] {
+                let prior = scroll(pair.clipped, axis).unwrap();
+                let bar = native_bar(pair.clipped, horizontal).unwrap();
+                let (start, end, click) = if horizontal {
+                    let start = bar.rcScrollBar.left;
+                    let end = bar.rcScrollBar.right;
+                    (start, end, start + (end - start) * 3 / 4)
+                } else {
+                    let start = bar.rcScrollBar.top;
+                    let end = bar.rcScrollBar.bottom;
+                    (start, end, start + (end - start) * 3 / 4)
+                };
+                assert!(scroll_to_track_point(pair.clipped, horizontal, click));
+                let current = scroll(pair.clipped, axis).unwrap();
+                assert!(
+                    current[3] > prior[3] + prior[2] / 2,
+                    "track click should move toward its clicked position: {horizontal} {start}..{end} {prior:?} -> {current:?}"
+                );
+            }
+        }
+        let after = semantics(pair.clipped);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.selection, before.selection);
+        assert_eq!(after.undo, before.undo);
+    }
+
+    #[test]
+    fn edit_track_click_target_is_centered_and_clamped_to_native_range() {
+        let info = SCROLLINFO {
+            nMin: 2,
+            nMax: 20_001,
+            nPage: 500,
+            nPos: 2,
+            ..Default::default()
+        };
+        assert_eq!(track_click_position(info, 500, 0, 18, 0), Some(2));
+        assert_eq!(track_click_position(info, 500, 0, 18, 499), Some(19_502));
+        assert_eq!(track_click_position(info, 8, 0, 18, 4), None);
+        assert_eq!(
+            track_click_position(
+                SCROLLINFO {
+                    nMax: 501,
+                    nPage: 500,
+                    ..info
+                },
+                500,
+                0,
+                18,
+                250,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_horizontal_track_click_translates_native_pixels_to_character_columns() {
+        let pair = Pair::new();
+        unsafe {
+            let initial = scroll(pair.clipped, SB_HORZ).unwrap();
+            let last = initial[1] - initial[2] + 1;
+            assert!(last > i64::from(u16::MAX), "wide native range: {initial:?}");
+
+            SendMessageW(
+                pair.clipped,
+                EM_LINESCROLL,
+                Some(WPARAM(800)),
+                Some(LPARAM(0)),
+            );
+            let start = scroll(pair.clipped, SB_HORZ).unwrap();
+            assert!(
+                start[3] > i64::from(u16::MAX),
+                "nonzero large start: {start:?}"
+            );
+            let start_semantics = semantics(pair.clipped);
+
+            SendMessageW(
+                pair.clipped,
+                EM_LINESCROLL,
+                Some(WPARAM(1)),
+                Some(LPARAM(0)),
+            );
+            let advanced = scroll(pair.clipped, SB_HORZ).unwrap();
+            let character_step = advanced[3] - start[3];
+            assert!(character_step > 0);
+            SendMessageW(
+                pair.clipped,
+                EM_LINESCROLL,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(0)),
+            );
+            assert_eq!(scroll(pair.clipped, SB_HORZ).unwrap()[3], start[3]);
+            assert_eq!(
+                super::super::control_scroll::horizontal_unit(pair.clipped),
+                character_step as i32,
+                "font-derived character unit must match native EDIT movement"
+            );
+
+            let bar = native_bar(pair.clipped, true).unwrap();
+            let track_start = bar.rcScrollBar.left;
+            let track_length = bar.rcScrollBar.right - track_start;
+            let thumb_length = bar.xyThumbBottom - bar.xyThumbTop;
+            let travel = track_length - thumb_length;
+            let click = track_start + track_length * 3 / 4;
+            let thumb_top = (click - track_start - thumb_length / 2).clamp(0, travel);
+            let target =
+                initial[0] + i64::from(thumb_top) * (last - initial[0]) / i64::from(travel);
+            assert!(target > start[3] && target < last);
+
+            assert!(scroll_to_track_point(pair.clipped, true, click));
+            let actual = scroll(pair.clipped, SB_HORZ).unwrap()[3];
+            assert!(
+                (actual - target).abs() <= character_step,
+                "horizontal track target={target} actual={actual} char_step={character_step} start={}",
+                start[3]
+            );
+            assert!(actual < last, "track click must not clamp to the far end");
+
+            let bar = native_bar(pair.clipped, true).unwrap();
+            let click_back = bar.rcScrollBar.left + track_length / 4;
+            let thumb_length = bar.xyThumbBottom - bar.xyThumbTop;
+            let thumb_top = (click_back - bar.rcScrollBar.left - thumb_length / 2)
+                .clamp(0, track_length - thumb_length);
+            let target_back =
+                initial[0] + i64::from(thumb_top) * (last - initial[0]) / i64::from(travel);
+            assert!(target_back < actual && target_back > initial[0]);
+            assert!(scroll_to_track_point(pair.clipped, true, click_back));
+            let actual_back = scroll(pair.clipped, SB_HORZ).unwrap()[3];
+            assert!(
+                (actual_back - target_back).abs() <= character_step,
+                "backward track target={target_back} actual={actual_back} char_step={character_step}"
+            );
+            assert!(actual_back < actual && actual_back > initial[0]);
+
+            let end_semantics = semantics(pair.clipped);
+            assert_eq!(end_semantics.text, start_semantics.text);
+            assert_eq!(end_semantics.selection, start_semantics.selection);
+            assert_eq!(end_semantics.undo, start_semantics.undo);
+        }
     }
 
     #[test]

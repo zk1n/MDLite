@@ -1,5 +1,42 @@
 # Rust UI・周辺機能の実装記録
 
+## 2026年10月23–24日・UIとプロパティ編集（scoped確認済み、全体受入 pending）
+
+通常のFront Matter編集は、raw行のみという旧契約から専用のkey/value領域へ変更する。
+永続正本はDocument/cropのMarkdown、履歴も既存DocumentのUndo/Redoを使う。
+ローカルリンクの抜粋／画像preview、コード言語の選択、実表示に基づくpanel icon、
+区切り行の背景所属、scroll geometryとnative railの統一を今回の対象とする。
+この節の実装記述は、実画面・実IME・Human受入やdevelop配送の完了宣言ではない。
+最終結果は[受入記録](rust-acceptance.md)へ対応付ける。
+
+既存UIの見直し範囲と判断は次のとおり。
+最終Release候補ではPanelMove 162のkeyboard/hover helpを実画像で確認した。A–G/Rのpinと未確認範囲は[受入記録](rust-acceptance.md)に対応付ける。これは全UI suiteのPASSではない。
+
+| 対象 | 修正・維持と理由 |
+|---|---|
+| 上部操作・menu | 主要操作名とiconを維持。重複するenabled-label helpは省き、meaningful helpとdisabled reasonは保持する。keyboardとpointerから同じ補足を確認できる。 |
+| Palette | queryと候補の配置を維持。有効な操作名と無効理由は必要情報として残す。 |
+| Explorer | Workspace選択と対象名を維持。未設定状態の入口を消さない。 |
+| Search | query／scope／filterと結果状態を維持。設定対象と検索未完了を隠さない。 |
+| Calendar | 日付セルの「祝」を外し、祝日名は選択後の詳細へ。曜日と日付を拡大し、Daily印を数字と分離する。 |
+| Outline | 見出しの階層と選択を維持。繰り返し説明や新しいheaderを追加しない。 |
+| Git | 操作名、対象、Trust、Busy、失敗と危険操作の警告を維持。実tooltip登録のABIを修正する。 |
+| 設定 | 無選択時の一般的な操作説明を除去。focus中の項目説明、適用元・有効値・対象・下書きを維持する。 |
+| Status | 項目別の配置を維持。hoverリンクの常設操作説明の重複を除き、previewに内容を表示する。 |
+| プロパティ・code・preview | keyと値を整列し、code言語を独立した小さな行に置く。fallback理由と編集入口は対象箇所に残す。 |
+
+既存scrollbarの棚卸しと接続範囲は次のとおり。表示を揃えても各controlのrange単位を維持する。
+
+| 実在する面 | 表示と位置の接続 |
+|---|---|
+| Editor・Settings form | 共通geometryを使うD2D／所有rail。Editorのgrab offsetとtrack位置を同じ計算へ揃える。 |
+| Explorer・Quick Open・Search結果・Git一覧等の固定高ListBox | 所有する細いVerticalRail。件数・行高・client高とLB_GETTOPINDEXから位置を読み、LB_SETTOPINDEXへ接続。Explorerには横railもある。 |
+| Settings・Git等のdropdown ComboBox | ComboLBox popupへ同じadapterを接続する。 |
+| Properties複数行・Search入力・Git summary/diff・Diagnostics等のmultiline EDIT | native range/通知を保持して所有railを重ねる。横のpixel位置とEM_LINESCROLLの平均文字幅による単位を区別する。 |
+
+OutlineとCalendarのprofile一覧はD2D内部scrollで、既存の表示thumb/trackはない。
+製品はTreeView/ListViewを生成しておらず、OS所有のファイルダイアログは対象外とする。
+
 ## 2026年10月22日・Live編集と描画負荷（今回範囲のMachine確認済み）
 
 今回のLive編集契約は[Editor操作](editor-operations.md)に従う。

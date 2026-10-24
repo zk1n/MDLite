@@ -40,7 +40,13 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::{Direct2D::*, DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP, Gdi::MapWindowPoints},
+        Graphics::{
+            Direct2D::*,
+            DirectWrite::{
+                DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
+            },
+            Gdi::MapWindowPoints,
+        },
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
         UI::{
             Controls::{
@@ -75,13 +81,13 @@ const BUTTON_NOTIFY: u32 = 0x00000400;
 const CALENDAR_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_GRID_TOP: f32 = 72.0;
 const CALENDAR_COMPACT_HEIGHT: f32 = 273.0;
-const CALENDAR_MIN_BODY_HEIGHT: f32 = 180.0;
+const CALENDAR_MIN_BODY_HEIGHT: f32 = 234.0;
 const CALENDAR_WEEK_STEP: f32 = 23.0;
 const CALENDAR_LIST_GAP: f32 = 6.0;
 const CALENDAR_STATUS_HEIGHT: f32 = 17.0;
 const CALENDAR_ROW_HEIGHT: f32 = 18.0;
 const CALENDAR_CELL_INSET: f32 = 2.0;
-const CALENDAR_DAY_FONT_SIZE: f32 = 9.0;
+const CALENDAR_DAY_FONT_SIZE: f32 = 14.0;
 const PROFILE_BUTTON_FOOTER: f32 = 34.0;
 const PROFILE_LIST_TOP: f32 = 26.0;
 const OUTLINE_ROW_HEIGHT: f32 = 22.0;
@@ -320,14 +326,6 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     })
 }
 
-fn calendar_day_label(day: i32, daily_file: bool, holiday: bool) -> String {
-    format!(
-        "{day}{}{}",
-        if daily_file { "•" } else { "" },
-        if holiday { "祝" } else { "" }
-    )
-}
-
 fn calendar_cell_color(tokens: shell::Tokens, cell: &CalendarCell) -> super::D2D1_COLOR_F {
     if tokens.high_contrast && (cell.marks.selected || cell.marks.focused) {
         let rgb = unsafe {
@@ -384,14 +382,7 @@ fn calendar_layout(body_height: f32) -> CalendarLayout {
     } else {
         CALENDAR_GRID_TOP
     };
-    let full_grid_height = 6.0 * CALENDAR_WEEK_STEP;
-    let status_height = if body_height
-        >= grid_top
-            + full_grid_height
-            + CALENDAR_LIST_GAP
-            + CALENDAR_STATUS_HEIGHT
-            + CALENDAR_ROW_HEIGHT
-    {
+    let status_height = if body_height >= CALENDAR_MIN_BODY_HEIGHT {
         CALENDAR_STATUS_HEIGHT
     } else {
         0.0
@@ -698,6 +689,11 @@ const PROFILE_BUTTONS: [usize; 6] = [4080, 4081, 4082, 4083, 4084, 4088];
 const FORM_BUTTONS: [usize; 3] = [4085, 4086, 4087];
 
 impl FeaturePanes {
+    pub(super) fn preview_workspace_root(&self) -> Option<PathBuf> {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+    }
     pub(super) fn explorer_paint_handle(&self) -> ExplorerPaintSlot {
         Rc::clone(&self.explorer_paint)
     }
@@ -1922,20 +1918,29 @@ impl FeaturePanes {
             .iter()
             .enumerate()
         {
-            draw_feature_text(
-                app,
-                target,
-                label,
-                x0 + column as f32 * width,
-                body.y + (layout.grid_top - 18.0).max(0.0),
-                width,
-                11.,
-                match column {
-                    0 => &red,
-                    6 => &blue,
-                    _ => muted,
-                },
-            )?;
+            unsafe {
+                let heading = app.ui_text_layout(label, width, 13.)?;
+                heading.SetFontWeight(
+                    DWRITE_FONT_WEIGHT_BOLD,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: 0,
+                        length: label.encode_utf16().count() as u32,
+                    },
+                )?;
+                target.DrawTextLayout(
+                    super::point(
+                        x0 + column as f32 * width,
+                        body.y + (layout.grid_top - 21.0).max(0.0),
+                    ),
+                    &heading,
+                    match column {
+                        0 => &red,
+                        6 => &blue,
+                        _ => muted,
+                    },
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
         }
         for (index, cell) in cells.iter().enumerate() {
             let row = index / 7;
@@ -1966,7 +1971,7 @@ impl FeaturePanes {
                 }
             }
             if let Some(date) = cell.date {
-                let label = calendar_day_label(date.day, cell.marks.daily_file, cell.marks.holiday);
+                let label = date.day.to_string();
                 let ink = calendar_cell_color(tokens, cell);
                 let brush = unsafe { target.CreateSolidColorBrush(&ink, None)? };
                 draw_feature_text_single_line(
@@ -1977,11 +1982,45 @@ impl FeaturePanes {
                     calendar_day_font_size(&label, bounds.label.width),
                     &brush,
                 )?;
+                if cell.marks.daily_file {
+                    unsafe {
+                        target.FillEllipse(
+                            &D2D1_ELLIPSE {
+                                point: super::point(
+                                    bounds.cell.x + bounds.cell.width - 3.,
+                                    bounds.cell.y + bounds.cell.height - 3.,
+                                ),
+                                radiusX: 1.5,
+                                radiusY: 1.5,
+                            },
+                            accent,
+                        );
+                    }
+                }
             }
         }
         let list_y = body.y + layout.list_top;
+        if self.calendar.listing.is_none()
+            && layout.status_height > 0.
+            && let Some(date) = self.calendar.interaction.selected()
+            && let HolidayStatus::Holiday(name) = self.calendar.holidays.status(date)
+        {
+            draw_feature_text_single_line(
+                app,
+                target,
+                name,
+                Rect {
+                    x: body.x + 8.,
+                    y: list_y,
+                    width: body.width - 16.,
+                    height: layout.status_height,
+                },
+                11.,
+                muted,
+            )?;
+        }
         if let Some(result) = &self.calendar.listing {
-            let status = match result.state {
+            let mut status = match result.state {
                 CalendarListState::Reading => "一覧を読み込み中…".to_owned(),
                 CalendarListState::Zero => "この日のファイルはありません".to_owned(),
                 CalendarListState::Ready => format!("この日: {} 件", result.files.len()),
@@ -1991,6 +2030,11 @@ impl FeaturePanes {
                     .unwrap_or_else(|| "一覧を取得できません".to_owned()),
                 CalendarListState::Cancelled => "一覧の取得を中止しました".to_owned(),
             };
+            if let Some(date) = self.calendar.interaction.selected()
+                && let HolidayStatus::Holiday(name) = self.calendar.holidays.status(date)
+            {
+                status = format!("{name} · {status}");
+            }
             if layout.status_height > 0.0 {
                 draw_feature_text_single_line(
                     app,
@@ -5377,6 +5421,7 @@ impl App {
 
     pub(super) fn feature_ime_active(&self) -> bool {
         self.composing
+            || self.properties_composing()
             || self.shell.control_composing()
             || self.features_control_composing()
             || self.search_control_composing()
@@ -6396,7 +6441,7 @@ mod tests {
         }
         assert_eq!(calendar_layout(270.0).grid_top, CALENDAR_COMPACT_GRID_TOP);
         assert_eq!(calendar_layout(270.0).visible_rows, 2);
-        assert_eq!(calendar_layout(250.0).status_height, 0.0);
+        assert_eq!(calendar_layout(250.0).status_height, CALENDAR_STATUS_HEIGHT);
         assert_eq!(calendar_layout(273.0).grid_top, CALENDAR_GRID_TOP);
         let default = calendar_layout(320.0);
         assert_eq!(default.visible_rows, 4);
@@ -6405,11 +6450,7 @@ mod tests {
     }
 
     #[test]
-    fn calendar_day_labels_keep_both_markers_on_one_bounded_line() {
-        assert_eq!(calendar_day_label(31, true, true), "31•祝");
-        assert_eq!(calendar_day_label(31, true, false), "31•");
-        assert_eq!(calendar_day_label(31, false, true), "31祝");
-
+    fn calendar_cell_bounds_reserve_legible_day_labels() {
         for body in [
             Rect {
                 x: 13.0,
@@ -6445,9 +6486,11 @@ mod tests {
                 assert!(bounds.label.y >= bounds.cell.y);
                 assert!(bounds.label.x + bounds.label.width <= bounds.cell.x + bounds.cell.width);
                 assert!(bounds.label.y + bounds.label.height <= bounds.cell.y + bounds.cell.height);
-                let size = calendar_day_font_size("31•祝", bounds.label.width);
+                let size = calendar_day_font_size("31", bounds.label.width);
                 assert!(size > 0.0 && size <= CALENDAR_DAY_FONT_SIZE);
-                assert!(size < bounds.cell.height);
+                if body.height >= CALENDAR_MIN_BODY_HEIGHT {
+                    assert!(size < bounds.cell.height);
+                }
             }
         }
     }

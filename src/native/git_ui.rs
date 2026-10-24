@@ -599,7 +599,7 @@ impl App {
                     };
                     tooltip_text.push(wide(label));
                     let mut tool = TTTOOLINFOW {
-                        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                        cbSize: shell::TOOLTIP_INFO_SIZE,
                         uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                         hwnd: self.shell.main_window,
                         uId: child.0 as usize,

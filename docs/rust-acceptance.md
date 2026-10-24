@@ -1,5 +1,124 @@
 # Rust Editor受入記録
 
+## 2026年10月24日・最終候補の対象確認（全体受入 pending）
+
+Task `20261023-mdlite-ui-properties-scroll-polish` Rev1の最終候補pin:
+
+| 要素 | SHA-256 |
+|---|---|
+| Release EXE (`target/ui-properties-a-fix/target/release/mdlite.exe`) | `494cd6c9ca7857661630cba576aed7c903353c74def6d9da38684a5af16b0280` |
+| Builder aggregate | `a560b8b1d0b80b7837ff2326bcdb29d3c77c1960e4952e4ea87b02bb3303306e` |
+| GUI source aggregate | `dc887ba29f2ad548c7f56f21def89109793411de202366e1ab94533c88c30ad0` |
+| Acceptance harness | `4b11b56b6dcc9d5cab55cdc189b09a079ce3011225c41a7e6fe4f593ae5cd2e5` |
+| Final A private runner | `ae263f44325ea48e58f7cd1015626ecde3f8466aed2728b517754454685cf10d` |
+
+Rust fmt、global check、strict Clippy、registered Release buildはこの候補でPASSした。
+これらは全UI suiteやHuman受入のPASSを意味しない。
+独立correctness reviewは最終候補をCLEARとし、product must-fixなしと判断した。
+Final Aのprivate runner hashとtracked acceptance harness hashは別identityである。
+過去のreceiptへcurrent harness hashを遡及して割り当てない。
+
+- Aの最終native fixtureではkeyboard selectionとpointer hoverの両方からmeaningful PanelMove 162 helpを確認した。`TTN_SHOW`のcustom-position結果は1で、tooltipはmenu stackと重ならずwork area内に収まった。source/layout/history/focusと保護disk fixtureは不変で、processはexit 0で終了した。これはこの合成fixtureのkeyboard/hover経路だけを確認する。
+- 別のread-only既知synthetic fixtureでnative Ctrl+V pasteとUndo/Redoのsource、control、disk不変条件を確認した。元のOS clipboard内容や復元状態は主張しない。
+
+### A–G/R adoption matrix
+
+これは要求ごとの採用範囲と未確認境界を示す。B–Gの以前のreceiptは最終diffで影響を受けない経路に限って引き継ぎ、全体suite PASSへ拡張しない。
+
+| ID | 最終候補で採用する実装・確認 | 未確認・残余境界 |
+|---|---|---|
+| A | 重複説明を省き、警告・無効理由・meaningful helpを保持。最終keyboard/hover画像と通常終了で`TTN_SHOW`の実寸配置を確認。 | 選択したPanelMove 162経路。全tooltip組合せは未確認。 |
+| B | 実geometry/drawerに基づくicon状態、変更childだけのinvalidate。4状態、empty right、保存意図/所属、左右移動、狭幅drawerを確認。 | 他端末の主観的表示差は未確認。 |
+| C1 | code/YAMLの物理終端行をblock内に所有。LF/CRLF、区切り解除/再入力/Undo、pointer/keyboard、短いCRLF終端を確認。 | zero-extent Ctrl+End viewと実終端行を区別する。全YAML行列ではない。 |
+| C2 | 専用header/native menu、既知/未知/未指定、取消/同値/Source往復/履歴、狭幅を確認。 | 追加info付き言語削除は理由付き無効。全言語組合せは未確認。 |
+| D1 | native EDITのkey/value/list、追加削除・型変更、title/source/URL/date/author/tags/description、Tab/Esc/複数行、代表ATOK、read-only既知fixtureのCtrl+Vを確認。 | 物理手入力、preedit/candidate pixels、別IMEは未確認。clipboard復旧とは別。 |
+| D2 | 範囲限定transaction、comment/unknown/order/EOL/body保全、UndoRedo/Source/save-reopen、stale/invalid/complex fallbackを確認。 | YAML全仕様GUIではない。未対応構造は明示Source入口へ案内。 |
+| E | bounded worker/cacheと未保存snapshot。local note/fragment/image、missing/outside/URL no-fetch、Esc後のstationary抑止とmotion再hoverを確認。 | 未試験preview内容・外部取得は未実施。 |
+| F | quote 3.5DIP、measured gutter gap、3桁番号/表/画像位置、calendar日付/曜日/祝なし/Daily印を対象画像・操作で確認。 | 全Calendar経路と他DPIは未確認。 |
+| G | common geometry/grab offset、track/clamp/capture終了/native range。Editor press/drag/track/end/loss/resizeとQuickOpen ListBox scrollを確認。 | Outline/Calendarに表示thumbなし。全native-control scrollと体感performanceは未確認。 |
+| R | 影響範囲のregression/targeted tests、fmt/check/strict Clippy/registered Release buildを確認。 | Monolithic full-suite PASS、physical input、Human受入、Git配送とは別。 |
+
+Human受入、physical keyboard/typematic、別IME、別DPI/monitor、全UI suiteは未確認。OS clipboard original content/restorationも未確認のまま別扱いとする。これはTask全体の完了ではなく、Git統合・配送は別の配送記録で管理する。過去の失敗候補は下の歴史記録として保持し、現在候補の一括PASSへ読み替えない。
+
+## Historical checkpoint: UI・プロパティ編集改善（2026年10月23日 JST、最終候補前）
+
+Task `20261023-mdlite-ui-properties-scroll-polish` Rev1。開始developは
+`0c1d0c2bf45cb4ad30292f1c456562daead436f1`。過去の節は当時の履歴として保持する。
+以下はde083候補時点の記録であり、現在のRelease pinとA結果は上の最終候補節を参照する。
+当時もtask branch上の候補で、develop統合・Git配送・Human受入は完了していなかった。
+
+### 当時の候補と機械確認
+
+- Rust 1.99.1、Release。source aggregate `001bbb7e3cce46d0926dafc145d79868f7545a3623cb84c2736da45c31bc5197`。
+- EXE `D:/codex_work/MDLite/target/ui-properties-reviewed/target/release/mdlite.exe`、SHA-256 `de083444469e87e22f42f2f8c636536756934089fc15d2d281e442e7dc969688`。
+- 通常の`target/release/mdlite.exe`は過去taskの起動中processが使用しているため保持した。
+  通常F5のDebug/Release設定はそれぞれ従来のtargetへ向き、この候補へ自動では切り替わらない。
+- Release native試験は345成功、0失敗、11明示GUI専用ignored。Release all-target strict Clippyとfmt確認成功。
+- Release lib生結果は181成功・1失敗。未変更のprocess fixtureでready event後のstdout marker確認が失敗し、
+  同じRelease・同じoracleのexact隔離試験は成功した。元commandを全面PASSへ書き換えない。
+- properties core15、local preview core13、code language core3の対象確認を採用する。
+  最後のD入力継続修正はnative property15と関連12件（計27件）、strict Clippy、整形確認が成功した。
+  続くRelease起動で発見した空tab時のアクセスを修正し、起動3件・property16件が成功した。
+  失敗候補`b7b44a24…`と起動panicの原記録は別に保持する。
+  frameや見た目・実IMEの確認とは別である。build receiptの`test/fmt/clippy=NOT_RUN`はそのbuild呼出し内の有無で、別logの結果を表さない。
+
+### 当時の契約と受入範囲
+
+| ID | 当時の実装・機械確認 | 当時の候補での実操作・実画面 |
+|---|---|---|
+| A | UI見直し一覧、不要な常設説明整理、必要な状態と理由保持、tooltip登録ABI修正 | 受入中 |
+| B | 表示領域geometryとdrawerに基づくicon状態。保存意図・所属・幅とは分離 | 4状態の領域・保存配置と狭幅を観測。ボタンの古いON線が残る必須修正を実画像で発見し、修正中 |
+| C1 | 認識済み区切りの物理行所有と背景。LF/CRLF・入力/Undo/再入力・原文位置の対象試験 | コード終端のSource/Live caret・pointerと背景を確認。再入力の履歴、YAML等は受入中 |
+| C2 | 別header行の言語menu、原文のtoken限定transaction、既知/未知/未指定と履歴 | `982cb322…`の対象実操作・header/menu画像を確認。最後のD変更とは影響範囲を分けて採用 |
+| D | source範囲を持つtyped投影、native EDIT一時入力、IME/保存/切替guard、Document履歴、fallback | `801058ce…`の起動・key変更/Tab・title確定・次文字のnative欄内保持・Escを確認。残項目は受入中 |
+| E | bounded worker/cache、local文書/fragment/未保存snapshot/画像、Unicodeとroot/ancestor junctionの拒否試験 | 受入中 |
+| F | 引用線3.5 DIP、本文font計測の追加gutter間隔、拡大日付と太字曜日、祝日詳細、別位置のDaily印 | 引用・表・画像・3桁gutterとCalendarの実画像、単/二重clickを確認。Dailyからの復帰は受入中 |
+| G | 共通geometry、grab offset、track/capture/cancel、native range、横EDITのpixel/column変換 | Editorの押下・drag・track・端・capture loss・resize・短文を実操作で確認。native controlは受入中 |
+| R | 現在sourceに対する上記Release regressionと対象試験。source/dirty/保存/Undoの保持 | 受入中 |
+
+追加infoのあるcodeから言語だけを消すと、残りの先頭tokenが言語へ変わる。
+この組合せの「未指定」は理由付きで無効にし、原文編集へ案内する。追加infoを削除したり空labelだけを保持したりしない。
+追加infoのない通常の言語削除は対応する。
+
+当時の独立Sol High reviewerはread-onlyでtransaction、range、Trust、capture/単位、assertionを確認した。
+indentless YAML listの所有、Unicode path、root/ancestor reparse、横EDIT単位を修正し、対象確認を行った。
+実画面で見つかった通常property focus時のraw YAML重複は、form所有範囲をcaret fallbackから除いて修正した。
+修正前失敗・修正後成功の同一対象試験とLF/CRLF/Source確認を保持する。Ponytail自己点検とは別のreviewである。
+native EDITで表現できないdecoded control文字は、完全な対象範囲を原文fallbackへ戻す。
+Enter/Esc/保存後の親windowへの入力落下は、文書に結び付けた欄の所有とpristine再開で修正した。
+当時の独立reviewは、その候補の修正とclipboard helper範囲を再確認し、別のPonytail complexity reviewも指摘なしだった。
+この候補限定評価は現在のOS clipboard original-content recovery/restoreの安全性証明ではない。
+
+### 当時の実画面採取状態
+
+旧候補`33fbe39e…`ではkey変更・Tab・保持値の正常Enter確定と保存を限定確認したが、
+raw重複修正後の本候補のGUI合格へ読み替えない。失敗したharnessの原記録は保持する。
+旧候補のcaseはpaint admissionで停止した。原記録は保持し、A〜G/Rの完了へ読み替えない。
+診断messageがMainを更新することと、ATOKの所有浮動paletteがYAML入口へ重なることをread-onlyで確認した。
+paletteの下のpixelsを製品描画の合格/不具合と断定しない。task専用のpassive採取はsource・新しい完成frame・identityを保持し、
+既知の所有ATOK paletteとの交差を明示する。その他の重なりは拒否する。
+`982cb322…`のC2は実際の言語変更・取消・通常の指定削除・Source同期・UndoRedo・keyboard・狭幅を確認した。
+Rootは専用headerとmenuの実画像を確認した。このFront Matterを持たないC2 fixtureは最後のD変更の影響範囲外として採用する。
+decoded-control fallbackの実表示も同候補で確認した。D入力継続修正後の本候補と、未実行の独立sectionは受入中である。
+物理手入力、別IME/別DPI、本人の主観的受入は別途pendingとする。
+
+### Historical: de083候補の追加確認（2026年10月24日 JST）
+
+`de083444…`はB/Aの描画・必要なhelp保持/配置と、EのEsc抑止を統合したRelease候補。
+fmt、all-target check、warnings禁止のall-target Clippy、登録Release buildが成功した。
+Bのpublisher/実toggle/idle native検査とA/Shell/Menuの8対象filter、preview core13とApp3が成功した。
+新しい広いsuiteは繰り返していない。過去のFAILとその後の原因・対象確認は別の記録として保持する。
+
+- B：この候補の4表示状態・狭幅の左右assigned drawerを実操作/実画像で確認。両方非表示の古いON線は消え、表示とstripeが一致した。配置・幅・所属と保護fixture bytesを保持し、元配置へ戻して通常終了exit0。
+- E：対象の表示完了後に一度Escを送り、診断要求なしの静止観測で1000ms以上非表示が継続。実際のpointer移動で同じlinkへ再hoverでき、離脱で閉じた。原文・選択・scroll・focus・履歴・disk不変。
+- C1：短い66byte、7CRLF、末尾改行なしのfixtureで、YAML終端と次の本文、code終端のLeft/Home/End/pointerを確認。Ctrl+Endの既存zero-extent EOF viewは別のaffinity位置として記録し、終端行へのアクセスと混同しない。previewなしのnative欄X→Esc取消も成功。
+- D：`801058ce…`のURL/長いdescriptionの専用欄編集、保存、通常File close、再openとSource/Liveでbytes一致。実ATOKの日本語確定・取消・UndoRedoと制御文字fallbackを別scopeで確認。実OS clipboard貼付けは専用caseを準備中で、まだPASSではない。
+- A：このcheckpointのNew重複help省略・安全条件や意味のある説明の保持はsourceと対象検査で確認した。PanelMove help実画面はこの候補の操作では未確認で、原因も未確定だった。後の最終候補実画面結果は上段に記録する。
+
+B/E/C1の古いharness失敗は書き換えていない。caption overlapは所有B windowを通常終了して解消した。
+Ctrl+Wのdelivery/routeはUNKNOWNで、File menu closeが実際に動いた結果と分けて記録する。
+このcheckpoint時点でOS clipboard操作は行っていなかった。A実画面と実貼付けの未確認が残り、Git統合・配送・Task完了はまだ行っていなかった。
+
 ## 描画負荷・Live編集修正（2026年10月22日 JST、今回範囲のMachine確認済み）
 
 Task `20261022-mdlite-rendering-live-editing-repair` Revision 1。開始developは

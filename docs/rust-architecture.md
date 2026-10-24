@@ -18,6 +18,21 @@ Markdown原文を永続正本とし、表示は派生データとする。
 
 ## 選定
 
+2026年10月23日のプロパティ領域は、既存Markdown parserが認識するFront Matterを
+`properties`の上限付き投影へ渡す。平坦scalarと文字列listの編集範囲を保持し、
+revisionに対応する対象だけをDocument transactionへ接続する。block全体のparse/dumpや
+別文書・別履歴は追加しない。複雑なYAMLは範囲と理由を示して明示Sourceへ案内する。
+原文保持と小さな対応範囲を優先し、YAML全仕様の実装や追加依存は導入しない。
+入力中だけnative EDITを一つ所有し、IMEはそのcontrolの既存Windows処理を使う。
+欄の論理focusは文書とrevisionに結び付ける。確定・取消・保存後は同じ欄をpristineで再開し、
+本文・Source・文書切替で解放する。仮想フォームfocus中は親のraw編集経路へ入力を流さない。
+
+local previewは一つのworkerと置換可能な最新requestで読取り・decodeを分離する。
+open文書はcrop snapshotを渡し、必要な対象だけを上限内でmaterializeする。
+cacheと画像・抜粋を上限付きにし、generationとDocument revisionが違う結果を捨てる。
+popupは非activatingなWin32所有windowで、外部通信・埋込resource取得・shell実行を行わない。
+新しいUI／YAML／Web基盤の依存は追加しない。
+
 2026年10月22日の描画負荷調査では、同じEXE・同じ所有windowで
 `WS_EX_COMPOSITED`だけを解除すると、静止時の連続paintが止まることを確認した。
 DCへ描く現在のDirect2D経路にMain/Compact全体の合成styleを重ねず、
@@ -40,6 +55,13 @@ manifestやcontrol frameworkを切り替えない。
 [`TTM_ADDTOOL`](https://learn.microsoft.com/en-us/windows/win32/controls/ttm-addtool)の戻り値と、
 [`TTTOOLINFOW`](https://learn.microsoft.com/en-us/windows/win32/api/commctrl/ns-commctrl-tttoolinfow)の
 text buffer契約を守る。調査時のmanual size比較と、production登録経路の回帰確認を区別する。
+
+Native menu helpは、`WM_MENUSELECT`で保存したmenu-stack/work-area boundsを使い、
+retained tooltipからの[`TTN_SHOW`](https://learn.microsoft.com/en-us/windows/win32/controls/ttn-show)で位置を決める。
+実tooltip矩形を`GetWindowRect`で測り、`SetWindowPos`は位置だけを変えてsize/activation/Z-orderを維持する。
+成功時だけ`TTN_SHOW`へTRUEを返し、`TTM_GETBUBBLESIZE`の事前推定には依存しない。
+`TTM_TRACKPOSITION`も使わず、sizeまたはplacementが使えない場合はdefault位置へfallbackし、
+そのケースをcustom placement成功として扱わない。
 
 Win32とDirectWrite/Direct2Dを選ぶ。OSの文字整形と同じlayoutを描画、
 hit test、selection、IME候補位置に使い、独自の文字幅推測を避ける。

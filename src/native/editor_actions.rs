@@ -59,6 +59,11 @@ pub(super) const COMMANDS: &[(usize, &str, Option<&'static str>)] = &[
     (TABLE_MENU, "表・画像の操作メニューを開く", None),
     (TABLE_SOURCE, "表のソース / Liveを切り替え", None),
     (TABLE_OPERATIONS, "表・画像の操作にフォーカス", None),
+    (
+        super::code_language::COMMAND,
+        "コード言語を選択",
+        Some("Ctrl+Alt+L"),
+    ),
 ];
 
 #[derive(Clone, Debug)]
@@ -162,6 +167,9 @@ impl EditorActions {
         }
         let completion = match id {
             TABLE_SOURCE => {
+                if !app.properties_gate() {
+                    return (true, ActionCompletion::None);
+                }
                 let raw = &mut app.tabs[app.active].raw;
                 *raw = !*raw;
                 if *raw {
@@ -502,6 +510,10 @@ impl App {
     }
 
     pub(super) fn editor_action(&mut self, id: usize) -> bool {
+        if id == super::code_language::COMMAND {
+            self.code_language_menu_at_caret();
+            return true;
+        }
         let mut actions = std::mem::take(&mut self.editor_actions);
         let (handled, completion) = actions.command(self, id);
         self.complete_editor_action(actions, completion);
@@ -525,10 +537,16 @@ impl App {
     }
 
     pub(super) fn editor_enabled(&self, id: usize) -> bool {
+        if id == super::code_language::COMMAND {
+            return self.code_language_available();
+        }
         self.editor_actions.enabled(self, id)
     }
 
     pub(super) fn editor_disabled_reason(&self, id: usize) -> &'static str {
+        if id == super::code_language::COMMAND {
+            return "Liveのコードブロック内にcaretを移動してください";
+        }
         self.editor_actions.disabled_reason(self, id)
     }
 }
@@ -947,7 +965,7 @@ mod tests {
     fn registry_ids_are_unique_and_within_the_shared_range() {
         let ids: Vec<_> = COMMANDS.iter().map(|entry| entry.0).collect();
         for (index, id) in ids.iter().enumerate() {
-            assert!((20..=39).contains(id));
+            assert!((20..=40).contains(id));
             assert!(!ids[..index].contains(id));
         }
         for id in [
@@ -968,6 +986,7 @@ mod tests {
             TABLE_MENU,
             TABLE_SOURCE,
             TABLE_OPERATIONS,
+            super::super::code_language::COMMAND,
         ] {
             assert!(is_editor_command(id));
         }

@@ -1020,7 +1020,7 @@ impl FormWindow {
                         "すべてのワークスペース共通、または現在のWorkspaceを選びます。切り替えても各対象の下書きは保持されます。",
                     )
                 })
-                .unwrap_or("設定の項目へTabで移動すると、ここに補足を表示します。hoverでも同じ説明を確認できます。");
+                .unwrap_or("");
             let _ = SetWindowTextW(self.help, PCWSTR(wide(help).as_ptr()));
         }
     }

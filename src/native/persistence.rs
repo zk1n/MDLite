@@ -333,12 +333,14 @@ impl App {
     pub(super) fn persistence_tick(&mut self, now: Instant) {
         let delay = self.persistence.delay;
         let mutation_blocked = self.background_mutation_busy();
+        let property_blocked = self.properties_pending();
         for index in 0..self.tabs.len() {
             let tab = &mut self.tabs[index];
             tab.persistence
                 .schedule
                 .changed(tab.doc.revision(), tab.doc.is_dirty(), now, delay);
-            let blocked = mutation_blocked || self.composing && index == self.active;
+            let blocked =
+                mutation_blocked || (self.composing || property_blocked) && index == self.active;
             if tab.persistence.was_blocked && !blocked && tab.doc.is_dirty() {
                 tab.persistence.schedule.autosave_attempted(now, delay);
             }

@@ -2,6 +2,7 @@
 //! WindowState lives until the message loop exits. Synchronous native reentry
 //! snapshots IME notifications outside App's borrow and drains them in order.
 
+mod code_language;
 mod control_scroll;
 mod control_style;
 mod diagnostics;
@@ -11,9 +12,11 @@ mod editor_actions;
 mod explorer_icons;
 mod features;
 mod git_ui;
+mod link_preview;
 mod menu_style;
 mod persistence;
 mod presentation;
+mod properties_ui;
 mod scrollbar_style;
 mod search_ui;
 mod settings_dialog;
@@ -431,6 +434,7 @@ struct App {
     source_line_starts: Vec<usize>,
     gutter_rows: Vec<GutterRow>,
     gutter_width: f32,
+    gutter_number_width: f32,
     visible_tokens: Vec<VisibleToken>,
     tables: Vec<TableView>,
     images: Vec<ImageView>,
@@ -449,6 +453,7 @@ struct App {
     revealed_source: Option<Range<usize>>,
     dragging: bool,
     dragging_scroll: bool,
+    scroll_drag_offset: Option<f32>,
     preedit: String,
     composing: bool,
     ime_owner: Option<(u64, u64, usize, usize)>,
@@ -480,6 +485,9 @@ struct App {
     git_ui: git_ui::GitPane,
     search_ui: SearchPane,
     editor_actions: EditorActions,
+    properties_ui: properties_ui::PropertiesUi,
+    code_languages: code_language::CodeLanguageUi,
+    preview_ui: link_preview::PreviewUi,
     diagnostics: DiagnosticsPane,
     close_target: Option<HWND>,
     settings_requested: bool,
@@ -492,6 +500,7 @@ struct App {
 // may be queued while a modal/native callback holds its RefCell borrow.
 struct WindowState {
     phase_trace: Option<Rc<PhaseTrace>>,
+    tooltip_operation_depth: Cell<u32>,
     app: RefCell<App>,
     notifications: RefCell<VecDeque<(ImeEnvelope, NativeNotification)>>,
     document_id: Cell<u64>,
@@ -521,6 +530,7 @@ impl WindowState {
         let explorer_paint = app.features.explorer_paint_handle();
         Self {
             phase_trace,
+            tooltip_operation_depth: Cell::new(0),
             app: RefCell::new(app),
             notifications: RefCell::new(VecDeque::new()),
             document_id,
@@ -640,21 +650,38 @@ impl PhaseTrace {
         Some(trace)
     }
     fn record(&self, phase: &'static str, event: &'static str) {
+        self.write_record(phase, event, None);
+    }
+    fn record_value(&self, phase: &'static str, event: &'static str, value: i64) {
+        self.write_record(phase, event, Some(value));
+    }
+    fn write_record(&self, phase: &'static str, event: &'static str, value: Option<i64>) {
         use std::io::Write;
         let Ok(mut file) = self.file.try_borrow_mut() else {
             self.dropped.set(self.dropped.get().saturating_add(1));
             return;
         };
-        if writeln!(
-            file,
-            "{{\"t_us\":{},\"phase\":\"{}\",\"event\":\"{}\",\"dropped_total\":{}}}",
-            self.started.elapsed().as_micros(),
-            phase,
-            event,
-            self.dropped.get()
-        )
-        .is_err()
-        {
+        let result = if let Some(value) = value {
+            writeln!(
+                file,
+                "{{\"t_us\":{},\"phase\":\"{}\",\"event\":\"{}\",\"value\":{},\"dropped_total\":{}}}",
+                self.started.elapsed().as_micros(),
+                phase,
+                event,
+                value,
+                self.dropped.get()
+            )
+        } else {
+            writeln!(
+                file,
+                "{{\"t_us\":{},\"phase\":\"{}\",\"event\":\"{}\",\"dropped_total\":{}}}",
+                self.started.elapsed().as_micros(),
+                phase,
+                event,
+                self.dropped.get()
+            )
+        };
+        if result.is_err() {
             self.dropped.set(self.dropped.get().saturating_add(1));
         }
     }
@@ -662,6 +689,16 @@ impl PhaseTrace {
 fn record_phase(trace: &Option<Rc<PhaseTrace>>, phase: &'static str, event: &'static str) {
     if let Some(trace) = trace {
         trace.record(phase, event);
+    }
+}
+fn record_phase_value(
+    trace: &Option<Rc<PhaseTrace>>,
+    phase: &'static str,
+    event: &'static str,
+    value: i64,
+) {
+    if let Some(trace) = trace {
+        trace.record_value(phase, event, value);
     }
 }
 struct PhaseSpan {
@@ -680,6 +717,42 @@ impl PhaseSpan {
 impl Drop for PhaseSpan {
     fn drop(&mut self) {
         record_phase(&self.trace, self.phase, "end");
+    }
+}
+struct MessagePhaseSpan {
+    trace: Rc<PhaseTrace>,
+    phase: &'static str,
+    message: u32,
+}
+impl MessagePhaseSpan {
+    fn new(trace: Rc<PhaseTrace>, phase: &'static str, message: u32) -> Self {
+        trace.record_value(phase, "entry", i64::from(message));
+        Self {
+            trace,
+            phase,
+            message,
+        }
+    }
+}
+impl Drop for MessagePhaseSpan {
+    fn drop(&mut self) {
+        self.trace
+            .record_value(self.phase, "scope_exit", i64::from(self.message));
+    }
+}
+struct TooltipOperationScope<'a> {
+    depth: &'a Cell<u32>,
+}
+impl<'a> TooltipOperationScope<'a> {
+    fn new(state: &'a WindowState) -> Self {
+        let depth = &state.tooltip_operation_depth;
+        depth.set(depth.get().saturating_add(1));
+        Self { depth }
+    }
+}
+impl Drop for TooltipOperationScope<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
     }
 }
 
@@ -1101,6 +1174,7 @@ fn startup_window_state(
         source_line_starts: Vec::new(),
         gutter_rows: Vec::new(),
         gutter_width: 0.0,
+        gutter_number_width: 0.0,
         visible_tokens: Vec::new(),
         tables: Vec::new(),
         images: Vec::new(),
@@ -1119,6 +1193,7 @@ fn startup_window_state(
         revealed_source: None,
         dragging: false,
         dragging_scroll: false,
+        scroll_drag_offset: None,
         preedit: String::new(),
         composing: false,
         ime_owner: None,
@@ -1150,6 +1225,9 @@ fn startup_window_state(
         git_ui: git_ui::GitPane::default(),
         search_ui: SearchPane::default(),
         editor_actions: EditorActions::default(),
+        properties_ui: properties_ui::PropertiesUi::default(),
+        code_languages: code_language::CodeLanguageUi::default(),
+        preview_ui: link_preview::PreviewUi::default(),
         diagnostics: DiagnosticsPane::default(),
         close_target: None,
         settings_requested: false,
@@ -1277,6 +1355,15 @@ pub fn run() -> windows::core::Result<()> {
             drain_native_notifications(&app, &mut app.app.borrow_mut());
             if key_down {
                 let mut owner = app.app.borrow_mut();
+                let is_escape = message.wParam.0 == VK_ESCAPE.0 as usize;
+                let dismissed_preview = if is_escape {
+                    owner.preview_escape()
+                } else {
+                    owner.preview_cancel()
+                };
+                if is_escape && dismissed_preview {
+                    continue;
+                }
                 owner.features_reset_calendar_click();
                 owner.invalidate_stale_reconversion();
                 if let Some(cancel) =
@@ -1289,6 +1376,10 @@ pub fn run() -> windows::core::Result<()> {
                 }
             }
             replay_deferred_paints(&app);
+            let handled = app.app.borrow_mut().properties_message(&message);
+            if handled {
+                continue;
+            }
             let handled = app.app.borrow_mut().shell_message(&message);
             settings_dialog::run_requested(&app);
             replay_deferred_paints(&app);
@@ -1359,6 +1450,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
         }
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
+        let _tooltip_callback = if pointer.is_null() {
+            None
+        } else {
+            let state = &*pointer;
+            if state.tooltip_operation_depth.get() == 0 {
+                None
+            } else {
+                state.phase_trace.as_ref().map(|trace| {
+                    MessagePhaseSpan::new(Rc::clone(trace), "menu.tooltip_owner_callback", msg)
+                })
+            }
+        };
         if msg == WM_NCDESTROY {
             if !pointer.is_null() {
                 let state = &*pointer;
@@ -1874,6 +1977,32 @@ unsafe fn dispatch_window_message(
     app: &mut App,
 ) -> Option<LRESULT> {
     unsafe {
+        if msg == WM_KEYDOWN && wp.0 == VK_ESCAPE.0 as usize && app.preview_escape() {
+            return Some(LRESULT(0));
+        }
+        if matches!(
+            msg,
+            WM_SIZE
+                | WM_DPICHANGED
+                | WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+                | WM_KILLFOCUS
+                | WM_CLOSE
+                | WM_CHAR
+                | WM_KEYDOWN
+                | WM_SYSKEYDOWN
+                | WM_COMMAND
+        ) {
+            app.preview_cancel();
+        }
+        if msg == WM_KILLFOCUS {
+            app.dragging = false;
+            app.cancel_editor_scroll_drag(hwnd);
+            app.finish_splitter();
+            app.features_finish_outline_drag(true);
+        }
         if matches!(
             msg,
             WM_SIZE
@@ -1964,6 +2093,13 @@ unsafe fn dispatch_window_message(
             WM_LBUTTONDOWN => {
                 let x = (lp.0 as u16 as i16) as f32 / app.dpi;
                 let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                if app.properties_click(x, y, false) || app.code_language_click(x, y) {
+                    app.refresh();
+                    return Some(LRESULT(0));
+                }
+                if !app.properties_gate() {
+                    return Some(LRESULT(0));
+                }
                 let _ = SetFocus(Some(hwnd));
                 if !app
                     .feature_panel_rect(mdlite::panel::PanelId::Calendar)
@@ -2036,10 +2172,11 @@ unsafe fn dispatch_window_message(
                             app.switch_tab(strip.first + slot);
                         }
                     }
-                } else if x > app.width - 20.0 {
-                    app.dragging_scroll = true;
-                    app.scroll_at(y);
+                } else if app.begin_editor_scroll_drag(x, y) {
                     SetCapture(hwnd);
+                    if GetCapture() != hwnd {
+                        app.cancel_editor_scroll_drag(hwnd);
+                    }
                 } else if app.toggle_task_at(x, y) {
                     app.after_input();
                 } else {
@@ -2082,23 +2219,43 @@ unsafe fn dispatch_window_message(
                         app.refresh();
                         return Some(LRESULT(0));
                     }
-                    if !app.dragging
-                        && !app.composing
-                        && x >= app.editor_left()
-                        && x <= app.editor_right()
-                        && y >= app.editor_top()
-                        && let Some(destination) =
-                            app.link_destination_at(app.hit_with_affinity(x, y).0)
-                    {
-                        app.status = format!("リンク: {destination}（Ctrl+クリックで開く）");
-                    }
                 }
+                let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                let destination = if !app.dragging
+                    && !app.dragging_scroll
+                    && !app.properties_pending()
+                    && !app.feature_ime_active()
+                    && x >= app.content_left()
+                    && x <= app.editor_right()
+                    && y >= app.editor_top()
+                    && y < app.editor_bottom()
+                {
+                    app.link_destination_at(app.hit_with_affinity(x, y).0)
+                } else {
+                    None
+                };
+                let mut cursor = POINT {
+                    x: (x * app.dpi).round() as i32,
+                    y: (y * app.dpi).round() as i32,
+                };
+                if ClientToScreen(hwnd, &mut cursor).as_bool() {
+                    app.preview_hover(destination.as_deref(), cursor, hwnd);
+                }
+                if destination.is_some() {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                }
+                app.update_editor_scroll_hover(hwnd, x, y);
                 if app.shell.enabled && app.shell_mouse_move(lp) {
                     return Some(LRESULT(0));
                 }
-                if app.dragging_scroll {
-                    let dpi = app.dpi;
-                    app.scroll_at(((lp.0 >> 16) as u16 as i16) as f32 / dpi);
+                if app.dragging_scroll && app.drag_editor_scroll(y) {
                     app.refresh();
                 }
                 if app.dragging {
@@ -2122,8 +2279,7 @@ unsafe fn dispatch_window_message(
                 }
                 app.finish_splitter();
                 app.dragging = false;
-                app.dragging_scroll = false;
-                let _ = ReleaseCapture();
+                app.cancel_editor_scroll_drag(hwnd);
                 LRESULT(0)
             }
             value if value == WM_APP + 20 => {
@@ -2135,7 +2291,19 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
+                app.preview_cancel();
+                app.dragging = false;
+                app.cancel_editor_scroll_drag(hwnd);
+                app.finish_splitter();
                 app.features_finish_outline_drag(true);
+                LRESULT(0)
+            }
+            windows::Win32::UI::Controls::WM_MOUSELEAVE => {
+                app.set_editor_scroll_hover(hwnd, false);
+                let mut cursor = POINT::default();
+                if GetCursorPos(&mut cursor).is_ok() {
+                    app.preview_pointer_leave(cursor);
+                }
                 LRESULT(0)
             }
             WM_DRAWITEM => {
@@ -2156,6 +2324,15 @@ unsafe fn dispatch_window_message(
                 }
             }
             WM_RBUTTONUP => {
+                let x = (lp.0 as u16 as i16) as f32 / app.dpi;
+                let y = ((lp.0 >> 16) as u16 as i16) as f32 / app.dpi;
+                if app.properties_click(x, y, true) {
+                    app.refresh();
+                    return Some(LRESULT(0));
+                }
+                if !app.properties_gate() {
+                    return Some(LRESULT(0));
+                }
                 app.context_menu();
                 LRESULT(0)
             }
@@ -2205,6 +2382,12 @@ unsafe fn dispatch_window_message(
             WM_IME_SETCONTEXT => return None,
             WM_COMMAND => {
                 let id = wp.0 & 0xffff;
+                if app.properties_control(id, (wp.0 >> 16) as u16) {
+                    return Some(LRESULT(0));
+                }
+                if !app.properties_gate() {
+                    return Some(LRESULT(0));
+                }
                 let notification = (wp.0 >> 16) as u16;
                 if app.features_control(id, notification)
                     || app.git_control(id, notification)
@@ -2222,6 +2405,7 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == PERSISTENCE_TIMER => {
+                app.preview_tick();
                 let dirty = app.tabs.iter().any(|t| t.doc.is_dirty());
                 let status = app.status.clone();
                 app.persistence_tick(Instant::now());
@@ -2264,6 +2448,9 @@ unsafe fn dispatch_window_message(
                 LRESULT(0)
             }
             WM_CLOSE => {
+                if !app.properties_gate() {
+                    return Some(LRESULT(0));
+                }
                 record_phase(&app.phase_trace, "close", "dispatch");
                 let confirm_phase = PhaseSpan::new(&app.phase_trace, "close.confirm");
                 if app.confirm_all() {
@@ -2628,6 +2815,10 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            if self.properties_block_parent_edit() {
+                self.refresh();
+                return;
+            }
             if IsClipboardFormatAvailable(8).is_ok() {
                 match read_dib(self.hwnd) {
                     Ok((w, h, pixels)) => {
@@ -2656,6 +2847,9 @@ impl App {
         self.layout_key = None;
     }
     fn paste(&mut self, text: &str) {
+        if self.properties_block_parent_edit() {
+            return;
+        }
         if !self.tabs[self.active].raw && (text.contains('\t') || text.contains('\n')) {
             let p = self.doc().selection().head;
             if let Some(table) = self.tables.iter().find(|t| t.table.cell_at(p).is_some()) {
@@ -2795,6 +2989,9 @@ impl App {
         self.edit_range(range, text);
     }
     fn edit_range(&mut self, range: Range<usize>, text: &str) {
+        if self.properties_block_parent_edit() {
+            return;
+        }
         let authoring_table = self.pending_table_authoring.is_some_and(|(id, start)| {
             id == self.doc().id()
                 && self.tables.iter().any(|table| {
@@ -2885,6 +3082,9 @@ impl App {
         self.apply_live_edit(plan);
     }
     fn apply_live_edit(&mut self, plan: LiveEdit) {
+        if self.properties_block_parent_edit() {
+            return;
+        }
         let before_revision = self.doc().revision();
         let selection = Selection::caret(plan.caret);
         let result = if self.typing {
@@ -2942,6 +3142,10 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            if self.properties_block_parent_edit() {
+                self.refresh();
+                return;
+            }
             if self.shell.enabled && GetFocus() != self.editing_window() {
                 return;
             }
@@ -3144,6 +3348,10 @@ impl App {
         self.start_composition_for(envelope);
     }
     fn start_composition_for(&mut self, envelope: ImeEnvelope) {
+        if self.properties_block_parent_edit() {
+            self.ime_ingress.retire(envelope);
+            return;
+        }
         let selection = self.doc().selection();
         self.invalidate_stale_reconversion();
         self.reconversion_owner = self
@@ -3176,6 +3384,7 @@ impl App {
             let updated = matches!(notification, NativeNotification::Update(_));
             match notification {
                 NativeNotification::Start => {
+                    self.preview_cancel();
                     let envelope = self
                         .ime_ingress
                         .start(self.doc().id(), self.editing_window());
@@ -3312,6 +3521,9 @@ impl App {
     }
     unsafe fn key_with_modifiers(&mut self, key: u16, ctrl: bool, shift: bool) {
         unsafe {
+            if key == VK_TAB.0 && !ctrl && self.properties_tab_entry(shift) {
+                return;
+            }
             if self.shell.enabled && GetFocus() != self.editing_window() {
                 return;
             }
@@ -3392,6 +3604,7 @@ impl App {
                     self.doc_mut().undo();
                 }
                 self.after_input();
+                self.properties_restore_history_focus();
                 return;
             }
             if !self.tabs[self.active].raw
@@ -3825,6 +4038,7 @@ impl App {
         }
     }
     unsafe fn after_input(&mut self) {
+        self.preview_cancel();
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -3875,6 +4089,10 @@ impl App {
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            if cut && self.properties_block_parent_edit() {
+                self.refresh();
+                return;
+            }
             let selection = self.doc().selection();
             let range = selection.anchor.min(selection.head)..selection.anchor.max(selection.head);
             if range.is_empty() {
@@ -3962,6 +4180,10 @@ impl App {
         &mut self.tabs[self.active].doc
     }
     fn new_document(&mut self) {
+        if !self.properties_gate() {
+            return;
+        }
+        self.properties_release_focus();
         if self.shell.compact_window != HWND::default() {
             unsafe {
                 self.return_from_compact();
@@ -3986,6 +4208,10 @@ impl App {
         self.layout_key = None;
     }
     fn open_path(&mut self, path: PathBuf) {
+        self.preview_cancel();
+        if !self.properties_gate() {
+            return;
+        }
         if self.composing {
             self.status = "IME確定後に文書を開いてください。現在の本文は保持しています".into();
             return;
@@ -4008,6 +4234,7 @@ impl App {
                 self.record_navigation();
                 let id = self.next_id;
                 self.next_id += 1;
+                self.properties_release_focus();
                 self.tabs.push(Tab {
                     doc: Document::new(id, loaded.source),
                     file: Some(loaded.snapshot),
@@ -4129,6 +4356,11 @@ impl App {
         self.image_cache.clear();
     }
     fn switch_tab(&mut self, index: usize) {
+        self.preview_cancel();
+        if !self.properties_gate() {
+            return;
+        }
+        self.properties_release_focus();
         if self.composing {
             return;
         }
@@ -4195,6 +4427,9 @@ impl App {
         }
     }
     unsafe fn save(&mut self, as_new: bool) -> bool {
+        if !self.properties_gate() {
+            return false;
+        }
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -4211,6 +4446,9 @@ impl App {
         }
     }
     fn save_as_to(&mut self, path: &Path) -> bool {
+        if !self.properties_gate() {
+            return false;
+        }
         if self.composing {
             return false;
         }
@@ -4268,6 +4506,9 @@ impl App {
         }
     }
     fn save_current(&mut self) -> bool {
+        if !self.properties_gate() {
+            return false;
+        }
         if self.composing {
             return false;
         }
@@ -4294,6 +4535,9 @@ impl App {
         }
     }
     unsafe fn confirm_current(&mut self) -> bool {
+        if !self.properties_gate() {
+            return false;
+        }
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -4326,6 +4570,9 @@ impl App {
         }
     }
     unsafe fn confirm_all(&mut self) -> bool {
+        if !self.properties_gate() {
+            return false;
+        }
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
@@ -4345,9 +4592,13 @@ impl App {
         }
     }
     unsafe fn command(&mut self, id: usize) {
+        self.preview_cancel();
         // SAFETY: called on the window owner thread; handles and COM resources
         // remain owned by App, and borrowed buffers outlive each synchronous call.
         unsafe {
+            if !self.properties_gate() {
+                return;
+            }
             if self.shell_command(id) {
                 return;
             }
@@ -4367,12 +4618,15 @@ impl App {
                 }
                 CMD_SAVE => {
                     self.save(false);
+                    self.properties_resume_field();
                 }
                 CMD_SAVE_AS => {
                     self.save(true);
+                    self.properties_resume_field();
                 }
                 CMD_CLOSE => {
                     if self.confirm_current() {
+                        self.properties_release_focus();
                         self.clear_images();
                         self.projection_cache = None;
                         self.parsed_tables.clear();
@@ -4386,6 +4640,7 @@ impl App {
                     }
                 }
                 CMD_RAW => {
+                    self.properties_release_focus();
                     if !self.is_markdown_document() {
                         self.status = "テキスト文書は原文表示を保持します".into();
                         return;
@@ -4471,14 +4726,20 @@ impl App {
             Ok(layout)
         }
     }
-    unsafe fn measure_gutter_width(&self, line_count: usize) -> windows::core::Result<f32> {
+    unsafe fn measure_gutter_width(&mut self, line_count: usize) -> windows::core::Result<f32> {
         unsafe {
             let sample = "9".repeat(presentation::line_number_digits(line_count));
             let layout = self.text_layout(&sample, 1024.0, self.font_size())?;
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut metrics)?;
-            Ok(metrics.widthIncludingTrailingWhitespace + GUTTER_HORIZONTAL_PADDING)
+            self.gutter_number_width = metrics.widthIncludingTrailingWhitespace;
+            let glyph = self.text_layout("00", 1024.0, self.font_size())?;
+            let mut glyph_metrics = DWRITE_TEXT_METRICS::default();
+            glyph.GetMetrics(&mut glyph_metrics)?;
+            Ok(metrics.widthIncludingTrailingWhitespace
+                + GUTTER_HORIZONTAL_PADDING
+                + glyph_metrics.widthIncludingTrailingWhitespace * 0.75)
         }
     }
     unsafe fn gutter_presentation(
@@ -4655,6 +4916,8 @@ impl App {
             let _phase = PhaseSpan::new(&self.phase_trace, "layout.rebuild");
             self.revealed_source = reveal;
             self.views.clear();
+            self.properties_ui.rows.clear();
+            self.properties_ui.model = None;
             self.visible_tokens.clear();
             self.tables.clear();
             self.images.clear();
@@ -4665,6 +4928,7 @@ impl App {
             let width = self.content_width();
             self.gutter_rows.clear();
             if self.tabs[self.active].raw {
+                self.properties_release_focus();
                 let mut start = 0;
                 for line in source.split_inclusive('\n') {
                     let text = line.trim_end_matches(['\r', '\n']);
@@ -4867,6 +5131,10 @@ impl App {
                     {
                         continue;
                     }
+                    if matches!(block.kind, BlockKind::FrontMatter) {
+                        y = self.properties_layout(y, width)?;
+                        continue;
+                    }
                     if matches!(block.kind, BlockKind::Table)
                         && let Some(table) = self
                             .parsed_tables
@@ -5067,6 +5335,8 @@ impl App {
             if !self.tabs[self.active].raw {
                 y = self.layout_source_markers(&source, y, width, &line_starts)?;
             }
+            y = self.code_language_layout(y);
+            self.properties_position();
             self.views
                 .sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
             self.source_line_starts = line_starts;
@@ -5160,6 +5430,7 @@ impl App {
             empty_anchor_positions.sort_unstable();
             empty_anchor_positions.dedup();
 
+            source_y.extend(self.properties_marker_anchors());
             source_y.sort_unstable_by_key(|(source_start, _)| *source_start);
             let mut suffix_min_y = vec![0.0; source_y.len()];
             for index in (0..source_y.len()).rev() {
@@ -5182,6 +5453,14 @@ impl App {
             table_ranges.sort_unstable_by_key(|range| range.start);
             let mut markers = Vec::new();
             for &position in line_starts {
+                if self
+                    .properties_ui
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| model.content_range.contains(&position))
+                {
+                    continue;
+                }
                 let end = source[position..]
                     .find(['\r', '\n'])
                     .map_or(source.len(), |offset| position + offset);
@@ -5290,6 +5569,7 @@ impl App {
                 );
                 view.y += row_offsets[shifts];
             }
+            self.properties_shift_markers(&row_positions, &row_offsets);
             for image in &mut self.images {
                 let shifts =
                     presentation::source_row_shift_count(&row_positions, image.source.start, true);
@@ -5339,10 +5619,20 @@ impl App {
             }
             bottom += row_offsets.last().copied().unwrap();
             let p = self.doc().selection().head;
+            // Property fields own their source anchors without TextView maps.
+            // The generic unmapped-caret fallback must not append raw YAML
+            // during ordinary form focus or native child editing. Delimiters
+            // remain outside content_range and keep their source views.
+            let property_owned = self.properties_ui.model.as_ref().is_some_and(|model| {
+                model.document_id == self.doc().id()
+                    && model.revision == self.doc().revision()
+                    && model.content_range.contains(&p)
+            });
             if !self
                 .tables
                 .iter()
                 .any(|table| table.table.range.contains(&p))
+                && !property_owned
                 && !self
                     .views
                     .iter()
@@ -6068,7 +6358,7 @@ impl App {
     ) -> windows::core::Result<()> {
         unsafe {
             let font_size = self.font_size();
-            let number_width = (self.gutter_width - GUTTER_HORIZONTAL_PADDING).max(1.0);
+            let number_width = self.gutter_number_width.max(1.0);
             let label_baseline = presentation::line_spacing(font_size).1;
             let top = self.editor_top();
             let first = if let Some(visual) = composition {
@@ -6354,23 +6644,29 @@ impl App {
             GetClientRect(self.hwnd, &mut r)?;
             let viewport = self.editor_bottom();
             let scroll = self.tabs[self.active].scroll;
-            let page = (viewport - self.editor_top()).max(1.0);
+            let page = (viewport - self.editor_top()).max(0.0);
             let composition = self.composition_visual();
             let content = (self.height + composition.as_ref().map_or(0.0, |visual| visual.growth)
                 - self.editor_top())
-            .max(page);
-            if content > page {
-                let thumb = (page * page / content).max(28.0);
-                let y = self.editor_top() + (page - thumb) * scroll / (content - page);
+            .max(0.0);
+            let geometry = scrollbar_style::Geometry::new(
+                self.editor_top(),
+                page,
+                content,
+                page,
+                scroll,
+                scrollbar_style::MIN_THUMB_DIP,
+            );
+            if let Some((y, thumb)) = geometry.thumb() {
+                let rail_width = scrollbar_style::RAIL_WIDTH_DIP;
+                let thumb_width = scrollbar_style::thumb_width_dip(
+                    self.dragging_scroll || self.shell.scroll_hover,
+                );
                 t.FillRectangle(
                     &rect(
-                        self.editor_right() - 6.0,
+                        self.editor_right() - rail_width + (rail_width - thumb_width) / 2.0,
                         y,
-                        if self.dragging_scroll || self.shell.scroll_hover {
-                            10.
-                        } else {
-                            6.
-                        },
+                        thumb_width,
                         thumb,
                     ),
                     &muted,
@@ -6396,6 +6692,8 @@ impl App {
                 ),
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
+            self.properties_draw(&t, scroll)?;
+            self.code_language_draw(&t, scroll)?;
             let selection = self.doc().selection();
             let a = selection.anchor.min(selection.head);
             let b = selection.anchor.max(selection.head);
@@ -6511,7 +6809,7 @@ impl App {
                         point(view.x - 5.0, y),
                         point(view.x - 5.0, y + view.height),
                         &border,
-                        2.0,
+                        3.5,
                         None,
                     );
                 }
@@ -6625,7 +6923,7 @@ impl App {
                         point(image.x - 5.0, y),
                         point(image.x - 5.0, y + image.height),
                         &border,
-                        2.0,
+                        3.5,
                         None,
                     );
                 }
@@ -7064,6 +7362,7 @@ impl App {
             // Native caret coordinates and visibility must use that final
             // viewport, rather than retaining a pre-clamp offscreen position.
             self.update_caret();
+            self.properties_position();
             if editor_only && !self.full_paint {
                 let left = if self.shell.enabled {
                     self.shell.editor.x
@@ -7090,19 +7389,117 @@ impl App {
         }
     }
     fn scroll(&mut self, delta: f32) {
+        self.preview_cancel();
         let tab = &mut self.tabs[self.active];
         tab.scroll = (tab.scroll + delta).max(0.0);
     }
-    fn scroll_at(&mut self, y: f32) {
-        let mut client = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.hwnd, &mut client);
+    fn editor_scroll_geometry(&self) -> scrollbar_style::Geometry {
+        let top = self.editor_top();
+        let page = (self.editor_bottom() - top).max(0.0);
+        let composition = self.composition_visual();
+        let content =
+            (self.height + composition.as_ref().map_or(0.0, |value| value.growth) - top).max(0.0);
+        scrollbar_style::Geometry::new(
+            top,
+            page,
+            content,
+            page,
+            self.tabs[self.active].scroll,
+            scrollbar_style::MIN_THUMB_DIP,
+        )
+    }
+    fn editor_scroll_hit(&self, x: f32, y: f32) -> bool {
+        let top = self.editor_top();
+        let bottom = self.editor_bottom();
+        let right = self.editor_right();
+        x >= right - scrollbar_style::RAIL_WIDTH_DIP && x < right && y >= top && y < bottom
+    }
+    fn begin_editor_scroll_drag(&mut self, x: f32, y: f32) -> bool {
+        if !self.editor_scroll_hit(x, y) {
+            return false;
         }
-        let page = (self.editor_bottom() - self.editor_top()).max(1.0);
-        let max = (self.height - self.editor_top() - page).max(0.0);
-        self.tabs[self.active].scroll = ((y - self.editor_top()) / page).clamp(0.0, 1.0) * max;
+        let geometry = self.editor_scroll_geometry();
+        let offset = if let Some(offset) = geometry.thumb_offset_at(y) {
+            offset
+        } else {
+            let position = geometry.position_for_track_click(y);
+            self.set_editor_scroll(position, geometry.max_scroll());
+            let Some((top, size)) = geometry.with_position(position).thumb() else {
+                return false;
+            };
+            (y - top).clamp(0.0, size)
+        };
+        self.dragging_scroll = true;
+        self.scroll_drag_offset = Some(offset);
+        true
+    }
+    fn drag_editor_scroll(&mut self, y: f32) -> bool {
+        let Some(offset) = self.scroll_drag_offset else {
+            return false;
+        };
+        let geometry = self.editor_scroll_geometry();
+        if geometry.thumb().is_none() {
+            return false;
+        }
+        self.set_editor_scroll(
+            geometry.position_for_pointer(y, offset),
+            geometry.max_scroll(),
+        )
+    }
+    fn set_editor_scroll(&mut self, position: f32, maximum: f32) -> bool {
+        let position = if position.is_finite() {
+            position.clamp(0.0, maximum)
+        } else {
+            0.0
+        };
+        let scroll = &mut self.tabs[self.active].scroll;
+        if *scroll == position {
+            return false;
+        }
+        *scroll = position;
+        self.preview_cancel();
+        true
+    }
+    fn cancel_editor_scroll_drag(&mut self, hwnd: HWND) {
+        self.dragging_scroll = false;
+        self.scroll_drag_offset = None;
+        unsafe {
+            if GetCapture() == hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
+    }
+    fn set_editor_scroll_hover(&mut self, hwnd: HWND, hover: bool) {
+        if self.shell.scroll_hover == hover {
+            return;
+        }
+        self.shell.scroll_hover = hover;
+        unsafe {
+            if hover {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    ..Default::default()
+                };
+                let _ = TrackMouseEvent(&mut track);
+            }
+            let dpi = self.dpi;
+            let rect = RECT {
+                left: ((self.editor_right() - scrollbar_style::RAIL_WIDTH_DIP) * dpi).floor()
+                    as i32,
+                top: (self.editor_top() * dpi).floor() as i32,
+                right: (self.editor_right() * dpi).ceil() as i32,
+                bottom: (self.editor_bottom() * dpi).ceil() as i32,
+            };
+            let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
+        }
+    }
+    fn update_editor_scroll_hover(&mut self, hwnd: HWND, x: f32, y: f32) {
+        self.set_editor_scroll_hover(hwnd, self.editor_scroll_hit(x, y));
     }
     fn horizontal_scroll(&mut self, delta: f32) {
+        self.preview_cancel();
         let byte = self.doc().selection().head;
         if let Some(t) = self.tables.iter().find(|t| t.table.range.contains(&byte)) {
             let available = self.content_width();
@@ -7260,6 +7657,7 @@ impl App {
         true
     }
     fn select_at(&mut self, x: f32, y: f32, extend: bool) {
+        self.properties_release_focus();
         if self.composing || x < self.content_left() {
             return;
         }
@@ -7283,6 +7681,16 @@ impl App {
         let _phase = PhaseSpan::new(&self.phase_trace, "diagnostic.total");
         let build_phase = PhaseSpan::new(&self.phase_trace, "diagnostic.build");
         let sel = self.doc().selection();
+        let scroll_geometry = self.editor_scroll_geometry();
+        let editor_scroll = serde_json::json!({
+            "x":self.editor_right()-scrollbar_style::RAIL_WIDTH_DIP,
+            "width":scrollbar_style::RAIL_WIDTH_DIP,"track_y":self.editor_top(),
+            "track_height":(self.editor_bottom()-self.editor_top()).max(0.),
+            "maximum":scroll_geometry.max_scroll(),
+            "thumb":scroll_geometry.thumb().map(|(top,height)| serde_json::json!({"y":top,"height":height})),
+            "dragging":self.dragging_scroll,"grab_offset":self.scroll_drag_offset,
+            "capture_hwnd":unsafe { GetCapture().0 as usize }
+        });
         let views:Vec<_>=self.views.iter().map(|v|serde_json::json!({"source_start":v.source.start,"source_end":v.source.end,"x":v.x,"y":v.y-self.tabs[self.active].scroll,"width":v.width,"height":v.height,"table":v.table,"map":v.map})).collect();
         let tables:Vec<_>=self.tables.iter().map(|t|serde_json::json!({"source_start":t.table.range.start,"source_end":t.table.range.end,"y":t.y,"height":t.height,"width":t.width})).collect();
         // Only the opt-in diagnostic path queries the current owner-thread TIP.
@@ -7299,7 +7707,7 @@ impl App {
                 "revision": frame.revision, "sequence": frame.sequence,
             })
         });
-        let data = serde_json::json!({"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"painted_frame":painted_frame,"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
+        let data = serde_json::json!({"editor_scroll":editor_scroll,"preview":self.preview_test_geometry(),"properties":self.properties_test_geometry(),"code_languages":self.code_language_geometry(),"parent_root":self.parent_root_diagnostic(),"document_id":self.doc().id(),"revision":self.doc().revision(),"painted_frame":painted_frame,"source":self.doc().source(),"selection":{"anchor":sel.anchor,"head":sel.head},"dirty":self.doc().is_dirty(),"undo_count":self.doc().undo_count(),"redo_count":self.doc().redo_count(),"raw":self.tabs[self.active].raw,"tabs":self.tabs.len(),"scroll":self.tabs[self.active].scroll,"layout_count":self.views.len(),"animation_timer_armed":self.animation_timer_armed,"animations":self.image_cache.iter().filter(|(_,c)|c.animation.is_some()).map(|(p,c)|serde_json::json!({"path":p,"frame":c.frame_sequence,"running":c.animation.as_ref().and_then(|a|a.next_due()).is_some()})).collect::<Vec<_>>(),"tables":self.tables.len(),"table_geometry":tables,"views":views,"ime":{"active":self.composing,"preedit":self.preedit,"open_status":ime_open_status},"active_input_profile":active_input_profile,"caret":{"x":self.caret.0,"y":self.caret.1,"height":self.caret.2},"native_caret":{"size":self.native_caret.size,"position":self.native_caret.position},"status":self.status});
         let mut data = data;
         data["line_numbers"] = serde_json::json!({
             "physical_line_count": self.source_line_starts.len(),
@@ -9867,6 +10275,26 @@ mod tests {
     }
 
     #[test]
+    fn startup_initializer_then_native_callbacks_create_and_edit_document() {
+        // Exercise the real empty-tabs initializer, not a prepopulated editor
+        // fixture: the bootstrap gate must run before WindowState owns input.
+        let state = startup_window_state(startup_test_graphics(), None, Vec::new());
+        let fixture = MessagePumpFixture::new(state.app.into_inner());
+        unsafe {
+            shell::send(fixture.hwnd, WM_COMMAND, WPARAM(CMD_NEW), LPARAM(0));
+            shell::send(fixture.hwnd, WM_CHAR, WPARAM('X' as usize), LPARAM(0));
+        }
+        let app = fixture.state.app.borrow();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1);
+        assert!(app.tabs[0].doc.source().is_empty());
+        assert_eq!(app.tabs[0].doc.undo_count(), 0);
+        assert_eq!(app.doc().source(), "X");
+        assert_eq!(app.doc().undo_count(), 1);
+        assert!(app.properties_test_geometry()["draft"].is_null());
+    }
+
+    #[test]
     fn startup_initializer_opens_multiple_synthetic_files_before_window_state() {
         let first = startup_fixture_path(1);
         let second = startup_fixture_path(2);
@@ -10890,6 +11318,110 @@ mod tests {
             DestroyMenu(menu).unwrap();
         }
     }
+    #[test]
+    fn native_tooltip_ttn_show_repositions_without_app_borrow_or_state_change() {
+        use windows::Win32::UI::Controls::*;
+
+        let directory = TestDirectory::new("tooltip-ttn-show");
+        let diagnostic = directory.path().join("fixture.json");
+        let mut fixture = MessagePumpFixture::new(composing_test_app("source"));
+        fixture.state.phase_trace = PhaseTrace::open(&diagnostic);
+        assert!(fixture.state.phase_trace.is_some());
+        unsafe {
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+            let foreground_before = GetForegroundWindow();
+            let focus_before = GetFocus();
+            let monitor = MonitorFromWindow(fixture.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut monitor_info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            assert!(GetMonitorInfoW(monitor, &mut monitor_info).as_bool());
+            let work = monitor_info.rcWork;
+            let work_width = work.right.saturating_sub(work.left);
+            let work_height = work.bottom.saturating_sub(work.top);
+            assert!(
+                work_width >= 500 && work_height >= 250,
+                "work area is too small for the native tooltip fixture"
+            );
+            let menu_bounds = RECT {
+                left: work.left + 24,
+                top: work.top + 24,
+                right: work.left + 80,
+                bottom: work.top + 84,
+            };
+            let menu = CreatePopupMenu().unwrap();
+            AppendMenuW(menu, MF_STRING, 12, w!("Disabled action")).unwrap();
+            let help = [(12usize, "Finish the active operation first.".to_owned())];
+            let scope = menu_style::MenuScope::with_help_for_test(
+                &fixture.state,
+                fixture.hwnd,
+                menu,
+                shell::Tokens::default(),
+                1.,
+                &help,
+            )
+            .expect("nonempty-help menu scope");
+            let tooltip = scope.tooltip_handle_for_test();
+            assert_ne!(tooltip, HWND::default());
+            assert_eq!(
+                shell::send(tooltip, TTM_GETTOOLCOUNT, WPARAM(0), LPARAM(0)).0,
+                1
+            );
+            scope.set_pending_placement_for_test(menu_bounds, work);
+
+            let before = document_state(fixture.state.app.borrow().doc());
+            {
+                let _app_borrow = fixture.state.app.borrow_mut();
+                scope.activate_tooltip_for_test();
+            }
+
+            let mut tooltip_rect = RECT::default();
+            GetWindowRect(tooltip, &mut tooltip_rect).unwrap();
+            assert!(IsWindowVisible(tooltip).as_bool());
+            assert!(tooltip_rect.right > tooltip_rect.left);
+            assert!(tooltip_rect.bottom > tooltip_rect.top);
+            assert!(tooltip_rect.left >= work.left && tooltip_rect.top >= work.top);
+            assert!(tooltip_rect.right <= work.right && tooltip_rect.bottom <= work.bottom);
+            assert!(
+                tooltip_rect.right <= menu_bounds.left
+                    || tooltip_rect.left >= menu_bounds.right
+                    || tooltip_rect.bottom <= menu_bounds.top
+                    || tooltip_rect.top >= menu_bounds.bottom,
+                "tooltip overlaps the pending menu fixture bounds: {tooltip_rect:?}"
+            );
+            assert_eq!(GetForegroundWindow(), foreground_before);
+            assert_eq!(GetFocus(), focus_before);
+            assert_eq!(document_state(fixture.state.app.borrow().doc()), before);
+            drop(scope);
+            assert!(fixture.state.menu_paint.borrow().is_empty());
+            DestroyMenu(menu).unwrap();
+        }
+
+        drop(fixture);
+        let sidecar = diagnostic.with_extension("phases.jsonl");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(sidecar)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records.iter().any(|record| {
+            record["phase"] == "menu.tooltip.ttn_show"
+                && record["event"] == "custom_position"
+                && record["value"] == 1
+        }));
+        assert!(records.iter().any(|record| {
+            record["phase"] == "menu.tooltip_owner_callback"
+                && record["event"] == "entry"
+                && record["value"].as_u64() == Some(u64::from(WM_NOTIFY))
+        }));
+        assert!(records.iter().any(|record| {
+            record["phase"] == "menu.tooltip_owner_callback"
+                && record["event"] == "scope_exit"
+                && record["value"].as_u64() == Some(u64::from(WM_NOTIFY))
+        }));
+    }
+
     #[test]
     fn themed_popup_scope_high_contrast_foreign_items_and_unwind() {
         let fixture = EditorFixture::new("body", false);
@@ -12420,12 +12952,69 @@ mod tests {
             unsafe { app.ensure_layout().unwrap() };
             let start = 3 + eol.len();
             let end = start + "title: value".len();
+            let closing = end + eol.len();
+            // D replaces the raw Live body row with aligned key/value fields.
+            // Its oracle is the literal fixture value and block boundaries,
+            // rather than expecting a source-character map for form labels.
+            let geometry = app.properties_test_geometry();
+            let rows = geometry["rows"].as_array().unwrap();
+            let field = |name: &str| rows.iter().find(|row| row["field"] == name).unwrap();
+            let key = field("Key(0)");
+            let value = field("Value(0)");
+            assert_eq!(key["text"], "title");
+            assert_eq!(value["text"], "value");
+            assert_eq!(
+                rows.iter().filter(|row| row["field"] == "Key(0)").count(),
+                1
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row["field"] == "Value(0)").count(),
+                1
+            );
+            assert_eq!(key["y"], value["y"]);
+            assert!(
+                value["x"].as_f64().unwrap()
+                    > key["x"].as_f64().unwrap() + key["width"].as_f64().unwrap()
+            );
+            assert!(
+                !app.views
+                    .iter()
+                    .any(|view| view.source.start < end && view.source.end > start)
+            );
+            let opening = app
+                .source_view_at(0, Some(BoundaryAffinity::After))
+                .unwrap();
+            let closing_view = app
+                .source_view_at(closing, Some(BoundaryAffinity::After))
+                .unwrap();
+            let first = rows.first().unwrap();
+            let last = rows.last().unwrap();
+            // Diagnostics use viewport DIP; TextViews retain document DIP.
+            let scroll = app.tabs[app.active].scroll as f64;
+            assert!(
+                opening.y as f64 + opening.height as f64
+                    <= first["y"].as_f64().unwrap() + scroll + 0.1
+            );
+            assert!(
+                last["y"].as_f64().unwrap() + last["height"].as_f64().unwrap() + scroll
+                    <= closing_view.y as f64 + 0.1
+            );
+            let following = source.find("following").unwrap();
+            let following_view = app
+                .source_view_at(following, Some(BoundaryAffinity::After))
+                .unwrap();
+            assert!(closing_view.y + closing_view.height <= following_view.y + 0.1);
+            assert_eq!(document_state(app.doc()), before);
+
+            // Source retains complete physical rows and exact EOL mapping.
+            app.tabs[0].raw = true;
+            unsafe { app.ensure_layout().unwrap() };
             let body = app
                 .views
                 .iter()
                 .find(|view| String::from_utf16_lossy(&view.text) == "title: value")
                 .unwrap();
-            assert_eq!(body.source, start..end);
+            assert_eq!(body.source, start..closing);
             assert!(
                 body.map
                     .iter()
@@ -12434,18 +13023,13 @@ mod tests {
             );
             assert_eq!(body.map.last(), Some(&end));
             assert_eq!(body.before.last(), Some(&end));
-            assert!((body.height - presentation::line_height(app.font_size())).abs() < 0.1);
-            let closing = end + eol.len();
-            let row_height = presentation::line_height(app.font_size());
-            let opening_y = app
-                .source_view_at(0, Some(BoundaryAffinity::After))
-                .unwrap()
-                .y;
-            let closing_y = app
-                .source_view_at(closing, Some(BoundaryAffinity::After))
-                .unwrap()
-                .y;
-            assert!((closing_y - opening_y - 2. * row_height).abs() < 0.1);
+            assert_eq!(
+                app.gutter_rows
+                    .iter()
+                    .map(|row| row.line_number)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5]
+            );
             for byte in start..=end {
                 let (x, y, height) = app.caret_location_at(byte, BoundaryAffinity::After);
                 assert_eq!(app.hit(x + 0.1, y + height * 0.5), byte);
@@ -12467,7 +13051,17 @@ mod tests {
                         app.after_input();
                     }
                     let rows: Vec<_> = app.gutter_rows.iter().map(|r| r.line_number).collect();
-                    assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+                    // The form owns property line 2; delimiter/body source
+                    // rows remain independently represented in the Live gutter.
+                    assert_eq!(rows, vec![1, 3, 4, 5, 6]);
+                    let geometry = app.properties_test_geometry();
+                    assert!(
+                        geometry["rows"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|row| row["field"] == "Value(0)" && row["text"] == "日本語 👩‍💻")
+                    );
                     let (x, y, height) = app.caret_location();
                     let (hit, _) = app.hit_with_affinity(x + 0.5, y + height * 0.5);
                     assert_eq!(hit, p, "delimiter hit-test at {p}");
@@ -12490,9 +13084,32 @@ mod tests {
                         app.key_with_modifiers(0x59, true, false);
                     }
                     assert_eq!(app.doc().source(), edited);
+                }
+                // Retyping the deleted delimiter character reconstructs the
+                // form through the actual native character path, without repair.
+                fixture.message(WM_CHAR, '-' as usize);
+                {
+                    let mut app = fixture.state.app.borrow_mut();
+                    assert_eq!(app.doc().source(), source);
+                    assert!(app.properties_ui.model.is_some());
+                    assert_eq!(app.doc().selection(), Selection::caret(p + 1));
                     unsafe {
                         app.key_with_modifiers(0x5a, true, false);
                     }
+                    let mut deleted = source.clone();
+                    deleted.remove(p);
+                    assert_eq!(app.doc().source(), deleted);
+                    unsafe {
+                        app.key_with_modifiers(0x59, true, false);
+                    }
+                    assert_eq!(app.doc().source(), source);
+                    unsafe {
+                        app.key_with_modifiers(0x5a, true, false);
+                        app.key_with_modifiers(0x5a, true, false);
+                    }
+                    assert_eq!(app.doc().source(), source);
+                    assert_eq!(app.doc().selection(), Selection::caret(p));
+                    assert!(!app.doc().is_dirty());
                 }
                 fixture.message(WM_CHAR, '字' as usize);
                 let app = fixture.state.app.borrow();
@@ -13458,6 +14075,7 @@ mod tests {
             source_line_starts: Vec::new(),
             gutter_rows: Vec::new(),
             gutter_width: 0.0,
+            gutter_number_width: 0.0,
             visible_tokens: Vec::new(),
             tables: Vec::new(),
             images: Vec::new(),
@@ -13476,6 +14094,7 @@ mod tests {
             revealed_source: None,
             dragging: false,
             dragging_scroll: false,
+            scroll_drag_offset: None,
             preedit: "かな".into(),
             composing: true,
             ime_owner: Some((1, 2, selection.anchor, selection.head)),
@@ -13507,6 +14126,9 @@ mod tests {
             git_ui: git_ui::GitPane::default(),
             search_ui: SearchPane::default(),
             editor_actions: EditorActions::default(),
+            properties_ui: properties_ui::PropertiesUi::default(),
+            code_languages: code_language::CodeLanguageUi::default(),
+            preview_ui: link_preview::PreviewUi::default(),
             diagnostics: DiagnosticsPane::default(),
             close_target: None,
             settings_requested: false,
@@ -14553,14 +15175,17 @@ mod tests {
             &[1, 2, 3, 4, 5, 6],
             false,
         );
-        assert_rows(
-            "---\ntitle: note\n---\n\nbody\n",
-            &[1, 2, 3, 4, 5, 6],
-            false,
-        );
+        for eol in ["\n", "\r\n"] {
+            let yaml = format!("---{eol}title: note{eol}---{eol}{eol}body{eol}");
+            // Live presents source line 2 inside the property form, just as
+            // table cells need not each own a raw physical gutter row.
+            // Delimiters, following blank/body and EOF stay source-addressed.
+            assert_rows(&yaml, &[1, 3, 4, 5, 6], false);
+            // Source mode still exposes every physical YAML/document line.
+            assert_rows(&yaml, &[1, 2, 3, 4, 5, 6], true);
+        }
         assert_rows("one\n\nthree\n", &[1, 2, 3, 4], true);
     }
-
     #[test]
     fn live_fenced_source_rows_hit_edit_language_delimiters_and_restore_exact_history() {
         for eol in ["\n", "\r\n"] {

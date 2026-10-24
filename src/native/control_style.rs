@@ -1,5 +1,6 @@
 //! UI-thread-owned fonts and client-only cursors for native child controls.
-//! Standard scrollbars, combo dropdown tracking and nonclient cursors stay native.
+//! Combo dropdown tracking and nonclient cursors stay native; scrollbar pixels
+//! are styled by the rail adapters while retaining native range notifications.
 use super::*;
 use windows::Win32::UI::Controls::*;
 

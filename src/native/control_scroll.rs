@@ -1,5 +1,5 @@
-//! Fixed-height native LISTBOX vertical adapter. The LISTBOX still owns content,
-//! selection, keys and its horizontal axis; only wheel routing and the V rail differ.
+//! Fixed-height native list vertical adapter. LISTBOX and ComboLBox keep their
+//! content, selection, keys and range; only wheel routing and the V rail differ.
 use super::*;
 use std::cell::OnceCell;
 use windows::Win32::UI::Controls::*;
@@ -21,6 +21,7 @@ unsafe fn same_thread(hwnd: HWND) -> bool {
 struct State {
     hwnd: Cell<HWND>,
     rail: scrollbar_style::VerticalRail,
+    combo_popup: bool,
     tokens: Cell<shell::Tokens>,
     native: Cell<bool>,
     reserve: Cell<i32>,
@@ -38,33 +39,82 @@ struct Horizontal {
 }
 
 /// Call only for a LISTBOX created without WS_VSCROLL. Keep its original H style.
-/// Variable-height/multicolumn/dropdown lists retain their original native policy.
+/// Variable-height and multicolumn LISTBOX controls retain their native policy.
 pub(super) unsafe fn attach_listbox(hwnd: HWND, tokens: shell::Tokens) -> Result<(), String> {
+    unsafe { attach(hwnd, tokens, false) }
+}
+
+/// Reuse the LISTBOX rail for the OS-created popup list owned by a ComboBox.
+/// The popup window owns its scroll range and lifetime; only its rail is adapted.
+pub(super) unsafe fn attach_combo_list(combo: HWND, tokens: shell::Tokens) -> Result<(), String> {
+    unsafe {
+        if !same_thread(combo) {
+            return Err("ComboBox popup rail requires its owning UI thread".into());
+        }
+        let style = GetWindowLongW(combo, GWL_STYLE) as u32;
+        if style & 0x3 == CBS_SIMPLE as u32 {
+            return Err("Simple ComboBox has no popup list rail".into());
+        }
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        GetComboBoxInfo(combo, &mut info)
+            .map_err(|error| format!("Cannot query ComboBox popup list: {error}"))?;
+        if info.hwndList == HWND::default() {
+            return Err("ComboBox has no popup list window".into());
+        }
+        attach(info.hwndList, tokens, true)
+    }
+}
+
+unsafe fn attach(hwnd: HWND, tokens: shell::Tokens, combo_popup: bool) -> Result<(), String> {
     unsafe {
         if !same_thread(hwnd) {
             return Err("LISTBOX rail requires its owning UI thread".into());
         }
         let existing = GetPropW(hwnd, PROPERTY);
         if !existing.is_invalid() {
-            return refresh_listbox(hwnd, tokens);
+            if attached(hwnd).is_some_and(|state| state.combo_popup == combo_popup) {
+                return refresh_listbox(hwnd, tokens);
+            }
+            return Err("List window already has an incompatible rail adapter".into());
         }
         let mut name = [0u16; 32];
         let length = GetClassNameW(hwnd, &mut name);
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        if !String::from_utf16_lossy(&name[..length as usize]).eq_ignore_ascii_case("LISTBOX")
-            || style & (WS_VSCROLL.0 | LBS_MULTICOLUMN as u32 | LBS_OWNERDRAWVARIABLE as u32) != 0
-            || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LEFTSCROLLBAR.0 != 0
-        {
-            return Err(
+        let class = String::from_utf16_lossy(&name[..length as usize]);
+        let valid_class = if combo_popup {
+            class.eq_ignore_ascii_case("ComboLBox")
+        } else {
+            class.eq_ignore_ascii_case("LISTBOX")
+        };
+        let invalid_style = if combo_popup {
+            style & (LBS_MULTICOLUMN as u32 | LBS_OWNERDRAWVARIABLE as u32) != 0
+        } else {
+            style & (WS_VSCROLL.0 | LBS_MULTICOLUMN as u32 | LBS_OWNERDRAWVARIABLE as u32) != 0
+                || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LEFTSCROLLBAR.0 != 0
+        };
+        if !valid_class || invalid_style {
+            return Err(if combo_popup {
+                "Popup rail requires a fixed-height ComboLBox"
+            } else {
                 "Vertical rail requires a fixed-height LTR LISTBOX created without WS_VSCROLL"
-                    .into(),
-            );
+            }
+            .into());
         }
-        let rail = scrollbar_style::VerticalRail::new_sibling(hwnd, REQUEST, tokens)
-            .ok_or("Cannot create LISTBOX vertical rail")?;
+        let rail = if combo_popup {
+            // ComboLBox is a popup parented to the desktop, so a normal sibling
+            // rail would be placed in the wrong z-order and coordinate space.
+            scrollbar_style::VerticalRail::new(hwnd, REQUEST, tokens)
+        } else {
+            scrollbar_style::VerticalRail::new_sibling(hwnd, REQUEST, tokens)
+        }
+        .ok_or("Cannot create LISTBOX vertical rail")?;
         let state = Rc::new(State {
             hwnd: Cell::new(hwnd),
             rail,
+            combo_popup,
             tokens: Cell::new(tokens),
             native: Cell::new(false),
             reserve: Cell::new(0),
@@ -87,7 +137,16 @@ pub(super) unsafe fn attach_listbox(hwnd: HWND, tokens: shell::Tokens) -> Result
             return Err("Cannot attach LISTBOX vertical subclass".into());
         }
         // Sibling rail occupies the reserved NC strip, never the text client area.
-        SetWindowLongW(hwnd, GWL_STYLE, (style | WS_CLIPSIBLINGS.0) as i32);
+        SetWindowLongW(
+            hwnd,
+            GWL_STYLE,
+            (style
+                | if combo_popup {
+                    WS_CLIPCHILDREN.0
+                } else {
+                    WS_CLIPSIBLINGS.0
+                }) as i32,
+        );
         let _ = EnableWindow(state.rail.hwnd(), IsWindowEnabled(hwnd).as_bool());
         state.sync(
             GetDpiForWindow(hwnd).max(1),
@@ -104,6 +163,11 @@ pub(super) unsafe fn refresh_listbox(hwnd: HWND, tokens: shell::Tokens) -> Resul
         }
         let pointer = GetPropW(hwnd, PROPERTY).0 as *const State;
         if pointer.is_null() {
+            let mut name = [0u16; 32];
+            let length = GetClassNameW(hwnd, &mut name);
+            if String::from_utf16_lossy(&name[..length as usize]).eq_ignore_ascii_case("COMBOBOX") {
+                return attach_combo_list(hwnd, tokens);
+            }
             return Err("LISTBOX vertical rail is not attached".into());
         }
         Rc::increment_strong_count(pointer);
@@ -179,7 +243,7 @@ pub(super) unsafe fn set_horizontal_offset(hwnd: HWND, offset: i32) -> bool {
     unsafe { attached(hwnd).is_some_and(|state| state.set_offset(offset)) }
 }
 
-fn horizontal_unit(hwnd: HWND) -> i32 {
+pub(super) fn horizontal_unit(hwnd: HWND) -> i32 {
     unsafe {
         let font = SendMessageW(hwnd, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0)));
         let font = if font.0 == 0 {
@@ -395,18 +459,29 @@ impl State {
             if changed {
                 self.cancel();
             }
-            if changed && !hc {
+            if changed && !hc && !self.combo_popup {
                 let _ = ShowScrollBar(hwnd, if h.is_some() { SB_BOTH } else { SB_VERT }, false);
             }
             let mut client = RECT::default();
             let _ = GetClientRect(hwnd, &mut client);
             let old_v = self.reserve.get();
             let old_h = self.bottom.get();
-            let range = self.range(hwnd);
+            let mut range = self.range(hwnd);
+            if self.combo_popup {
+                // ComboLBox toggles WS_VSCROLL as its top item changes. Keep
+                // its native range/position, but hide the pixels in custom mode.
+                let native_bar = hc && range.maximum() > 0;
+                let has_native_style = GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0 != 0;
+                if native_bar != has_native_style {
+                    let _ = ShowScrollBar(hwnd, SB_VERT, native_bar);
+                    let _ = GetClientRect(hwnd, &mut client);
+                    range = self.range(hwnd);
+                }
+            }
             let item_height = SendMessageW(hwnd, LB_GETITEMHEIGHT, Some(WPARAM(0)), Some(LPARAM(0)))
                 .0
                 .max(1) as i32;
-            let (v, bottom) = if hc {
+            let (v, bottom) = if hc || self.combo_popup {
                 (0, 0)
             } else {
                 reservations(
@@ -415,7 +490,7 @@ impl State {
                     range.content,
                     item_height,
                     h.map(|value| value.extent.get()),
-                    (10. * dpi as f32 / 96.).round().max(1.) as i32,
+                    scrollbar_style::rail_width(dpi),
                 )
             };
             self.reserve.set(v);
@@ -471,9 +546,14 @@ impl State {
                     right: origin.x + client.right + v,
                     bottom: origin.y + client.bottom,
                 };
-                let mut placed =
+                let mut placed = if self.combo_popup {
                     self.rail
-                        .update_sibling(range, dpi, self.tokens.get(), hc || hidden, vrect);
+                        .update(range, dpi, self.tokens.get(), hc || hidden);
+                    hc || hidden || !self.rail.native()
+                } else {
+                    self.rail
+                        .update_sibling(range, dpi, self.tokens.get(), hc || hidden, vrect)
+                };
                 if let Some(h) = h {
                     let mut range = self.h_range(hwnd);
                     let next = h.offset.get().clamp(0, (range.content - range.page).max(0));
@@ -504,8 +584,13 @@ impl State {
                     self.reserve.set(0);
                     self.bottom.set(0);
                     self.cancel();
-                    self.rail
-                        .update_sibling(range, dpi, self.tokens.get(), true, vrect);
+                    if self.combo_popup {
+                        let _ = ShowScrollBar(hwnd, SB_VERT, true);
+                        self.rail.update(range, dpi, self.tokens.get(), true);
+                    } else {
+                        self.rail
+                            .update_sibling(range, dpi, self.tokens.get(), true, vrect);
+                    }
                     if let Some(h) = h {
                         h.rail.update_horizontal_sibling(
                             self.h_range(hwnd),
@@ -727,6 +812,122 @@ unsafe extern "system" fn list_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combo_popup_rail_uses_native_range_and_popup_client_geometry() {
+        unsafe {
+            let owner = super::super::tests::hidden_test_window_size(600, 400);
+            let combo = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("COMBOBOX"),
+                w!("popup geometry probe"),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+                8,
+                8,
+                180,
+                240,
+                Some(owner),
+                Some(HMENU(1234usize as *mut _)),
+                None,
+                None,
+            )
+            .unwrap();
+            for index in 0..200 {
+                let item = format!("Choice {index:03}");
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(wide(&item).as_ptr() as isize)),
+                );
+            }
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+            let combo_info = || {
+                let mut info = COMBOBOXINFO {
+                    cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                GetComboBoxInfo(combo, &mut info).unwrap();
+                info
+            };
+            let before = combo_info();
+            let list = before.hwndList;
+            assert_ne!(list, HWND::default());
+            let mut class = [0u16; 64];
+            let class_len = GetClassNameW(list, &mut class).max(0) as usize;
+            assert_eq!(String::from_utf16_lossy(&class[..class_len]), "ComboLBox");
+            assert_ne!(GetParent(list).unwrap(), combo);
+            attach_combo_list(combo, shell::Tokens::default()).unwrap();
+            let state = attached(list).expect("popup list adapter");
+            assert!(state.combo_popup);
+            assert_eq!(GetParent(state.rail.hwnd()).unwrap(), list);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_VSCROLL.0, 0);
+
+            SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), Some(LPARAM(0)));
+            let opened = combo_info();
+            assert_eq!(opened.hwndList, list);
+            let mut window = RECT::default();
+            let mut client = RECT::default();
+            GetWindowRect(list, &mut window).unwrap();
+            GetClientRect(list, &mut client).unwrap();
+            let width = scrollbar_style::rail_width(GetDpiForWindow(list).max(1));
+            let rail = state.rail.hwnd();
+            let mut rail_window = RECT::default();
+            let mut origin = POINT::default();
+            GetWindowRect(rail, &mut rail_window).unwrap();
+            ClientToScreen(list, &mut origin).unwrap();
+            assert_eq!(rail_window.left - origin.x, client.right - width);
+            assert_eq!(rail_window.right - origin.x, client.right);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_VSCROLL.0, 0);
+            assert!(client.right >= window.right - window.left - width);
+
+            assert_eq!(SendMessageW(list, LB_GETCOUNT, None, None).0, 200);
+            assert!(window.right > window.left && window.bottom > window.top);
+            let mut client_rail = RECT::default();
+            GetClientRect(rail, &mut client_rail).unwrap();
+            let click = client_rail.bottom * 3 / 4;
+            SendMessageW(
+                rail,
+                WM_LBUTTONDOWN,
+                Some(WPARAM(0)),
+                Some(LPARAM((click as u16 as u32).wrapping_shl(16) as isize)),
+            );
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, Some(list), REQUEST, REQUEST, PM_REMOVE).as_bool() {
+                DispatchMessageW(&message);
+            }
+            let top = SendMessageW(list, LB_GETTOPINDEX, None, None).0;
+            assert!(
+                top > 100,
+                "track click should jump toward its location: {top}"
+            );
+            let mut scroll = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                ..Default::default()
+            };
+            GetScrollInfo(list, SB_VERT, &mut scroll).unwrap();
+            assert_eq!(scroll.nPos, top as i32);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_VSCROLL.0, 0);
+            assert!(!state.rail.native());
+
+            let dpi = GetDpiForWindow(list).max(1);
+            state.sync(dpi, true);
+            assert_ne!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_VSCROLL.0, 0);
+            assert!(state.rail.native(), "native fallback hides the custom rail");
+            state.sync(dpi, false);
+            assert_eq!(GetWindowLongW(list, GWL_STYLE) as u32 & WS_VSCROLL.0, 0);
+            assert!(!state.rail.native());
+
+            let _ = SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), Some(LPARAM(0)));
+            assert!(!state.shown.get());
+            let _ = SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), Some(LPARAM(0)));
+            assert_eq!(combo_info().hwndList, list);
+            assert_eq!(SendMessageW(combo, CB_GETCURSEL, None, None).0, 0);
+            let _ = DestroyWindow(owner);
+        }
+    }
+
     struct Surface(HDC, HBITMAP, HGDIOBJ);
     impl Surface {
         unsafe fn new(hwnd: HWND, width: i32, height: i32) -> Self {

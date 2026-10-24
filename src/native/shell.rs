@@ -779,6 +779,8 @@ pub(super) unsafe fn control(
         let role = class.to_string().unwrap_or_default();
         let list_adapter = role.eq_ignore_ascii_case("LISTBOX")
             && style.0 & (LBS_MULTICOLUMN as u32 | LBS_OWNERDRAWVARIABLE as u32) == 0;
+        let combo_list_adapter =
+            role.eq_ignore_ascii_case("COMBOBOX") && style.0 & 0x3 != CBS_SIMPLE as u32;
         let edit_adapter = role.eq_ignore_ascii_case("EDIT")
             && style.0 & ES_MULTILINE as u32 != 0
             && style.0 & (WS_HSCROLL.0 | WS_VSCROLL.0) != 0;
@@ -827,6 +829,14 @@ pub(super) unsafe fn control(
         };
         if hwnd != HWND::default() {
             configure(hwnd);
+            if combo_list_adapter
+                && let Err(error) =
+                    super::control_scroll::attach_combo_list(hwnd, Tokens::default())
+            {
+                // The list window is ComboBox-owned; retain it unchanged if its
+                // native popup cannot host the custom rail.
+                eprintln!("Native ComboBox popup scrollbar fallback (ID {id}): {error}");
+            }
             if edit_adapter && let Err(error) = super::edit_scroll::attach(hwnd, Tokens::default())
             {
                 // This HWND is unpublished. Recreate ONCE with its original
@@ -1100,6 +1110,11 @@ fn toggle_region_visibility(layout: &mut PanelLayout, left: bool) {
         layout.right_visible = !layout.right_visible;
     }
 }
+fn side_is_displayed(layout: &PanelLayout, panels: &[(PanelId, Rect); 5], side: Side) -> bool {
+    panels.iter().any(|(id, rect)| {
+        layout.side(*id) == side && layout.displayed(*id) && rect.width > 0. && rect.height > 0.
+    })
+}
 fn toolbar_query_rect(width: f32, compact: bool) -> Rect {
     let left = if compact {
         8.
@@ -1222,12 +1237,7 @@ impl App {
         Self::activity_view(index).is_some_and(|id| {
             self.activity_button_visible(index)
                 && self.shell.layout.selected(id)
-                && self.shell.layout.region_visible(id)
-                && (self.width >= 760.
-                    || self
-                        .shell
-                        .drawer
-                        .is_some_and(|drawer| self.shell.layout.group(drawer).representative == id))
+                && side_is_displayed(&self.shell.layout, &self.shell.panels, Side::Left)
         })
     }
     pub(super) fn parent_root_diagnostic(&self) -> serde_json::Value {
@@ -1258,7 +1268,7 @@ impl App {
                 |r: Rect| serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height});
             serde_json::json!({"schema":1,"hwnd":main.0 as usize,"editor_hwnd":self.editing_window().0 as usize,"compact_hwnd":self.shell.compact_window.0 as usize,"dpi":dpi,"dpi_raw":raw_dpi,
             "client_rect":{"left":client.left,"top":client.top,"right":client.right,"bottom":client.bottom},"window_rect":{"left":window.left,"top":window.top,"right":window.right,"bottom":window.bottom},
-            "left_region_visible":self.shell.layout.left_visible,"right_region_visible":self.shell.layout.right_visible,"editor_rect":rectangle(editor),"active_editor_rect":rectangle(self.shell.editor),"search_active":self.search_pane_active(),
+            "left_region_visible":side_is_displayed(&self.shell.layout,&panels,Side::Left),"right_region_visible":side_is_displayed(&self.shell.layout,&panels,Side::Right),"left_region_intent":self.shell.layout.left_visible,"right_region_intent":self.shell.layout.right_visible,"editor_rect":rectangle(editor),"active_editor_rect":rectangle(self.shell.editor),"search_active":self.search_pane_active(),
             "panel_rects":panels.iter().map(|(id,r)|{let state=self.shell.layout.get(*id);serde_json::json!({"id":(["explorer","calendar","outline","git","search"][*id as usize]),"rect":rectangle(*r),"body":rectangle(Rect{x:r.x,y:r.y+30.,width:r.width,height:(r.height-30.).max(0.)}),"hidden":state.hidden,"collapsed":state.collapsed,"side":format!("{:?}",self.shell.layout.side(*id)),"group":format!("{:?}",self.shell.layout.group(*id).representative),"selected":self.shell.layout.selected(*id)})}).collect::<Vec<_>>(),
             "panel_groups":self.shell.layout.groups.iter().map(|g|serde_json::json!({"representative":format!("{:?}",g.representative),"side":format!("{:?}",g.side),"views":g.views.iter().map(|v|format!("{:?}",v)).collect::<Vec<_>>(),"width":g.width,"active":self.shell.layout.active[g.side.index()]==Some(g.representative)})).collect::<Vec<_>>(),"features":self.feature_test_geometry(&panels),"search_busy":self.search_busy(),"git_job_busy":self.git_job_busy(),"mutation_busy":self.background_mutation_busy()})
         }
@@ -1814,7 +1824,10 @@ impl App {
         y: i32,
     ) -> windows::core::BOOL {
         let help: Vec<_> = commands()
-            .map(|command| (command.id(), self.command_help(command)))
+            .filter_map(|command| {
+                self.command_popup_help(command)
+                    .map(|text| (command.id(), text))
+            })
             .collect();
         unsafe {
             menu_style::track_popup_help(
@@ -1844,6 +1857,15 @@ impl App {
         } else {
             self.command_disabled_reason(command).to_owned()
         }
+    }
+    fn command_popup_help(&self, command: Command) -> Option<String> {
+        let text = self.command_help(command);
+        let label = self.command_label(command);
+        let displayed_label = label
+            .split_once('\t')
+            .map_or(label.as_str(), |(label, _)| label);
+        let helper_label = text.strip_prefix("Git: ").unwrap_or(&text);
+        (!text.is_empty() && helper_label != displayed_label).then_some(text)
     }
     fn command_disabled_reason(&self, c: Command) -> &'static str {
         if self.feature_ime_active() {
@@ -1921,12 +1943,12 @@ impl App {
             (
                 REGION_LEFT,
                 self.shell.region_buttons[0],
-                self.shell.layout.left_visible,
+                side_is_displayed(&self.shell.layout, &self.shell.panels, Side::Left),
             ),
             (
                 REGION_RIGHT,
                 self.shell.region_buttons[1],
-                self.shell.layout.right_visible,
+                side_is_displayed(&self.shell.layout, &self.shell.panels, Side::Right),
             ),
         ];
         buttons.extend(
@@ -1959,16 +1981,45 @@ impl App {
         if self.defer_theme_updates {
             return;
         }
-        unsafe {
+        let next = Rc::new(self.shell_button_paint());
+        let changed = unsafe {
             let pointer =
                 GetWindowLongPtrW(self.shell.main_window, GWLP_USERDATA) as *const WindowState;
             if let Some(state) = pointer.as_ref()
                 && state.owns_paint_surface(self.shell.main_window)
             {
-                let retired = state
-                    .shell_button_paint
-                    .replace(Some(Rc::new(self.shell_button_paint())));
+                let retired = state.shell_button_paint.replace(Some(Rc::clone(&next)));
+                let changed = retired
+                    .as_deref()
+                    .filter(|previous| previous.owner == next.owner)
+                    .map(|previous| {
+                        previous
+                            .buttons
+                            .iter()
+                            .filter_map(|(id, child, active)| {
+                                let next_active = next
+                                    .buttons
+                                    .iter()
+                                    .find(|button| button.0 == *id && button.1 == *child)
+                                    .map(|button| button.2)?;
+                                (next_active != *active).then_some((*id, *child))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 drop(retired);
+                Some((next.owner, changed))
+            } else {
+                None
+            }
+        };
+        if let Some((owner, changed)) = changed {
+            for (id, child) in changed {
+                if unsafe { valid_shell_erase_button(child, owner, id) } {
+                    unsafe {
+                        let _ = InvalidateRect(Some(child), None, false);
+                    }
+                }
             }
         }
     }
@@ -2788,6 +2839,7 @@ impl App {
                     self.doc_mut().undo();
                 }
                 self.after_input();
+                self.properties_restore_history_focus();
                 return true;
             }
             if id == PALETTE_EXECUTE {
@@ -2962,11 +3014,21 @@ impl App {
         self.save_panel_layout();
     }
     fn toggle_region(&mut self, left: bool) {
-        let visible = if left {
-            self.shell.layout.left_visible
-        } else {
-            self.shell.layout.right_visible
+        let side = if left { Side::Left } else { Side::Right };
+        let visible = side_is_displayed(&self.shell.layout, &self.shell.panels, side);
+        // An empty side has no region to display. Preserve its stored intent
+        // and group membership instead of manufacturing an ON state.
+        let Some(group) = self.shell.layout.groups.iter().find(|group| {
+            group.side == side
+                && Some(group.representative) == self.shell.layout.active[side.index()]
+                && group
+                    .views
+                    .iter()
+                    .any(|view| !self.shell.layout.get(*view).hidden)
+        }) else {
+            return;
         };
+        let representative = group.representative;
         let index = usize::from(!left);
         unsafe {
             let focus = GetFocus();
@@ -2986,7 +3048,16 @@ impl App {
                 }
             }
         }
-        toggle_region_visibility(&mut self.shell.layout, left);
+        if self.width < 760. {
+            if left {
+                self.shell.layout.left_visible = !visible;
+            } else {
+                self.shell.layout.right_visible = !visible;
+            }
+            self.shell.drawer = if visible { None } else { Some(representative) };
+        } else {
+            toggle_region_visibility(&mut self.shell.layout, left);
+        }
         self.presentation_changed();
         self.save_panel_layout();
         if !visible {
@@ -3340,6 +3411,9 @@ impl App {
             if self.composing {
                 return;
             }
+            if self.code_language_click(x, y) {
+                return;
+            }
             if self.shell.compact_window != HWND::default() && self.hwnd == self.shell.main_window {
                 return;
             }
@@ -3398,10 +3472,11 @@ impl App {
             if !self.shell.editor.contains(x, y) {
                 return;
             }
-            if x > self.editor_right() - 12. {
-                self.dragging_scroll = true;
-                self.scroll_at(y);
+            if self.begin_editor_scroll_drag(x, y) {
                 SetCapture(self.hwnd);
+                if GetCapture() != self.hwnd {
+                    self.cancel_editor_scroll_drag(self.hwnd);
+                }
                 return;
             }
             if self.toggle_task_at(x, y) {
@@ -3414,15 +3489,6 @@ impl App {
         }
     }
     pub(super) fn shell_mouse_move(&mut self, lp: LPARAM) -> bool {
-        let x = (lp.0 as u16 as i16) as f32 / self.dpi;
-        let y = ((lp.0 >> 16) as u16 as i16) as f32 / self.dpi;
-        let hover = self.shell.editor.contains(x, y) && x > self.editor_right() - 12.;
-        if self.shell.scroll_hover != hover {
-            self.shell.scroll_hover = hover;
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
-        }
         let Some(splitter) = self.shell.splitter else {
             return false;
         };
@@ -3936,6 +4002,7 @@ impl App {
             }
             if !self.feature_ime_active() && ctrl && alt {
                 let id = match msg.wParam.0 as u16 {
+                    0x4c if !shift => Some(super::code_language::COMMAND),
                     0x31..=0x34 => Some(160 + msg.wParam.0 - 0x31),
                     v if v == VK_UP.0 => Some(164),
                     v if v == VK_DOWN.0 => Some(165),
@@ -3983,6 +4050,10 @@ impl App {
     }
     pub(super) unsafe fn shell_shortcut(&mut self, key: u16, ctrl: bool, shift: bool) -> bool {
         unsafe {
+            if ctrl && !shift && GetKeyState(VK_MENU.0 as i32) < 0 && key == 0x4c {
+                self.command(super::code_language::COMMAND);
+                return true;
+            }
             for c in commands() {
                 let Some(binding) = c
                     .binding()
@@ -4829,9 +4900,13 @@ mod tests {
             assert!(!app.activity_button_visible(index));
         }
         app.focus_feature_panel(PanelId::Calendar);
+        // ON now means rendered area, so the fixture must publish geometry as
+        // the production layout path does, independently of child focus.
+        app.shell.panels = shell_geometry(&app.shell.layout, 1440., 900., None).1;
         assert!(app.activity_button_active(0));
         app.shell.layout.get_mut(PanelId::Calendar).collapsed = true;
         app.shell.layout.select(PanelId::Search);
+        app.shell.panels = shell_geometry(&app.shell.layout, 1440., 900., None).1;
         assert!(app.activity_button_active(1));
         let (_, search) = shell_geometry(&app.shell.layout, 1440., 900., None);
         assert_eq!(search[PanelId::Explorer as usize].1, Rect::default());
@@ -4890,6 +4965,37 @@ mod tests {
         layout.left_visible = false;
         let (_, rects) = shell_geometry(&layout, 600., 800., Some(PanelId::Explorer));
         assert_eq!(rects[PanelId::Explorer as usize].1, Rect::default());
+    }
+
+    #[test]
+    fn actual_region_state_follows_visible_geometry_and_drawer_without_mutating_intent() {
+        let mut layout = PanelLayout::default();
+        let intent = layout.serialize();
+        let (_, rects) = shell_geometry(&layout, 1100., 800., None);
+        assert!(side_is_displayed(&layout, &rects, Side::Left));
+        assert!(!side_is_displayed(&layout, &rects, Side::Right));
+        assert!(layout.right_visible, "empty side intent remains stored");
+        assert_eq!(layout.serialize(), intent);
+        let (_, closed) = shell_geometry(&layout, 600., 800., None);
+        assert!(!side_is_displayed(&layout, &closed, Side::Left));
+        let (_, open) = shell_geometry(&layout, 600., 800., Some(PanelId::Explorer));
+        assert!(side_is_displayed(&layout, &open, Side::Left));
+        layout.get_mut(PanelId::Explorer).hidden = true;
+        let (_, hidden) = shell_geometry(&layout, 600., 800., Some(PanelId::Explorer));
+        assert!(!side_is_displayed(&layout, &hidden, Side::Left));
+        layout.split_to(PanelId::Outline, Side::Right);
+        for (left, right) in [(true, true), (true, false), (false, true), (false, false)] {
+            layout.left_visible = left;
+            layout.right_visible = right;
+            layout.get_mut(PanelId::Explorer).hidden = false;
+            let (_, rects) = shell_geometry(&layout, 1100., 800., None);
+            assert_eq!(side_is_displayed(&layout, &rects, Side::Left), left);
+            assert_eq!(side_is_displayed(&layout, &rects, Side::Right), right);
+            let restored = PanelLayout::parse(&layout.serialize()).unwrap();
+            let (_, rects) = shell_geometry(&restored, 1100., 800., None);
+            assert_eq!(side_is_displayed(&restored, &rects, Side::Left), left);
+            assert_eq!(side_is_displayed(&restored, &rects, Side::Right), right);
+        }
     }
 
     #[test]
@@ -5341,6 +5447,47 @@ mod tests {
         }
     }
     #[test]
+    fn command_popup_help_omits_only_displayed_label_duplicates() {
+        let source = "| H1 | H2 |\n| --- | --- |\n| a | b |\n| c | d |\n";
+        let mut app = super::super::tests::composing_test_app(source);
+        app.clear_composition();
+        let caret = source.find("a | b").unwrap();
+        app.doc_mut().set_selection(caret, caret).unwrap();
+        app.editor_actions_sync();
+        let current = app.navigation_point();
+        app.shell.nav_back.push(NavigationPoint {
+            scroll: current.scroll + 1.,
+            ..current
+        });
+
+        assert!(app.command_enabled(Command::New));
+        assert!(app.command_popup_help(Command::New).is_none());
+        assert!(app.command_enabled(Command::Navigate(false)));
+        assert_eq!(
+            app.command_popup_help(Command::Navigate(false)).as_deref(),
+            Some("文書と編集位置の履歴を移動します。本文のUndo / Redoとは別です。")
+        );
+        assert!(app.command_enabled(Command::PanelMove(0)));
+        assert_eq!(
+            app.command_popup_help(Command::PanelMove(0)).as_deref(),
+            Some("このviewの所属だけを明示的に変更します。反対側のviewと入れ替えません。")
+        );
+        let delete_row = Command::Editor(21);
+        assert!(app.command_enabled(delete_row));
+        assert_eq!(app.command_label(delete_row), "行を削除");
+        assert_eq!(
+            app.command_popup_help(delete_row).as_deref(),
+            Some("行を削除（見出し・最後の行を保護）")
+        );
+
+        app.composing = true;
+        assert!(!app.command_enabled(Command::New));
+        assert_eq!(
+            app.command_popup_help(Command::New).as_deref(),
+            Some(app.command_disabled_reason(Command::New))
+        );
+    }
+    #[test]
     fn close_last_clean_tab_keeps_valid_navigation_state() {
         let mut app = super::super::tests::composing_test_app("clean\n");
         let window = super::super::tests::hidden_test_window_size(900, 600);
@@ -5531,6 +5678,128 @@ mod tests {
             SelectObject(dc, old);
             let _ = DeleteObject(bitmap.into());
             let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn shell_region_toggle_invalidates_only_the_changed_registered_button() {
+        let mut seed = super::super::tests::composing_test_app("panel paint");
+        seed.clear_composition();
+        let fixture = super::super::tests::MessagePumpFixture::new(seed);
+        unsafe {
+            fixture.state.app.borrow_mut().start_shell();
+            fixture.state.app.borrow_mut().update_shell_geometry(700.);
+            // Match the existing visible, no-activate native paint fixture.
+            let _ = ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+
+            let ((left, left_initial_active), (right, right_initial_active)) = {
+                let ready = fixture.state.shell_button_paint.borrow();
+                let paint = ready.as_ref().expect("shell paint cache is ready");
+                assert_eq!(paint.owner, fixture.hwnd);
+                let region = |id| {
+                    paint
+                        .buttons
+                        .iter()
+                        .find(|button| button.0 == id)
+                        .map(|button| (button.1, button.2))
+                        .expect("registered region button")
+                };
+                (region(REGION_LEFT), region(REGION_RIGHT))
+            };
+            assert!(left_initial_active, "the default left region starts active");
+            assert!(
+                !right_initial_active,
+                "the default right region starts inactive"
+            );
+            assert!(IsWindowVisible(fixture.hwnd).as_bool());
+            assert!(IsWindowVisible(left).as_bool());
+            assert!(IsWindowVisible(right).as_bool());
+            assert!(valid_shell_erase_button(left, fixture.hwnd, REGION_LEFT));
+            assert!(valid_shell_erase_button(right, fixture.hwnd, REGION_RIGHT));
+            for child in [left, right] {
+                let _ = ValidateRect(Some(child), None);
+                assert!(!GetUpdateRect(child, None, false).as_bool());
+            }
+            assert!(
+                InvalidateRect(Some(left), None, false).as_bool(),
+                "visible fixture accepts direct child damage"
+            );
+            assert!(
+                GetUpdateRect(left, None, false).as_bool(),
+                "visible fixture exposes the direct update region"
+            );
+            let _ = ValidateRect(Some(left), None);
+            assert!(!GetUpdateRect(left, None, false).as_bool());
+            assert!(!GetUpdateRect(right, None, false).as_bool());
+
+            {
+                let mut app = fixture.state.app.borrow_mut();
+                toggle_region_visibility(&mut app.shell.layout, true);
+                let (editor, panels) =
+                    shell_geometry(&app.shell.layout, app.width, 700., app.shell.drawer);
+                app.shell.editor = editor;
+                app.shell.panels = panels;
+                app.publish_shell_button_paint();
+            }
+
+            let (left_active, right_active) = {
+                let ready = fixture.state.shell_button_paint.borrow();
+                let paint = ready.as_ref().expect("updated shell paint cache is ready");
+                let active = |id| {
+                    paint
+                        .buttons
+                        .iter()
+                        .find(|button| button.0 == id)
+                        .map(|button| button.2)
+                        .expect("registered region button")
+                };
+                (active(REGION_LEFT), active(REGION_RIGHT))
+            };
+            assert!(
+                !left_active,
+                "publishing changed layout geometry turns off the left region"
+            );
+            assert_eq!(right_active, right_initial_active);
+            assert!(GetUpdateRect(left, None, false).as_bool());
+            assert!(!GetUpdateRect(right, None, false).as_bool());
+
+            let _ = ValidateRect(Some(left), None);
+            let _ = ValidateRect(Some(right), None);
+            fixture.state.app.borrow().publish_shell_button_paint();
+            assert!(!GetUpdateRect(left, None, false).as_bool());
+            assert!(!GetUpdateRect(right, None, false).as_bool());
+
+            fixture.state.app.borrow_mut().toggle_region(true);
+            let (left_active, right_active) = {
+                let ready = fixture.state.shell_button_paint.borrow();
+                let paint = ready.as_ref().expect("region toggle publishes paint");
+                let active = |id| {
+                    paint
+                        .buttons
+                        .iter()
+                        .find(|button| button.0 == id)
+                        .map(|button| button.2)
+                        .expect("registered region button")
+                };
+                (active(REGION_LEFT), active(REGION_RIGHT))
+            };
+            assert!(
+                left_active,
+                "the actual layout toggle restores the left region"
+            );
+            assert_eq!(right_active, right_initial_active);
+            assert!(GetUpdateRect(left, None, false).as_bool());
+
+            fixture.state.app.borrow_mut().update_shell_geometry(700.);
+            let _ = ValidateRect(Some(left), None);
+            let _ = ValidateRect(Some(right), None);
+            assert!(!GetUpdateRect(left, None, false).as_bool());
+            assert!(!GetUpdateRect(right, None, false).as_bool());
+            for _ in 0..2 {
+                fixture.state.app.borrow_mut().update_shell_geometry(700.);
+                assert!(!GetUpdateRect(left, None, false).as_bool());
+                assert!(!GetUpdateRect(right, None, false).as_bool());
+            }
         }
     }
 
